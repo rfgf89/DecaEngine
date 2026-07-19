@@ -3,14 +3,8 @@
 // Assume these are bound individually in C#
 Texture2D    _MainTex;
 SamplerState _MainTex_sampler;
-Texture2D ShadowMaps0;
-Texture2D ShadowMaps1;
-Texture2D ShadowMaps2;
-Texture2D ShadowMaps3;
-SamplerComparisonState ShadowMaps0_sampler;
-SamplerComparisonState ShadowMaps1_sampler;
-SamplerComparisonState ShadowMaps2_sampler;
-SamplerComparisonState ShadowMaps3_sampler;
+Texture2DArray ShadowMaps;
+SamplerComparisonState ShadowMaps_sampler;
 
 cbuffer Light
 {
@@ -35,7 +29,7 @@ struct PSOutput
     float4 color : SV_TARGET;
 };
 
-float GetVisibility(SamplerComparisonState state, Texture2D tex, float4x4 lightSpaceMatrix, float3 worldPos, float3 normal, float3 lightDir)
+float GetVisibility(int cascade, float4x4 lightSpaceMatrix, float3 worldPos, float3 normal, float3 lightDir)
 {
     float4 lightSpacePos = mul(float4(worldPos, 1.0), lightSpaceMatrix);
     float3 projCoords = lightSpacePos.xyz / lightSpacePos.w;
@@ -55,7 +49,7 @@ float GetVisibility(SamplerComparisonState state, Texture2D tex, float4x4 lightS
     float bias = max(0.001 * (1.0 - cosTheta), 0.001);
 
     // SampleCmp returns 1.0 if the pixel is not in shadow, 0.0 if it is.
-    float visibility = tex.SampleCmp(state, float3(shadowUV, 0.0), projCoords.z - bias);
+    float visibility = ShadowMaps.SampleCmp(ShadowMaps_sampler, float3(shadowUV, cascade), projCoords.z - bias);
 
     return visibility > projCoords.z + bias;
 }
@@ -82,13 +76,13 @@ PSOutput Main(in PSInput input)
     float viewDepth = distance(input.worldPos, viewData.CameraWorldPos);
 
     if (viewDepth <= lightData.CascadeSplits.x) {
-        shadowIntensity = GetVisibility(ShadowMaps0_sampler, ShadowMaps0, lightData.CascadeMatrix[0], input.worldPos, normal, lightDir);
+        shadowIntensity = GetVisibility(0, lightData.CascadeMatrix[0], input.worldPos, normal, lightDir);
     } else if (viewDepth <= lightData.CascadeSplits.y) {
-        shadowIntensity = GetVisibility(ShadowMaps1_sampler, ShadowMaps1, lightData.CascadeMatrix[1], input.worldPos, normal, lightDir);
+        shadowIntensity = GetVisibility(1, lightData.CascadeMatrix[1], input.worldPos, normal, lightDir);
     } else if (viewDepth <= lightData.CascadeSplits.z) {
-        shadowIntensity = GetVisibility(ShadowMaps2_sampler, ShadowMaps2, lightData.CascadeMatrix[2], input.worldPos, normal, lightDir);
+        shadowIntensity = GetVisibility(2, lightData.CascadeMatrix[2], input.worldPos, normal, lightDir);
     } else {
-        shadowIntensity = GetVisibility(ShadowMaps3_sampler, ShadowMaps3, lightData.CascadeMatrix[3], input.worldPos, normal, lightDir);
+        shadowIntensity = GetVisibility(3, lightData.CascadeMatrix[3], input.worldPos, normal, lightDir);
     }
 
     float shadowStrength = lightData.SpotAngles.z;

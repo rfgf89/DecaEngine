@@ -220,11 +220,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		material.SetBuffer("View", _viewConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 		material.SetBuffer("Light", _lightConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 
-		for (int i = 0; i < _shadowRenderer.ShadowMaps.Length; i++)
-		{
-			material.SetTexture($"ShadowMaps{i}", _shadowRenderer.ShadowMaps[i], HandleAccess.Pixel);
-			material.SetSampler($"ShadowMaps{i}_sampler", _shadowRenderer.ShadowSampler[i], HandleAccess.Pixel, false);
-		}
+		material.SetTexture($"ShadowMaps", _shadowRenderer.ShadowMaps, HandleAccess.Pixel);
+		material.SetSampler($"ShadowMaps_sampler", _shadowRenderer.ShadowSampler, HandleAccess.Pixel, false);
 
 		if (_gpuInstancesDataBuffer != null)
 			material.SetBuffer("GPURenderInstances", _gpuInstancesDataBuffer, HandleAccess.Vertex);
@@ -488,7 +485,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		if (_instancesSubset.instances.Length == 0 || _totalCommands == 0) return;
 		UpdateGpuMegaBuffers();
 		UpdateDrawRangesCache();
-		_shadowRenderer.ExecuteDrawShadows(cmd, _megaVertexBufferGPU, _megaIndexBufferGPU, cullResult, cascadeIndex);
+		_shadowRenderer.ExecuteDrawShadows(cmd, _megaVertexBufferGPU, _megaIndexBufferGPU, cullResult, (uint)cascadeIndex);
 	}
 
 	public void ExecuteDrawBatching(ICommandBuffer cmd, CullResult cullResult)
@@ -498,10 +495,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		UpdateGpuMegaBuffers();
 		UpdateDrawRangesCache();
 
-		for (int i = 0; i < _shadowRenderer.ShadowMaps.Length; i++)
-		{
-			cmd.TransitionResource(_shadowRenderer.ShadowMaps[i], ResourceState.ShaderResource);
-		}
+		cmd.TransitionResource(_shadowRenderer.ShadowMaps, ResourceState.ShaderResource);
 
 		cmd.TransitionResource(cullResult.FinallyInstancesBuffer, ResourceState.VertexBuffer);
 		cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);

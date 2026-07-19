@@ -14,14 +14,14 @@ namespace DecaEngine.Graphics.Diligent
 	{
 		private readonly DiligentGraphicsPipeline _pipeline;
 		private readonly IMaterialObject _shadowMaterial;
-		private ISamplerObject[] _shadowSampler;
-		private IRenderTarget[] _shadowMaps;
+		private ISamplerObject _shadowSampler;
+		private IRenderTarget _shadowMaps;
 		
 		public const int MaxCascades = 4;
 		public const int ShadowMapSize = 8192;
 
-		public IRenderTarget[] ShadowMaps => _shadowMaps;
-		public ISamplerObject[] ShadowSampler => _shadowSampler;
+		public IRenderTarget ShadowMaps => _shadowMaps;
+		public ISamplerObject ShadowSampler => _shadowSampler;
 
 		public ShadowRenderer(DiligentGraphicsPipeline pipeline)
 		{
@@ -34,29 +34,21 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void CreateShadowMap()
 		{
-			_shadowMaps = new IRenderTarget[MaxCascades];
-			_shadowSampler = new ISamplerObject[MaxCascades];
-
-			for (int i = 0; i < MaxCascades; i++)
+			_shadowMaps = _pipeline.CreateRenderTarget(new RenderTargetInfo
 			{
-				var shadowMapInfo = new RenderTargetInfo
-				{
-					name = $"Shadow Map {i}",
-					width = ShadowMapSize,
-					height = ShadowMapSize,
-					textureFormat = RenderTargetInfo.Format.D32_FLOAT,
-				};
-				_shadowMaps[i] = _pipeline.CreateRenderTarget(shadowMapInfo);
+				name = $"Shadow Map",
+				width = ShadowMapSize,
+				height = ShadowMapSize,
+				textureFormat = RenderTargetInfo.Format.D32_FLOAT,
+				arraySize = MaxCascades
+			});
 
-
-				_shadowSampler[i] = _pipeline.CreateSampler(
-					$"Shadow Sampler{i}",
-					TextureFilter.ComparisonLinear,
-					TextureAddress.Border,
-					CompFunction.Greater,
-					new Vector4(0.0f, 0.0f, 0.0f, 0.0f)
-				);
-			}
+			_shadowSampler = _pipeline.CreateSampler(
+				$"Shadow Sampler",
+				TextureFilter.ComparisonLinear,
+				TextureAddress.Border,
+				CompFunction.Greater,
+				new Vector4(0.0f, 0.0f, 0.0f, 0.0f));
 		}
 
 		private void CreateShadowPso()
@@ -88,21 +80,19 @@ namespace DecaEngine.Graphics.Diligent
 			DiligentBufferHandle megaVertexBufferGPU,
 			DiligentBufferHandle megaIndexBufferGPU,
 			CullResult cullResult,
-			int cascadeIndex)
+			uint cascadeIndex)
 		{
 			if (cascadeIndex < 0 || cascadeIndex >= MaxCascades) return;
 
-			var target = _shadowMaps[cascadeIndex];
-
-			cmd.TransitionResource(target, ResourceState.DepthWrite);
+			cmd.TransitionResource(_shadowMaps, ResourceState.DepthWrite);
 
 			cmd.TransitionResource(cullResult.FinallyInstancesBuffer, ResourceState.VertexBuffer);
 			cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);
 			cmd.TransitionResource(cullResult.IndirectArgsBuffers, ResourceState.IndirectArgument);
 			
-			cmd.SetRenderTarget(null, target, 0, 0);
+			cmd.SetRenderTarget(null, _shadowMaps, 0, cascadeIndex);
 			cmd.SetViewport(ShadowMapSize, ShadowMapSize);
-			cmd.ClearDepthStencil(target, ClearDepthStencilFlags.Depth, 0.0f, 0, 0);
+			cmd.ClearDepthStencil(_shadowMaps, ClearDepthStencilFlags.Depth, 0.0f, 0, cascadeIndex);
 
 			cmd.SetVertexBuffers(0, [megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 			cmd.SetIndexBuffer(megaIndexBufferGPU, 0);
@@ -118,7 +108,7 @@ namespace DecaEngine.Graphics.Diligent
 
 			cmd.DrawIndexedIndirect(cullResult.IndirectArgsBuffers, drawRange, IndexType.UInt32);
 
-			cmd.TransitionResource(target, ResourceState.ShaderResource);
+			cmd.TransitionResource(_shadowMaps, ResourceState.ShaderResource);
 		}
 
 		private GraphicsPipelineStateCreateInfo GetBaseState()
@@ -174,9 +164,9 @@ namespace DecaEngine.Graphics.Diligent
 		{
 			if (_shadowMaps != null)
 			{
-				foreach (var map in _shadowMaps)
-					map?.Release();
+				_shadowMaps?.Release();
 			}
+
 			_shadowMaterial?.Release();
 		}
 	}
