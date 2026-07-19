@@ -1,0 +1,62 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <OutputType>Exe</OutputType>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\DecaEngine.Core.Build\DecaEngine.Core.Build.csproj" />
+      <ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.Generic\DecaEngine.Generic.csproj" />
+      <ProjectReference Include="..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.ImGui.Core\DecaEngine.ImGui.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.Input.Sdl3\DecaEngine.Input.Sdl3.csproj" />
+      <ProjectReference Include="..\DecaEngine\DecaEngine.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Hexa.NET.ImGui.Widgets" Version="1.2.18" />
+      <PackageReference Include="Microsoft.Build.Runtime" Version="18.6.3" />
+    </ItemGroup>
+	
+	<ItemGroup>
+        <Content Include="EditorAssets\**">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </Content>
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Common.overridetasks" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Common.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Common.tasks" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Common.CrossTargeting.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Common.CurrentVersion.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Common.Test.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.CSharp.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.CSharp.CrossTargeting.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.CSharp.CurrentVersion.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Managed.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Managed.After.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.Managed.Before.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.NET.props" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.NETFramework.props" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.NETFramework.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.NETFramework.CurrentVersion.props" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.NETFramework.CurrentVersion.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.VisualBasic.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.VisualBasic.CrossTargeting.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\Microsoft.VisualBasic.CurrentVersion.targets" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\MSBuild.dll" />
+        <Content Remove="..\..\..\.nuget\packages\microsoft.build.runtime\18.6.3\contentFiles\any\net10.0\MSBuild.runtimeconfig.json" />
+    </ItemGroup>
+	
+	<ItemGroup>
+	  <ClCompile Include="EditorAssets\shader\Instancing.hlsl" />
+	</ItemGroup>
+	
+	<ItemGroup>
+	  <Folder Include="EditorAssets\models\" />
+	</ItemGroup>
+	
+</Project>

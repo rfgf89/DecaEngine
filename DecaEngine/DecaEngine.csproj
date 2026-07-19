@@ -1,0 +1,53 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <Configurations>Debug;</Configurations>
+        <Platforms>x64;x86</Platforms>
+        <AssemblyName>DecaEngine</AssemblyName>
+        <RootNamespace>DecaEngine</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="DiligentGraphics.DiligentEngine.Core" Version="2.5.6" />
+        <PackageReference Include="Hexa.NET.ImGui" Version="2.2.10-prerelease" />
+        <PackageReference Include="Hexa.NET.ImGuizmo" Version="2.2.10-prerelease" />
+        <PackageReference Include="Hexa.NET.ImNodes" Version="2.2.10-prerelease" />
+        <PackageReference Include="Hexa.NET.ImPlot" Version="2.2.10-prerelease" />
+        <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
+        <PackageReference Include="ppy.SDL3-CS" Version="2026.429.0" />
+        <PackageReference Include="StbImageSharp" Version="2.30.15"/>
+        <PackageReference Include="System.CommandLine" Version="3.0.0-preview.3.26207.106" />
+    </ItemGroup>
+
+<!--    <ItemGroup>-->
+<!--        <Reference Include="DiligentCore">-->
+<!--            <HintPath>..\..\DecaEngine\net-build\Lib\net8.0\DecaEngine.dll</HintPath>-->
+<!--        </Reference>-->
+<!--    </ItemGroup>-->
+
+    <ItemGroup>
+        <Content Include="Assets\**">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </Content>
+    </ItemGroup>
+
+    <ItemGroup>
+      <ClCompile Include="Assets\Shaders\ImGuiFrag.hlsl" />
+      <ClCompile Include="Assets\Shaders\ImGuiVertex.hlsl" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.Generator\DecaEngine.Generator.csproj" />
+      <ProjectReference Include="..\DecaEngine.ImGui.Core\DecaEngine.ImGui.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.ImGui.DiligentRender\DecaEngine.ImGui.DiligentRender.csproj" />
+      <ProjectReference Include="..\DecaEngine.Input.Core\DecaEngine.Input.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.Input.Sdl3\DecaEngine.Input.Sdl3.csproj" />
+      <ProjectReference Include="..\DecaEngine.Profiling\DecaEngine.Profiling.csproj" />
+    </ItemGroup>
+</Project>

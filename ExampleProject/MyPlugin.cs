@@ -1,0 +1,1 @@
+public class MyPlugin : IPlugin{	public string Name => "My Awesome Plugin";	public void Execute()	{		Console.WriteLine("Hello from plugin!");	}}
