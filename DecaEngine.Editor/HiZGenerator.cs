@@ -7,7 +7,7 @@ namespace DecaEngine.Editor;
 
 public class HiZGenerator : IDisposable
 {
-    private readonly DiligentGraphicsPipeline _pipeline;
+    private readonly DiligentGraphicsApi _api;
     
     private readonly IPipelineState _copyPso;
     private readonly IShaderResourceBinding _copySrb;
@@ -27,9 +27,9 @@ public class HiZGenerator : IDisposable
     private readonly uint _width;
     private readonly uint _height;
 
-    public HiZGenerator(DiligentGraphicsPipeline pipeline, ITexture hizTexture1, ITexture hizTexture2)
+    public HiZGenerator(DiligentGraphicsApi api, ITexture hizTexture1, ITexture hizTexture2)
     {
-        _pipeline = pipeline;
+        _api = api;
         _hizTexture1 = hizTexture1;
         _hizTexture2 = hizTexture2;
 
@@ -87,19 +87,19 @@ public class HiZGenerator : IDisposable
             } ];
         }
         var psoDesc = new ComputePipelineStateCreateInfo { PSODesc = new PipelineStateDesc { Name = name, PipelineType = PipelineType.Compute, ResourceLayout = layoutDesc }, Cs = shader };
-        return _pipeline.Device.CreateComputePipelineState(psoDesc);
+        return _api.Device.CreateComputePipelineState(psoDesc);
     }
 
     private IShader CreateShader(string fileName, string entryPoint)
     {
-        using var factory = _pipeline.EngineFactory.CreateDefaultShaderSourceStreamFactory("EditorAssets/shader");
+        using var factory = _api.EngineFactory.CreateDefaultShaderSourceStreamFactory("EditorAssets/shader");
         var ci = new ShaderCreateInfo { SourceLanguage = ShaderSourceLanguage.Hlsl, Desc = new ShaderDesc { Name = fileName, ShaderType = ShaderType.Compute, UseCombinedTextureSamplers = false }, EntryPoint = entryPoint, FilePath = fileName, ShaderSourceStreamFactory = factory };
-        return _pipeline.Device.CreateShader(ci, out var blob);
+        return _api.Device.CreateShader(ci, out var blob);
     }
 
     public void Generate(ITexture sourceDepth, bool useFirstTexture)
     {
-        var context = _pipeline.ImmediateContext;
+        var context = _api.ImmediateContext;
         var reduceSrbs = useFirstTexture ? _reduceSrbs1 : _reduceSrbs2;
         var hizTexture = useFirstTexture ? _hizTexture1 : _hizTexture2;
         var uavs = useFirstTexture ? _hizUavs1 : _hizUavs2;

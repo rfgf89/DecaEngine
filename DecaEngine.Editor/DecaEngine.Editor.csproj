@@ -52,6 +52,7 @@
     </ItemGroup>
 	
 	<ItemGroup>
+	  <ClCompile Include="EditorAssets\shader\BasicStructure.hlsl" />
 	  <ClCompile Include="EditorAssets\shader\Instancing.hlsl" />
 	</ItemGroup>
 	

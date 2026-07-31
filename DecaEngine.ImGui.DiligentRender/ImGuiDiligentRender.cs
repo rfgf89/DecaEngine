@@ -31,19 +31,19 @@ public class ImGuiDiligentRender : ImGuiRender
 
 	private static int _ids = 1;
 
-	private readonly DiligentGraphicsPipeline _graphicsPipeline;
+	private readonly DiligentGraphicsApi _graphicsApi;
 
-	public ImGuiDiligentRender(DiligentGraphicsPipeline graphicsPipeline) : base(graphicsPipeline)
+	public ImGuiDiligentRender(DiligentGraphicsApi graphicsApi) : base(graphicsApi)
 	{
-		_graphicsPipeline = graphicsPipeline;
+		_graphicsApi = graphicsApi;
 	}
 
 	public override void Initialize(DevicePull devicePull)
 	{
-		_engineFactory = _graphicsPipeline.EngineFactory;
-		_swapChain = _graphicsPipeline.SwapChain;
-		_deviceContext = _graphicsPipeline.ImmediateContext;
-		_device = _graphicsPipeline.Device;
+		_engineFactory = _graphicsApi.EngineFactory;
+		_swapChain = _graphicsApi.SwapChain;
+		_deviceContext = _graphicsApi.ImmediateContext;
+		_device = _graphicsApi.Device;
 
 		BindBackTarget(null);
 
@@ -457,7 +457,7 @@ public class ImGuiDiligentRender : ImGuiRender
 			Ps = pixelShader
 		};
 
-		return _graphicsPipeline.PsoManager.CreateGraphicsPipelineState(pipelineCreateInfo);
+		return _graphicsApi.PsoManager.CreateGraphicsPipelineState(pipelineCreateInfo);
 	}
 
 	protected override void UpdateTextureData(ImTextureDataPtr textureData)

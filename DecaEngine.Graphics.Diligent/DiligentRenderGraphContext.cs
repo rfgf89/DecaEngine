@@ -1,63 +1,77 @@
-﻿using System.Numerics;
+using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Graphics.Core;
+using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
-using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent;
 
 public class DiligentRenderGraphContext : IRenderGraphContext
 {
-	public IGraphicsPipeline Pipeline => _diligentGraphicsPipeline;
+	public IGraphicsApi Api => _diligentGraphicsApi;
+	public ICommandBuffer cmd => _commandBuffer;
 
 	public IDeviceContext Context { get; private set; }
 
 	private DiligentRenderGraphBuilder _builder;
-	private DiligentGraphicsPipeline _diligentGraphicsPipeline;
-	private int _contextIdx;
+	private DiligentGraphicsApi _diligentGraphicsApi;
+	private DiligentCommandBuffer _commandBuffer;
 
-	public void Initialize(int contextIdx, DiligentGraphicsPipeline pipeline, IDeviceContext context, DiligentRenderGraphBuilder builder)
+	public void BeginRecording(DiligentGraphicsApi api, IDeviceContext context, DiligentRenderGraphBuilder builder)
 	{
-		_contextIdx = contextIdx;
-		_diligentGraphicsPipeline = pipeline;
+		_diligentGraphicsApi = api;
 		Context = context;
 		_builder = builder;
-	}
 
-	public void SetRenderTargets(TextureResource textureResource)
-	{
-		var resource = _builder.renderContainer.BindWrittenTargets[textureResource.bindId];
-
-		Context.SetRenderTargets([resource], null, _contextIdx == 0 ? ResourceStateTransitionMode.Transition : ResourceStateTransitionMode.Verify);
-	}
-
-	public void ClearRenderTarget(TextureResource textureResource, float r, float g, float b, float a)
-	{
-		var resource = _builder.renderContainer.BindWrittenTargets[textureResource.bindId];
-
-		Context.ClearRenderTarget(resource, new Vector4(r, g, b, a), _contextIdx == 0 ? ResourceStateTransitionMode.Transition : ResourceStateTransitionMode.Verify);
-	}
-
-
-
-	public void SetPipelineState(PsoResource psoResource)
-	{
-		//var resource = _builder.PsoTargets[0];
-		//Context.SetPipelineState(resource.value);
-	}
-
-	public void DrawIndexed(uint indicesStart, uint indicesCount, uint vertexStart, uint instanceStart, uint instanceCount, IndexType indexType)
-	{
-		var drawAttr = new DrawIndexedAttribs()
+		if (_commandBuffer == null)
 		{
-			IndexType = (ValueType)indexType,
-			BaseVertex = vertexStart,
-			FirstIndexLocation = indicesStart,
-			FirstInstanceLocation = instanceStart,
-			Flags = DrawFlags.VerifyAll,
-			NumIndices = indicesCount,
-			NumInstances = instanceCount
-		};
+			_commandBuffer = new DiligentCommandBuffer(context);
+		}
+		else
+		{
+			_commandBuffer.Retarget(context);
+		}
 
-		Context.DrawIndexed(drawAttr);
+		_commandBuffer.BeginRecording();
 	}
+
+	public void Freeze()
+	{
+		_commandBuffer.Freeze();
+	}
+
+	public void Execute(IDeviceContext context)
+	{
+		_commandBuffer.Retarget(context);
+		_commandBuffer.Execute();
+	}
+
+	public IGpuTexture GetTexture(TextureResource textureResource)
+	{
+		var nativeTexture = _builder.GetTexture(textureResource.Id);
+		var textureInfo = _builder.GetTextureInfo(textureResource.Id);
+
+		// A fresh DiligentGpuTexture wrapper around the graph's native ITexture: it lazily creates its
+		// own SRV/UAV/RTV views on demand (same as any other IGpuTexture), independent of the specific
+		// RTV/DSV/SRV view the graph itself already created for SetRenderTargets/ClearRenderTarget.
+		return new DiligentGpuTexture(textureInfo.name, textureInfo, nativeTexture);
+	}
+
+	public IBufferHandle GetBuffer(BufferResource bufferResource)
+	{
+		var nativeBuffer = _builder.GetBuffer(bufferResource.Id);
+		var pinnedInfo = _builder.GetBufferInfo(bufferResource.Id);
+
+		// Wraps the graph-owned native buffer without allocating a new one, so it flows through the
+		// same DiligentCommandBuffer/DiligentMaterial code paths as any other IBufferHandle.
+		return new DiligentBufferHandle(nativeBuffer, pinnedInfo);
+	}
+
+#if DEBUG
+	/// <summary>Debug-only pass-through to the underlying command buffer's recorded stats.</summary>
+	public (int drawCalls, int dispatchCalls, int transitionCount, long triangles) GetDebugStats()
+	{
+		return _commandBuffer?.GetDebugStats() ?? (0, 0, 0, 0);
+	}
+#endif
 }

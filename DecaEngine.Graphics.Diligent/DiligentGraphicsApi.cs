@@ -4,14 +4,17 @@ using System.Runtime.InteropServices;
 using DecaEngine.Core;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Graphics.Diligent.RenderGraph;
+using Diligent;
 using Diligent;
 using SharpGLTF.Schema2;
 using StbImageSharp;
+using TextureInfo = DecaEngine.Graphics.Core.TextureInfo;
 using Version = Diligent.Version;
 
 namespace DecaEngine
 {
-	public class DiligentGraphicsPipeline : IGraphicsPipeline
+	public class DiligentGraphicsApi : IGraphicsApi
 	{
 		private IEngineFactory? _engineFactory;
 		private IRenderDevice? _renderDevice;
@@ -33,7 +36,7 @@ namespace DecaEngine
 		public IWindowHandle WindowHandle { get; set; }
 		public DiligentPsoManager PsoManager { get; private set; }
 
-		public DiligentGraphicsPipeline(IWindowHandle windowHandle)
+		public DiligentGraphicsApi(IWindowHandle windowHandle)
 		{
 			WindowHandle = windowHandle;
 		}
@@ -54,6 +57,11 @@ namespace DecaEngine
 				ImmediateContext.ClearDepthStencil(dsv, ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
 		}
 
+		public IRenderGraph CreateRenderGraph()
+		{
+			return new DiligentRenderGraph(this);
+		}
+
 		public IMeshObject CreateMesh(string name)
 		{
 			return new DiligentMesh(name, Device);
@@ -69,9 +77,27 @@ namespace DecaEngine
 			return new DiligentComputeMaterial(name, this);
 		}
 
+		public IStateObject CreateGraphicsState(GraphicsStateInfo info)
+		{
+			return new DiligentGraphicsStateObject(info.Name ?? "Graphics State", info);
+		}
+
+		public IStateObject CreateComputeState(ComputeStateInfo info)
+		{
+			return new DiligentComputeStateObject(info.Name ?? "Compute State", info);
+		}
+
+		public TextureObjectFormat SwapChainColorFormat => DiligentResourceFormats.ToTextureObjectFormat(SwapChain.GetDesc().ColorBufferFormat);
+		public TextureObjectFormat SwapChainDepthFormat => DiligentResourceFormats.ToTextureObjectFormat(SwapChain.GetDesc().DepthBufferFormat);
+
 		public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type)
 		{
 			return new DiligentShader(this, name, factoryPath, filePath, type);
+		}
+
+		public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type, string entryPoint)
+		{
+			return new DiligentShader(this, name, factoryPath, filePath, type, entryPoint);
 		}
 
 		private static TextureAddressMode ToDiligent(TextureAddress mode)
@@ -92,6 +118,7 @@ namespace DecaEngine
 			return filter switch
 			{
 				TextureFilter.Anisotropic => FilterType.Anisotropic,
+				TextureFilter.ComparisonLinear => FilterType.ComparisonLinear, // Added this line
 				_ => FilterType.Linear
 			};
 		}
@@ -112,7 +139,7 @@ namespace DecaEngine
 				AddressU = ToDiligent(address),
 				AddressV = ToDiligent(address),
 				AddressW = ToDiligent(address),
-				Name = name
+				Name = name,
 			};
 
 			var sampler = Device.CreateSampler(desc);
@@ -173,9 +200,24 @@ namespace DecaEngine
 			return new DiligentGpuTexture(data.Name, textureInfo, nativeTexture);
 		}
 
-		public IRenderTarget CreateRenderTarget(RenderTargetInfo info)
+		public IRenderTarget CreateRenderTarget(TextureInfo info)
 		{
 			return new DiligentRenderTarget(Device, info);
+		}
+
+		public ICommandBuffer CreateCommandBuffer()
+		{
+			return new DiligentCommandBuffer(ImmediateContext);
+		}
+
+		public ITextureView GetBackBufferColorView()
+		{
+			return SwapChain.GetCurrentBackBufferRTV();
+		}
+
+		public ITextureView GetBackBufferDepthView()
+		{
+			return SwapChain.GetDepthBufferDSV();
 		}
 
 		public IBufferHandle CreateBuffer<T>(BufferInfo info)
@@ -195,7 +237,7 @@ namespace DecaEngine
 			return handle;
 		}
 
-		public IRenderHandle CreateRenderHandle(RenderTargetInfo info)
+		public IRenderHandle CreateRenderHandle(TextureInfo info)
 		{
 			var handle = new DiligentRenderHandle(Device);
 			handle.Alloc(info);

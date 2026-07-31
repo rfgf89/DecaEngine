@@ -272,14 +272,14 @@ public class Scene
 		}
 	}
 
-	public unsafe Scene(IGraphicsPipeline graphicsPipeline)
+	public unsafe Scene(IGraphicsApi graphicsApi)
 	{
-		var model = ModelRoot.Load(Path.Combine(Environment.CurrentDirectory, "EditorAssets/models/result.gltf"));
+		var model = ModelRoot.Load(Path.Combine(Environment.CurrentDirectory, "EditorAssets/models/Sponza/Sponza.gltf"));
 		
-		var cubeShaderPs = graphicsPipeline.CreateShader("Cube Shader Ps", "EditorAssets/shader", "CubeInstancePS.hlsl", ShaderObjectType.Pixel);
-		var cubeShaderVs = graphicsPipeline.CreateShader("Cube Shader Vs", "EditorAssets/shader", "CubeInstanceVS.hlsl", ShaderObjectType.Vertex);
+		var cubeShaderPs = graphicsApi.CreateShader("Cube Shader Ps", "EditorAssets/shader", "CubeInstancePS.hlsl", ShaderObjectType.Pixel);
+		var cubeShaderVs = graphicsApi.CreateShader("Cube Shader Vs", "EditorAssets/shader", "CubeInstanceVS.hlsl", ShaderObjectType.Vertex);
 
-		var defaultMaterial = graphicsPipeline.CreateMaterial("Default Material");
+		var defaultMaterial = graphicsApi.CreateMaterial("Default Material");
 		defaultMaterial.SetShader(cubeShaderPs, cubeShaderVs);
 		
 		materialObjects.Add(-1, defaultMaterial);
@@ -294,7 +294,7 @@ public class Scene
 				continue;
 			}
 
-			var materialObj = graphicsPipeline.CreateMaterial(logicalMaterial.Name ?? $"Material_{index}");
+			var materialObj = graphicsApi.CreateMaterial(logicalMaterial.Name ?? $"Material_{index}");
 			materialObj.SetShader(cubeShaderPs, cubeShaderVs);
 
 			var baseColorTexture = logicalMaterial.GetDiffuseTexture();
@@ -307,13 +307,13 @@ public class Scene
 				};
 
 				var texture = new Core.Texture(cpuData.Name, cpuData);
-				texture.Upload(graphicsPipeline, true);
+				texture.Upload(graphicsApi, true);
 
 				var sampler = baseColorTexture.Sampler;
 				var addressMode = ToAddressMode(sampler.WrapS);
 				var filterMode = ToFilter(sampler.MinFilter, sampler.MagFilter);
 
-				var samplerObject = graphicsPipeline.CreateSampler(
+				var samplerObject = graphicsApi.CreateSampler(
 					name: "_MainTex_Sampler",
 					filter: filterMode,
 					address: addressMode,
@@ -321,8 +321,8 @@ public class Scene
 					border: Vector4.Zero
 				);
 
-				materialObj.SetTexture("_MainTex", texture.GpuHandle, HandleAccess.Pixel);
-				materialObj.SetSampler("_MainTex", samplerObject, HandleAccess.Pixel);
+				materialObj.SetTexture("_MainTex", texture.GpuHandle);
+				materialObj.SetImmutableSampler("_MainTex", samplerObject);
 			}
 
 			materialObjects.Add(index, materialObj);
@@ -367,7 +367,7 @@ public class Scene
 					};
 				}
 
-				var meshObj = graphicsPipeline.CreateMesh(logicalMesh.Name ?? $"Mesh_{logicalMesh.LogicalIndex}");
+				var meshObj = graphicsApi.CreateMesh(logicalMesh.Name ?? $"Mesh_{logicalMesh.LogicalIndex}");
 				meshObj.SetVertices(sourceVertices.ToArray());
 				meshObj.SetIndices(indices.ToArray());
 				meshObj.RecalculateBounds();

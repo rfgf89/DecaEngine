@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Core;
 
@@ -10,16 +11,21 @@ public abstract unsafe class RenderGraphPass<T>() : IRenderGraphPass
 
 	public abstract T Setup(IRenderGraphBuilder builder);
 
-	public abstract void Execute(in T value, in IRenderGraphContext context);
+	public abstract void WriteCommands(in T value, in IRenderGraphContext context);
 
 	public void SetupPassData(IRenderGraphBuilder builder)
 	{
 		_passData = Setup(builder);
 	}
 
-	public void Execute(in IRenderGraphContext context)
+	public void WriteCommands(in IRenderGraphContext context)
 	{
-		Execute(_passData, context);
+		WriteCommands(_passData, context);
+	}
+
+	public virtual void EarlyCommands()
+	{
+
 	}
 }
 
@@ -29,7 +35,9 @@ public interface IRenderGraphPass
 
 	public void SetupPassData(IRenderGraphBuilder builder);
 
-	public void Execute(in IRenderGraphContext context);
+	public void WriteCommands(in IRenderGraphContext context);
+
+	public void EarlyCommands();
 }
 
 public struct Target<T>
@@ -60,7 +68,7 @@ public interface IRenderGraphBuilder
 
 	BufferResource ReadBuffer(BufferResource bufferResource);
 
-	TextureResource PinTexture(RenderTargetInfo info);
+	TextureResource PinTexture(TextureInfo info);
 
 	BufferResource PinBuffer(BufferInfo bufferInfo);
 
@@ -70,24 +78,51 @@ public interface IRenderGraphBuilder
 
 public interface IRenderGraphContext
 {
-	IGraphicsPipeline Pipeline { get; }
+	IGraphicsApi Api { get; }
 
-	void SetRenderTargets(TextureResource textureResource);
+	/// <summary>
+	/// Wraps a texture pinned/read via <see cref="IRenderGraphBuilder.ReadTarget"/> (or written via
+	/// <see cref="IRenderGraphBuilder.WriteTarget"/>) as an <see cref="IGpuTexture"/>, so it can be
+	/// bound into materials (<see cref="IMaterialObject.SetTexture"/>/<see cref="IComputeMaterial.SetTexture"/>)
+	/// or passed to <see cref="ICommandBuffer"/> calls exactly like any other engine texture.
+	/// Must be called from within a pass's Execute, after the graph has allocated the resource.
+	/// The graph owns the returned wrapper's underlying native resource: never call
+	/// <see cref="IReleaseObject.Release"/> on it, the render graph releases it on <c>Clean</c>.
+	/// </summary>
+	IGpuTexture GetTexture(TextureResource textureResource);
 
-	void ClearRenderTarget(TextureResource textureResource, float r, float g, float b, float a);
+	/// <summary>
+	/// Wraps a buffer pinned via <see cref="IRenderGraphBuilder.PinBuffer"/> as an <see cref="IBufferHandle"/>,
+	/// so it can be bound into materials, vertex/index buffer slots, or any other <see cref="ICommandBuffer"/>
+	/// call that expects an <see cref="IBufferHandle"/>.
+	/// Must be called from within a pass's Execute, after the graph has allocated the resource.
+	/// The graph owns the returned wrapper's underlying native resource: never call
+	/// <see cref="IReleaseObject.Release"/> on it, the render graph releases it on <c>Clean</c>.
+	/// </summary>
+	IBufferHandle GetBuffer(BufferResource bufferResource);
 
-	void SetPipelineState(PsoResource psoResource);
-
-	void DrawIndexed(uint indicesStart, uint indicesCount, uint vertexStart, uint instanceStart, uint instanceCount, IndexType indexType);
+	public ICommandBuffer cmd { get; }
 }
 
-public interface IRenderGraph
+public interface IRenderGraph : IReleaseObject
 {
 	void AddPass(IRenderGraphPass pass);
 
 	void Compile();
 
 	void Execute();
+
+	/// <summary>
+	/// Debug-only snapshot of the last executed frame (per-pass timings, draw call counts,
+	/// resource lifetimes). Always null in Release builds. Populated at the end of <see cref="Execute"/>.
+	/// </summary>
+	RenderGraphDebugSnapshot DebugSnapshot { get; }
+
+	/// <summary>
+	/// Debug-only ring buffer of recent frame snapshots, for frame-time history graphs. Always
+	/// null in Release builds.
+	/// </summary>
+	RenderGraphDebugHistory DebugHistory { get; }
 }
 
 public readonly struct GraphId : IEquatable<GraphId>, IEqualityComparer<GraphId>

@@ -1,9 +1,10 @@
+using System.Diagnostics;
 using DecaEngine.Core;
 using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;
 
-public class DiligentRenderGraph : IRenderGraph
+public sealed class DiligentRenderGraph : IRenderGraph
 {
 	private class PassData(int id, IRenderGraphPass pass)
 	{
@@ -11,29 +12,34 @@ public class DiligentRenderGraph : IRenderGraph
 		public int Id { get; } = id;
 	}
 
-	private class DependencyLevel()
-	{
-		public List<PassData> Passes { get; } = new();
-	}
-
 	private readonly List<DiligentRenderGraphContext> _graphContext = new();
 	private readonly List<PassData> _passes = new();
 	private readonly List<int> _topologicallySortedPasses = new();
 	private readonly List<List<int>> _adjacencyLists = new();
-	private readonly List<DependencyLevel> _dependencyLevels = new();
 
-	private readonly DiligentGraphicsPipeline _pipeline;
+	private readonly DiligentGraphicsApi _api;
 	private readonly DiligentRenderGraphBuilder _builder;
 	private bool _isCompiled = false;
 
-	public DiligentRenderGraph(DiligentGraphicsPipeline pipeline)
+#if DEBUG
+	private readonly Stopwatch _passStopwatch = new();
+	private readonly RenderGraphDebugHistory _debugHistory = new(240); // ~4s of history at 60fps
+	public RenderGraphDebugSnapshot DebugSnapshot { get; private set; }
+	public RenderGraphDebugHistory DebugHistory => _debugHistory;
+#else
+	public RenderGraphDebugSnapshot DebugSnapshot => null;
+	public RenderGraphDebugHistory DebugHistory => null;
+#endif
+
+	public DiligentRenderGraph(DiligentGraphicsApi api)
 	{
-		_pipeline = pipeline;
-		_builder = new DiligentRenderGraphBuilder(_pipeline);
+		_api = api;
+		_builder = new DiligentRenderGraphBuilder(_api);
 	}
 
 	public void AddPass(IRenderGraphPass pass)
 	{
+		ArgumentNullException.ThrowIfNull(pass);
 		_passes.Add(new PassData(_passes.Count, pass));
 		_graphContext.Add(new DiligentRenderGraphContext());
 		_isCompiled = false;
@@ -41,6 +47,7 @@ public class DiligentRenderGraph : IRenderGraph
 
 	public void Compile()
 	{
+		_isCompiled = false;
 		_builder.Clean();
 		
 		for (var index = 0; index < _passes.Count; index++)
@@ -54,7 +61,19 @@ public class DiligentRenderGraph : IRenderGraph
 
 		BuildAdjacencyLists();
 		TopologicalSort();
-		BuildDependencyLevels();
+
+		for (int passId = 0; passId < _passes.Count; passId++)
+		{
+			_builder.Allocate(passId);
+		}
+
+		foreach (var passId in _topologicallySortedPasses)
+		{
+			var graphContext = _graphContext[passId];
+			graphContext.BeginRecording(_api, _api.ImmediateContext, _builder);
+			_passes[passId].Pass.WriteCommands(graphContext);
+			graphContext.Freeze();
+		}
 
 		_isCompiled = true;
 	}
@@ -73,15 +92,8 @@ public class DiligentRenderGraph : IRenderGraph
 
 			for (int j = i + 1; j < _passes.Count; j++)
 			{
-				if (_builder.renderContainer.DependenceCheck(passAdjacencyList, i, j))
-				{
-					break;
-				}
-
-				if (_builder.bufferContainer.DependenceCheck(passAdjacencyList, i, j))
-				{
-					break;
-				}
+				_builder.renderContainer.DependenceCheck(passAdjacencyList, i, j);
+				_builder.bufferContainer.DependenceCheck(passAdjacencyList, i, j);
 			}
 		}
 	}
@@ -89,64 +101,41 @@ public class DiligentRenderGraph : IRenderGraph
 	private void TopologicalSort()
 	{
 		_topologicallySortedPasses.Clear();
-		bool[] visited = new bool[_passes.Count];
+		var incomingEdges = new int[_passes.Count];
 
 		for (int i = 0; i < _passes.Count; i++)
 		{
-			if (!visited[i])
+			foreach (var dependentPass in _adjacencyLists[i])
 			{
-				DepthFirstSearch(i, visited, _topologicallySortedPasses);
+				incomingEdges[dependentPass]++;
 			}
 		}
 
-		_topologicallySortedPasses.Reverse();
-	}
-
-	private void DepthFirstSearch(int i, bool[] visited, List<int> sorted)
-	{
-		visited[i] = true;
-		foreach (var j in _adjacencyLists[i])
+		var ready = new PriorityQueue<int, int>();
+		for (int i = 0; i < incomingEdges.Length; i++)
 		{
-			if (!visited[j])
+			if (incomingEdges[i] == 0)
 			{
-				DepthFirstSearch(j, visited, sorted);
+				ready.Enqueue(i, i);
 			}
 		}
-		sorted.Add(i);
-	}
 
-	private void BuildDependencyLevels()
-	{
-		_dependencyLevels.Clear();
-		if (_passes.Count == 0)
+		while (ready.TryDequeue(out var passId, out _))
 		{
-			return;
-		}
-
-		int[] distances = new int[_passes.Count];
-
-		for (int u = 0; u < _topologicallySortedPasses.Count; u++)
-		{
-			int i = _topologicallySortedPasses[u];
-			foreach (int v in _adjacencyLists[i])
+			_topologicallySortedPasses.Add(passId);
+			foreach (var dependentPass in _adjacencyLists[passId])
 			{
-				if (distances[v] < distances[i] + 1)
+				incomingEdges[dependentPass]--;
+				if (incomingEdges[dependentPass] == 0)
 				{
-					distances[v] = distances[i] + 1;
+					ready.Enqueue(dependentPass, dependentPass);
 				}
 			}
 		}
 
-		int maxLevel = distances.Length > 0 ? distances.Max() + 1 : 0;
-		for (int i = 0; i < maxLevel; i++)
+		if (_topologicallySortedPasses.Count != _passes.Count)
 		{
-			_dependencyLevels.Add(new DependencyLevel());
-		}
-
-		for (int i = 0; i < _passes.Count; i++)
-		{
-			int level = distances[i];
-			_dependencyLevels[level].Passes.Add(_passes[i]);
+			throw new InvalidOperationException("The render graph contains a dependency cycle.");
 		}
 	}
 
@@ -157,91 +146,80 @@ public class DiligentRenderGraph : IRenderGraph
 			Compile();
 		}
 
-		var immediateContext = _pipeline.ImmediateContext;
-		var deferredContexts = _pipeline.DeferredContexts;
+		var immediateContext = _api.ImmediateContext;
 
-		for (var index = 0; index < _dependencyLevels.Count; index++)
+#if DEBUG
+		var passInfos = new PassDebugInfo[_topologicallySortedPasses.Count];
+		double totalCpu = 0;
+		int debugIdx = 0;
+#endif
+
+		foreach (var passId in _topologicallySortedPasses)
 		{
-			var level = _dependencyLevels[index];
+			_passes[passId].Pass.EarlyCommands();
 
-			var activePasses = level.Passes;
-			if (activePasses.Count == 0)
+#if DEBUG
+			_passStopwatch.Restart();
+#endif
+			_graphContext[passId].Execute(immediateContext);
+#if DEBUG
+			_passStopwatch.Stop();
+
+			var (drawCalls, dispatchCalls, transitionCount, triangles) = _graphContext[passId].GetDebugStats();
+			var (reads, writes) = _builder.GetPassResourceNames(passId);
+			var cpuMs = _passStopwatch.Elapsed.TotalMilliseconds;
+
+			passInfos[debugIdx++] = new PassDebugInfo
 			{
-				continue;
-			}
+				Id = passId,
+				Name = _passes[passId].Pass.Name,
+				CpuMs = cpuMs,
+				DrawCalls = drawCalls,
+				DispatchCalls = dispatchCalls,
+				TransitionCount = transitionCount,
+				TriangleCount = triangles,
+				ReadResources = reads,
+				WriteResources = writes,
+			};
+			totalCpu += cpuMs;
+#endif
+		}
 
-			for (int i = 0; i < activePasses.Count; i++)
+#if DEBUG
+		var resources = _builder.ExportResourceDebugInfo();
+		ulong totalMemory = 0;
+		foreach (var r in resources) totalMemory += r.SizeInBytes;
+
+		DebugSnapshot = new RenderGraphDebugSnapshot
+		{
+			TotalCpuMs = totalCpu,
+			TotalResourceMemoryBytes = totalMemory,
+			Passes = passInfos,
+			Resources = resources.ToArray(),
+			TopologicalOrder = _topologicallySortedPasses.ToArray(),
+		};
+		_debugHistory.Push(DebugSnapshot);
+#endif
+	}
+
+	public void Release()
+	{
+		_builder.Clean();
+		foreach (var pass in _passes)
+		{
+			if (pass.Pass is IDisposable disposable)
 			{
-				_builder.Allocate(activePasses[i].Id);
-			}
-
-			var passDataImmediate = activePasses[0];
-			_graphContext[0].Initialize(0, _pipeline, immediateContext, _builder);
-
-			passDataImmediate.Pass.Execute(_graphContext[0]);
-
-			if (activePasses.Count > 1)
-			{
-				var deferredContextQueue = new System.Collections.Concurrent.BlockingCollection<IDeviceContext>();
-				foreach (var ctx in deferredContexts)
-				{
-					deferredContextQueue.Add(ctx);
-				}
-
-				var commandListsToExecute = new System.Collections.Concurrent.ConcurrentBag<ICommandList>();
-				var deferredTasks = new Task[activePasses.Count - 1];
-
-				for (int i = 1; i < activePasses.Count; i++)
-				{
-					int j = i; // local copy for closure
-
-					deferredTasks[i - 1] = Task.Run(() =>
-					{
-						var deferredCtx = deferredContextQueue.Take();
-						try
-						{
-							deferredCtx.Begin(0);
-							_graphContext[j].Initialize(j, _pipeline, deferredCtx, _builder);
-
-							activePasses[j].Pass.Execute(_graphContext[j]);
-
-							var cmdList = deferredCtx.FinishCommandList();
-
-							deferredCtx.FinishFrame();
-							if (cmdList != null)
-							{
-								commandListsToExecute.Add(cmdList);
-							}
-						}
-						finally
-						{
-							deferredContextQueue.Add(deferredCtx);
-						}
-					});
-				}
-
-				Task.WaitAll(deferredTasks);
-
-				var cmds = commandListsToExecute.ToArray();
-				if (cmds.Length > 0)
-				{
-					immediateContext.ExecuteCommandLists(cmds);
-					foreach (var cmd in cmds)
-					{
-						cmd.Dispose();
-					}
-				}
-			}
-
-			for (int i = 0; i < level.Passes.Count; i++)
-			{
-				_builder.Release(level.Passes[i].Id);
+				disposable.Dispose();
 			}
 		}
 
-		foreach (var deferredCtx in deferredContexts)
-		{
-			deferredCtx.FinishFrame();
-		}
+		_passes.Clear();
+		_graphContext.Clear();
+		_topologicallySortedPasses.Clear();
+		_adjacencyLists.Clear();
+		_isCompiled = false;
+#if DEBUG
+		DebugSnapshot = null;
+#endif
 	}
 }

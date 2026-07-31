@@ -71,6 +71,8 @@ struct LightData
 
     float4x4 CascadeMatrix[4];
     float4 CascadeSplits;
+    float4 CascadeSizes;
+    float4 CascadeNearPlanes;
 };
 
 RWStructuredBuffer<uint> BatchCounters;

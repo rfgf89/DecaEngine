@@ -24,48 +24,48 @@ namespace DecaEngine.Editor
         public static DiligentMesh CylinderMesh { get; private set; }
         public static DiligentMaterial CylinderMaterial { get; private set; }
 
-        public static void Initialize(DiligentGraphicsPipeline diligentGraphicsPipeline)
+        public static void Initialize(DiligentGraphicsApi diligentGraphicsApi)
         {
             // Sphere
-            var sphereShaderPs = new DiligentShader(diligentGraphicsPipeline, "Sphere Shader Ps",
+            var sphereShaderPs = new DiligentShader(diligentGraphicsApi, "Sphere Shader Ps",
                 "EditorAssets/shader", "SpherePS.hlsl", ShaderObjectType.Pixel);
-            var sphereShaderVs = new DiligentShader(diligentGraphicsPipeline, "Sphere Shader Vs",
+            var sphereShaderVs = new DiligentShader(diligentGraphicsApi, "Sphere Shader Vs",
                 "EditorAssets/shader", "SphereVS.hlsl", ShaderObjectType.Vertex);
 
-            SphereMaterial = new DiligentMaterial("Sphere Material", diligentGraphicsPipeline);
+            SphereMaterial = new DiligentMaterial("Sphere Material", diligentGraphicsApi);
             SphereMaterial.SetShader(sphereShaderPs);
             SphereMaterial.SetShader(sphereShaderVs);
 
-            SphereMesh = new DiligentMesh("Sphere", diligentGraphicsPipeline.Device);
+            SphereMesh = new DiligentMesh("Sphere", diligentGraphicsApi.Device);
             CreateSphere(SphereMesh, 32, 32);
             
             // Cube
-            var cubeShaderPs = new DiligentShader(diligentGraphicsPipeline, "Cube Shader Ps",
+            var cubeShaderPs = new DiligentShader(diligentGraphicsApi, "Cube Shader Ps",
                 "EditorAssets/shader", "CubeInstancePS.hlsl", ShaderObjectType.Pixel);
-            var cubeShaderVs = new DiligentShader(diligentGraphicsPipeline, "Cube Shader Vs",
+            var cubeShaderVs = new DiligentShader(diligentGraphicsApi, "Cube Shader Vs",
                 "EditorAssets/shader", "CubeInstanceVS.hlsl", ShaderObjectType.Vertex);
 
-            CubeMaterial = new DiligentMaterial("Cube Material", diligentGraphicsPipeline);
+            CubeMaterial = new DiligentMaterial("Cube Material", diligentGraphicsApi);
             CubeMaterial.SetShader(cubeShaderPs);
             CubeMaterial.SetShader(cubeShaderVs);
 
-            CubeMesh = new DiligentMesh("Cube", diligentGraphicsPipeline.Device);
+            CubeMesh = new DiligentMesh("Cube", diligentGraphicsApi.Device);
             CreateCube(CubeMesh);
 
             // Capsule
-            CapsuleMaterial = new DiligentMaterial("Capsule Material", diligentGraphicsPipeline);
+            CapsuleMaterial = new DiligentMaterial("Capsule Material", diligentGraphicsApi);
             CapsuleMaterial.SetShader(cubeShaderPs);
             CapsuleMaterial.SetShader(cubeShaderVs);
 
-            CapsuleMesh = new DiligentMesh("Capsule", diligentGraphicsPipeline.Device);
+            CapsuleMesh = new DiligentMesh("Capsule", diligentGraphicsApi.Device);
             CreateCapsule(CapsuleMesh, 2.0f, 0.5f, 32);
 
             // Cylinder
-            CylinderMaterial = new DiligentMaterial("Cylinder Material", diligentGraphicsPipeline);
+            CylinderMaterial = new DiligentMaterial("Cylinder Material", diligentGraphicsApi);
             CylinderMaterial.SetShader(cubeShaderPs);
             CylinderMaterial.SetShader(cubeShaderVs);
 
-            CylinderMesh = new DiligentMesh("Cylinder", diligentGraphicsPipeline.Device);
+            CylinderMesh = new DiligentMesh("Cylinder", diligentGraphicsApi.Device);
             CreateCylinder(CylinderMesh, 2.0f, 0.5f, 32);
         }
 

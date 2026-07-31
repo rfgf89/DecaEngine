@@ -1,5 +1,6 @@
-﻿using DecaEngine.Core;
-using Diligent;
+using System.Numerics;
+using DecaEngine.Core;
+using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Graphics.Diligent;
 
@@ -20,12 +21,12 @@ public class ClearRenderTargetPass : RenderGraphPass<ClearRenderTargetPass.PassD
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		var texture = builder.PinTexture(
-			new RenderTargetInfo()
+			new TextureInfo()
 			{
 				name = Name,
 				width = 1024,
 				height = 1024,
-				textureFormat = RenderTargetInfo.Format.R8G8B8A8_UNORM
+				format = TextureObjectFormat.R8G8B8A8UNorm
 			});
 
 		return new PassData()
@@ -34,9 +35,11 @@ public class ClearRenderTargetPass : RenderGraphPass<ClearRenderTargetPass.PassD
 		};
 	}
 
-	public override void Execute(in PassData value, in IRenderGraphContext context)
+	public override void WriteCommands(in PassData value, in IRenderGraphContext context)
 	{
-		context.SetRenderTargets(value.textureResource);
-		context.ClearRenderTarget(value.textureResource, 0.0f, 0.0f, 1.0f, 1.0f);
+		var cmd = context.cmd;
+		var target = context.GetTexture(value.textureResource);
+		cmd.SetRenderTarget(target, null);
+		cmd.ClearRenderTarget(target, new Vector4(0.0f, 0.0f, 1.0f, 1.0f));
 	}
 }

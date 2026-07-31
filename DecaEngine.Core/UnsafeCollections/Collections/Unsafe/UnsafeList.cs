@@ -233,19 +233,19 @@ namespace UnsafeCollections.Collections.Unsafe
             *items.Element<T>(index) = item;
         }
 
-        public static T Get<T>(UnsafeList* list, int index) where T : unmanaged
+        public static T Get<T>(UnsafeList* list, int index, bool checkCount = true) where T : unmanaged
         {
-            return *GetPtr<T>(list, index);
+            return *GetPtr<T>(list, index, checkCount);
         }
 
-        public static T* GetPtr<T>(UnsafeList* list, int index) where T : unmanaged
+        public static T* GetPtr<T>(UnsafeList* list, int index, bool checkCount = true) where T : unmanaged
         {
             UDebug.Assert(list != null);
             UDebug.Assert(list->_items.Ptr != null);
             UDebug.Assert(typeof(T).TypeHandle.Value == list->_typeHandle);
 
             // cast to uint trick, which eliminates < 0 check
-            if ((uint)index >= (uint)list->_count)
+            if (checkCount && (uint)index >= (uint)list->_count)
             {
                 throw new IndexOutOfRangeException(ThrowHelper.ArgumentOutOfRange_Index);
             }
@@ -254,9 +254,9 @@ namespace UnsafeCollections.Collections.Unsafe
             return items.Element<T>(index);
         }
 
-        public static ref T GetRef<T>(UnsafeList* list, int index) where T : unmanaged
+        public static ref T GetRef<T>(UnsafeList* list, int index, bool checkCount = true) where T : unmanaged
         {
-            return ref *GetPtr<T>(list, index);
+            return ref *GetPtr<T>(list, index, checkCount);
         }
 
         public static void RemoveAt(UnsafeList* list, int index)

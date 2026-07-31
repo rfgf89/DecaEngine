@@ -23,13 +23,13 @@ namespace DecaEngine.Graphics.Core
         /// <summary>
         /// Uploads the texture data from RAM to VRAM.
         /// </summary>
-        /// <param name="pipeline">The graphics pipeline to use for the upload.</param>
+        /// <param name="api">The graphics pipeline to use for the upload.</param>
         /// <param name="freeCpuMemory">If true, the CPU-side pixel data will be freed after upload.</param>
-        public void Upload(IGraphicsPipeline pipeline, bool freeCpuMemory = true)
+        public void Upload(IGraphicsApi api, bool freeCpuMemory = true)
         {
             if (IsUploaded) return;
 
-            GpuHandle = pipeline.CreateTexture(CpuData);
+            GpuHandle = api.CreateTexture(CpuData);
 
             if (freeCpuMemory)
             {

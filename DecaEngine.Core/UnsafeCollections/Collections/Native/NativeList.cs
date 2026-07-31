@@ -132,9 +132,9 @@ namespace UnsafeCollections.Collections.Native
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public ref T GetRef(int index)
+        public ref T GetRef(int index, bool checkCount = true)
         {
-            return ref UnsafeList.GetRef<T>(m_inner, index);
+            return ref UnsafeList.GetRef<T>(m_inner, index, checkCount);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

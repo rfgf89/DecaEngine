@@ -18,7 +18,7 @@ namespace DecaEngine.Editor.ECS
                 Quaternion rot = entity.Rotation.value;
                 Vector3 scale = entity.Scale3.value;
 
-                Matrix4x4 modelMatrix = MathUtils.CreateTrs(pos, rot, scale);
+                Matrix4x4 modelMatrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(pos, rot, scale);
 
                 var gpuData = new Transform()
                 {

@@ -5,6 +5,14 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
 {
     public class ResourceStateTracker
     {
+        // A single tracker instance may be shared between the immediate context and
+        // several deferred contexts that record in parallel (one per render-graph
+        // dependency-level pass). Passes within the same level never touch the same
+        // resource (guaranteed by the graph's dependency analysis), but the backing
+        // Dictionary/List are not safe for concurrent access from multiple threads
+        // regardless of key overlap, so all mutation goes through this lock.
+        private readonly object _lock = new();
+
         private readonly Dictionary<IDeviceObject, ResourceState> _resourceStates = new();
         private readonly List<StateTransitionDesc> _pendingTransitions = new();
         private readonly Dictionary<int, StateTransitionDesc[]> _arrayCache = new();
@@ -13,68 +21,82 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         {
             if (resource == null) return;
 
-            if (_resourceStates.TryGetValue(resource, out var currentState))
+            lock (_lock)
             {
-                // Allow UAV-to-UAV transition as it acts as a UAV barrier in Diligent
-                if (currentState == newState && newState != ResourceState.UnorderedAccess) return;
+                if (_resourceStates.TryGetValue(resource, out var currentState))
+                {
+                    // Allow UAV-to-UAV transition as it acts as a UAV barrier in Diligent
+                    if (currentState == newState && newState != ResourceState.UnorderedAccess) return;
 
-                _pendingTransitions.Add(new StateTransitionDesc
+                    _pendingTransitions.Add(new StateTransitionDesc
+                    {
+                        Resource = resource,
+                        OldState = currentState,
+                        NewState = newState,
+                        Flags = StateTransitionFlags.UpdateState
+                    });
+                }
+                else
                 {
-                    Resource = resource,
-                    OldState = currentState,
-                    NewState = newState,
-                    Flags = StateTransitionFlags.UpdateState
-                });
+                    _pendingTransitions.Add(new StateTransitionDesc
+                    {
+                        Resource = resource,
+                        OldState = ResourceState.Unknown,
+                        NewState = newState,
+                        Flags = StateTransitionFlags.UpdateState
+                    });
+                }
+                _resourceStates[resource] = newState;
             }
-            else
-            {
-                _pendingTransitions.Add(new StateTransitionDesc
-                {
-                    Resource = resource,
-                    OldState = ResourceState.Unknown,
-                    NewState = newState,
-                    Flags = StateTransitionFlags.UpdateState
-                });
-            }
-            _resourceStates[resource] = newState;
         }
 
         public void SetState(IDeviceObject resource, ResourceState state)
         {
             if (resource == null) return;
-            _resourceStates[resource] = state;
+            lock (_lock)
+            {
+                _resourceStates[resource] = state;
+            }
         }
 
         public void Flush(IDeviceContext context)
         {
-            int count = _pendingTransitions.Count;
-            if (count == 0) return;
-
-            if (!_arrayCache.TryGetValue(count, out var transitions))
+            lock (_lock)
             {
-                transitions = new StateTransitionDesc[count];
-                _arrayCache[count] = transitions;
-            }
+                int count = _pendingTransitions.Count;
+                if (count == 0) return;
 
-            for (int i = 0; i < count; i++)
-            {
-                transitions[i] = _pendingTransitions[i];
-            }
+                if (!_arrayCache.TryGetValue(count, out var transitions))
+                {
+                    transitions = new StateTransitionDesc[count];
+                    _arrayCache[count] = transitions;
+                }
 
-            context.TransitionResourceStates(transitions);
-            _pendingTransitions.Clear();
+                for (int i = 0; i < count; i++)
+                {
+                    transitions[i] = _pendingTransitions[i];
+                }
+
+                context.TransitionResourceStates(transitions);
+                _pendingTransitions.Clear();
+            }
         }
 
         public void ResetTransitions()
         {
-            _pendingTransitions.Clear();
+            lock (_lock)
+            {
+                _pendingTransitions.Clear();
+            }
         }
 
         public void Clear()
         {
-            _resourceStates.Clear();
-            _pendingTransitions.Clear();
-            _arrayCache.Clear();
+            lock (_lock)
+            {
+                _resourceStates.Clear();
+                _pendingTransitions.Clear();
+            }
         }
     }
 }

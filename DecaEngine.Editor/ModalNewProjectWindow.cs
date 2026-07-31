@@ -1,6 +1,7 @@
 ﻿using System.Numerics;
 using Hexa.NET.ImGui;
 using Hexa.NET.ImGui.Widgets.Dialogs;
+using Engine.ImGui.Core;
 
 namespace DecaEngine.Editor;
 
@@ -37,6 +38,7 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 
 	public ModalNewProjectWindow(string title, ImGuiRender imGuiRender) : base(title, imGuiRender)
 	{
+		_editorBuilder = new EditorBuilder();
 	}
 
 	protected override void OnRender(uint dockId)

@@ -1,45 +1,21 @@
 ﻿using DecaEngine.Core;
-using DecaEngine.Generic;
-using Hexa.NET.ImGui;
+using DecaEngine.Graphics;
+using Engine.ImGui.Core;
 
-namespace DecaEngine.Editor;
-
-public class GameViewWindow : ImGuiDockingWindow, IFactoryObject
+namespace DecaEngine.Editor
 {
-	private readonly IRenderHandle _renderHandle;
-	private ImTextureRef _textureRef;
-
-	public unsafe GameViewWindow(string title, IRenderHandle renderHandle, ImGuiRender imGuiRender) : base(title, imGuiRender)
+	public class GameViewWindow : ImGuiDockingWindow
 	{
-		_renderHandle = renderHandle;
-	}
+		private IRenderHandle _renderHandle;
 
-	public void StartScene()
-	{
+		public GameViewWindow(string name, IRenderHandle renderHandle, ImGuiRender imGuiRender) : base(name, imGuiRender)
+		{
+			_renderHandle = renderHandle;
+		}
 
-	}
-
-	public void ChangeState(LoopCore.State state)
-	{
-
-	}
-
-	public void EndScene()
-	{
-		_textureRef.Destroy();
-	}
-
-	public override unsafe void FirstFrame(uint dockId)
-	{
-		base.FirstFrame(dockId);
-
-		_textureRef = _imGuiRender.GetNewTexture();
-		_imGuiRender.BindRenderTarget(_textureRef.TexID, _renderHandle);
-	}
-
-	protected override void OnRender(uint dockId)
-	{
-		var workSize = ImGui.GetContentRegionAvail();
-		ImGui.Image(_textureRef, workSize);
+		protected override void OnRender(uint dockId)
+		{
+			// TODO: Implement game view window UI
+		}
 	}
 }

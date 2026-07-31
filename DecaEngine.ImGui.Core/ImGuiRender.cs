@@ -18,13 +18,13 @@ public abstract unsafe class ImGuiRender
 	private Vector2 _windowScale;
 	private bool _frameBegin;
 	private int _nextTexId = 1;
-	public IGraphicsPipeline graphicsPipeline { get; private set; }
+	public IGraphicsApi GraphicsApi { get; private set; }
 
 	protected Dictionary<FontType, ImFontPtr> _fonts = new();
 
-	public ImGuiRender(IGraphicsPipeline graphicsPipeline)
+	public ImGuiRender(IGraphicsApi graphicsApi)
 	{
-		this.graphicsPipeline = graphicsPipeline;
+		this.GraphicsApi = graphicsApi;
 	}
 
 	public void AddFont(FontType type, ImFont* font)

@@ -65,7 +65,7 @@ public abstract class ImGuiWindow
 
 	public virtual void Render(uint dockId)
 	{
-		_scale = _imGuiRender.graphicsPipeline.WindowHandle.GetScale();
+		_scale = _imGuiRender.GraphicsApi.WindowHandle.GetScale();
 		ImGui.SetNextWindowSizeConstraints(new Vector2(200, 100) * _scale, new Vector2(float.MaxValue, float.MaxValue));
 	}
 

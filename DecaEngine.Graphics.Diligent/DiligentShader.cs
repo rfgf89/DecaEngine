@@ -6,7 +6,7 @@ namespace DecaEngine.Graphics.Diligent;
 
 public class DiligentShader : IShaderObject
 {
-	private readonly DiligentGraphicsPipeline _pipeline;
+	private readonly DiligentGraphicsApi _api;
 	private IShader? _nativeShader;
 
 	public ShaderObjectType Type { get; }
@@ -17,9 +17,9 @@ public class DiligentShader : IShaderObject
 
 	public IShader NativeShader => _nativeShader ?? throw new NullReferenceException("Shader is not compiled.");
 
-	public DiligentShader(DiligentGraphicsPipeline pipeline, string name, string factoryPath, string file, ShaderObjectType type, string entryPoint = "Main")
+	public DiligentShader(DiligentGraphicsApi api, string name, string factoryPath, string file, ShaderObjectType type, string entryPoint = "Main")
 	{
-		_pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
+		_api = api ?? throw new ArgumentNullException(nameof(api));
 		Name = name;
 		FilePath = file;
 		FactoryPath = factoryPath;
@@ -34,7 +34,7 @@ public class DiligentShader : IShaderObject
 			return;
 		}
 
-		using var shaderSourceFactory = _pipeline.EngineFactory.CreateDefaultShaderSourceStreamFactory(Path.Combine(Environment.CurrentDirectory, FactoryPath));
+		using var shaderSourceFactory = _api.EngineFactory.CreateDefaultShaderSourceStreamFactory(Path.Combine(Environment.CurrentDirectory, FactoryPath));
 
 		var diligentType = Type switch
 		{
@@ -62,7 +62,7 @@ public class DiligentShader : IShaderObject
 			ShaderSourceStreamFactory = shaderSourceFactory,
 		};
 
-		_nativeShader = _pipeline.Device.CreateShader(shaderCi, out var compilerOutput);
+		_nativeShader = _api.Device.CreateShader(shaderCi, out var compilerOutput);
 		compilerOutput?.Dispose();
 	}
 

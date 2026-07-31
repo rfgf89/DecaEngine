@@ -12,60 +12,69 @@ namespace DecaEngine.Graphics.Diligent
 {
 	public class ShadowRenderer : IReleaseObject
 	{
-		private readonly DiligentGraphicsPipeline _pipeline;
+		private readonly DiligentGraphicsApi _api;
 		private readonly IMaterialObject _shadowMaterial;
-		private ISamplerObject _shadowSampler;
+		private ISamplerObject _shadowComparisonSampler;
+		private ISamplerObject _shadowPointSampler;
 		private IRenderTarget _shadowMaps;
 		
 		public const int MaxCascades = 4;
-		public const int ShadowMapSize = 8192;
+		public const int ShadowMapSize = 4096;
 
-		public IRenderTarget ShadowMaps => _shadowMaps;
-		public ISamplerObject ShadowSampler => _shadowSampler;
+		public IRenderTarget ShadowMapsTarget => _shadowMaps;
+		public ISamplerObject ShadowComparisonSampler => _shadowComparisonSampler;
+		public ISamplerObject ShadowPointSampler => _shadowPointSampler;
 
-		public ShadowRenderer(DiligentGraphicsPipeline pipeline)
+		public ShadowRenderer(DiligentGraphicsApi api)
 		{
-			_pipeline = pipeline;
-			CreateShadowMap();
+			_api = api;
+			CreateShadowMapAndSamplers();
 
-			_shadowMaterial = new DiligentMaterial("Shadow Material", pipeline);
+			_shadowMaterial = new DiligentMaterial("Shadow Material", api);
 			CreateShadowPso();
 		}
 
-		private void CreateShadowMap()
+		private void CreateShadowMapAndSamplers()
 		{
-			_shadowMaps = _pipeline.CreateRenderTarget(new RenderTargetInfo
+			_shadowMaps = _api.CreateRenderTarget(new TextureInfo
 			{
 				name = $"Shadow Map",
 				width = ShadowMapSize,
 				height = ShadowMapSize,
-				textureFormat = RenderTargetInfo.Format.D32_FLOAT,
-				arraySize = MaxCascades
+				format = TextureObjectFormat.D32Float,
+				arraySize = MaxCascades,
 			});
 
-			_shadowSampler = _pipeline.CreateSampler(
-				$"Shadow Sampler",
+			// Sampler for hardware PCF comparison
+			_shadowComparisonSampler = _api.CreateSampler(
+				"Shadow Comparison Sampler",
 				TextureFilter.ComparisonLinear,
-				TextureAddress.Border,
-				CompFunction.Greater,
-				new Vector4(0.0f, 0.0f, 0.0f, 0.0f));
+				TextureAddress.Clamp,
+				CompFunction.LessEqual, // Correct for reversed-Z depth buffer (clear value 0.0, depth func Greater)
+				new Vector4(1.0f, 1.0f, 1.0f, 1.0f));
+			
+			// Sampler for raw depth reads (blocker search in PCSS)
+			_shadowPointSampler = _api.CreateSampler(
+				"Shadow Point Sampler",
+				TextureFilter.Point,
+				TextureAddress.Clamp,
+				CompFunction.LessEqual,
+				new Vector4(1.0f, 1.0f, 1.0f, 1.0f));
 		}
 
 		private void CreateShadowPso()
 		{
-			var shadowVs = new DiligentShader(_pipeline, "Shadow VS", "EditorAssets/shader", "ShadowVS.hlsl", ShaderObjectType.Vertex, "Main");
+			var shadowVs = new DiligentShader(_api, "Shadow VS", "EditorAssets/shader", "ShadowVS.hlsl", ShaderObjectType.Vertex, "Main");
 			_shadowMaterial.SetShader(shadowVs);
 
-			var psoCi = GetBaseState();
-			psoCi.Ps = null;
-			psoCi.GraphicsPipeline.NumRenderTargets = 0;
-			psoCi.GraphicsPipeline.RTVFormats = [];
-			psoCi.GraphicsPipeline.DSVFormat = TextureFormat.D32_Float;
+			var stateInfo = GetBaseState();
+			stateInfo.Name = "Shadow PSO";
+			stateInfo.RenderTargetFormats = [];
+			stateInfo.DepthStencilFormat = TextureObjectFormat.D32Float;
+			// Using Less (with reversed-Z this behaves as "closer to light") during shadow map generation
+			stateInfo.DepthStencilState.DepthFunc = ComparisonFunctionType.Less;
 
-			psoCi.PSODesc.Name = "Shadow PSO";
-			psoCi.GraphicsPipeline.DepthStencilDesc.DepthFunc = ComparisonFunction.Greater;
-
-			((DiligentMaterial)_shadowMaterial).SetBasePipelineState(psoCi);
+			_shadowMaterial.SetState(_api.CreateGraphicsState(stateInfo));
 		}
 
 		public void UpdateMaterialResources(IBufferHandle viewConstants, IBufferHandle lightConstants, IBufferHandle gpuInstances)
@@ -73,6 +82,13 @@ namespace DecaEngine.Graphics.Diligent
 			_shadowMaterial.SetBuffer("View", viewConstants, HandleAccess.Vertex);
 			_shadowMaterial.SetBuffer("Light", lightConstants, HandleAccess.Vertex);
 			_shadowMaterial.SetBuffer("GPURenderInstances", gpuInstances, HandleAccess.Vertex);
+		}
+
+		public void SetShadowResources(IMaterialObject material)
+		{
+			material.SetTexture("ShadowMaps", ShadowMapsTarget);
+			material.SetSampler("ShadowMaps_sampler", ShadowComparisonSampler);
+			material.SetSampler("ShadowMaps_sampler_point", ShadowPointSampler);
 		}
 
 		public void ExecuteDrawShadows(
@@ -92,7 +108,8 @@ namespace DecaEngine.Graphics.Diligent
 			
 			cmd.SetRenderTarget(null, _shadowMaps, 0, cascadeIndex);
 			cmd.SetViewport(ShadowMapSize, ShadowMapSize);
-			cmd.ClearDepthStencil(_shadowMaps, ClearDepthStencilFlags.Depth, 0.0f, 0, cascadeIndex);
+			// Clear depth to 0.0 for reversed-Z
+			cmd.ClearDepthStencil(_shadowMaps, ClearDepthStencilFlags.Depth, 1.0f, 0, cascadeIndex);
 
 			cmd.SetVertexBuffers(0, [megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 			cmd.SetIndexBuffer(megaIndexBufferGPU, 0);
@@ -111,53 +128,36 @@ namespace DecaEngine.Graphics.Diligent
 			cmd.TransitionResource(_shadowMaps, ResourceState.ShaderResource);
 		}
 
-		private GraphicsPipelineStateCreateInfo GetBaseState()
+		private GraphicsStateInfo GetBaseState()
 		{
-			var pipelineCreateInfo = new GraphicsPipelineStateCreateInfo
+			return new GraphicsStateInfo
 			{
-				PSODesc = new PipelineStateDesc
+				Name = "Shadow PSO",
+				RenderTargetFormats = [],
+				PrimitiveTopology = PrimitiveTopologyType.TriangleList,
+				RasterizerState = new RasterizerStateInfo
 				{
-					Name = "Shadow PSO",
-					PipelineType = PipelineType.Graphics,
-					ResourceLayout = new PipelineResourceLayoutDesc
-					{
-						DefaultVariableType = ShaderResourceVariableType.Mutable
-					}
+					CullMode = CullModeType.Front,
+					DepthBias = 0,
 				},
-				GraphicsPipeline = new GraphicsPipelineDesc
+				DepthStencilState = new DepthStencilStateInfo
 				{
-					NumRenderTargets = 0,
-					PrimitiveTopology = PrimitiveTopology.TriangleList,
-					RasterizerDesc = new RasterizerStateDesc
+					DepthEnable = true,
+					DepthFunc = ComparisonFunctionType.Less
+				},
+				InputLayout =
+				[
+					new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					new InputLayoutElementInfo
 					{
-						CullMode = CullMode.None,
-						DepthBias = 0,
-						SlopeScaledDepthBias = 1.5f
-					},
-					DepthStencilDesc = new DepthStencilStateDesc
-					{
-						DepthEnable = true,
-						DepthFunc = ComparisonFunction.GreaterEqual
-					},
-					InputLayout = new InputLayoutDesc
-					{
-						LayoutElements =
-						[
-							new LayoutElement { InputIndex = 0, NumComponents = 3, ValueType = ValueType.Float32, IsNormalized = false },
-							new LayoutElement { InputIndex = 1, NumComponents = 2, ValueType = ValueType.Float32, IsNormalized = false },
-							new LayoutElement { InputIndex = 2, NumComponents = 3, ValueType = ValueType.Float32, IsNormalized = false },
-							new LayoutElement
-							{
-								InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = ValueType.Int32,
-								IsNormalized = false,
-								Frequency = InputElementFrequency.PerInstance
-							}
-						]
+						InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32,
+						IsNormalized = false,
+						Frequency = InputElementFrequencyType.PerInstance
 					}
-				}
+				]
 			};
-
-			return pipelineCreateInfo;
 		}
 
 		public void Release()

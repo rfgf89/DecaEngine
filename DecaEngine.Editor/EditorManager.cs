@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 using DecaEngine.Editor.ECS;
@@ -22,15 +23,19 @@ public enum WindowType
 
 public class EditorManager : TimeLoopCore
 {
-	private IGraphicsPipeline _graphicsPipeline;
+	private IGraphicsApi _graphicsApi;
+	private IGraphicsPipeline _pipeline;
 	private IWindowHandle _windowHandle;
 	private DevicePull _devicePull;
 	private IInputEventPull _inputEventPull;
-	private ImGuiRender _imGuiRender;
+	private ImGuiManager _imGuiManager;
 	private DockLayout _dockLayout;
-	private IRenderGraph _renderGraph;
 	private DiligentBatchRenderer _batchRenderer;
 	private IRenderHandle _renderHandle;
+	private DebugWindow _debugWindow;
+#if DEBUG
+	private RenderGraphDebugWindow _renderGraphDebugWindow;
+#endif
 
 	// --- ECS ---
 	private EntityStore _ecsWorld;
@@ -43,8 +48,8 @@ public class EditorManager : TimeLoopCore
 		_windowHandle = new SdlWindowHandle();
 		_devicePull = new SdlDevicePull();
 		_inputEventPull = new SdlEventPull(_windowHandle, _devicePull as SdlDevicePull);
-		_graphicsPipeline = new DiligentGraphicsPipeline(_windowHandle);
-		_imGuiRender = new ImGuiDiligentRender(_graphicsPipeline as DiligentGraphicsPipeline);
+		_graphicsApi = new DiligentGraphicsApi(_windowHandle);
+		_imGuiManager = new ImGuiManager(_graphicsApi, _windowHandle, _inputEventPull, _devicePull);
 
 		_dockLayout = new DockLayout("Dock Layout");
 		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Project", imGuiDir = ImGuiDir.Left, ratio = 0.20f });
@@ -54,76 +59,17 @@ public class EditorManager : TimeLoopCore
 		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Inspector", imGuiDir = ImGuiDir.Right, ratio = 0.25f });
 		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Game View", imGuiDir = ImGuiDir.Down, ratio = 0.2f });
 
-		new MenuBarWindow("Menu Bar", _dockLayout, _imGuiRender).Show();
-
-		_graphicsPipeline.OnCreateSetupInfo += setupInfo =>
+		_graphicsApi.OnCreateSetupInfo += setupInfo =>
 		{
 			setupInfo.contextCount = 4;
 			if (setupInfo.backend == GraphicsBackend.D3D12) { setupInfo.dynamicHeapPageSize = 26 << 20; }
 			else if (setupInfo.backend == GraphicsBackend.Vulkan) { setupInfo.dynamicHeapSize = 26 << 20; }
 		};
-		//var tt = new MsBuildAssemblyCollector();
-		//tt.Collect("C:\\Users\\rfgf89\\Desktop\\NewProject33\\NewProject33.csproj");
-		//var tt = CsprojOutputResolver.GetBuildOutputs("C:\\Users\\rfgf89\\Desktop\\NewProject33\\NewProject33.csproj");
-
-		//new Thread(() =>
-		//{
-		//	EditorBuilder.ExecuteCommand($"dotnet watch run --no-hot-reload --project \"C:\\Users\\rfgf89\\Desktop\\NewProject33\\NewProject33.sln\"");
-		//}).Start();
-
-		//var assembly = new AssemblyApp(typeof(IEngineRun).GetTypeInfo().Assembly.Location);
-		//assembly.LoadFromPath();
-		//assembly.Run();
-
-		/*assembly.Load($$"""
-		                using System;
-		                using DecaEngine.Core;
-
-		                namespace AppCore;
-
-		                class Program
-		                {
-		                	private static IEngineRun _engineRun = new LoopCore().GetRun();
-
-		                	private static void Main(string[] args)
-		                	{
-		                		_engineRun.Run();
-		                	}
-
-		                	public static void Play()
-		                	{
-		                		_engineRun.Play();
-		                	}
-
-		                	public static void Pause()
-		                	{
-		                		_engineRun.Pause();
-		                	}
-
-		                	public static void Quit()
-		                	{
-		                		_engineRun.Quit();
-		                	}
-		                }
-		                """);*/
-
+		
 		this.Run();
 	}
 
-	private ImGuiWindow ProjectCreateInstance() => new ProjectWindow("Project", _imGuiRender);
-	private ImGuiWindow AssetBrowserCreateInstance() => new AssetBrowserWindow("Asset Browser", _imGuiRender);
-	private ImGuiWindow ConsoleCreateInstance() => new ConsoleWindow("Console", _imGuiRender);
-	private ImGuiWindow HierarchyCreateInstance() => new HierarchyWindow("Hierarchy", _imGuiRender);
-	private ImGuiWindow InspectorCreateInstance() => new InspectorWindow("Inspector", _imGuiRender);
-	private ImGuiWindow GameViewCreateInstance() => new GameViewWindow("Game View", _renderHandle, _imGuiRender);
-
 	private void OnWindowHandleResize() { }
-
-	private void OnSurfaceResize(Vector2 surface)
-	{
-		_imGuiRender.SetupWindow(surface, Vector2.One);
-		_windowHandle.Size = surface;
-	}
 
 	protected override void OnStart()
 	{
@@ -131,89 +77,30 @@ public class EditorManager : TimeLoopCore
 		{
 			_windowHandle.Initialize("DecaEngine Editor", 0, new Vector2(1920, 1080));
 			_windowHandle.LoadAndSetIcon(Path.Combine(Environment.CurrentDirectory, "EditorAssets/Icons", "download (6).jpg"));
-			_graphicsPipeline.Initialize(GraphicsBackend.Vulkan);
+			_graphicsApi.Initialize(GraphicsBackend.Vulkan);
 
-			ImGuiRender.InitializeImGui(ImGuiConfigFlags.NavEnableKeyboard |
-			                            ImGuiConfigFlags.NavEnableGamepad |
-			                            ImGuiConfigFlags.DockingEnable |
-			                            ImGuiConfigFlags.ViewportsEnable);
+			_imGuiManager.Initialize();
 
-			var io = ImGui.GetIO();
-			io.ConfigViewportsNoAutoMerge = false;
-			io.ConfigViewportsNoTaskBarIcon = false;
-			io.ConfigDragClickToInputText = true;
-			io.ConfigDebugIsDebuggerPresent = Debugger.IsAttached;
-			io.ConfigErrorRecoveryEnableDebugLog = true;
-			io.ConfigErrorRecovery = true;
-			io.ConfigErrorRecoveryEnableAssert = false;
-			io.ConfigDpiScaleFonts = true;
-			io.ConfigDpiScaleViewports = true;
-			io.WantSaveIniSettings = false;
-
-			uint* glyphRanges = stackalloc uint[]
-			{
-				(uint)0xe005, (uint)0xe684,
-				(uint)0xF000, (uint)0xF8FF,
-				(uint)0 // null terminator
-			};
-
-			uint* glyphMaterialRanges = stackalloc uint[]
-			{
-				0xe003, 0xF8FF,
-				0 // null terminator
-			};
-
-			var config = ImGui.ImFontConfig();
-			config.FontDataOwnedByAtlas = true;
-			config.GlyphRanges = glyphRanges;
-
-			var configMaterial = ImGui.ImFontConfig();
-			configMaterial.FontDataOwnedByAtlas = true;
-			configMaterial.GlyphRanges = glyphMaterialRanges;
-			configMaterial.MergeMode = true;
-			configMaterial.GlyphOffset.Y = 5f;
-
-			var regularFont = io.Fonts.AddFontFromFileTTF(Path.Combine(Environment.CurrentDirectory, "EditorAssets/Inter/Inter_24pt-Medium.ttf"), 24f, config);
-			var headingFont = io.Fonts.AddFontFromFileTTF(Path.Combine(Environment.CurrentDirectory, "EditorAssets/proggyfonts/ProggyVector/ProggyVector-Dotted.ttf"), 20f, config);
-			var materialFont = io.Fonts.AddFontFromFileTTF(Path.Combine(Environment.CurrentDirectory, "EditorAssets/MaterialIcons-Regular.ttf"), 24f, configMaterial);
-
-			_imGuiRender.AddFont(FontType.Regular, regularFont);
-			_imGuiRender.AddFont(FontType.Heading, headingFont);
-			_imGuiRender.AddFont(FontType.MaterialSymbols, materialFont);
-
-			io.FontDefault = regularFont;
-
-			OnSurfaceResize(_windowHandle.Size);
-			_imGuiRender.Initialize(_devicePull);
-
-			_inputEventPull.OnSurfaceResize += OnSurfaceResize;
 			_windowHandle.OnWindowResize += OnWindowHandleResize;
 
-			_renderHandle = new DiligentRenderHandle((_graphicsPipeline as DiligentGraphicsPipeline).Device);
+			_renderHandle = new DiligentRenderHandle((_graphicsApi as DiligentGraphicsApi).Device);
 
-			_renderHandle.Alloc(new RenderTargetInfo
+			_renderHandle.Alloc(new TextureInfo
 			{
 				width = (uint)_windowHandle.Size.X,
 				height = (uint)_windowHandle.Size.Y,
-				textureFormat = RenderTargetInfo.Format.R8G8B8A8_UNORM,
+				format = TextureObjectFormat.R8G8B8A8UNorm,
 				name = "Game Main Render Target"
 			});
 
-			GameViewCreateInstance().Show();
-			InspectorCreateInstance().Show();
-			HierarchyCreateInstance().Show();
-			ConsoleCreateInstance().Show();
-			AssetBrowserCreateInstance().Show();
-			ProjectCreateInstance().Show();
-
-			var dilPipe = _graphicsPipeline as DiligentGraphicsPipeline;
+			var dilPipe = _graphicsApi as DiligentGraphicsApi;
 			_batchRenderer = new DiligentBatchRenderer(dilPipe);
-			
-			_ecsWorld = new EntityStore();
-			_scene = new Scene(_graphicsPipeline);
+			_pipeline = new GraphicsPipeline(dilPipe, _batchRenderer);
 
-			_renderResourceManager = new RenderResourceManager( _scene.instances.Count,
-				 _scene.Meshes.Count * _scene.materialObjects.Count, _ecsWorld, _batchRenderer);
+			_ecsWorld = new EntityStore();
+			_scene = new Scene(_graphicsApi);
+
+			_renderResourceManager = new RenderResourceManager(2, 2, _ecsWorld, _batchRenderer);
 
 			var cameraComponent = new CameraComponent(new CameraData(90f, 0.1f, 1000f, new Vector4(0, 0f, 1920f, 1080f)));
 			cameraComponent.data.cullFlags = CullFlags.All;
@@ -228,12 +115,26 @@ public class EditorManager : TimeLoopCore
 			_root = new SystemRoot()
 			{
 				new GpuInstanceBufferSystem(),
-				new CullingAndRenderSystem(_batchRenderer, _renderResourceManager, _graphicsPipeline as DiligentGraphicsPipeline),
+				new CullingAndRenderSystem(_renderResourceManager, _graphicsApi, _pipeline),
 				new FlyCameraSystem([ent], _devicePull)
 			};
 			_root.AddStore(_ecsWorld);
 
 			CreateTestSceneEntities();
+			
+			new MenuBarWindow("Menu Bar", _dockLayout, _imGuiManager.ImGuiRender).Show();
+			new GameViewWindow("Game View", _renderHandle, _imGuiManager.ImGuiRender).Show();
+			new InspectorWindow("Inspector", _imGuiManager.ImGuiRender).Show();
+			new HierarchyWindow("Hierarchy", _imGuiManager.ImGuiRender).Show();
+			new ConsoleWindow("Console", _imGuiManager.ImGuiRender).Show();
+			new AssetBrowserWindow("Asset Browser", _imGuiManager.ImGuiRender).Show();
+			new ProjectWindow("Project", _imGuiManager.ImGuiRender).Show();
+			_debugWindow = new DebugWindow("Debug", _ecsWorld, _batchRenderer, _imGuiManager.ImGuiRender);
+			_debugWindow.Show();
+#if DEBUG
+			_renderGraphDebugWindow = new RenderGraphDebugWindow("Render Graph Debugger", _pipeline, _imGuiManager.ImGuiRender);
+			_renderGraphDebugWindow.Show();
+#endif
 		}
 	}
 
@@ -241,16 +142,13 @@ public class EditorManager : TimeLoopCore
 
 	private void CreateTestSceneEntities()
 	{
+		var baseMaterialState = _batchRenderer.GetBaseState();
 		var materialIdMap = new Dictionary<int, MaterialId>();
 		for (int i = 0; i < _scene.materialObjects.Count; i++)
 		{
 			var kvp = _scene.materialObjects.GetAt(i);
 			var materialObj = kvp.Value;
-
-			if (materialObj is DiligentMaterial dilMat)
-			{
-				dilMat.SetBasePipelineState(_batchRenderer.GetBaseState());
-			}
+			materialObj.SetState(baseMaterialState);
 
 			var matId = _batchRenderer.Register(materialObj);
 			materialIdMap.Add(kvp.Key, matId);
@@ -313,11 +211,7 @@ public class EditorManager : TimeLoopCore
 			}
         );
 	}
-
-	private bool _isBatchDebug;
-    private Vector3 _tempEuler = Vector3.Zero;
-    private int _lastLightEntityId = -1;
-
+	
 	protected override unsafe void OnUpdate(float deltaTime)
 	{
 		if (_inputEventPull.PullEvent())
@@ -326,147 +220,20 @@ public class EditorManager : TimeLoopCore
 		}
 
 		StyleEditorManager.SetDarkThemeColors(_windowHandle.GetScale());
-		_graphicsPipeline.SetBackBufferTarget(new Vector4(0.1f, 0.1f, 0.1f,1));
 		
 		_root.Update(new UpdateTick(deltaTime, time));
+		_pipeline.Execute();
 		
-		_imGuiRender.BeforeLayout(deltaTime);
+		_imGuiManager.BeforeLayout(deltaTime);
 		
-		ImGui.Begin("Drawing");
+		_debugWindow.FramePerSecond = framePerSecond;
 
-		ImGui.Text("Fps : " + framePerSecond);
-
-		ImGui.Checkbox("Debug Batch Renderer", ref _isBatchDebug);
-
-		var cameras = _ecsWorld.Query<CameraComponent>();
-		cameras.ForEachEntity((ref CameraComponent camera, Entity entity) =>
-		{
-			bool frustumCulling = (camera.data.cullFlags & CullFlags.Frustum) != 0;
-			if (ImGui.Checkbox("Frustum Culling", ref frustumCulling) && frustumCulling)
-			{
-				camera.data.cullFlags |= CullFlags.Frustum;
-			}
-
-			bool lodSelection = (camera.data.cullFlags & CullFlags.Lod) != 0;
-			if (ImGui.Checkbox("LOD Selection", ref lodSelection) && lodSelection)
-			{
-				camera.data.cullFlags |= CullFlags.Lod;
-			}
-		});
-
-		if (_isBatchDebug)
-		{
-			var info = _batchRenderer.ReadInfo();
-			ImGui.Text($"Total Batches: {_batchRenderer.GetBatches().Count}, Draw Calls: {info.pipelineStateCount}");
-
-            // Debug Light Data
-            if (ImGui.TreeNode("Light Debug"))
-            {
-                var lights = _ecsWorld.Query<LightComponent, SunComponent>();
-                lights.ForEachEntity((ref LightComponent light, ref SunComponent sun, Entity lightEntity) =>
-                {
-                    if (_lastLightEntityId != lightEntity.Id)
-                    {
-                        _lastLightEntityId = lightEntity.Id;
-                        _tempEuler = ToEulerAngles(lightEntity.Rotation.value) * (180f / (float)Math.PI);
-                    }
-
-                    ImGui.Text($"Entity: {lightEntity.Id}");
-                    
-                    var pos = lightEntity.Position.value;
-                    if (ImGui.DragFloat3("Position", ref pos))
-                        lightEntity.Position = new Position(pos.X, pos.Y, pos.Z);
-
-                    if (ImGui.DragFloat3("Rotation (Euler)", ref _tempEuler))
-                    {
-                        var rad = _tempEuler * ((float)Math.PI / 180f);
-                        lightEntity.Rotation = new Rotation { value = Quaternion.CreateFromYawPitchRoll(rad.Y, rad.X, rad.Z) };
-                    }
-                    
-                    ImGui.DragFloat("Intensity", ref light.Intensity, 0.05f, 0f, 100f);
-                    ImGui.ColorEdit3("Color", ref light.Color);
-                    ImGui.DragFloat("Shadow Strength", ref light.ShadowStrength, 0.001f, 0f, 10f);
-
-                    var lightDirection = Vector3.Transform(Vector3.UnitZ, lightEntity.Rotation.value);
-                    ImGui.Text($"Direction: {lightDirection}");
-                });
-                ImGui.TreePop();
-            }
-
-			var indirectArgs = _batchRenderer.ReadIndirectArgsForDebugging();
-			var drawRanges = _batchRenderer.GetDebugDrawRanges();
-
-			long totalVisibleIndices = 0;
-
-			if (ImGui.TreeNode("Material Draw Ranges"))
-			{
-				foreach (var kvp in drawRanges)
-				{
-					var materialId = kvp.Key;
-					var range = kvp.Value;
-					ImGui.Text($"Material {materialId}: {range.DrawCount} batches, starting at index {range.FirstDrawIndex}");
-				}
-				ImGui.TreePop();
-			}
-
-			if (ImGui.TreeNode("Batch Details"))
-			{
-				var batches = _batchRenderer.GetBatches();
-				int count = Math.Min(indirectArgs.Length, batches.Count);
-
-				if (count > 0)
-				{
-					if (ImGui.BeginTable("BatchTable", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY))
-					{
-						ImGui.TableSetupColumn("Batch");
-						ImGui.TableSetupColumn("Mesh ID");
-						ImGui.TableSetupColumn("Material ID");
-						ImGui.TableSetupColumn("Visible Instances");
-						ImGui.TableHeadersRow();
-
-						var clipper = new ImGuiListClipper();
-						clipper.Begin(count);
-
-						while (clipper.Step())
-						{
-							for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
-							{
-								var batchInfo = batches[i];
-								var args = indirectArgs[i];
-
-								ImGui.TableNextRow();
-								ImGui.TableSetColumnIndex(0);
-								ImGui.Text($"{i}");
-								ImGui.TableSetColumnIndex(1);
-								ImGui.Text($"{batchInfo.Value.mesh.meshId}");
-								ImGui.TableSetColumnIndex(2);
-								ImGui.Text($"{batchInfo.Value.material.materialId}");
-								ImGui.TableSetColumnIndex(3);
-								ImGui.Text($"{args.NumInstances}");
-							}
-						}
-						ImGui.EndTable();
-					}
-				}
-				ImGui.TreePop();
-			}
-
-			if (indirectArgs.Length > 0)
-			{
-				for (int i = 0; i < indirectArgs.Length; i++)
-				{
-					var args = indirectArgs[i];
-					totalVisibleIndices += (long)args.NumInstances * args.NumIndices;
-				}
-			}
-			
-			ImGui.Text($"Visible Triangles: {totalVisibleIndices / 3f / 1000000f:F2}m");
-		}
-
-		ImGui.End();
-
-		_imGuiRender.AfterLayout();
-		_graphicsPipeline.Present();
+		_debugWindow.Render(0);
+#if DEBUG
+		_renderGraphDebugWindow.Render(0);
+#endif
+		_imGuiManager.AfterLayout();
+		_graphicsApi.Present();
 
 		++numFramesRendered;
 		timeFps += deltaTime;
@@ -479,30 +246,6 @@ public class EditorManager : TimeLoopCore
 		}
 	}
 
-    private Vector3 ToEulerAngles(Quaternion q)
-    {
-        Vector3 angles = new();
-
-        // pitch (x-axis rotation)
-        double sinp = 2 * (q.W * q.Y - q.Z * q.X);
-        if (Math.Abs(sinp) >= 1)
-            angles.X = (float)Math.CopySign(Math.PI / 2, sinp); 
-        else
-            angles.X = (float)Math.Asin(sinp);
-
-        // yaw (y-axis rotation)
-        double sinr_cosp = 2 * (q.W * q.X + q.Y * q.Z);
-        double cosr_cosp = 1 - 2 * (q.X * q.X + q.Y * q.Y);
-        angles.Y = (float)Math.Atan2(sinr_cosp, cosr_cosp);
-
-        // roll (z-axis rotation)
-        double siny_cosp = 2 * (q.W * q.Z + q.X * q.Y);
-        double cosy_cosp = 1 - 2 * (q.Y * q.Y + q.Z * q.Z);
-        angles.Z = (float)Math.Atan2(siny_cosp, cosy_cosp);
-
-        return angles;
-    }
-
 	private float framePerSecond;
 	private ulong numFramesRendered;
 	private ulong lastNumFramesRendered;
@@ -511,9 +254,9 @@ public class EditorManager : TimeLoopCore
 
 	protected override void OnQuit()
 	{
-		_inputEventPull.OnSurfaceResize -= OnSurfaceResize;
+		_imGuiManager.Release();
 		_windowHandle.OnWindowResize -= OnWindowHandleResize;
 		_windowHandle.Release();
-		_graphicsPipeline.Release();
+		_graphicsApi.Release();
 	}
 }

@@ -14,7 +14,7 @@ public class DiligentComputeMaterial : IComputeMaterial
 {
 	public string Name { get; }
 
-	private readonly DiligentGraphicsPipeline _pipeline;
+	private readonly DiligentGraphicsApi _api;
 	private IPipelineState? _pipelineState;
 	private IShaderResourceBinding? _srb;
 
@@ -27,11 +27,12 @@ public class DiligentComputeMaterial : IComputeMaterial
 	private readonly ConcurrentDictionary<string, List<IShaderResourceVariable>> _variables = new();
 
 	private bool _isDirty = true;
+	private ComputePipelineStateCreateInfo? _basePsoCreateInfo;
 	private readonly object _psoRebuildLock = new object();
 
-	public DiligentComputeMaterial(string name, DiligentGraphicsPipeline pipeline)
+	public DiligentComputeMaterial(string name, DiligentGraphicsApi api)
 	{
-		_pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
+		_api = api ?? throw new ArgumentNullException(nameof(api));
 		Name = name;
 	}
 
@@ -51,6 +52,21 @@ public class DiligentComputeMaterial : IComputeMaterial
 
 		dilShader.Compile();
 		_computeShader = dilShader.NativeShader;
+		_isDirty = true;
+	}
+
+	public void SetState(IStateObject stateObject)
+	{
+		ArgumentNullException.ThrowIfNull(stateObject);
+
+		if (stateObject is not DiligentComputeStateObject computeState)
+		{
+			throw new ArgumentException(
+				$"Unsupported state object '{stateObject.GetType().Name}'. Expected {nameof(DiligentComputeStateObject)}.",
+				nameof(stateObject));
+		}
+
+		_basePsoCreateInfo = computeState.CreateInfo;
 		_isDirty = true;
 	}
 
@@ -112,12 +128,12 @@ public class DiligentComputeMaterial : IComputeMaterial
 
 	public unsafe void SetConstant<T>(string name, ref T data) where T : unmanaged
 	{
-		SetConstant(_pipeline.ImmediateContext, name, ref data);
+		SetConstant(_api.ImmediateContext, name, ref data);
 	}
 
 	public unsafe void SetConstant<T>(int ctx, string name, ref T data) where T : unmanaged
 	{
-		SetConstant(_pipeline.DeferredContexts[ctx], name, ref data);
+		SetConstant(_api.DeferredContexts[ctx], name, ref data);
 	}
 
 	public unsafe void SetConstant<T>(IDeviceContext ctx, string name, ref T data) where T : unmanaged
@@ -129,7 +145,7 @@ public class DiligentComputeMaterial : IComputeMaterial
 		{
 			buffer?.Release();
 
-			buffer = new DiligentBufferHandle(_pipeline.Device);
+			buffer = new DiligentBufferHandle(_api.Device);
 			buffer.Alloc(new BufferInfo
 			{
 				name = name,
@@ -165,7 +181,7 @@ public class DiligentComputeMaterial : IComputeMaterial
 				throw new InvalidOperationException("Compute shader must be set before dispatching");
 			}
 
-			var psoCreateInfo = new ComputePipelineStateCreateInfo();
+			var psoCreateInfo = _basePsoCreateInfo ?? new ComputePipelineStateCreateInfo();
 			psoCreateInfo.PSODesc.Name = $"{Name} Compute PSO";
 			psoCreateInfo.PSODesc.PipelineType = PipelineType.Compute;
 			psoCreateInfo.Cs = _computeShader;
@@ -184,7 +200,7 @@ public class DiligentComputeMaterial : IComputeMaterial
 			psoCreateInfo.PSODesc.ResourceLayout = layout;
 
 			_pipelineState?.Dispose();
-			_pipelineState = _pipeline.PsoManager.CreateComputePipelineState(psoCreateInfo);
+			_pipelineState = _api.PsoManager.CreateComputePipelineState(psoCreateInfo);
 			_variables.Clear();
 
 			_srb?.Dispose();
@@ -233,7 +249,7 @@ public class DiligentComputeMaterial : IComputeMaterial
 	{
 		RebuildPipelineIfNeeded();
 
-		var ctx = _pipeline.ImmediateContext;
+		var ctx = _api.ImmediateContext;
 		ctx.SetPipelineState(_pipelineState);
 		ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Transition);
 

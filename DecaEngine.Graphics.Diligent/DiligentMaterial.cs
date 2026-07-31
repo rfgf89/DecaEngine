@@ -14,7 +14,7 @@ public class DiligentMaterial : IMaterialObject
 {
 	public string Name { get; }
 
-	private readonly DiligentGraphicsPipeline _pipeline;
+	private readonly DiligentGraphicsApi _api;
 	private IPipelineState? _pipelineState;
 	private IShaderResourceBinding? _srb;
 
@@ -31,9 +31,9 @@ public class DiligentMaterial : IMaterialObject
 	private GraphicsPipelineStateCreateInfo? _basePsoCreateInfo;
 	private readonly object _psoRebuildLock = new object();
 
-	public DiligentMaterial(string name, DiligentGraphicsPipeline pipeline)
+	public DiligentMaterial(string name, DiligentGraphicsApi api)
 	{
-		_pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
+		_api = api ?? throw new ArgumentNullException(nameof(api));
 		Name = name;
 	}
 
@@ -62,7 +62,19 @@ public class DiligentMaterial : IMaterialObject
 		}
 	}
 
-	public void SetBasePipelineState(GraphicsPipelineStateCreateInfo psoCreateInfo)
+	public void SetState(IStateObject stateObject)
+	{
+		ArgumentNullException.ThrowIfNull(stateObject);
+
+		if (stateObject is not DiligentGraphicsStateObject graphicsState)
+		{
+			throw new ArgumentException($"Unsupported state object '{stateObject.GetType().Name}'. Expected {nameof(DiligentGraphicsStateObject)}.", nameof(stateObject));
+		}
+
+		SetBasePipelineState(graphicsState.CreateInfo);
+	}
+
+	private void SetBasePipelineState(GraphicsPipelineStateCreateInfo psoCreateInfo)
 	{
 		_basePsoCreateInfo = psoCreateInfo;
 		_isDirty = true;
@@ -116,61 +128,70 @@ public class DiligentMaterial : IMaterialObject
 
 	public void SetSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel)
 	{
-		SetSampler(name, sampler, access, true);
-	}
-
-	public void SetSampler(string name, ISamplerObject sampler, HandleAccess access, bool immutable)
-	{
-		if (sampler is DiligentSamplerObject dilSampler)
+		if (sampler is not DiligentSamplerObject dilSampler)
 		{
-			var shaderStages = DiligentGraphicsUtility.AccessToShaderType(access);
-			if (shaderStages == ShaderType.Unknown) shaderStages = ShaderType.Pixel;
+			return;
+		}
 
-			if (immutable)
+		var shaderStages = DiligentGraphicsUtility.AccessToShaderType(access);
+		if (shaderStages == ShaderType.Unknown)
+		{
+			shaderStages = ShaderType.Pixel;
+		}
+
+		if (_immutableSamplers.Remove(name))
+		{
+			_isDirty = true;
+		}
+
+		_pendingResources[name] = dilSampler.Sampler;
+
+		if (name.EndsWith("_sampler"))
+		{
+			string textureName = name.Substring(0, name.Length - 8);
+			if (_pendingResources.TryGetValue(textureName, out var res) && res is ITextureView view)
 			{
-				if (_immutableSamplers.TryGetValue(name, out var existing))
-				{
-					if (existing.ShaderStages == shaderStages) return;
-				}
-
-				_immutableSamplers[name] = new ImmutableSamplerDesc
-				{
-					ShaderStages = shaderStages,
-					SamplerOrTextureName = name,
-					Desc = dilSampler.Desc,
-				};
-				_isDirty = true;
-			}
-			else
-			{
-				if (_immutableSamplers.Remove(name)) _isDirty = true;
-
-				_pendingResources[name] = dilSampler.Sampler;
-
-				// Привязываем семплер к текстуре, если она уже существует в ресурсах
-				if (name.EndsWith("_sampler"))
-				{
-					string textureName = name.Substring(0, name.Length - 8);
-					if (_pendingResources.TryGetValue(textureName, out var res) && res is ITextureView view)
-					{
-						view.SetSampler(dilSampler.Sampler);
-					}
-				}
-
-				DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, shaderStages, ref _isDirty);
-				DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
+				view.SetSampler(dilSampler.Sampler);
 			}
 		}
+
+		DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, shaderStages, ref _isDirty);
+		DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
+	}
+
+	public void SetImmutableSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel)
+	{
+		if (sampler is not DiligentSamplerObject dilSampler)
+		{
+			return;
+		}
+
+		var shaderStages = DiligentGraphicsUtility.AccessToShaderType(access);
+		if (shaderStages == ShaderType.Unknown) shaderStages = ShaderType.Pixel;
+
+		if (_immutableSamplers.TryGetValue(name, out var existing))
+		{
+			if (existing.ShaderStages == shaderStages) return;
+		}
+
+		_immutableSamplers[name] = new ImmutableSamplerDesc
+		{
+			ShaderStages = shaderStages,
+			SamplerOrTextureName = name,
+			Desc = dilSampler.Desc,
+		};
+
+		_isDirty = true;
 	}
 
 	public unsafe void SetConstant<T>(string name, ref T data, HandleAccess access = HandleAccess.Pixel) where T : unmanaged
 	{
-		SetConstant(_pipeline.ImmediateContext, name, ref data, access);
+		SetConstant(_api.ImmediateContext, name, ref data, access);
 	}
 
 	public unsafe void SetConstant<T>(int ctx, string name, ref T data, HandleAccess access = HandleAccess.Pixel) where T : unmanaged
 	{
-		SetConstant(_pipeline.DeferredContexts[ctx], name, ref data, access);
+		SetConstant(_api.DeferredContexts[ctx], name, ref data, access);
 	}
 
 	public unsafe void SetConstant<T>(IDeviceContext ctx, string name, ref T data, HandleAccess access = HandleAccess.Pixel) where T : unmanaged
@@ -182,7 +203,7 @@ public class DiligentMaterial : IMaterialObject
 		{
 			buffer?.Release();
 
-			buffer = new DiligentBufferHandle(_pipeline.Device);
+			buffer = new DiligentBufferHandle(_api.Device);
 			buffer.Alloc(new BufferInfo
 			{
 				name = name,
@@ -258,7 +279,7 @@ public class DiligentMaterial : IMaterialObject
 			psoCreateInfo.PSODesc = psoDesc;
 
 			_pipelineState?.Dispose();
-			_pipelineState = _pipeline.PsoManager.CreateGraphicsPipelineState(psoCreateInfo);
+			_pipelineState = _api.PsoManager.CreateGraphicsPipelineState(psoCreateInfo);
 			_variables.Clear();
 
 			var stagesToTry = new[] { ShaderType.Vertex, ShaderType.Pixel, ShaderType.Compute, ShaderType.Geometry, ShaderType.Domain, ShaderType.Hull };

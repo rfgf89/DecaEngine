@@ -11,9 +11,11 @@ public struct MaterialDrawRange
 	public uint DrawCount;
 }
 
-public interface IMaterialObject : IReleaseObject
+public interface IMaterialObject : IStateObject
 {
-	public string Name { get; }
+	PipelineStateType IStateObject.StateType => PipelineStateType.Graphics;
+
+	public void SetState(IStateObject stateObject);
 
 	public void SetShader(IShaderObject shaderObject);
 	public void SetShader(params IShaderObject[] shaders);
@@ -27,12 +29,15 @@ public interface IMaterialObject : IReleaseObject
 	public void SetTexture(string name, IGpuTexture texture, HandleAccess access = HandleAccess.Pixel);
 
 	public void SetSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel);
+	public void SetImmutableSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel);
 }
 
 // ?????: ????????? ????????? ??? Compute
-public interface IComputeMaterial : IReleaseObject
+public interface IComputeMaterial : IStateObject
 {
-	public string Name { get; }
+	PipelineStateType IStateObject.StateType => PipelineStateType.Compute;
+
+	public void SetState(IStateObject stateObject);
 
 	public void SetShader(IShaderObject computeShader);
 

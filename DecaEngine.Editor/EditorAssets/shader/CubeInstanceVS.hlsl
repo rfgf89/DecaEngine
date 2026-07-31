@@ -2,6 +2,11 @@
 
 StructuredBuffer<GPURenderInstance> GPURenderInstances;
 
+cbuffer Light
+{
+    LightData lightData;
+}
+
 cbuffer View
 {
     ViewData viewData;
@@ -22,6 +27,7 @@ struct PSInput
     float2 uv       : TEX_COORD;
     float3 normal   : NORMAL;
     float3 worldPos : WORLDPOS;
+    float4 lightViewPos[4] : LIGHT_VIEW_POS;
 };
 
 PSInput Main(in VSInput input)
@@ -36,6 +42,11 @@ PSInput Main(in VSInput input)
     result.pos = mul(vertexPos, viewData.viewProj);
     result.uv  = input.uv;
     result.normal = mul(input.normal, (float3x3)instanceTransform);
+
+    for (int i = 0; i < 4; i++)
+    {
+        result.lightViewPos[i] = mul(vertexPos, lightData.CascadeMatrix[i]);
+    }
 
     return result;
 }

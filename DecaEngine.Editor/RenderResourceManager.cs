@@ -13,7 +13,7 @@ public class RenderResourceManager
 	private readonly NativeStack<int> _freeSlots;
 	private readonly EntityStore _store;
 	private readonly ArchetypeQuery<BatchRenderInfo> _deadEntitiesQuery;
-	private readonly int[] _batchCounts;
+	private int[] _batchCounts;
 
 	public int totalInstances;
 	public int totalFreeSlot;
@@ -70,8 +70,43 @@ public class RenderResourceManager
 	{
 		if (_freeSlots.Count == 0)
 		{
-			Console.WriteLine("RenderResourceManager: No free slots available!");
-			return false;
+			int newInstances = totalInstances == 0 ? 128 : totalInstances * 2;
+			var newInstancesArray = new NativeArray<IndirectInstance>(newInstances);
+			var newGpuData = new NativeArray<GPURenderInstance>(newInstances);
+			var newDrawData = new NativeArray<DrawData>(newInstances);
+
+			if (totalInstances > 0)
+			{
+				NativeArray<IndirectInstance>.Copy(_renderSubset.instances, newInstancesArray);
+				NativeArray<GPURenderInstance>.Copy(_renderSubset.gpuData, newGpuData);
+				NativeArray<DrawData>.Copy(_renderSubset.drawData, newDrawData);
+
+				_renderSubset.instances.Dispose();
+				_renderSubset.gpuData.Dispose();
+				_renderSubset.drawData.Dispose();
+			}
+
+			for (var i = totalInstances; i < newInstances; i++)
+			{
+				newInstancesArray[i] = new IndirectInstance { batchId = new BatchId(-1), objectId = -1 };
+				_freeSlots.Push(newInstances - 1 - (i - totalInstances));
+			}
+
+			_renderSubset.instances = newInstancesArray;
+			_renderSubset.gpuData = newGpuData;
+			_renderSubset.drawData = newDrawData;
+			totalInstances = newInstances;
+
+			if (totalInstances > 0)
+			{
+				_store.Query<BatchRenderInfo, LinkDrawInfo>().ForEachEntity((ref BatchRenderInfo batchInfo, ref LinkDrawInfo linkInfo, Entity ent) =>
+				{
+					linkInfo.renderInstance = UnsafeArray.GetPtr<GPURenderInstance>(_renderSubset.gpuData.GetNative(), batchInfo.GpuSlotIndex);
+					linkInfo.drawData = UnsafeArray.GetPtr<DrawData>(_renderSubset.drawData.GetNative(), batchInfo.GpuSlotIndex);
+				});
+			}
+
+			_batchRenderer.PinInstances(_renderSubset);
 		}
 
 		var slotIndex = _freeSlots.Pop();
@@ -83,7 +118,28 @@ public class RenderResourceManager
 			objectId = slotIndex
 		};
 
-		if (batchId.batchId >= 0 && batchId.batchId < _batchCounts.Length)
+		if (batchId.batchId >= 0 && batchId.batchId >= _batchCounts.Length)
+		{
+			int newBatchCountsLength = _batchCounts.Length == 0 ? 128 : _batchCounts.Length;
+			while (batchId.batchId >= newBatchCountsLength)
+			{
+				newBatchCountsLength *= 2;
+			}
+
+			Array.Resize(ref _batchCounts, newBatchCountsLength);
+			var newCountData = new NativeArray<int>(newBatchCountsLength);
+
+			if (_renderSubset.countData.Length > 0)
+			{
+				NativeArray<int>.Copy(_renderSubset.countData, newCountData);
+				_renderSubset.countData.Dispose();
+			}
+
+			_renderSubset.countData = newCountData;
+			_batchRenderer.PinInstances(_renderSubset);
+		}
+
+		if (batchId.batchId >= 0)
 		{
 			_batchCounts[batchId.batchId]++;
 
@@ -105,5 +161,28 @@ public class RenderResourceManager
 			});
 
 		return true;
+	}
+
+	public unsafe void UnregisterRenderable(Entity entity)
+	{
+		if (entity.TryGetComponent<BatchRenderInfo>(out var batchInfo))
+		{
+			_freeSlots.Push(batchInfo.GpuSlotIndex);
+			totalFreeSlot = _freeSlots.Count;
+
+			_renderSubset.instances[batchInfo.GpuSlotIndex] = new IndirectInstance { batchId = new BatchId(-1), objectId = -1 };
+
+			if (batchInfo.BatchId.batchId >= 0 && batchInfo.BatchId.batchId < _batchCounts.Length)
+			{
+				_batchCounts[batchInfo.BatchId.batchId]--;
+				for (var i = batchInfo.BatchId.batchId + 1; i < _batchCounts.Length; i++)
+				{
+					_renderSubset.countData.GetRef(i)--;
+				}
+			}
+
+			entity.RemoveComponent<BatchRenderInfo>();
+			entity.RemoveComponent<LinkDrawInfo>();
+		}
 	}
 }

@@ -17,15 +17,16 @@ namespace DecaEngine.Graphics.Diligent
 		public ITexture Texture => _texture;
 
 		private readonly IRenderDevice _device;
-		private RenderTargetInfo _info;
+		private TextureInfo _info;
 		private ITexture _texture;
 		private readonly Dictionary<(TextureViewType, uint), ITextureView> _views = new();
 
-		public DiligentRenderTarget(IRenderDevice device, RenderTargetInfo info)
+		public DiligentRenderTarget(IRenderDevice device, TextureInfo info)
 		{
 			_device = device;
 			_info = info;
 			if (_info.arraySize == 0) _info.arraySize = 1;
+			_info.type = _info.arraySize > 1 ? TextureType.Texture2DArray : TextureType.Texture2D;
 			Size = new Vector2(info.width, info.height);
 			CreateTexture();
 		}
@@ -44,14 +45,7 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void CreateTexture()
 		{
-			var (dilFormat, bindFlags) = _info.textureFormat switch
-			{
-				RenderTargetInfo.Format.R16G16B16A16_FLOAT => (TextureFormat.RGBA16_Float, BindFlags.RenderTarget | BindFlags.ShaderResource),
-				RenderTargetInfo.Format.D32_FLOAT => (TextureFormat.D32_Float, BindFlags.DepthStencil | BindFlags.ShaderResource),
-				RenderTargetInfo.Format.D32_Float_S8X24_UInt => (TextureFormat.D32_Float_S8X24_UInt, BindFlags.DepthStencil | BindFlags.ShaderResource),
-				RenderTargetInfo.Format.D24_UNorm_S8_UInt => (TextureFormat.D24_UNorm_S8_UInt, BindFlags.DepthStencil | BindFlags.ShaderResource),
-				_ => (TextureFormat.RGBA8_UNorm, BindFlags.RenderTarget | BindFlags.ShaderResource)
-			};
+			var (dilFormat, bindFlags) = DiligentResourceFormats.ToRenderTargetFormat(_info.format);
 
 			var desc = new TextureDesc
 			{
@@ -67,21 +61,8 @@ namespace DecaEngine.Graphics.Diligent
 			};
 
 			_texture = _device.CreateTexture(desc);
-			
-			Info = new TextureInfo
-			{
-				name = _info.name,
-				width = _info.width,
-				height = _info.height,
-				arraySize = _info.arraySize,
-				type = _info.arraySize > 1 ? TextureType.Texture2DArray : TextureType.Texture2D,
-				format = _info.textureFormat switch
-				{
-					RenderTargetInfo.Format.R16G16B16A16_FLOAT => TextureObjectFormat.R16G16B16A16Float,
-					RenderTargetInfo.Format.D32_FLOAT => TextureObjectFormat.D32Float,
-					_ => TextureObjectFormat.R8G8B8A8UNorm
-				}
-			};
+
+			Info = _info;
 		}
 
 		public ITextureView GetView(TextureViewType type, uint slice = 0)
@@ -90,19 +71,24 @@ namespace DecaEngine.Graphics.Diligent
 				return view;
 
 			ITextureView newView;
+			// If we are requesting slice 0 and the texture is not an array, get the default view.
 			if (slice == 0 && _info.arraySize <= 1)
 			{
 				newView = _texture.GetDefaultView(type);
 			}
 			else
 			{
+				// If the texture is an array, we must create a specific view for the slice.
+				// The dimension of the view must match the dimension of the texture.
+				var viewDim = _info.arraySize > 1 ? ResourceDimension.Tex2dArray : ResourceDimension.Tex2d;
+				
 				newView = _texture.CreateView(new TextureViewDesc
 				{
 					Name = $"{Name} View {type} Slice {slice}",
 					ViewType = type,
+					TextureDim = viewDim, // Correctly specify the view dimension
 					FirstSlice = slice,
 					NumSlices = 1,
-					TextureDim = ResourceDimension.Tex2d,
 				});
 			}
 

@@ -4,7 +4,7 @@ using Diligent;
 
 namespace DecaEngine.Graphics.Diligent
 {
-    public readonly struct CullResult
+    public readonly struct CullResult : ICullResult
     {
         public readonly DiligentBufferHandle FinallyInstancesBuffer;
         public readonly DiligentBufferHandle IndirectArgsBuffers;

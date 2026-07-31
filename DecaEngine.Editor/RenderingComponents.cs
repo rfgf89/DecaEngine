@@ -113,13 +113,23 @@ namespace DecaEngine.Editor.ECS
 			camera.view.M44 = 1.0f;
 		}
 
+		public static void MakeOrthographic(this ref RenderCamera camera, float width, float height, float near, float far)
+		{
+			camera.proj = new Matrix4x4(
+				2.0f / width, 0, 0, 0,
+				0, 2.0f / height, 0, 0,
+				0, 0, 1.0f / (near - far), 0,
+				0, 0, -near / (near - far), 1.0f
+			);
+		}
+
 		public static void MakeOrthographicReversedZ(this ref RenderCamera camera, float width, float height, float near, float far)
 		{
 			camera.proj = new Matrix4x4(
 				2.0f / width, 0, 0, 0,
 				0, 2.0f / height, 0, 0,
 				0, 0, 1.0f / (near - far), 0,
-				0, 0, near / (near - far), 1.0f
+				0, 0, -far / (near - far), 1.0f // Corrected M43 component
 			);
 		}
 
@@ -235,7 +245,7 @@ namespace DecaEngine.Editor.ECS
 					renderCamera.MakePerspectiveReversedZ(data.fovRad, data.aspect, data.near);
 					break;
 				default:
-					renderCamera.MakeOrthographicReversedZ(data.viewport.Z, data.viewport.W, data.near, data.far);
+					renderCamera.MakeOrthographic(data.viewport.Z, data.viewport.W, data.near, data.far);
 					break;
 			}
 		}
@@ -249,8 +259,8 @@ namespace DecaEngine.Editor.ECS
 			Matrix4x4 projectionT = Matrix4x4.Transpose(renderCamera.proj);
 			Vector4 frustumX = (projectionT[3] + projectionT[0]);
 			Vector4 frustumY = (projectionT[3] + projectionT[1]);
-			MathUtils.NormalizePlane(ref frustumX);
-			MathUtils.NormalizePlane(ref frustumY);
+			DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumX);
+			DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumY);
 
 			cullData.frustum = new Vector4(frustumX.X, frustumX.Z, frustumY.Y, frustumY.Z);
 			cullData.P00 = renderCamera.proj.M11;

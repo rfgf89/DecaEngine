@@ -6,21 +6,21 @@ namespace DecaEngine;
 
 public class Sample : TimeLoopCore
 {
-	private readonly DiligentGraphicsPipeline _graphicsPipeline;
+	private readonly DiligentGraphicsApi _graphicsApi;
 	private IPipelineState? _pipelineState;
 	private readonly IRenderHandle _renderHandle;
 	private readonly ICommandList[] _commandLists;
 
-	public Sample(ICommandList[] commandLists, IRenderHandle renderHandle, DiligentGraphicsPipeline graphicsPipeline)
+	public Sample(ICommandList[] commandLists, IRenderHandle renderHandle, DiligentGraphicsApi graphicsApi)
 	{
 		_commandLists = commandLists;
-		_graphicsPipeline = graphicsPipeline;
+		_graphicsApi = graphicsApi;
 		_renderHandle = renderHandle;
 	}
 
 	private IShader CreateShader(ShaderType shaderType)
 	{
-		using var shaderSourceFactory = _graphicsPipeline.EngineFactory.CreateDefaultShaderSourceStreamFactory(Path.Combine(Environment.CurrentDirectory, "Assets"));;
+		using var shaderSourceFactory = _graphicsApi.EngineFactory.CreateDefaultShaderSourceStreamFactory(Path.Combine(Environment.CurrentDirectory, "Assets"));;
 		var shaderCi = new ShaderCreateInfo()
 		{
 			SourceLanguage = ShaderSourceLanguage.Hlsl,
@@ -36,7 +36,7 @@ public class Sample : TimeLoopCore
 			ShaderSourceStreamFactory = shaderSourceFactory,
 		};
 
-		return _graphicsPipeline.Device.CreateShader(shaderCi, out var blob);
+		return _graphicsApi.Device.CreateShader(shaderCi, out var blob);
 	}
 
 	private IPipelineState CreatePipelineState()
@@ -54,8 +54,8 @@ public class Sample : TimeLoopCore
 			GraphicsPipeline = new GraphicsPipelineDesc()
 			{
 				NumRenderTargets = 1,
-				RTVFormats = [_graphicsPipeline.SwapChain.GetDesc().ColorBufferFormat],
-				DSVFormat = _graphicsPipeline.SwapChain.GetDesc().DepthBufferFormat,
+				RTVFormats = [_graphicsApi.SwapChain.GetDesc().ColorBufferFormat],
+				DSVFormat = _graphicsApi.SwapChain.GetDesc().DepthBufferFormat,
 				PrimitiveTopology = PrimitiveTopology.TriangleList,
 				RasterizerDesc = new RasterizerStateDesc()
 				{
@@ -70,7 +70,7 @@ public class Sample : TimeLoopCore
 			Ps = pixelShader,
 		};
 
-		return _graphicsPipeline.Device.CreateGraphicsPipelineState(pipelineCreateInfo);
+		return _graphicsApi.Device.CreateGraphicsPipelineState(pipelineCreateInfo);
 	}
 
 	protected override void OnStart()
@@ -80,21 +80,21 @@ public class Sample : TimeLoopCore
 
 	protected override void OnUpdate(float deltaTime)
 	{
-		_graphicsPipeline.DeferredContexts[0].Begin(0);
+		_graphicsApi.DeferredContexts[0].Begin(0);
 		//_graphicsPipeline.SetRenderTarget(_renderHandle);
 
-		_graphicsPipeline.DeferredContexts[0].SetPipelineState(_pipelineState ?? throw new NullReferenceException());
+		_graphicsApi.DeferredContexts[0].SetPipelineState(_pipelineState ?? throw new NullReferenceException());
 
 		var drawAttribs = new DrawAttribs()
 		{
 			NumVertices = 3
 		};
-		_graphicsPipeline.DeferredContexts[0].Draw(drawAttribs);
+		_graphicsApi.DeferredContexts[0].Draw(drawAttribs);
 
-		_commandLists[0] = _graphicsPipeline.DeferredContexts[0].FinishCommandList();
+		_commandLists[0] = _graphicsApi.DeferredContexts[0].FinishCommandList();
 
-		_graphicsPipeline.DeferredContexts[0].InvalidateState();
-		_graphicsPipeline.DeferredContexts[0].FinishFrame();
+		_graphicsApi.DeferredContexts[0].InvalidateState();
+		_graphicsApi.DeferredContexts[0].FinishFrame();
 	}
 
 	protected override void OnQuit()

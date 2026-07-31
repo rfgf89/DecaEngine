@@ -1,3 +1,4 @@
+using DecaEngine.Graphics.Diligent;
 using Diligent;
 
 namespace DecaEngine;
@@ -16,6 +17,19 @@ public class DiligentBufferHandle : IBufferHandle
 	public DiligentBufferHandle(IRenderDevice device)
 	{
 		_device = device;
+	}
+
+	/// <summary>
+	/// Wraps an already-created native buffer (e.g. one owned and allocated by the render graph)
+	/// without creating a new one, so render graph resources can flow through the same
+	/// <see cref="ICommandBuffer"/>/<see cref="IMaterialObject"/> code paths as any other
+	/// <see cref="IBufferHandle"/>. See <see cref="DiligentRenderGraphContext.GetBuffer"/>.
+	/// </summary>
+	public DiligentBufferHandle(IBuffer buffer, BufferInfo info)
+	{
+		_buffer = buffer;
+		Info = info;
+		SizeInBytes = info.sizeInBytes;
 	}
 
 	public void Alloc(BufferInfo info)
@@ -72,27 +86,7 @@ public class DiligentBufferHandle : IBufferHandle
 
 	private void CreateBuffer()
 	{
-		BindFlags bindFlags = (BindFlags)Info.type;
-		/*
-				BufferHandleType.Structured => BindFlags.None,
-				BufferHandleType.Constant => BindFlags.UniformBuffer,
-				BufferHandleType.Vertex => BindFlags.VertexBuffer,
-				BufferHandleType.Index => BindFlags.IndexBuffer,
-				BufferHandleType.IndirectArgs => BindFlags.IndirectDrawArgs
-			};*/
-
-		if (Info.type is not BufferHandleType.Constant)
-		{
-			if (Info.access == HandleAccess.Compute)
-			{
-				bindFlags |= BindFlags.UnorderedAccess;
-			}
-
-			if (Info.access is HandleAccess.Vertex or HandleAccess.Pixel)
-			{
-				bindFlags |= BindFlags.ShaderResource;
-			}
-		}
+		BindFlags bindFlags = DiligentResourceFormats.ToBufferBindFlags(Info.type, Info.access);
 
 		var usage = Info.dynamic ? Usage.Dynamic : Usage.Default;
 		var cpuAccessFlags = Info.dynamic ? CpuAccessFlags.Write : CpuAccessFlags.None;

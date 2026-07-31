@@ -15,9 +15,9 @@ using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent;
 
-public unsafe class DiligentBatchRenderer : IReleaseObject
+public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 {
-	private readonly DiligentGraphicsPipeline _pipeline;
+	private readonly DiligentGraphicsApi _api;
 	private readonly RenderDeviceType _deviceType;
 	private readonly ShadowRenderer _shadowRenderer;
 
@@ -82,22 +82,24 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 	public bool IsDirty => _isDrawBatchCmdDirty;
 	public void ClearDirty() => _isDrawBatchCmdDirty = false;
 
-	public DiligentBatchRenderer(DiligentGraphicsPipeline pipeline)
+	public int ShadowCascadeCount => ShadowRenderer.MaxCascades;
+
+	public DiligentBatchRenderer(DiligentGraphicsApi api)
 	{
 		_perMeshData = UnsafeList.Allocate<PerMeshData>(32);
-		_pipeline = pipeline;
-		_deviceType = _pipeline.Device.GetDeviceInfo().Type;
+		_api = api;
+		_deviceType = _api.Device.GetDeviceInfo().Type;
 		
 		_cullConstantsBuffer = CreateConstantsBuffer<CullData>("Cull Constants");
 		_viewConstantsBuffer = CreateConstantsBuffer<ViewData>("View Constants");
 		_lightConstantsBuffer = CreateConstantsBuffer<LightData>("Light Constants");
 
-		var cullingShader = new DiligentShader(_pipeline, "Batching Instancing CS", "EditorAssets/shader", "BatchingInstancingCS.hlsl", ShaderObjectType.Compute, "CSMain");
-		_cullingMaterial = new DiligentComputeMaterial("Batching Instancing CS", _pipeline);
+		var cullingShader = new DiligentShader(_api, "Batching Instancing CS", "EditorAssets/shader", "BatchingInstancingCS.hlsl", ShaderObjectType.Compute, "CSMain");
+		_cullingMaterial = new DiligentComputeMaterial("Batching Instancing CS", _api);
 		_cullingMaterial.SetShader(cullingShader);
 		_cullingMaterial.SetBuffer("Constants", _cullConstantsBuffer);
 
-		_shadowRenderer = new ShadowRenderer(pipeline);
+		_shadowRenderer = new ShadowRenderer(api);
 	}
 
 	private void SetAllCommandsDirty()
@@ -107,7 +109,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 
 	private DiligentBufferHandle CreateConstantsBuffer<T>(string name) where T: unmanaged
 	{
-		return (DiligentBufferHandle)_pipeline.CreateBuffer<T>(new BufferInfo()
+		return (DiligentBufferHandle)_api.CreateBuffer<T>(new BufferInfo()
 		{
 			name = name,
 			type = BufferHandleType.Constant,
@@ -118,7 +120,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 	{
 		buffer?.Release();
 
-		buffer = (DiligentBufferHandle)_pipeline.CreateBuffer<T>(bufferCapacity,
+		buffer = (DiligentBufferHandle)_api.CreateBuffer<T>(bufferCapacity,
 			new BufferInfo
 			{
 				name = name,
@@ -131,7 +133,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 	{
 		buffer?.Release();
 
-		buffer = (DiligentBufferHandle)_pipeline.CreateBuffer<int>(bufferCapacity * _instanceBufferSectorCapacity, new BufferInfo
+		buffer = (DiligentBufferHandle)_api.CreateBuffer<int>(bufferCapacity * _instanceBufferSectorCapacity, new BufferInfo
 		{
 			name = $"{typeof(T).Name} Param Instance Data Buffer",
 			type = BufferHandleType.Vertex,
@@ -145,7 +147,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 
 		int count = bufferCapacity * _instanceBufferSectorCapacity;
 
-		buffer = (DiligentBufferHandle)_pipeline.CreateBuffer<T>(count,
+		buffer = (DiligentBufferHandle)_api.CreateBuffer<T>(count,
 			new BufferInfo
 			{
 				name = $"{typeof(T).Name} Param Instance Data Buffer",
@@ -159,7 +161,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 	{
 		buffer?.Release();
 
-		buffer = (DiligentBufferHandle)_pipeline.CreateBuffer<DrawIndexedIndirectCommand>(maxCommands,
+		buffer = (DiligentBufferHandle)_api.CreateBuffer<DrawIndexedIndirectCommand>(maxCommands,
 			new BufferInfo
 			{
 				name = "Indirect Draw Args Buffer",
@@ -220,11 +222,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		material.SetBuffer("View", _viewConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 		material.SetBuffer("Light", _lightConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 
-		material.SetTexture($"ShadowMaps", _shadowRenderer.ShadowMaps, HandleAccess.Pixel);
-		material.SetSampler($"ShadowMaps_sampler", _shadowRenderer.ShadowSampler, HandleAccess.Pixel, false);
+		_shadowRenderer.SetShadowResources(materialObject);
 
-		if (_gpuInstancesDataBuffer != null)
-			material.SetBuffer("GPURenderInstances", _gpuInstancesDataBuffer, HandleAccess.Vertex);
+		material.SetBuffer("GPURenderInstances", _gpuInstancesDataBuffer, HandleAccess.Vertex);
 
 		gMaterialIndex++;
 		_isDrawBatchCmdDirty = true;
@@ -256,23 +256,25 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 	public unsafe void SetupViewData(ICommandBuffer? cmd, ref ViewData viewData)
 	{
 		fixed(ViewData* ptr = &viewData)
-		cmd.UpdateBuffer<ViewData>(_viewConstantsBuffer, 0, ptr);
+		{
+			cmd.UpdateBuffer(_viewConstantsBuffer, 0, ptr);
+		}
 	}
 
 	public unsafe void SetupCullData(ICommandBuffer? cmd, ref CullData cullData)
 	{
 		fixed (CullData* ptr = &cullData)
-		cmd.UpdateBuffer(_cullConstantsBuffer, 0, ptr);
+		{
+			cmd.UpdateBuffer(_cullConstantsBuffer, 0, ptr);
+		}
 	}
 
 	public unsafe void SetupLightData(ICommandBuffer? cmd, ref LightData lightData)
 	{
-		//_shadowRenderer.CalculateCascades(cullData, viewData, ref lightData, out var cascadeProjMatrices);
-		
 		fixed (LightData* ptr = &lightData)
-		cmd.UpdateBuffer(_lightConstantsBuffer, 0, ptr);
-		
-		//_lastCascadeProjMatrices = cascadeProjMatrices;
+		{
+			cmd.UpdateBuffer(_lightConstantsBuffer, 0, ptr);
+		}
 	}
 
 	public IReadOnlyList<KeyValuePair<int, DiligentMaterial>> GetMaterials() => _materialObjects;
@@ -284,7 +286,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		if (_totalCommands == 0) return [];
 		var data = new DrawIndexedIndirectCommand[_totalCommands];
 		fixed (void* ptr = data)
-			_pipeline.ImmediateContext.ReadBufferExt<DrawIndexedIndirectCommand>(_pipeline.Device, _indirectArgsBuffers.Buffer, ptr, (uint)(_totalCommands * sizeof(DrawIndexedIndirectCommand)));
+			_api.ImmediateContext.ReadBufferExt<DrawIndexedIndirectCommand>(_api.Device, _indirectArgsBuffers.Buffer, ptr, (uint)(_totalCommands * sizeof(DrawIndexedIndirectCommand)));
 		return data;
 	}
 
@@ -331,7 +333,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 
 			UnsafeArray.Resize<DrawIndexedIndirectCommand>(ref _indirectDatas, _totalCommands);
 
-			IDeviceContext ctx = _pipeline.ImmediateContext;
+			IDeviceContext ctx = _api.ImmediateContext;
 			ctx.UploadBufferExt<IndirectInstance>(_inputIndirectInstancesBuffer.Buffer, _instancesSubset.instances.GetNative());
 			ctx.UploadBufferExt<DrawData>(_instanceDrawDataBuffer.Buffer, _instancesSubset.drawData.GetNative());
 			ctx.UploadBufferExt<GPURenderInstance>(_gpuInstancesDataBuffer.Buffer, _instancesSubset.gpuData.GetNative());
@@ -427,6 +429,13 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		return new CullResult(_finallyInstancesBuffer, _indirectArgsBuffers, _gpuInstancesDataBuffer, _materialDrawRanges);
 	}
 
+	// --- IBatchRenderer explicit implementations (boxed CullResult behind the ICullResult marker) ---
+	ICullResult IBatchRenderer.ExecuteComputeCulling(ICommandBuffer cmd, int cascadeIndex) => ExecuteComputeCulling(cmd, cascadeIndex);
+
+	void IBatchRenderer.ExecuteDrawShadows(ICommandBuffer cmd, ICullResult cullResult, int cascadeIndex) => ExecuteDrawShadows(cmd, (CullResult)cullResult, cascadeIndex);
+
+	void IBatchRenderer.ExecuteDrawBatching(ICommandBuffer cmd, ICullResult cullResult) => ExecuteDrawBatching(cmd, (CullResult)cullResult);
+
 	private void UpdateGpuMegaBuffers()
 	{
 		if (!_isMeshBuffersDirty) return;
@@ -434,11 +443,11 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		_megaVertexBufferGPU?.Release();
 		_megaIndexBufferGPU?.Release();
 
-		_megaVertexBufferGPU = (DiligentBufferHandle)_pipeline.CreateBuffer<Vertex>(_megaVertexBufferCPU.Count, new BufferInfo { name = "Mega Vertex Buffer", type = BufferHandleType.Vertex });
-		_megaIndexBufferGPU = (DiligentBufferHandle)_pipeline.CreateBuffer<uint>(_megaIndexBufferCPU.Count, new BufferInfo { name = "Mega Index Buffer", type = BufferHandleType.Index });
+		_megaVertexBufferGPU = (DiligentBufferHandle)_api.CreateBuffer<Vertex>(_megaVertexBufferCPU.Count, new BufferInfo { name = "Mega Vertex Buffer", type = BufferHandleType.Vertex });
+		_megaIndexBufferGPU = (DiligentBufferHandle)_api.CreateBuffer<uint>(_megaIndexBufferCPU.Count, new BufferInfo { name = "Mega Index Buffer", type = BufferHandleType.Index });
 
-		_pipeline.ImmediateContext.UploadBufferExt<Vertex>(_megaVertexBufferGPU.Buffer, _megaVertexBufferCPU.GetNative());
-		_pipeline.ImmediateContext.UploadBufferExt<uint>(_megaIndexBufferGPU.Buffer, _megaIndexBufferCPU.GetNative());
+		_api.ImmediateContext.UploadBufferExt<Vertex>(_megaVertexBufferGPU.Buffer, _megaVertexBufferCPU.GetNative());
+		_api.ImmediateContext.UploadBufferExt<uint>(_megaIndexBufferGPU.Buffer, _megaIndexBufferCPU.GetNative());
 
 		_stateTracker.SetState(_megaVertexBufferGPU.Buffer, ResourceState.CopyDest);
 		_stateTracker.SetState(_megaIndexBufferGPU.Buffer, ResourceState.CopyDest);
@@ -449,12 +458,21 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 
 	private void UpdateDrawRangesCache()
 	{
-		if (!_isDrawRangesCacheDirty) return;
+		if (!_isDrawRangesCacheDirty)
+		{
+			return;
+		}
 		_materialDrawRanges.Clear();
-		if (_indirectBatches.Count == 0) { _isDrawRangesCacheDirty = false; return; }
+		if (_indirectBatches.Count == 0)
+		{
+			_isDrawRangesCacheDirty = false; return;
+		}
 
 		var sortedPairs = _indirectBatches.OrderBy(p => p.Value.material.materialId).ToList();
-		if (sortedPairs.Count == 0) { _isDrawRangesCacheDirty = false; return; }
+		if (sortedPairs.Count == 0)
+		{
+			_isDrawRangesCacheDirty = false; return;
+		}
 		
 		uint currentCommand = 0;
 		MaterialId currentMaterialId = sortedPairs[0].Value.material;
@@ -482,7 +500,11 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 
 	public void ExecuteDrawShadows(ICommandBuffer cmd, CullResult cullResult, int cascadeIndex)
 	{
-		if (_instancesSubset.instances.Length == 0 || _totalCommands == 0) return;
+		if (_instancesSubset.instances.Length == 0 || _totalCommands == 0)
+		{
+			return;
+		}
+
 		UpdateGpuMegaBuffers();
 		UpdateDrawRangesCache();
 		_shadowRenderer.ExecuteDrawShadows(cmd, _megaVertexBufferGPU, _megaIndexBufferGPU, cullResult, (uint)cascadeIndex);
@@ -495,7 +517,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		UpdateGpuMegaBuffers();
 		UpdateDrawRangesCache();
 
-		cmd.TransitionResource(_shadowRenderer.ShadowMaps, ResourceState.ShaderResource);
+		cmd.TransitionResource(_shadowRenderer.ShadowMapsTarget, ResourceState.ShaderResource);
 
 		cmd.TransitionResource(cullResult.FinallyInstancesBuffer, ResourceState.VertexBuffer);
 		cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);
@@ -503,9 +525,6 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 
 		cmd.SetVertexBuffers(0, [_megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 		cmd.SetIndexBuffer(_megaIndexBufferGPU, 0);
-
-		var scDesc = _pipeline.SwapChain.GetDesc();
-		cmd.SetViewport(scDesc.Width, scDesc.Height);
 
 		foreach (var kvp in cullResult.MaterialDrawRanges)
 		{
@@ -522,38 +541,24 @@ public unsafe class DiligentBatchRenderer : IReleaseObject
 		_batchRendererInfo.pipelineStateCount = cullResult.MaterialDrawRanges.Count;
 	}
 
-	public GraphicsPipelineStateCreateInfo GetBaseState()
+	public IStateObject GetBaseState()
 	{
-		var pipelineCreateInfo = new GraphicsPipelineStateCreateInfo
+		return _api.CreateGraphicsState(new GraphicsStateInfo
 		{
-			PSODesc = new PipelineStateDesc
-			{
-				Name = "Instancing PSO",
-				PipelineType = PipelineType.Graphics,
-				ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Mutable }
-			},
-			GraphicsPipeline = new GraphicsPipelineDesc
-			{
-				NumRenderTargets = 1,
-				RTVFormats = [_pipeline.SwapChain.GetDesc().ColorBufferFormat],
-				DSVFormat = _pipeline.SwapChain.GetDesc().DepthBufferFormat,
-				PrimitiveTopology = PrimitiveTopology.TriangleList,
-				RasterizerDesc = new RasterizerStateDesc { CullMode = CullMode.Back },
-				DepthStencilDesc = new DepthStencilStateDesc { DepthEnable = true, DepthFunc = ComparisonFunction.Greater },
-				InputLayout = new InputLayoutDesc
-				{
-					LayoutElements =
-					[
-						new LayoutElement { InputIndex = 0, NumComponents = 3, ValueType = ValueType.Float32, IsNormalized = false },
-						new LayoutElement { InputIndex = 1, NumComponents = 2, ValueType = ValueType.Float32, IsNormalized = false },
-						new LayoutElement { InputIndex = 2, NumComponents = 3, ValueType = ValueType.Float32, IsNormalized = false },
-						new LayoutElement { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = ValueType.Int32, IsNormalized = false, Frequency = InputElementFrequency.PerInstance }
-					]
-				}
-			}
-		};
-
-		return pipelineCreateInfo;
+			Name = "Instancing PSO",
+			RenderTargetFormats = [_api.SwapChainColorFormat],
+			DepthStencilFormat = _api.SwapChainDepthFormat,
+			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
+			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.Back },
+			DepthStencilState = new DepthStencilStateInfo { DepthEnable = true, DepthFunc = ComparisonFunctionType.Greater },
+			InputLayout =
+			[
+				new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
+			]
+		});
 	}
 
 	public void Release()

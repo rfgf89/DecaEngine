@@ -36,15 +36,10 @@ namespace DecaEngine.Graphics.Core
 		R16G16B16A16Float = 2,
 		R32G32B32A32Float = 3,
 		D32Float = 4,
-		D24UNormS8UInt = 5
+		D24UNormS8UInt = 5,
+		D32FloatS8X24UInt = 6
 	}
 
-	// --- NEW ABSTRACTIONS ---
-
-	/// <summary>
-	/// Represents texture data stored in CPU memory (RAM).
-	/// Completely unaware of the Graphics API.
-	/// </summary>
 	public class CpuTextureData
 	{
 		public string Name { get; set; }
@@ -56,9 +51,6 @@ namespace DecaEngine.Graphics.Core
 		public Image Image { get; set; } 
 	}
 
-	/// <summary>
-	/// Base interface for any texture living in GPU memory (VRAM).
-	/// </summary>
 	public interface IGpuTexture : IReleaseObject
 	{
 		public string Name { get; }

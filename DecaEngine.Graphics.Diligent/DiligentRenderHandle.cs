@@ -1,5 +1,7 @@
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Graphics.Core;
+using DecaEngine.Graphics.Diligent;
 using Diligent;
 
 namespace DecaEngine;
@@ -11,7 +13,7 @@ public class DiligentRenderHandle : IRenderHandle
 	private readonly IRenderDevice _device;
 	private ITexture _texture;
 	private ITextureView _rtv;
-	private RenderTargetInfo _info;
+	private TextureInfo _info;
 
 	public ITextureView RTV => _rtv;
 
@@ -22,7 +24,7 @@ public class DiligentRenderHandle : IRenderHandle
 		_device = device;
 	}
 
-	public void Alloc(RenderTargetInfo info)
+	public void Alloc(TextureInfo info)
 	{
 		_info = info;
 		Size = new Vector2(info.width, info.height);
@@ -46,11 +48,11 @@ public class DiligentRenderHandle : IRenderHandle
 
 	private void CreateTexture()
 	{
-		var dilFormat = _info.textureFormat switch
+		var dilFormat = DiligentResourceFormats.ToNativeFormat(_info.format);
+		if (dilFormat == Diligent.TextureFormat.Unknown)
 		{
-			RenderTargetInfo.Format.R16G16B16A16_FLOAT => Diligent.TextureFormat.RGBA16_Float,
-			_ => Diligent.TextureFormat.RGBA8_UNorm
-		};
+			dilFormat = Diligent.TextureFormat.RGBA8_UNorm;
+		}
 
 		var desc = new TextureDesc
 		{
