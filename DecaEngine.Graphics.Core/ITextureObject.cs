@@ -44,11 +44,21 @@ namespace DecaEngine.Graphics.Core
 	{
 		public string Name { get; set; }
 		public TextureInfo Info { get; set; }
-		
-		// For now, holding the SharpGLTF Image. 
-		// Ideally, this would be a raw byte array (byte[]) or Memory<byte> 
+
+		// For now, holding the SharpGLTF Image.
+		// Ideally, this would be a raw byte array (byte[]) or Memory<byte>
 		// after decoding, to decouple from GLTF entirely.
-		public Image Image { get; set; } 
+		public Image Image { get; set; }
+
+		/// <summary>
+		/// Already-decoded RGBA8 pixels for <see cref="Image"/>, if decoding was done ahead of time
+		/// (e.g. on a background thread by <see cref="DecaEngine.Graphics.ModelLoader"/>) so that
+		/// IGraphicsApi.CreateTexture, which must run on the GPU/main thread, can skip the decode step.
+		/// Null if the implementation should decode <see cref="Image"/> itself.
+		/// </summary>
+		public byte[] DecodedPixels { get; set; }
+		public int DecodedWidth { get; set; }
+		public int DecodedHeight { get; set; }
 	}
 
 	public interface IGpuTexture : IReleaseObject

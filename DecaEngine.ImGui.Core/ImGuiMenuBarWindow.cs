@@ -1,6 +1,8 @@
 ﻿using System.Numerics;
 using Hexa.NET.ImGui;
 
+using ImGui = Hexa.NET.ImGui.ImGui;
+
 namespace Engine.ImGui.Core;
 
 public class DockLayoutElement
@@ -43,7 +45,6 @@ public abstract class ImGuiMenuBarWindow : ImGuiWindow
 		                                   ImGuiWindowFlags.NoCollapse |
 		                                   ImGuiWindowFlags.NoBringToFrontOnFocus |
 		                                   ImGuiWindowFlags.NoNavFocus |
-		                                   ImGuiWindowFlags.NoSavedSettings |
 		                                   ImGuiWindowFlags.NoDocking);
 
 		OnRender(dockId);

@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DecaEngine;
 using DecaEngine.Core;
+using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 using Hexa.NET.ImGui;
@@ -79,6 +80,27 @@ public class ImGuiDiligentRender : ImGuiRender
 		isSwapChainOutput = false;
 	}
 
+	/// <summary>
+	/// Disposes the shader-resource binding/variable previously cached for <paramref name="textureId"/>,
+	/// if any. Callers must invoke this BEFORE disposing/recreating the underlying texture (e.g. before
+	/// <see cref="DecaEngine.Graphics.Diligent.DiligentRenderTarget.Resize"/>): the cached SRB is bound
+	/// to a view of that texture, and releasing the SRB after the view is already gone accesses freed
+	/// native memory instead of cleanly releasing it (observed as an access violation inside
+	/// <c>ComObject.Release</c>). The texture itself is NOT disposed here: for this overload it's
+	/// externally owned.
+	/// </summary>
+	public override void ReleaseRenderTargetBinding(ImTextureID textureId)
+	{
+		if (_textures.Remove(textureId, out var previous))
+		{
+			// Only the binding itself is disposed - the IShaderResourceVariable (Item3) is not an
+			// independently ref-counted object, it's a query into the SRB's internal variable table
+			// (obtained via GetVariableByName); disposing it separately from/in addition to the SRB
+			// double-releases the same underlying native pointer and crashes inside ComObject.Release.
+			previous.Item2.Dispose();
+		}
+	}
+
 	public override void BindRenderTarget(ImTextureID textureId, IRenderHandle renderHandle)
 	{
 		if (renderHandle is not DiligentRenderHandle dilHandle)
@@ -86,8 +108,23 @@ public class ImGuiDiligentRender : ImGuiRender
 			throw new InvalidOperationException("Invalid render handle type");
 		}
 
+		ReleaseRenderTargetBinding(textureId);
 		GetTextureBinding(dilHandle.Texture, out var shaderResourceBinding, out var shaderResourceTexture);
 		_textures[textureId] = (dilHandle.Texture, shaderResourceBinding, shaderResourceTexture);
+	}
+
+	public override void BindRenderTarget(ImTextureID textureId, IGpuTexture texture)
+	{
+		ITexture native = texture switch
+		{
+			DiligentRenderTarget dilRenderTarget => dilRenderTarget.Texture,
+			DiligentGpuTexture dilGpuTexture => dilGpuTexture.Texture,
+			_ => throw new InvalidOperationException("Unsupported texture type '" + texture.GetType() + "' for ImGui binding")
+		};
+
+		ReleaseRenderTargetBinding(textureId);
+		GetTextureBinding(native, out var shaderResourceBinding, out var shaderResourceTexture);
+		_textures[textureId] = (native, shaderResourceBinding, shaderResourceTexture);
 	}
 
 	public override unsafe ImTextureRef GetNewTexture()
@@ -279,11 +316,18 @@ public class ImGuiDiligentRender : ImGuiRender
 						_deviceContext.CommitShaderResources(texture.Item2, ResourceStateTransitionMode.Transition);
 						lastTexId = texId;
 					}
-					else if (lastTexId == null && _textures.Count > 0)
+					else
 					{
-						// Fallback to first texture if current one is not found to at least bind SOMETHING
-						_deviceContext.CommitShaderResources(_textures.First().Value.Item2, ResourceStateTransitionMode.Transition);
-						lastTexId = _textures.First().Key;
+						// Texture not (yet) registered - e.g. an AssetBrowser icon whose GPU texture/SRB is
+						// still being created/rebound this same frame (ModelIconCache.Invalidate can drop an
+						// entry mid-frame while a new icon is baked - see ModelIconBaker). Must NOT fall
+						// through to DrawIndexed below without rebinding: the GPU still has whatever SRB was
+						// last committed (a DIFFERENT, unrelated texture) bound, and drawing this command
+						// against it stamps that unrelated icon into this quad instead of just leaving it
+						// blank - the more distinct icons churn per frame, the more visible this gets ("every
+						// image renders some other image"). Skip the draw instead.
+						lastTexId = null;
+						continue;
 					}
 				}
 

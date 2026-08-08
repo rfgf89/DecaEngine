@@ -28,12 +28,20 @@ public class MouseSdlDevice : InputDevice, IPerformSdlEvent
 	{
 		if (_actions.TryGetValue(MouseEvent.Position, out var mousePosition))
 		{
-			mousePosition.Perform(new Vector2(sdlEvent.motion.x, sdlEvent.motion.y));
+			var value = new Vector2(sdlEvent.motion.x, sdlEvent.motion.y);
+			foreach (var action in mousePosition)
+			{
+				action.Perform(value);
+			}
 		}
 
 		if (_actions.TryGetValue(MouseEvent.PositionDelta, out var mouseDeltaPosition))
 		{
-			mouseDeltaPosition.Perform(new Vector2(sdlEvent.motion.xrel, sdlEvent.motion.yrel));
+			var value = new Vector2(sdlEvent.motion.xrel, sdlEvent.motion.yrel);
+			foreach (var action in mouseDeltaPosition)
+			{
+				action.Perform(value);
+			}
 		}
 	}
 
@@ -42,22 +50,22 @@ public class MouseSdlDevice : InputDevice, IPerformSdlEvent
 		switch (sdlEvent.button.Button)
 		{
 			case SDLButton.SDL_BUTTON_LEFT when _actions.TryGetValue(MouseEvent.LeftButton, out var buttonLeft):
-				buttonLeft.Pressed(1f);
+				foreach (var action in buttonLeft) action.Pressed(1f);
 				break;
 			case SDLButton.SDL_BUTTON_RIGHT when _actions.TryGetValue(MouseEvent.RightButton, out var buttonRight):
-				buttonRight.Pressed(1f);
+				foreach (var action in buttonRight) action.Pressed(1f);
 				break;
 			case SDLButton.SDL_BUTTON_MIDDLE
 				when _actions.TryGetValue(MouseEvent.MiddleButton, out var buttonMiddle):
-				buttonMiddle.Pressed(1f);
+				foreach (var action in buttonMiddle) action.Pressed(1f);
 				break;
 			case SDLButton.SDL_BUTTON_X1
 				when _actions.TryGetValue(MouseEvent.WheelUp, out var buttonWheelUp):
-				buttonWheelUp.Pressed(1f);
+				foreach (var action in buttonWheelUp) action.Pressed(1f);
 				break;
 			case SDLButton.SDL_BUTTON_X2
 				when _actions.TryGetValue(MouseEvent.WheelDown, out var buttonWheelDown):
-				buttonWheelDown.Pressed(1f);
+				foreach (var action in buttonWheelDown) action.Pressed(1f);
 				break;
 			default:
 				break;
@@ -70,23 +78,23 @@ public class MouseSdlDevice : InputDevice, IPerformSdlEvent
 		{
 			case SDLButton.SDL_BUTTON_LEFT
 				when _actions.TryGetValue(MouseEvent.LeftButton, out var buttonLeft):
-				buttonLeft.Released(0f);
+				foreach (var action in buttonLeft) action.Released(0f);
 				break;
 			case SDLButton.SDL_BUTTON_RIGHT
 				when _actions.TryGetValue(MouseEvent.RightButton, out var buttonRight):
-				buttonRight.Released(0f);
+				foreach (var action in buttonRight) action.Released(0f);
 				break;
 			case SDLButton.SDL_BUTTON_MIDDLE
 				when _actions.TryGetValue(MouseEvent.MiddleButton, out var buttonMiddle):
-				buttonMiddle.Released(0f);
+				foreach (var action in buttonMiddle) action.Released(0f);
 				break;
 			case SDLButton.SDL_BUTTON_X1
 				when _actions.TryGetValue(MouseEvent.WheelUp, out var buttonWheelUp):
-				buttonWheelUp.Released(0f);
+				foreach (var action in buttonWheelUp) action.Released(0f);
 				break;
 			case SDLButton.SDL_BUTTON_X2
 				when _actions.TryGetValue(MouseEvent.WheelDown, out var buttonWheelDown):
-				buttonWheelDown.Released(0f);
+				foreach (var action in buttonWheelDown) action.Released(0f);
 				break;
 			default:
 				break;
@@ -97,7 +105,11 @@ public class MouseSdlDevice : InputDevice, IPerformSdlEvent
 	{
 		if (_actions.TryGetValue(MouseEvent.WheelDelta, out var mouseWheelDelta))
 		{
-			mouseWheelDelta.Perform(new Vector2(sdlEvent.wheel.x, sdlEvent.wheel.y));
+			var value = new Vector2(sdlEvent.wheel.x, sdlEvent.wheel.y);
+			foreach (var action in mouseWheelDelta)
+			{
+				action.Perform(value);
+			}
 		}
 	}
 }

@@ -1,192 +1,115 @@
 ﻿using System.Numerics;
-using DecaEngine.Core.Build;
 using Engine.ImGui.Core;
 using Hexa.NET.ImGui;
-using Hexa.NET.ImGui.Widgets.Dialogs;
 
 namespace DecaEngine.Editor
 {
+	/// <summary>
+	/// Окно "Project" отвечает за конфигурацию текущего загруженного проекта: имя, версия,
+	/// иконка и т.д. — то, что и положено проектному окну. Загрузка/сборка/запуск сборки
+	/// проекта вынесены в <see cref="ProjectSession"/> (см. также <see cref="MenuBarWindow"/>,
+	/// который инициирует загрузку проекта через сессию).
+	/// </summary>
 	public class ProjectWindow : ImGuiDockingWindow
 	{
-		private OpenFolderDialog? _openFolderDialog;
-		private AssemblyApp? _assemblyApp;
+		private readonly ProjectSession _session;
 
-		private string? _projectSlnPath;
-		private string? _projectCsprojPath;
-		private string _statusMessage = "Проект не загружен";
-		private bool _isBusy;
+		private ProjectConfig? _config;
+		private string? _loadedProjectDirectory;
 
-		public ProjectWindow(string name, ImGuiRender imGuiRender) : base(name, imGuiRender)
+		private string _nameBuffer = string.Empty;
+		private string _versionBuffer = string.Empty;
+		private string _iconPathBuffer = string.Empty;
+		private bool _isDirty;
+
+		public ProjectWindow(string name, ProjectSession session, ImGuiRender imGuiRender) : base(name, imGuiRender)
 		{
+			_session = session;
 		}
 
 		protected override void OnRender(uint dockId)
 		{
-			ImGui.BeginDisabled(_isBusy);
+			var projectDirectory = _session.ProjectDirectory;
 
-			if (ImGui.Button("Открыть проект..."))
+			if (string.IsNullOrEmpty(projectDirectory))
 			{
-				_openFolderDialog = new OpenFolderDialog();
-				_openFolderDialog.Show(OnProjectFolderSelected);
+				ImGui.TextDisabled("Load project (File → Import Project) to configure it.");
+				return;
+			}
+
+			if (!string.Equals(_loadedProjectDirectory, projectDirectory, StringComparison.OrdinalIgnoreCase))
+			{
+				_config = ProjectConfig.Load(projectDirectory);
+				_nameBuffer = _config.Name;
+				_versionBuffer = _config.Version;
+				_iconPathBuffer = _config.IconPath ?? string.Empty;
+				_loadedProjectDirectory = projectDirectory;
+				_isDirty = false;
+			}
+
+			ImGui.TextUnformatted("Configuration");
+			ImGui.Spacing();
+
+			if (ImGui.InputText("Name", ref _nameBuffer, 128))
+			{
+				_isDirty = true;
+			}
+
+			if (ImGui.InputText("Version", ref _versionBuffer, 32))
+			{
+				_isDirty = true;
+			}
+
+			if (ImGui.InputText("Icon", ref _iconPathBuffer, 260))
+			{
+				_isDirty = true;
 			}
 
 			ImGui.SameLine();
-
-			var state = _assemblyApp?.State ?? AssemblyAppState.NotLoaded;
-
-			ImGui.BeginDisabled(state is AssemblyAppState.NotLoaded);
-			if (ImGui.Button("Play"))
+			if (ImGui.Button("..."))
 			{
-				OnPlay();
+				// TODO: открыть диалог выбора файла иконки (см. OpenFolderDialog в MenuBarWindow
+				// как пример существующей интеграции с Hexa.NET.ImGui.Widgets.Dialogs).
 			}
 
-			ImGui.SameLine();
-			ImGui.BeginDisabled(state is not (AssemblyAppState.Playing or AssemblyAppState.Paused));
-			if (ImGui.Button("Pause"))
+			DrawIconPreview(projectDirectory);
+
+			ImGui.Spacing();
+			ImGui.BeginDisabled(!_isDirty);
+			if (ImGui.Button("Save"))
 			{
-				_assemblyApp?.Pause();
+				SaveConfig(projectDirectory);
 			}
 			ImGui.EndDisabled();
-
-			ImGui.SameLine();
-			ImGui.BeginDisabled(state is not (AssemblyAppState.Playing or AssemblyAppState.Paused));
-			if (ImGui.Button("Stop"))
-			{
-				OnStop();
-			}
-			ImGui.EndDisabled();
-			ImGui.EndDisabled();
-
-			ImGui.Separator();
-
-			ImGui.TextWrapped(_projectSlnPath is null ? "Проект: (не выбран)" : $"Проект: {_projectSlnPath}");
-			ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), _statusMessage);
-
-			ImGui.EndDisabled();
-
-			if (_openFolderDialog != null)
-			{
-				var viewportSize = ImGui.GetMainViewport().Size;
-				ImGui.SetNextWindowSize(viewportSize * 0.33f);
-				ImGui.SetNextWindowPos(viewportSize / 2 - _openFolderDialog.Size / 2);
-				ImGui.SetNextWindowFocus();
-				_openFolderDialog.Draw(ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoTitleBar);
-			}
 		}
 
-		private void OnProjectFolderSelected(object? sender, DialogResult result)
+		private void DrawIconPreview(string projectDirectory)
 		{
-			_openFolderDialog = null;
-			if (result != DialogResult.Ok || sender is not OpenFolderDialog dialog)
+			if (string.IsNullOrWhiteSpace(_iconPathBuffer))
 			{
 				return;
 			}
 
-			var folder = dialog.SelectedFolder;
-			if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+			var fullPath = Path.IsPathRooted(_iconPathBuffer)
+				? _iconPathBuffer
+				: Path.Combine(projectDirectory, _iconPathBuffer);
+
+			if (!File.Exists(fullPath))
 			{
-				_statusMessage = "Папка проекта не найдена";
-				return;
-			}
-
-			var slnFile = Directory.GetFiles(folder, "*.sln", SearchOption.TopDirectoryOnly).FirstOrDefault()
-				?? Directory.GetFiles(folder, "*.sln", SearchOption.AllDirectories).FirstOrDefault();
-
-			if (slnFile is null)
-			{
-				_statusMessage = "В выбранной папке не найден .sln";
-				return;
-			}
-
-			LoadProject(slnFile);
-		}
-
-		private void LoadProject(string slnPath)
-		{
-			// Останавливаем и выгружаем предыдущий проект, если он был загружен.
-			if (_assemblyApp is not null && _assemblyApp.State != AssemblyAppState.NotLoaded)
-			{
-				_assemblyApp.Quit();
-			}
-
-			_isBusy = true;
-			_statusMessage = "Загрузка проекта...";
-
-			try
-			{
-				var slnDir = Path.GetDirectoryName(slnPath)!;
-				var slnName = Path.GetFileNameWithoutExtension(slnPath);
-				var csprojPath = Path.Combine(slnDir, $"{slnName}.csproj");
-
-				if (!File.Exists(csprojPath))
-				{
-					// Резервный вариант: берём первый .csproj с тем же именем, что и папка проекта.
-					csprojPath = Directory.GetFiles(slnDir, "*.csproj", SearchOption.TopDirectoryOnly).FirstOrDefault()
-						?? throw new FileNotFoundException("Не найден .csproj проекта рядом с .sln", slnPath);
-				}
-
-				// Требование 2: при открытии проекта в редакторе синхронизируем
-				// ссылки на все модули движка (кроме DecaEngine.Editor).
-				EditorBuilder.AttachEngineReferences(csprojPath);
-
-				var outputs = CsprojOutputResolver.GetBuildOutputs(csprojPath, buildIfMissing: true);
-				var assemblyName = Path.GetFileNameWithoutExtension(csprojPath);
-				var dllPath = outputs.FirstOrDefault(p =>
-					string.Equals(Path.GetFileNameWithoutExtension(p), assemblyName, StringComparison.OrdinalIgnoreCase) &&
-					Path.GetExtension(p).Equals(".dll", StringComparison.OrdinalIgnoreCase));
-
-				if (dllPath is null)
-				{
-					_statusMessage = "Не удалось собрать проект (см. вывод консоли)";
-					return;
-				}
-
-				_assemblyApp = new AssemblyApp();
-				_assemblyApp.LoadFromPath(dllPath);
-
-				_projectSlnPath = slnPath;
-				_projectCsprojPath = csprojPath;
-				_statusMessage = "Проект загружен, готов к запуску";
-			}
-			catch (Exception ex)
-			{
-				_statusMessage = $"Ошибка загрузки проекта: {ex.Message}";
-			}
-			finally
-			{
-				_isBusy = false;
+				ImGui.TextColored(new Vector4(0.9f, 0.5f, 0.4f, 1f), "Icon file not found");
 			}
 		}
 
-		private void OnPlay()
+		private void SaveConfig(string projectDirectory)
 		{
-			if (_assemblyApp is null)
-			{
-				return;
-			}
+			_config ??= ProjectConfig.Load(projectDirectory);
+			_config.Name = _nameBuffer;
+			_config.Version = _versionBuffer;
+			_config.IconPath = string.IsNullOrWhiteSpace(_iconPathBuffer) ? null : _iconPathBuffer;
 
-			if (_assemblyApp.State == AssemblyAppState.Stopped)
+			if (_config.Save())
 			{
-				_assemblyApp.Run();
-				_statusMessage = "Выполняется";
-			}
-			else if (_assemblyApp.State == AssemblyAppState.Paused)
-			{
-				_assemblyApp.Play();
-				_statusMessage = "Выполняется";
-			}
-		}
-
-		private void OnStop()
-		{
-			_assemblyApp?.Quit();
-			_statusMessage = "Проект остановлен";
-
-			// После Stop сборка выгружена из процесса — для повторного запуска
-			// нужно загрузить проект заново.
-			if (_projectCsprojPath != null)
-			{
-				LoadProject(_projectSlnPath!);
+				_isDirty = false;
 			}
 		}
 	}

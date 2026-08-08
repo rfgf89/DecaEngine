@@ -18,7 +18,7 @@ namespace DecaEngine.Editor;
 
 public enum WindowType
 {
-	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project
+	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView
 }
 
 public class EditorManager : TimeLoopCore
@@ -33,6 +33,7 @@ public class EditorManager : TimeLoopCore
 	private DiligentBatchRenderer _batchRenderer;
 	private IRenderHandle _renderHandle;
 	private DebugWindow _debugWindow;
+	private MenuBarWindow _menuBarWindow;
 #if DEBUG
 	private RenderGraphDebugWindow _renderGraphDebugWindow;
 #endif
@@ -41,6 +42,11 @@ public class EditorManager : TimeLoopCore
 	private EntityStore _ecsWorld;
 	private SystemRoot _root;
 	private RenderResourceManager _renderResourceManager;
+	private ProjectSession _projectSession;
+	private EditorSettings _editorSettings;
+	private ModelPreviewViewport _modelPreviewViewport;
+	private ModelIconCache _modelIconCache;
+	private ModelIconBaker _modelIconBaker;
 	// --- /ECS ---
 
 	public void Initialize()
@@ -58,6 +64,7 @@ public class EditorManager : TimeLoopCore
 		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Hierarchy", imGuiDir = ImGuiDir.Down, ratio = 0.1f, });
 		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Inspector", imGuiDir = ImGuiDir.Right, ratio = 0.25f });
 		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Game View", imGuiDir = ImGuiDir.Down, ratio = 0.2f });
+		_dockLayout.AddDockLayoutElement(new DockLayoutElement { name = "Scene View", imGuiDir = ImGuiDir.Right, ratio = 0.4f });
 
 		_graphicsApi.OnCreateSetupInfo += setupInfo =>
 		{
@@ -77,7 +84,7 @@ public class EditorManager : TimeLoopCore
 		{
 			_windowHandle.Initialize("DecaEngine Editor", 0, new Vector2(1920, 1080));
 			_windowHandle.LoadAndSetIcon(Path.Combine(Environment.CurrentDirectory, "EditorAssets/Icons", "download (6).jpg"));
-			_graphicsApi.Initialize(GraphicsBackend.Vulkan);
+			_graphicsApi.Initialize(GraphicsBackend.D3D12);
 
 			_imGuiManager.Initialize();
 
@@ -98,7 +105,9 @@ public class EditorManager : TimeLoopCore
 			_pipeline = new GraphicsPipeline(dilPipe, _batchRenderer);
 
 			_ecsWorld = new EntityStore();
-			_scene = new Scene(_graphicsApi);
+
+			_editorSettings = EditorSettings.Load();
+			EditorAssetDatabase.Rescan();
 
 			_renderResourceManager = new RenderResourceManager(2, 2, _ecsWorld, _batchRenderer);
 
@@ -120,33 +129,93 @@ public class EditorManager : TimeLoopCore
 			};
 			_root.AddStore(_ecsWorld);
 
-			CreateTestSceneEntities();
-			
-			new MenuBarWindow("Menu Bar", _dockLayout, _imGuiManager.ImGuiRender).Show();
-			new GameViewWindow("Game View", _renderHandle, _imGuiManager.ImGuiRender).Show();
-			new InspectorWindow("Inspector", _imGuiManager.ImGuiRender).Show();
-			new HierarchyWindow("Hierarchy", _imGuiManager.ImGuiRender).Show();
+		BeginLoadDefaultScene();
+
+		_projectSession = new ProjectSession(_graphicsApi, _renderHandle, _ecsWorld, _root);
+		_imGuiManager.ImGuiRender.UiScaleMultiplier = _editorSettings.UiScaleMultiplier;
+		EditorPalette.ApplyFrom(_editorSettings);
+
+			_menuBarWindow = new MenuBarWindow("Menu Bar", _dockLayout, _windowHandle, _projectSession, _editorSettings, _imGuiManager.ImGuiRender);
+			_menuBarWindow.Show();
+
+			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.GameView, () => new GameViewWindow("Game View", _renderHandle, _projectSession, _imGuiManager.ImGuiRender));
+
+		var projectWindow = new ProjectWindow("Project", _projectSession, _imGuiManager.ImGuiRender);
+		new GameViewWindow("Game View", _renderHandle, _projectSession, _imGuiManager.ImGuiRender).Show();
+		_modelPreviewViewport = new ModelPreviewViewport(_graphicsApi, _editorSettings);
+		_modelIconCache = new ModelIconCache(_graphicsApi, _imGuiManager.ImGuiRender);
+		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache);
+		var inspectorWindow = new InspectorWindow("Inspector", _modelPreviewViewport, _imGuiManager.ImGuiRender);
+		inspectorWindow.Show();
+		_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.SceneView, () => new SceneViewWindow("Scene View", inspectorWindow, _imGuiManager.ImGuiRender));
+		new SceneViewWindow("Scene View", inspectorWindow, _imGuiManager.ImGuiRender).Show();
+		new HierarchyWindow("Hierarchy", _imGuiManager.ImGuiRender).Show();
 			new ConsoleWindow("Console", _imGuiManager.ImGuiRender).Show();
-			new AssetBrowserWindow("Asset Browser", _imGuiManager.ImGuiRender).Show();
-			new ProjectWindow("Project", _imGuiManager.ImGuiRender).Show();
-			_debugWindow = new DebugWindow("Debug", _ecsWorld, _batchRenderer, _imGuiManager.ImGuiRender);
-			_debugWindow.Show();
+			new AssetBrowserWindow("Asset Browser", _projectSession, inspectorWindow, _modelIconCache, _modelIconBaker, _imGuiManager.ImGuiRender).Show();
+			projectWindow.Show();
+			//_debugWindow = new DebugWindow("Debug", _ecsWorld, _batchRenderer, _imGuiManager.ImGuiRender);
+			//_debugWindow.ForceShow();
+
 #if DEBUG
-			_renderGraphDebugWindow = new RenderGraphDebugWindow("Render Graph Debugger", _pipeline, _imGuiManager.ImGuiRender);
-			_renderGraphDebugWindow.Show();
+			//_renderGraphDebugWindow = new RenderGraphDebugWindow("Render Graph Debugger", _pipeline, _imGuiManager.ImGuiRender);
+			//_renderGraphDebugWindow.ForceShow();
 #endif
 		}
 	}
 
-	private Scene _scene;
+	private ModelLoader _modelLoader;
+	private ModelLoader.ModelLoadRequest _defaultSceneLoadRequest;
+	private EditorLoadingStatus.Handle _defaultSceneLoadHandle;
+
+	private void BeginLoadDefaultScene()
+	{
+		_defaultSceneLoadRequest = ModelLoader.BeginLoadAsync(_graphicsApi, ModelLoader.DefaultModelPath, new ModelLoadOptions
+		{
+			VertexShader = _editorSettings.DefaultVertexShader,
+			PixelShader = _editorSettings.DefaultPixelShader,
+			OptimizeMesh = true,
+			GenerateLods = true
+		});
+		_defaultSceneLoadHandle = EditorLoadingStatus.Begin("Loading scene");
+	}
+
+	private void PollDefaultSceneLoad()
+	{
+		if (_defaultSceneLoadRequest == null)
+		{
+			return;
+		}
+
+		_defaultSceneLoadHandle.Progress = _defaultSceneLoadRequest.Progress;
+
+		if (!_defaultSceneLoadRequest.PrepareTask.IsCompleted)
+		{
+			return;
+		}
+
+		EditorLoadingStatus.End(_defaultSceneLoadHandle);
+
+		if (_defaultSceneLoadRequest.PrepareTask.IsCompletedSuccessfully)
+		{
+			_modelLoader = _defaultSceneLoadRequest.FinalizeOnMainThread();
+			CreateTestSceneEntities();
+		}
+		else
+		{
+			EditorConsoleLog.Add(LogLevel.Error,
+				$"Failed to load default scene: {_defaultSceneLoadRequest.PrepareTask.Exception?.GetBaseException().Message}");
+		}
+
+		_defaultSceneLoadRequest = null;
+	}
 
 	private void CreateTestSceneEntities()
 	{
 		var baseMaterialState = _batchRenderer.GetBaseState();
 		var materialIdMap = new Dictionary<int, MaterialId>();
-		for (int i = 0; i < _scene.materialObjects.Count; i++)
+		for (int i = 0; i < _modelLoader.materialObjects.Count; i++)
 		{
-			var kvp = _scene.materialObjects.GetAt(i);
+			var kvp = _modelLoader.materialObjects.GetAt(i);
 			var materialObj = kvp.Value;
 			materialObj.SetState(baseMaterialState);
 
@@ -155,18 +224,18 @@ public class EditorManager : TimeLoopCore
 		}
 
 		var meshIdMap = new Dictionary<int, MeshId>();
-		for (int i = 0; i < _scene.Meshes.Count; i++)
+		for (int i = 0; i < _modelLoader.Meshes.Count; i++)
 		{
-			var meshObj = _scene.Meshes[i];
+			var meshObj = _modelLoader.Meshes[i];
 			var meshId = _batchRenderer.Register(meshObj);
 			meshIdMap.Add(i, meshId);
 		}
 
 		var batchCache = new Dictionary<(int, int), BatchId>();
 
-		for (int i = 0; i < _scene.instances.Count; i++)
+		for (int i = 0; i < _modelLoader.instances.Count; i++)
 		{
-			var instance = _scene.instances[i];
+			var instance = _modelLoader.instances[i];
 
 			if (!meshIdMap.TryGetValue(instance.meshId, out var mId))
 			{
@@ -219,21 +288,35 @@ public class EditorManager : TimeLoopCore
 			Quit();
 		}
 
-		StyleEditorManager.SetDarkThemeColors(_windowHandle.GetScale());
-		
-		_root.Update(new UpdateTick(deltaTime, time));
-		_pipeline.Execute();
-		
-		_imGuiManager.BeforeLayout(deltaTime);
-		
-		_debugWindow.FramePerSecond = framePerSecond;
+		StyleEditorManager.SetDarkThemeColors(_windowHandle.GetScale() * _imGuiManager.ImGuiRender.UiScaleMultiplier);
 
-		_debugWindow.Render(0);
+		lock (GameHostBridge.GpuSync)
+		{
+			PollDefaultSceneLoad();
+
+			// Must run before the main scene render below: each offscreen Pipeline.Execute() here
+			// rebinds the device's active render target to its own preview/icon-bake color+depth
+			// texture (see ForwardPass.WriteCommands). _pipeline.Execute() unconditionally rebinds
+			// the swap-chain backbuffer, so it must be the LAST Execute() this frame - otherwise
+			// ImGui (and Present) would draw into whatever offscreen target was bound last instead
+			// of the backbuffer, making the whole editor appear to go blank.
+			_modelPreviewViewport.Update(deltaTime, time);
+			_modelIconBaker.Update(deltaTime, time);
+
+			_root.Update(new UpdateTick(deltaTime, time));
+			_pipeline.Execute();
+
+			_imGuiManager.BeforeLayout(deltaTime);
+			_imGuiManager.ImGuiRender.RenderWindows();
+			EditorLoadingStatus.Render(_imGuiManager.ImGuiRender.UiScaleMultiplier);
+			//_debugWindow.FramePerSecond = framePerSecond;
+			//_debugWindow.Render(0);
 #if DEBUG
-		_renderGraphDebugWindow.Render(0);
+			//_renderGraphDebugWindow.Render(0);
 #endif
-		_imGuiManager.AfterLayout();
-		_graphicsApi.Present();
+			_imGuiManager.AfterLayout();
+			_graphicsApi.Present();
+		}
 
 		++numFramesRendered;
 		timeFps += deltaTime;
@@ -254,6 +337,7 @@ public class EditorManager : TimeLoopCore
 
 	protected override void OnQuit()
 	{
+		GameHostBridge.Reset();
 		_imGuiManager.Release();
 		_windowHandle.OnWindowResize -= OnWindowHandleResize;
 		_windowHandle.Release();

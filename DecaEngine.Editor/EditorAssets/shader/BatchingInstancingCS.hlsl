@@ -82,12 +82,16 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
 	}
 
 	int objectID = Instances[instanceIdx].objectId;
-	if (objectID == 0)
+	int batchId = Instances[instanceIdx].batchId;
+
+	// Свободные/очищенные слоты помечаются objectId = -1 / batchId = -1 (см. RenderResourceManager) -
+	// именно ИХ надо пропускать. Прежняя проверка "objectID == 0" делала ровно обратное: валидный
+	// слот 0 (первый же зарегистрированный инстанс) никогда не рисовался, а мёртвые слоты проходили
+	// дальше и читали MeshBatchData[-1] (out-of-bounds), инкрементя чужие draw-команды.
+	if (objectID < 0 || batchId < 0)
 	{
 		return;
 	}
-
-	int batchId = Instances[instanceIdx].batchId;
 
 	DrawData drawData = InstancesDrawData[objectID];
 	PerMeshData meshData = MeshBatchData[batchId];

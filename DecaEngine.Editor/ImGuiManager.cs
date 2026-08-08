@@ -47,7 +47,7 @@ namespace DecaEngine.Editor
 			io.ConfigErrorRecoveryEnableAssert = false;
 			io.ConfigDpiScaleFonts = true;
 			io.ConfigDpiScaleViewports = true;
-			io.WantSaveIniSettings = false;
+			io.WantSaveIniSettings = true;
 
 			unsafe
 			{

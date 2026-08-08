@@ -57,7 +57,10 @@ public class KeyboardSdlDevice : InputDevice, IPerformSdlEvent
 
 		if (_actions.TryGetValue(KeyboardKeys.Keys.LastKeyChar, out var actionChar))
 		{
-			actionChar.Perform(str);
+			foreach (var action in actionChar)
+			{
+				action.Perform(str);
+			}
 		}
 	}
 
@@ -74,12 +77,18 @@ public class KeyboardSdlDevice : InputDevice, IPerformSdlEvent
 		{
 			if (_actions.TryGetValue(KeyboardKeys.Keys.All, out var actionAll))
 			{
-				actionAll.Released(keyEnumValue);
+				foreach (var action in actionAll)
+				{
+					action.Released(keyEnumValue);
+				}
 			}
 
-			if (_actions.TryGetValue(keyEnumValue, out var action))
+			if (_actions.TryGetValue(keyEnumValue, out var action1))
 			{
-				action.Released(0f);
+				foreach (var action in action1)
+				{
+					action.Released(0f);
+				}
 			}
 		}
 	}
@@ -96,12 +105,18 @@ public class KeyboardSdlDevice : InputDevice, IPerformSdlEvent
 		{
 			if (_actions.TryGetValue(KeyboardKeys.Keys.All, out var actionAll))
 			{
-				actionAll.Pressed(keyEnumValue);
+				foreach (var action in actionAll)
+				{
+					action.Pressed(keyEnumValue);
+				}
 			}
 
-			if (_actions.TryGetValue(keyEnumValue, out var action))
+			if (_actions.TryGetValue(keyEnumValue, out var action1))
 			{
-				action.Pressed(1f);
+				foreach (var action in action1)
+				{
+					action.Pressed(1f);
+				}
 			}
 		}
 	}

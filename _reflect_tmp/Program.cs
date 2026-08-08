@@ -1,22 +1,38 @@
-﻿using System.Reflection;
-var dll = @"C:\Users\rfgf89\.nuget\packages\diligent-engine-net\1.0.4\lib\net8.0\DiligentCore.dll";
+using System.Reflection;
+var dll = @"C:\Users\rfgf89\.nuget\packages\diligentgraphics.diligentengine.core\2.5.6\lib\net6.0\Diligent-GraphicsEngine.NET.dll";
 var runtimeDir = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();
 var paths = new List<string> { dll };
 paths.AddRange(Directory.GetFiles(runtimeDir, "*.dll"));
+foreach (var pkg in new[] { "sharpgen.runtime", "sharpgen.runtime.com" })
+{
+    var dir = Path.Combine(@"C:\Users\rfgf89\.nuget\packages", pkg);
+    if (!Directory.Exists(dir)) continue;
+    var best = Directory.GetFiles(dir, "SharpGen*.dll", SearchOption.AllDirectories)
+        .Where(p => p.Contains("net6") || p.Contains("net5") || p.Contains("netstandard"))
+        .OrderByDescending(p => System.Diagnostics.FileVersionInfo.GetVersionInfo(p).FileVersion)
+        .FirstOrDefault();
+    if (best != null) paths.Add(best);
+}
 var resolver = new PathAssemblyResolver(paths);
 using var mlc = new MetadataLoadContext(resolver);
 var asm = mlc.LoadFromAssemblyPath(dll);
-void Dump(string typeName)
+void DumpMatch(string typeName, string pattern)
 {
     var t = asm.GetType(typeName);
-    Console.WriteLine($"=== {typeName} : found={t != null} ===");
+    Console.WriteLine($"=== {typeName} (filter {pattern}) : found={t != null} ===");
     if (t == null) return;
-    Console.WriteLine("Interfaces: " + string.Join(", ", t.GetInterfaces().Select(i => i.FullName)));
     foreach (var m in t.GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
     {
-        Console.WriteLine("  " + m);
+        try
+        {
+            if (pattern == "*" || m.Name.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                Console.WriteLine("  " + m);
+        }
+        catch (Exception e) { Console.WriteLine("  <err " + m.Name + ": " + e.Message + ">"); }
     }
 }
-Dump("Diligent.ICommandList");
-Dump("Diligent.IDeviceContext");
-Dump("Diligent.IDeviceObject");
+DumpMatch("Diligent.IDeviceContext", "Map");
+DumpMatch("Diligent.IDeviceContext", "Copy");
+DumpMatch("Diligent.MappedTextureSubresource", "*");
+DumpMatch("Diligent.CopyTextureAttribs", "*");
+DumpMatch("Diligent.Box", "*");

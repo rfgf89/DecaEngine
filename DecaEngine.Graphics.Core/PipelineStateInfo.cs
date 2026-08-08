@@ -19,6 +19,12 @@ public enum CullModeType
 	Back,
 }
 
+public enum FillModeType
+{
+	Solid = 0,
+	Wireframe,
+}
+
 public enum ComparisonFunctionType
 {
 	Unknown = 0,
@@ -58,6 +64,7 @@ public struct InputLayoutElementInfo
 public struct RasterizerStateInfo
 {
 	public CullModeType CullMode;
+	public FillModeType FillMode;
 	public int DepthBias;
 }
 

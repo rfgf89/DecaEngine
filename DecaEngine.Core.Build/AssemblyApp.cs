@@ -31,6 +31,12 @@ public class AssemblyApp
 
 	public AssemblyAppState State { get; private set; } = AssemblyAppState.NotLoaded;
 
+	/// <summary>Срабатывает сразу после старта потока с точкой входа загруженного проекта, передавая его ManagedThreadId (используется, например, редактором для разметки вывода консоли по источнику).</summary>
+	public event Action<int>? ThreadStarted;
+
+	/// <summary>Срабатывает после остановки/выгрузки потока проекта.</summary>
+	public event Action? ThreadStopped;
+
 	/// <summary>Удобный конструктор для сценария "загрузить уже собранный проект" (<see cref="LoadFromPath"/>).</summary>
 	public AssemblyApp() : this(AppContext.BaseDirectory)
 	{
@@ -143,8 +149,14 @@ public class AssemblyApp
 
 	private static System.Reflection.Assembly? ResolveDependency(AssemblyLoadContext context, AssemblyName name, string assemblyDir)
 	{
-		// Подтягиваем зависимости пользовательской сборки (движковые dll и т.п.)
-		// из той же папки, куда она была собрана.
+		var alreadyLoaded = AssemblyLoadContext.Default.Assemblies
+			.FirstOrDefault(a => string.Equals(a.GetName().Name, name.Name, StringComparison.OrdinalIgnoreCase));
+
+		if (alreadyLoaded != null)
+		{
+			return alreadyLoaded;
+		}
+
 		var candidate = Path.Combine(assemblyDir, name.Name + ".dll");
 		return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
 	}
@@ -174,6 +186,7 @@ public class AssemblyApp
 
 		State = AssemblyAppState.Playing;
 		_executableThread.Start();
+		ThreadStarted?.Invoke(_executableThread.ManagedThreadId);
 	}
 
 	public void Play()
@@ -207,5 +220,6 @@ public class AssemblyApp
 		_executableThread = null;
 
 		State = AssemblyAppState.NotLoaded;
+		ThreadStopped?.Invoke();
 	}
 }

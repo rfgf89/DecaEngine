@@ -46,6 +46,16 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	private BatchSubset _instancesSubset;
 
 	private readonly UnsafeList* _perMeshData;
+
+	// Per-BATCH снимок PerMeshData, реально уходящий на GPU в _meshBatchDataBuffer: куллинг-шейдер
+	// (BatchingInstancingCS.hlsl) индексирует MeshBatchData по batchId инстанса, а _perMeshData
+	// индексирован по meshId. Пока модель регистрируется один раз, id совпадают (оба считаются с 0
+	// в одном порядке) и заливка _perMeshData "как есть" случайно работала; но при перезаселении
+	// сцены (превью сабмеша -> обратно целая модель, см. ModelPreviewViewport) меши регистрируются
+	// заново и нумерации расходятся - шейдер читал ЧУЖОЙ physicalCommandOffset/bounds и инкрементил
+	// чужие draw-команды (пустой рендер сабмеша, случайные куски сетки у целой модели).
+	private UnsafeArray* _perBatchData;
+
 	private UnsafeArray* _indirectDatas;
 	private UnsafeArray* _cpuBatchCounters;
 
@@ -66,11 +76,22 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private readonly int _instanceBufferSectorCapacity = 64;
 	private int _instanceBufferCapacity = 0;
+	private int _meshBatchDataCapacity = 0;
 	private int _totalCommands = 0;
 
-	private static int gMeshIndex;
-	private static int gMaterialIndex;
-	private static int gBatchIndex;
+	// NOTE: these must be INSTANCE fields, not static. Each DiligentBatchRenderer owns its own
+	// _perMeshData/_meshInfos/_materialObjects/_indirectBatches registries, which are indexed (or,
+	// for _perMeshData, positionally *appended*) starting from 0 - see Register()/CreateBatch().
+	// When these counters used to be `static`, a second DiligentBatchRenderer instance (e.g. the
+	// editor's off-screen ModelPreviewViewport render graph, created after the main scene's
+	// renderer had already registered N meshes) would hand out mesh/material/batch ids continuing
+	// from the main renderer's counters instead of starting at 0, while _perMeshData in the new
+	// instance is still empty/short - causing UnsafeList.GetPtr(..., batch.mesh.meshId) in
+	// CheckAndReallocateBuffers() to index far past the end of that renderer's own (much smaller)
+	// _perMeshData list.
+	private int gMeshIndex;
+	private int gMaterialIndex;
+	private int gBatchIndex;
 
 	private BatchRendererInfo _batchRendererInfo;
 
@@ -78,6 +99,18 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	public ResourceStateTracker StateTracker => _stateTracker;
 
 	private bool _isDrawBatchCmdDirty = true;
+
+	// Set whenever RenderResourceManager registers/unregisters an instance on an EXISTING batch
+	// (e.g. switching which sub-mesh is shown in ModelPreviewViewport re-populates a batch that
+	// was already created for a previously-visited sub-mesh). CheckAndReallocateBuffers only
+	// re-uploads _instancesSubset to the GPU and rebakes each batch's FirstInstanceLocation when
+	// `buffersRecreated` is true (new batch / capacity growth) - without this flag, re-selecting
+	// a previously-visited sub-mesh left the GPU-side instance buffer and indirect draw offsets
+	// exactly as they were the last time a buffer was actually recreated, so the compute culling
+	// pass kept compacting/drawing whichever sub-mesh's instances happened to be live back then
+	// instead of the newly selected one.
+	private bool _instancesContentDirty = true;
+	public void MarkInstancesContentDirty() => _instancesContentDirty = true;
 
 	public bool IsDirty => _isDrawBatchCmdDirty;
 	public void ClearDirty() => _isDrawBatchCmdDirty = false;
@@ -326,13 +359,33 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			buffersRecreated = true;
 		}
 
+		// _meshBatchDataBuffer is indexed by BATCH id on the GPU (the culling shader reads
+		// MeshBatchData[instance.batchId], see _perBatchData above), so it must cover every batch id
+		// ever handed out - batch ids are dense 0..gBatchIndex-1 and never removed, so gBatchIndex is
+		// exactly the required length. Sizing it by mesh count (as before) desynced from batch ids as
+		// soon as a scene was repopulated (preview switching model/sub-mesh) and mesh/batch numbering
+		// diverged.
+		int batchTotal = gBatchIndex;
+		if (batchTotal > _meshBatchDataCapacity)
+		{
+			_meshBatchDataCapacity = batchTotal;
+			buffersRecreated = true;
+		}
+
+		bool needsInstanceUpload = buffersRecreated || _instancesContentDirty;
+		_instancesContentDirty = false;
+
 		if (buffersRecreated)
 		{
 			CreateIndirectBuffer(ref _indirectArgsBuffers, _totalCommands);
-			CreateStructuredBuffer<PerMeshData>(ref _meshBatchDataBuffer, batchCount, "Mesh Batch Data Buffer");
+			CreateStructuredBuffer<PerMeshData>(ref _meshBatchDataBuffer, _meshBatchDataCapacity, "Mesh Batch Data Buffer");
 
 			UnsafeArray.Resize<DrawIndexedIndirectCommand>(ref _indirectDatas, _totalCommands);
+			UnsafeArray.Resize<PerMeshData>(ref _perBatchData, _meshBatchDataCapacity);
+		}
 
+		if (needsInstanceUpload)
+		{
 			IDeviceContext ctx = _api.ImmediateContext;
 			ctx.UploadBufferExt<IndirectInstance>(_inputIndirectInstancesBuffer.Buffer, _instancesSubset.instances.GetNative());
 			ctx.UploadBufferExt<DrawData>(_instanceDrawDataBuffer.Buffer, _instancesSubset.drawData.GetNative());
@@ -347,8 +400,14 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				var batchIndex = batchKvp.Key;
 
 				var meshInfo = _meshInfos[batch.mesh.meshId];
-				var pmd = UnsafeList.GetPtr<PerMeshData>(_perMeshData, batch.mesh.meshId);
-				pmd->physicalCommandOffset = commandOffset;
+
+				// Копия per-mesh данных ПОД ЭТОТ батч со своим physicalCommandOffset: раньше offset
+				// писался прямо в общий _perMeshData[meshId], так что два батча одного меша (один меш
+				// с разными материалами) затирали offset друг друга - последний выигрывал, и инстансы
+				// обоих батчей инкрементили одну и ту же draw-команду.
+				var pmd = *UnsafeList.GetPtr<PerMeshData>(_perMeshData, batch.mesh.meshId);
+				pmd.physicalCommandOffset = commandOffset;
+				UnsafeArray.Set(_perBatchData, batchIndex, pmd);
 
 				if (meshInfo.LodLevels != null && UnsafeArray.GetLength(meshInfo.LodLevels) > 0)
 				{
@@ -375,7 +434,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 					commandOffset++;
 				}
 			}
-			ctx.UploadBufferExt<PerMeshData>(_meshBatchDataBuffer.Buffer, _perMeshData);
+			ctx.UploadBufferExt<PerMeshData>(_meshBatchDataBuffer.Buffer, _perBatchData);
 			ctx.UploadBufferExt<DrawIndexedIndirectCommand>(_indirectArgsBuffers.Buffer, _indirectDatas);
 
 			SetAllCommandsDirty();
@@ -401,6 +460,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	public void ClearIndirectDrawBuffers(ICommandBuffer cmd)
 	{
+		if (_batchCountersBuffer == null || _indirectArgsBuffers == null) return;
+
 		cmd.UpdateBuffer<uint>(_batchCountersBuffer, _cpuBatchCounters);
 		cmd.UpdateBuffer<DrawIndexedIndirectCommand>(_indirectArgsBuffers, _indirectDatas);
 	}
@@ -556,6 +617,35 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
+			]
+		});
+	}
+
+	/// <summary>
+	/// Same layout as <see cref="GetBaseState"/>, but rasterized as wireframe with no backface
+	/// culling and a GreaterEqual depth test - used by <see cref="DecaEngine.Editor.ModelPreviewViewport"/>'s
+	/// "Highlight + Wireframe" mode to draw an edge overlay on top of an already-drawn, depth-coincident
+	/// solid pass of the same geometry (GreaterEqual lets the overlay pass depth-test equal to what the
+	/// solid pass already wrote, instead of failing/z-fighting against it).
+	/// </summary>
+	public IStateObject GetWireframeState()
+	{
+		return _api.CreateGraphicsState(new GraphicsStateInfo
+		{
+			Name = "Wireframe Overlay PSO",
+			RenderTargetFormats = [_api.SwapChainColorFormat],
+			DepthStencilFormat = _api.SwapChainDepthFormat,
+			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
+			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None, FillMode = FillModeType.Wireframe },
+			DepthStencilState = new DepthStencilStateInfo { DepthEnable = true, DepthFunc = ComparisonFunctionType.GreaterEqual },
+			InputLayout =
+			[
+				new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
 			]
 		});

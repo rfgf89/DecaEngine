@@ -1,3 +1,4 @@
+using System;
 using UnsafeCollections.Collections.Native;
 
 namespace DecaEngine.Graphics.Diligent;
@@ -10,6 +11,7 @@ public struct RenderCamerasData
 
     public RenderCamerasData(int capacity)
     {
+        capacity = Math.Max(1, capacity);
         cullData = new NativeList<CullData>(capacity);
         viewData = new NativeList<ViewData>(capacity);
         lightData = new NativeList<LightData>(capacity);
@@ -42,6 +44,7 @@ public struct DirectionalLightCascadeData
 
     public DirectionalLightCascadeData(int capacity)
     {
+        capacity = Math.Max(1, capacity);
         cullData = new NativeList<CullData>(capacity);
         viewData = new NativeList<ViewData>(capacity);
         lightData = new NativeList<LightData>(capacity);

@@ -1,3 +1,4 @@
+using System;
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics.Diligent;
@@ -34,10 +35,12 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             return;
         }
 
-        int drawCount = _resourceManager.totalInstances - _resourceManager.totalFreeSlot;
+        // Граница ИНДЕКСА занятых слотов, а не их количество - слоты выдаются из стека свободных и
+        // разрежены, см. RenderResourceManager.DrawInstanceCount.
+        int drawCount = _resourceManager.DrawInstanceCount;
         int shadowViewCount = lights.Count > 0 ? ShadowRenderer.MaxCascades : 0;
 
-        if (!_renderCamerasData.IsCreated || _renderCamerasData.Capacity != cameraCount)
+        if (!_renderCamerasData.IsCreated || _renderCamerasData.Capacity != cameraCount || _directionalLightCascadeData.Capacity != Math.Max(1, shadowViewCount))
         {
             if (_renderCamerasData.IsCreated)
             {

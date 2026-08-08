@@ -20,7 +20,7 @@
 
     <ItemGroup>
       <PackageReference Include="Hexa.NET.ImGui.Widgets" Version="1.2.18" />
-      <PackageReference Include="Microsoft.Build.Runtime" Version="18.6.3" />
+      <PackageReference Include="Microsoft.Build.Runtime" Version="18.6.3" ExcludeAssets="runtime;contentFiles" />
     </ItemGroup>
 	
 	<ItemGroup>

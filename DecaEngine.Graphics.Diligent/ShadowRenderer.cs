@@ -150,6 +150,12 @@ namespace DecaEngine.Graphics.Diligent
 					new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					// Unused by ShadowVS.hlsl (it only reads position), but must still be declared: this
+					// PSO reads from the same mega vertex buffer as DiligentBatchRenderer's (see
+					// GetBaseState there), and Diligent auto-computes each buffer slot's stride from its
+					// declared layout elements - omitting Tangent here would under-report slot 0's true
+					// per-vertex stride and misalign every vertex after the first.
+					new InputLayoutElementInfo { InputIndex = 4, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo
 					{
 						InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32,

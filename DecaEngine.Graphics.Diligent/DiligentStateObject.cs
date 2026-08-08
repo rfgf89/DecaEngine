@@ -85,6 +85,12 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 		_ => CullMode.None
 	};
 
+	private static FillMode ToNativeFillMode(FillModeType fillMode) => fillMode switch
+	{
+		FillModeType.Wireframe => FillMode.Wireframe,
+		_ => FillMode.Solid
+	};
+
 	private static ComparisonFunction ToNativeComparisonFunction(ComparisonFunctionType func) => func switch
 	{
 		ComparisonFunctionType.Never => ComparisonFunction.Never,
@@ -115,6 +121,7 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 	private static RasterizerStateDesc ToNativeRasterizerDesc(RasterizerStateInfo info) => new()
 	{
 		CullMode = ToNativeCullMode(info.CullMode),
+		FillMode = ToNativeFillMode(info.FillMode),
 		DepthBias = info.DepthBias
 	};
 

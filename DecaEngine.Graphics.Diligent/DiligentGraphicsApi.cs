@@ -33,6 +33,15 @@ namespace DecaEngine
 		public event Action<GraphicsPipelineSetupInfo> OnCreateSetupInfo;
 		public event Action OnSwapChainInfo;
 
+		/// <summary>
+		/// Срабатывает для каждого диагностического сообщения от нативного движка Diligent
+		/// (переданного через IEngineFactory.SetMessageCallback). Позволяет внешнему коду
+		/// (например, редактору) перехватывать эти сообщения со всей структурированной
+		/// информацией вместо парсинга текста из консоли. Если на событие никто не подписан,
+		/// сообщение по умолчанию печатается в Console.
+		/// </summary>
+		public static event Action<DebugMessageSeverity, string, string, string, int>? DebugMessage;
+
 		public IWindowHandle WindowHandle { get; set; }
 		public DiligentPsoManager PsoManager { get; private set; }
 
@@ -43,7 +52,14 @@ namespace DecaEngine
 
 		private static void OnMessageCallback(DebugMessageSeverity severity, string message, string function, string file, int line)
 		{
-			Console.WriteLine($"[{severity}] {message} ({function}): {file}, {line}");
+			if (DebugMessage is not null)
+			{
+				DebugMessage.Invoke(severity, message, function, file, line);
+			}
+			else
+			{
+				Console.WriteLine($"[{severity}] {message} ({function}): {file}, {line}");
+			}
 		}
 
 		public void SetBackBufferTarget(Vector4 color)
@@ -56,6 +72,7 @@ namespace DecaEngine
 			if (dsv != null)
 				ImmediateContext.ClearDepthStencil(dsv, ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
 		}
+
 
 		public IRenderGraph CreateRenderGraph()
 		{
@@ -148,15 +165,32 @@ namespace DecaEngine
 
 		public unsafe IGpuTexture CreateTexture(CpuTextureData data)
 		{
-			ImageResult imageResult =
-				ImageResult.FromMemory(data.Image.Content.Content.ToArray(), ColorComponents.RedGreenBlueAlpha);
+			byte[] pixels;
+			int width, height;
+
+			if (data.DecodedPixels != null)
+			{
+				// Decoding already happened off the GPU thread (see ModelLoader's background load
+				// pipeline) - avoid paying the decode cost again here.
+				pixels = data.DecodedPixels;
+				width = data.DecodedWidth;
+				height = data.DecodedHeight;
+			}
+			else
+			{
+				ImageResult imageResult =
+					ImageResult.FromMemory(data.Image.Content.Content.ToArray(), ColorComponents.RedGreenBlueAlpha);
+				pixels = imageResult.Data;
+				width = imageResult.Width;
+				height = imageResult.Height;
+			}
 
 			var desc = new TextureDesc
 			{
 				Name = data.Name,
 				Type = ResourceDimension.Tex2d,
-				Width = (uint)imageResult.Width,
-				Height = (uint)imageResult.Height,
+				Width = (uint)width,
+				Height = (uint)height,
 				Format = TextureFormat.RGBA8_UNorm,
 				BindFlags = BindFlags.ShaderResource,
 				Usage = Usage.Immutable,
@@ -164,11 +198,11 @@ namespace DecaEngine
 			};
 
 			ITexture nativeTexture;
-			fixed (byte* pData = imageResult.Data)
+			fixed (byte* pData = pixels)
 			{
 				var subResource = new TextureSubResData
 				{
-					Data = (IntPtr)pData, Stride = (uint)(imageResult.Width * 4)
+					Data = (IntPtr)pData, Stride = (uint)(width * 4)
 				};
 				var textureData = new TextureData { SubResources = [subResource], Context = ImmediateContext };
 				nativeTexture = Device.CreateTexture(desc, textureData);
@@ -191,8 +225,8 @@ namespace DecaEngine
 			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
 			{
 				name = data.Name,
-				width = (uint)imageResult.Width,
-				height = (uint)imageResult.Height,
+				width = (uint)width,
+				height = (uint)height,
 				format = TextureObjectFormat.R8G8B8A8UNorm,
 				type = TextureType.Texture2D,
 			};

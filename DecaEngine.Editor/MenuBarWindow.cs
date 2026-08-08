@@ -1,7 +1,8 @@
 ﻿using Hexa.NET.ImGui;
 using Hexa.NET.ImGui.Widgets.Dialogs;
-using SDL;
+using System.Linq;
 using System.Numerics;
+using DecaEngine.Core;
 using Engine.ImGui.Core;
 
 namespace DecaEngine.Editor;
@@ -10,13 +11,26 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 {
 	private readonly EditorBuilder _editorBuilder;
 	private readonly ModalNewProjectWindow _newProjectWindow;
+	private readonly SettingsWindow _settingsWindow;
 	private readonly DockLayout _dockLayout;
+	private readonly IWindowHandle _windowHandle;
+	private readonly RecentProjectsManager _recentProjects;
+	private readonly ProjectSession _projectSession;
+	private readonly EditorSettings _editorSettings;
 
-	public MenuBarWindow(string title, DockLayout dockLayout, ImGuiRender imGuiRender) : base(title, imGuiRender)
+	private OpenFolderDialog? _openFolderDialog;
+	private bool _autoLoadAttempted;
+
+	public MenuBarWindow(string title, DockLayout dockLayout, IWindowHandle windowHandle, ProjectSession projectSession, EditorSettings editorSettings, ImGuiRender imGuiRender) : base(title, imGuiRender)
 	{
 		_dockLayout = dockLayout;
+		_windowHandle = windowHandle;
+		_projectSession = projectSession;
+		_editorSettings = editorSettings;
 		_editorBuilder = new EditorBuilder();
 		_newProjectWindow = new ModalNewProjectWindow("New Project", imGuiRender);
+		_settingsWindow = new SettingsWindow("Settings", editorSettings, imGuiRender);
+		_recentProjects = new RecentProjectsManager();
 	}
 
 	public override void EndFirstFrame(uint dockId)
@@ -28,42 +42,72 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 	protected override void OnRender(uint dockId)
 	{
+		TryAutoLoadLastProject();
+
 		_newProjectWindow.Render(0);
+		_settingsWindow.Render(0);
 
 		if (ImGui.BeginMenuBar())
 		{
 			// Меню "File"
 			if (ImGui.BeginMenu("File"))
 			{
-				if (ImGui.MenuItem("New Scene", "Ctrl+N"))
-				{
-					// Обработка создания новой сцены
-				}
-
-				if (ImGui.MenuItem("Open Scene...", "Ctrl+O"))
-				{
-					// Обработка открытия сцены
-				}
-
-				if (ImGui.MenuItem("Save Scene", "Ctrl+S"))
+				if (ImGui.MenuItem("New Project", "Ctrl+S"))
 				{
 					_newProjectWindow.Show();
 				}
 
-				if (ImGui.MenuItem("Save Scene As..."))
+				if (ImGui.MenuItem("Import Project"))
 				{
-					// Обработка сохранения сцены с новым именем
+					_openFolderDialog = new OpenFolderDialog();
+					_openFolderDialog.Show(OnProjectFolderSelected);
 				}
 
-				ImGui.Separator();
-				if (ImGui.MenuItem("Import Models"))
+				if (ImGui.BeginMenu("Recently Project"))
 				{
-					// Обработка импорта моделей
-				}
+					if (_recentProjects.Entries.Count == 0)
+					{
+						ImGui.TextDisabled("Нет недавних проектов");
+					}
+					else
+					{
+						var currentSlnPath = _projectSession.ProjectSlnPath;
 
-				if (ImGui.MenuItem("Export Scene"))
-				{
-					// Обработка экспорта сцены
+						// Копия списка — LoadProjectFromSln может изменить _recentProjects.Entries
+						// (переместить/добавить запись), поэтому нельзя итерировать исходную коллекцию.
+						string? clickedSlnPath = null;
+						foreach (var entry in _recentProjects.Entries.ToArray())
+						{
+							var isCurrent = _projectSession.State != AssemblyAppState.NotLoaded
+								&& string.Equals(currentSlnPath, entry.SlnPath, StringComparison.OrdinalIgnoreCase);
+
+							var label = $"{entry.Name}##{entry.SlnPath}";
+
+							ImGui.BeginDisabled(isCurrent);
+							if (ImGui.MenuItem(label))
+							{
+								clickedSlnPath = entry.SlnPath;
+							}
+							ImGui.EndDisabled();
+
+							if (ImGui.IsItemHovered())
+							{
+								var tooltip = $"{entry.SlnPath}\nОткрыт: {entry.LastOpened:g}";
+								if (isCurrent)
+								{
+									tooltip += "\n(уже загружен)";
+								}
+								ImGui.SetTooltip(tooltip);
+							}
+						}
+
+						if (clickedSlnPath != null)
+						{
+							LoadProjectFromSln(clickedSlnPath);
+						}
+					}
+
+					ImGui.EndMenu();
 				}
 
 				ImGui.Separator();
@@ -102,6 +146,12 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 				if (ImGui.MenuItem("Paste"))
 				{
 					// Обработка вставки
+				}
+
+				ImGui.Separator();
+				if (ImGui.MenuItem("Preferences..."))
+				{
+					_settingsWindow.Show();
 				}
 
 				ImGui.EndMenu();
@@ -160,5 +210,72 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 		}
 
 		_dockLayout.Render(dockId);
+
+		if (_openFolderDialog != null)
+		{
+			var viewportSize = ImGui.GetMainViewport().Size;
+			ImGui.SetNextWindowSize(viewportSize * 0.33f);
+			ImGui.SetNextWindowPos(viewportSize / 2 - _openFolderDialog.Size / 2);
+			ImGui.SetNextWindowFocus();
+			_openFolderDialog.Draw(ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoTitleBar);
+		}
+	}
+
+	private void TryAutoLoadLastProject()
+	{
+		if (_autoLoadAttempted)
+		{
+			return;
+		}
+
+		_autoLoadAttempted = true;
+
+		if (!_editorSettings.AutoLoadLastProject)
+		{
+			return;
+		}
+
+		var lastProject = _recentProjects.Entries.FirstOrDefault();
+		if (lastProject is not null && File.Exists(lastProject.SlnPath))
+		{
+			LoadProjectFromSln(lastProject.SlnPath);
+		}
+	}
+
+	private void OnProjectFolderSelected(object? sender, DialogResult result)
+	{
+		_openFolderDialog = null;
+		if (result != DialogResult.Ok || sender is not OpenFolderDialog dialog)
+		{
+			return;
+		}
+
+		var folder = dialog.SelectedFolder;
+		if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+		{
+			return;
+		}
+
+		var slnFile = Directory.GetFiles(folder, "*.sln", SearchOption.TopDirectoryOnly).FirstOrDefault()
+			?? Directory.GetFiles(folder, "*.sln", SearchOption.AllDirectories).FirstOrDefault();
+
+		if (slnFile is null)
+		{
+			return;
+		}
+
+		LoadProjectFromSln(slnFile);
+	}
+
+	private void LoadProjectFromSln(string slnPath)
+	{
+		_projectSession.LoadProject(slnPath);
+
+		if (_projectSession.State != AssemblyAppState.NotLoaded)
+		{
+			_recentProjects.Add(slnPath);
+			_windowHandle.SetTitle($"{_projectSession.DisplayName} - DecaEngine Editor");
+		}
 	}
 }
+

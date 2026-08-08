@@ -15,9 +15,11 @@
     <ItemGroup>
       <PackageReference Include="Alimer.Bindings.MeshOptimizer" Version="1.2.1" />
       <PackageReference Include="Evergine.Mathematics" Version="2026.5.26.372" />
+      <PackageReference Include="Friflo.Engine.ECS" Version="4.0.0-preview.2" />
       <PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
       <PackageReference Include="SharpGLTF.Runtime" Version="1.0.6" />
       <PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
+      <PackageReference Include="StbImageSharp" Version="2.30.15" />
     </ItemGroup>
 
 </Project>

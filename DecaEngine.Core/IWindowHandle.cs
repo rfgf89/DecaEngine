@@ -12,6 +12,8 @@ public interface IWindowHandle : IReleaseObject
 
 	public void LoadAndSetIcon(string path);
 
+	public void SetTitle(string title);
+
 	public event Action OnWindowResize;
 
 	public float GetScale();

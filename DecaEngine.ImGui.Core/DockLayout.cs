@@ -34,12 +34,19 @@ public class DockLayout
 
 	private unsafe void BuildDockLayout(Vector2 workSize)
 	{
-		if (ImGuiP.DockBuilderGetNode(_centerId).IsNull)
+		var centerNode = ImGuiP.DockBuilderGetNode(_centerId);
+		if (centerNode.IsNull)
 		{
 			ImGuiP.DockBuilderAddNode(_centerId, ImGuiDockNodeFlags.NoDockingOverCentralNode);
+			centerNode = ImGuiP.DockBuilderGetNode(_centerId);
 		}
 
 		ImGuiP.DockBuilderSetNodeSize(_centerId, workSize);
+
+		if (ImGuiP.IsSplitNode(centerNode))
+		{
+			return;
+		}
 
 		for (int i = 0; i < _dockLayoutElements.Count; i++)
 		{

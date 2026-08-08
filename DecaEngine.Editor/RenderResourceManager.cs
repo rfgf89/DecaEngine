@@ -21,6 +21,25 @@ public class RenderResourceManager
 
 	private BatchSubset _renderSubset;
 
+	// Верхняя граница ЗАНЯТЫХ слотов (максимальный выданный индекс + 1), а не их количество.
+	// Слоты выдаются из стека свободных, поэтому занятые индексы РАЗРЕЖЕНЫ: после освобождения
+	// пачки слотов стек отдаёт их в обратном порядке, и следующая, более мелкая пачка инстансов
+	// садится в ХВОСТ диапазона (например слоты 8..9 при 10 освобождённых). Culling-шейдер
+	// (BatchingInstancingCS) обходит Instances[0..drawCount) и пропускает дырки по batchId/objectId
+	// < 0, так что drawCount - это граница ИНДЕКСА. Если подставить туда количество занятых слотов
+	// (totalInstances - totalFreeSlot), шейдер обойдёт только начало массива, где после churn-а
+	// лежат одни дырки, и не нарисует ничего - именно так пропадали превью сабмешей в
+	// AssetBrowser/Inspector после бейка целой модели (см. ModelIconBaker.CreateStageEntities).
+	private int _slotHighWaterMark;
+
+	/// <summary>
+	/// Сколько первых слотов массива инстансов должен обойти culling-шейдер - см.
+	/// <see cref="_slotHighWaterMark"/>. Подставляется в CullData.drawCount
+	/// (<see cref="DecaEngine.Editor.ECS.SimpleCullingAndRenderSystem"/>,
+	/// <see cref="DecaEngine.Editor.ECS.CullingAndRenderSystem"/>).
+	/// </summary>
+	public int DrawInstanceCount => _slotHighWaterMark;
+
 	public RenderResourceManager(int totalInstances, int totalBatch, EntityStore store,
 		DiligentBatchRenderer batchRenderer)
 	{
@@ -112,6 +131,11 @@ public class RenderResourceManager
 		var slotIndex = _freeSlots.Pop();
 		totalFreeSlot = _freeSlots.Count;
 
+		if (slotIndex + 1 > _slotHighWaterMark)
+		{
+			_slotHighWaterMark = slotIndex + 1;
+		}
+
 		_renderSubset.instances[slotIndex] = new IndirectInstance
 		{
 			batchId = batchId,
@@ -160,6 +184,8 @@ public class RenderResourceManager
 				drawData = UnsafeArray.GetPtr<DrawData>(_renderSubset.drawData.GetNative(), slotIndex)
 			});
 
+		_batchRenderer.MarkInstancesContentDirty();
+
 		return true;
 	}
 
@@ -169,6 +195,16 @@ public class RenderResourceManager
 		{
 			_freeSlots.Push(batchInfo.GpuSlotIndex);
 			totalFreeSlot = _freeSlots.Count;
+
+			// Опустить границу можно только когда занятых слотов не осталось вовсе - в общем случае
+			// дырка в середине не даёт её уменьшить (см. _slotHighWaterMark). Этого достаточно для
+			// сценариев превью/бейка, где сцена между этапами очищается целиком
+			// (ModelIconBaker.ClearStageEntities, ModelPreviewViewport.ClearInstances): следующий этап
+			// снова начинает набирать слоты с нуля, а не тянет за собой границу от прошлой модели.
+			if (_freeSlots.Count == totalInstances)
+			{
+				_slotHighWaterMark = 0;
+			}
 
 			_renderSubset.instances[batchInfo.GpuSlotIndex] = new IndirectInstance { batchId = new BatchId(-1), objectId = -1 };
 
@@ -183,6 +219,8 @@ public class RenderResourceManager
 
 			entity.RemoveComponent<BatchRenderInfo>();
 			entity.RemoveComponent<LinkDrawInfo>();
+
+			_batchRenderer.MarkInstancesContentDirty();
 		}
 	}
 }

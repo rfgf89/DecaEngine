@@ -21,6 +21,13 @@ namespace DecaEngine.Graphics.Diligent
 		private ITexture _texture;
 		private readonly Dictionary<(TextureViewType, uint), ITextureView> _views = new();
 
+		// Views obtained via ITexture.GetDefaultView() are owned by the texture itself - Diligent
+		// does not add a reference for them, so disposing one here would over-release the native
+		// object and corrupt the heap (surfacing as an unrelated access violation later, e.g. on the
+		// next GetDefaultView() call after a Resize()). Only views created via CreateView() (the
+		// array-slice branch below) are actually owned by us and must be disposed.
+		private readonly HashSet<(TextureViewType, uint)> _ownedViews = new();
+
 		public DiligentRenderTarget(IRenderDevice device, TextureInfo info)
 		{
 			_device = device;
@@ -90,6 +97,7 @@ namespace DecaEngine.Graphics.Diligent
 					FirstSlice = slice,
 					NumSlices = 1,
 				});
+				_ownedViews.Add((type, slice));
 			}
 
 			_views[(type, slice)] = newView;
@@ -98,9 +106,13 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void ReleaseResources()
 		{
-			foreach (var view in _views.Values)
-				view.Dispose();
+			foreach (var kvp in _views)
+			{
+				if (_ownedViews.Contains(kvp.Key))
+					kvp.Value.Dispose();
+			}
 			_views.Clear();
+			_ownedViews.Clear();
 			_texture?.Dispose();
 		}
 

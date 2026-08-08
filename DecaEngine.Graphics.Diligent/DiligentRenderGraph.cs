@@ -45,6 +45,11 @@ public sealed class DiligentRenderGraph : IRenderGraph
 		_isCompiled = false;
 	}
 
+	public void Invalidate()
+	{
+		_isCompiled = false;
+	}
+
 	public void Compile()
 	{
 		_isCompiled = false;

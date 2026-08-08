@@ -93,7 +93,7 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			ImGui.Spacing();
 
 			// Options
-			ImGui.TextColored(new Vector4(0.7f, 0.7f, 1.0f, 1.0f), "Options");
+			ImGui.TextColored(EditorSelectionStyle.Accent, "Options");
 			ImGui.Spacing();
 
 			ImGui.Checkbox("Initialize Git Repository", ref _createGitRepository);
@@ -148,7 +148,7 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			ImGui.Spacing();
 
 			// Template preview panel
-			ImGui.TextColored(new Vector4(0.7f, 0.7f, 1.0f, 1.0f), "Template Details");
+			ImGui.TextColored(EditorSelectionStyle.Accent, "Template Details");
 			ImGui.Spacing();
 
 			ImGui.BeginChild("TemplatePreview", new Vector2(-1, -1), ImGuiChildFlags.Borders);
@@ -331,6 +331,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			return;
 		}
 
-		//_editorBuilder.Build(Path.GetFileName(dialog.SelectedFolder)!, Path.GetPathRoot(dialog.SelectedFolder)!);
+		_projectPath = dialog.SelectedFolder ?? _projectPath;
 	}
 }

@@ -8,6 +8,7 @@ public abstract class ImGuiWindow
 	protected readonly ImGuiRender _imGuiRender;
 	protected string _title;
 	protected float _scale;
+	protected bool _forceDraw;
 
 	protected ImGuiWindow(string title, ImGuiRender imGuiRender)
 	{
@@ -65,7 +66,7 @@ public abstract class ImGuiWindow
 
 	public virtual void Render(uint dockId)
 	{
-		_scale = _imGuiRender.GraphicsApi.WindowHandle.GetScale();
+		_scale = _imGuiRender.GraphicsApi.WindowHandle.GetScale() * _imGuiRender.UiScaleMultiplier;
 		ImGui.SetNextWindowSizeConstraints(new Vector2(200, 100) * _scale, new Vector2(float.MaxValue, float.MaxValue));
 	}
 
@@ -79,6 +80,11 @@ public abstract class ImGuiWindow
 	protected virtual void OnRemove()
 	{
 
+	}
+
+	public void ForceShow()
+	{
+		_forceDraw = true;
 	}
 
 	public override int GetHashCode()

@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using DecaEngine.Core.Assets;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 
@@ -18,6 +19,12 @@ namespace DecaEngine.Editor.ECS
 	{
 		public Vector3 Center;
 		public Vector3 Extents;
+	}
+
+	public struct ModelRenderer : IComponent
+	{
+		[AssetType("gltf", "glb")]
+		public AssetRef modelRef;
 	}
 
 	public struct BatchRenderInfo : IComponent

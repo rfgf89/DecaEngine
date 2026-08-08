@@ -4,52 +4,89 @@ using Microsoft.Build.Construction;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Отвечает за создание нового пользовательского проекта (.sln + .csproj) и за
-/// синхронизацию ссылок на модули движка (все .csproj из главного DecaEngine.sln,
-/// кроме DecaEngine.Editor) с этим проектом.
-/// </summary>
 public class EditorBuilder
 {
-	/// <summary>
-	/// Создаёт новый .sln с одним консольным .csproj по указанному пути,
-	/// генерирует стартовый Program.cs и подключает к проекту ссылки на все
-	/// модули движка (кроме DecaEngine.Editor).
-	/// </summary>
 	public string Build(string projectName, string outputPath)
 	{
 		var projectDir = Path.Combine(outputPath, projectName);
 		var slnPath = Path.Combine(projectDir, $"{projectName}.sln");
-		var csprojPath = Path.Combine(projectDir, $"{projectName}.csproj");
+
+		var gameProjectDir = Path.Combine(projectDir, projectName);
+		var csprojPath = Path.Combine(gameProjectDir, $"{projectName}.csproj");
+
+		var assemblyProjectName = $"{projectName}.Assembly";
+		var assemblyProjectDir = Path.Combine(projectDir, assemblyProjectName);
+		var assemblyCsprojPath = Path.Combine(assemblyProjectDir, $"{assemblyProjectName}.csproj");
 
 		ExecuteCommand($"dotnet new sln --name \"{projectName}\" --format sln --output \"{projectDir}\"");
-		ExecuteCommand($"dotnet new console --output \"{projectDir}\" --force -f net10.0");
+
+		ExecuteCommand($"dotnet new classlib --output \"{gameProjectDir}\" --force -f net10.0");
 		ExecuteCommand($"dotnet sln \"{slnPath}\" add \"{csprojPath}\"");
 
-		WriteProgramTemplate(projectDir, projectName);
-		EnableProjectFeatures(csprojPath);
+		var defaultClassFile = Path.Combine(gameProjectDir, "Class1.cs");
+		if (File.Exists(defaultClassFile))
+		{
+			File.Delete(defaultClassFile);
+		}
 
-		// Добавляем остальные модули движка в новый .sln (чтобы всё можно было
-		// открыть и собрать вместе в IDE), и сразу же подключаем реальные
-		// ProjectReference, иначе типы движка не будут видны из кода проекта.
+		ExecuteCommand($"dotnet new console --output \"{assemblyProjectDir}\" --force -f net10.0");
+		ExecuteCommand($"dotnet sln \"{slnPath}\" add \"{assemblyCsprojPath}\"");
+
+		WriteGameProjectTemplate(gameProjectDir, projectName);
+		WriteAssemblyProjectTemplate(assemblyProjectDir, projectName);
+
+		EnableProjectFeatures(csprojPath);
+		EnableProjectFeatures(assemblyCsprojPath);
+
+		ExecuteCommand($"dotnet add \"{assemblyCsprojPath}\" reference \"{csprojPath}\"");
+
 		AddEngineProjectsToSolution(slnPath, csprojPath);
 		AttachEngineReferences(csprojPath);
+		AttachEngineReferences(assemblyCsprojPath);
 
 		return slnPath;
 	}
 
-	/// <summary>
-	/// Синхронизирует ProjectReference указанного .csproj со всеми модулями
-	/// движка (все .csproj из главного DecaEngine.sln), кроме DecaEngine.Editor.
-	/// Безопасно вызывать многократно (например, каждый раз при открытии
-	/// проекта в редакторе), уже подключённые ссылки просто игнорируются.
-	/// </summary>
 	public static void AttachEngineReferences(string csprojPath)
 	{
-		foreach (var enginePath in GetEngineProjectPaths(csprojPath))
+		var missingPaths = GetEngineProjectPaths(csprojPath)
+			.Select(Path.GetFullPath)
+			.Except(GetExistingReferencePaths(csprojPath), StringComparer.OrdinalIgnoreCase)
+			.ToList();
+
+		if (missingPaths.Count == 0)
+		{
+			return;
+		}
+
+		foreach (var enginePath in missingPaths)
 		{
 			ExecuteCommand($"dotnet add \"{csprojPath}\" reference \"{enginePath}\"");
 		}
+	}
+
+	private static HashSet<string> GetExistingReferencePaths(string csprojPath)
+	{
+		var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
+		var project = ProjectRootElement.Open(csprojPath);
+
+		var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var item in project.Items.Where(i => i.ItemType == "ProjectReference"))
+		{
+			var referencePath = item.Include;
+			if (string.IsNullOrWhiteSpace(referencePath))
+			{
+				continue;
+			}
+
+			var fullReferencePath = Path.IsPathRooted(referencePath)
+				? referencePath
+				: Path.Combine(projectDir, referencePath);
+
+			result.Add(Path.GetFullPath(fullReferencePath));
+		}
+
+		return result;
 	}
 
 	private static void AddEngineProjectsToSolution(string slnPath, string csprojPath)
@@ -69,7 +106,6 @@ public class EditorBuilder
 		ExecuteCommand($"{addCsProjToSlnCommand} --in-root");
 	}
 
-	/// <summary>Все .csproj из главного движкового .sln, кроме DecaEngine.Editor и самого проекта.</summary>
 	private static List<string> GetEngineProjectPaths(string csprojPath)
 	{
 		var engineSlnPath = FindSolutionFolder(AppContext.BaseDirectory);
@@ -89,48 +125,177 @@ public class EditorBuilder
 			.ToList();
 	}
 
-	private static void WriteProgramTemplate(string projectDir, string projectName)
+	private static void WriteGameProjectTemplate(string projectDir, string projectName)
 	{
 		var rootNamespace = ToValidIdentifier(projectName);
-		var programPath = Path.Combine(projectDir, "Program.cs");
+		var programPath = Path.Combine(projectDir, "GameApplication.cs");
 
 		var content = $$"""
+		                using System.Numerics;
+		                using DecaEngine;
 		                using DecaEngine.Core;
 
 		                namespace {{rootNamespace}};
 
-		                public class GameApplication : StateLoopCore
+		                public class GameApplication : GameBehaviour
 		                {
-		                	protected override void Start(ref State state)
+		                	private float _time;
+
+		                	protected override void OnInitialize()
 		                	{
-		                		// TODO: инициализация игры (окно, графическое устройство, загрузка сцены и т.д.)
+		                		_time = 0f;
 		                	}
 
-		                	protected override void OnProcess(ref State state)
+		                	protected override void OnUpdate(float deltaTime)
 		                	{
-		                		// TODO: логика обновления/рендера кадра
+		                		_time += deltaTime;
+
+		                		var hue = (_time * 0.15f) % 1.0f;
+		                		var color = HsvToRgb(hue, 0.65f, 0.9f);
+
+		                		lock (GameHostBridge.GpuSync)
+		                		{
+		                			var cmd = Context.GraphicsApi.CreateCommandBuffer();
+		                			cmd.BeginRecording();
+
+		                			if (Context.RenderHandle is DiligentRenderHandle dilHandle)
+		                			{
+		                				cmd.ClearRenderTarget(dilHandle.RTV, new Vector4(color, 1.0f));
+		                			}
+		                			else
+		                			{
+		                				cmd.SetBackBufferTarget(Context.GraphicsApi);
+		                				cmd.ClearBackBufferTarget(Context.GraphicsApi, new Vector4(color, 1.0f));
+		                			}
+
+		                			cmd.EndRecording();
+		                			cmd.Execute();
+		                		}
 		                	}
 
-		                	protected override void OnQuit(ref State state)
+		                	protected override void OnShutdown()
 		                	{
-		                		// TODO: освобождение ресурсов
+		                	}
+
+		                	private static Vector3 HsvToRgb(float h, float s, float v)
+		                	{
+		                		int i = (int)(h * 6.0f);
+		                		float f = h * 6.0f - i;
+		                		float p = v * (1.0f - s);
+		                		float q = v * (1.0f - f * s);
+		                		float t = v * (1.0f - (1.0f - f) * s);
+
+		                		return (i % 6) switch
+		                		{
+		                			0 => new Vector3(v, t, p),
+		                			1 => new Vector3(q, v, p),
+		                			2 => new Vector3(p, v, t),
+		                			3 => new Vector3(p, q, v),
+		                			4 => new Vector3(t, p, v),
+		                			_ => new Vector3(v, p, q),
+		                		};
+		                	}
+		                }
+		                """;
+
+		File.WriteAllText(programPath, content);
+	}
+
+	private static void WriteAssemblyProjectTemplate(string assemblyProjectDir, string projectName)
+	{
+		var rootNamespace = ToValidIdentifier(projectName);
+		var programPath = Path.Combine(assemblyProjectDir, "Program.cs");
+
+		var content = $$"""
+		                using System.Numerics;
+		                using DecaEngine;
+		                using DecaEngine.Core;
+		                using DecaEngine.Sdl;
+		                using Friflo.Engine.ECS;
+		                using {{rootNamespace}};
+
+		                namespace {{rootNamespace}}.Assembly;
+
+		                internal sealed class GameHost : TimeLoopCore
+		                {
+		                	private readonly GameApplication _game = new();
+		                	private IWindowHandle? _ownedWindowHandle;
+		                	private IGraphicsApi? _ownedGraphicsApi;
+		                	private SdlDevicePull? _ownedDevicePull;
+		                	private IInputEventPull? _ownedInputEventPull;
+		                	private bool _ownsGraphicsApi;
+
+		                	protected override void OnStart()
+		                	{
+		                		IGraphicsApi graphicsApi;
+		                		IRenderHandle? renderHandle;
+		                		EntityStore entityStore;
+
+		                		if (GameHostBridge.IsHosted)
+		                		{
+		                			graphicsApi = GameHostBridge.GraphicsApi!;
+		                			renderHandle = GameHostBridge.RenderHandle;
+		                			entityStore = GameHostBridge.EntityStore ?? new EntityStore();
+		                			_ownsGraphicsApi = false;
+		                		}
+		                		else
+		                		{
+		                			_ownedWindowHandle = new SdlWindowHandle();
+		                			_ownedWindowHandle.Initialize("{{projectName}}", 0, new Vector2(1280, 720));
+
+		                			_ownedGraphicsApi = new DiligentGraphicsApi(_ownedWindowHandle);
+		                			_ownedGraphicsApi.Initialize(GraphicsBackend.Vulkan);
+
+		                			_ownedDevicePull = new SdlDevicePull();
+		                			_ownedInputEventPull = new SdlEventPull(_ownedWindowHandle, _ownedDevicePull);
+
+		                			graphicsApi = _ownedGraphicsApi;
+		                			renderHandle = null;
+		                			entityStore = new EntityStore();
+		                			_ownsGraphicsApi = true;
+		                		}
+
+		                		_game.InternalInitialize(new GameContext(graphicsApi, renderHandle, entityStore, GameHostBridge.SystemRoot, GameHostBridge.IsHosted));
+
+		                		GameHostBridge.NotifyGameReady();
+		                	}
+
+		                	protected override void OnUpdate(float deltaTime)
+		                	{
+		                		if (_ownedInputEventPull != null && _ownedInputEventPull.PullEvent())
+		                		{
+		                			Quit();
+		                			return;
+		                		}
+
+		                		_game.InternalUpdate(deltaTime);
+
+		                		if (_ownsGraphicsApi)
+		                		{
+		                			_ownedGraphicsApi!.Present();
+		                		}
+		                	}
+
+		                	protected override void OnQuit()
+		                	{
+		                		_game.InternalShutdown();
+
+		                		_ownedGraphicsApi?.Release();
+		                		_ownedWindowHandle?.Release();
 		                	}
 		                }
 
 		                public static class Program
 		                {
-		                	private static readonly GameApplication _app = new();
+		                	private static readonly GameHost _host = new();
 
-		                	public static void Main(string[] args)
-		                	{
-		                		_app.Run();
-		                	}
+		                	public static void Main(string[] args) => _host.Run();
 
-		                	public static void Play() => _app.Play();
+		                	public static void Play() => _host.Play();
 
-		                	public static void Pause() => _app.Pause();
+		                	public static void Pause() => _host.Pause();
 
-		                	public static void Quit() => _app.Quit();
+		                	public static void Quit() => _host.Quit();
 		                }
 		                """;
 
@@ -176,7 +341,6 @@ public class EditorBuilder
 
 		while (dir != null)
 		{
-			// Проверяем наличие файла *.sln
 			var slnFiles = dir.GetFiles("*.sln");
 			if (slnFiles.Length > 0)
 			{
@@ -186,7 +350,7 @@ public class EditorBuilder
 			dir = dir.Parent;
 		}
 
-		return null; // решение не найдено
+		return null;
 	}
 
 	public static void ExecuteCommand(string command)
@@ -198,13 +362,11 @@ public class EditorBuilder
 		processInfo = new ProcessStartInfo("cmd.exe", "/c " + command);
 		processInfo.CreateNoWindow = true;
 		processInfo.UseShellExecute = false;
-		// *** Redirect the output ***
 		processInfo.RedirectStandardError = true;
 		processInfo.RedirectStandardOutput = true;
 
 		process = Process.Start(processInfo);
 
-		// *** Read the streams asychronously to prevent deadlocks ***
 		string output = "";
 		string error = "";
 

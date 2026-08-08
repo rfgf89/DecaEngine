@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Graphics.Core;
 using Hexa.NET.ImGui;
 
 public enum FontType
@@ -19,6 +20,13 @@ public abstract unsafe class ImGuiRender
 	private bool _frameBegin;
 	private int _nextTexId = 1;
 	public IGraphicsApi GraphicsApi { get; private set; }
+
+	/// <summary>
+	/// Дополнительный множитель масштаба интерфейса, задаваемый пользователем в настройках
+	/// редактора (см. DecaEngine.Editor.EditorSettings/SettingsWindow), поверх аппаратного
+	/// масштаба экрана (<see cref="IWindowHandle.GetScale"/>). По умолчанию 1.0 (100%).
+	/// </summary>
+	public float UiScaleMultiplier { get; set; } = 1f;
 
 	protected Dictionary<FontType, ImFontPtr> _fonts = new();
 
@@ -193,6 +201,26 @@ public abstract unsafe class ImGuiRender
 
 	public abstract void BindBackTarget(IRenderHandle? renderHandle);
 	public abstract void BindRenderTarget(ImTextureID textureId, IRenderHandle renderHandle);
+
+	/// <summary>
+	/// Binds an arbitrary "new"-style <see cref="IGpuTexture"/> (e.g. an <see cref="IRenderTarget"/>
+	/// created via <see cref="IGraphicsApi.CreateRenderTarget"/>) to an ImGui texture id, so it can be
+	/// drawn with <c>ImGui.Image</c>. Used by off-screen render-graph consumers such as
+	/// DecaEngine.Editor.ModelPreviewViewport, which render into their own persistent color target
+	/// rather than the legacy <see cref="IRenderHandle"/> used by the main Game View.
+	/// </summary>
+	public abstract void BindRenderTarget(ImTextureID textureId, IGpuTexture texture);
+
+	/// <summary>
+	/// Releases the shader-resource binding previously bound via <see cref="BindRenderTarget(ImTextureID,IGpuTexture)"/>
+	/// for <paramref name="textureId"/>, if any, without touching the underlying <see cref="IGpuTexture"/>
+	/// (externally owned). Callers that are about to dispose/recreate that texture (e.g.
+	/// DecaEngine.Editor.ModelPreviewViewport resizing its off-screen render target) MUST call this
+	/// first: the binding holds a reference to a view of the texture, and releasing the binding after
+	/// the view is already gone can crash instead of cleanly releasing it.
+	/// </summary>
+	public abstract void ReleaseRenderTargetBinding(ImTextureID textureId);
+
 	public abstract unsafe ImTextureRef GetNewTexture();
 	public abstract void GarbageTexture(ImTextureRef textureRef);
 	protected abstract void CreateDeviceResources();
@@ -202,6 +230,22 @@ public abstract unsafe class ImGuiRender
 	protected abstract void DestroyTexture(ImTextureDataPtr textureData);
 	protected abstract void ReleaseDeviceResources();
 
+	// "OnDeviceConnected" может сработать НЕСКОЛЬКО РАЗ для одного и того же DeviceType (например,
+	// SDL3 иногда сообщает о клавиатуре больше одного "device id" за сессию - разные бэкенды/драйверы
+	// одного и того же физического устройства). Обработчик ниже каждый раз создаёт НОВЫЕ InputAction
+	// и подписывает их на devicePull.GetFirstInputDevice(deviceType) - то есть, если сработает дважды,
+	// на ОДНО И ТО ЖЕ устройство навешивается ВТОРОЙ, независимый набор слушателей. AddListener в
+	// InputDevice допускает несколько подписчиков (это намеренно, см. комментарий в InputDevice.cs) -
+	// поэтому дубликат не отбрасывается, и каждое нажатие клавиши/каждый введённый символ доходит до
+	// ImGui ДВАЖДЫ (io.AddInputCharacter/io.AddKeyEvent вызываются по разу на каждый набор слушателей).
+	// Именно это было настоящей причиной "задвоения" печатаемых символов (в т.ч. при переименовании
+	// сущности в InspectorWindow) - баг был здесь, в мосте Input -> ImGui, а не в конкретном виджете.
+	// Флаги ниже гарантируют, что подписка на клавиатуру/мышь выполняется РОВНО ОДИН РАЗ за всё время
+	// жизни рендера, независимо от того, сколько раз ImGui-неретро "переподключится" одно и то же
+	// устройство.
+	private bool _keyboardInputBound;
+	private bool _mouseInputBound;
+
 	private void InitializeImGuiInput(DevicePull devicePull)
 	{
 		devicePull.OnDeviceConnected += deviceType =>
@@ -210,6 +254,12 @@ public abstract unsafe class ImGuiRender
 
 			if (deviceType == DevicePull.DeviceType.Keyboard)
 			{
+				if (_keyboardInputBound)
+				{
+					return;
+				}
+				_keyboardInputBound = true;
+
 				var textInputAction = new InputAction();
 				var buttonAction = new InputAction();
 
@@ -258,6 +308,12 @@ public abstract unsafe class ImGuiRender
 
 			if (deviceType == DevicePull.DeviceType.Mouse)
 			{
+				if (_mouseInputBound)
+				{
+					return;
+				}
+				_mouseInputBound = true;
+
 				var positionDeltaAction = new InputAction();
 				var positionAction = new InputAction();
 

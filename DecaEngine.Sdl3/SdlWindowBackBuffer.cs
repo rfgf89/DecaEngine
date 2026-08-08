@@ -46,6 +46,11 @@ public class SdlWindowHandle : IWindowHandle
 		ImageToSdlSurface(image.Width, image.Height, image.Data.AsSpan());
 	}
 
+	public unsafe void SetTitle(string title)
+	{
+		SDL3.SDL_SetWindowTitle(Window, title);
+	}
+
 	private unsafe void ImageToSdlSurface(int width, int height, Span<byte> data)
 	{
 		fixed (void* dataPtr = data)
@@ -69,7 +74,7 @@ public class SdlWindowHandle : IWindowHandle
 
 		if (SDL3.SDL_GetDisplayBounds(SDL3.SDL_GetDisplayForWindow(Window), &rect))
 		{
-			return rect.h / 1080f;
+			return (rect.h / 1080f);
 		}
 
 		return 1f;

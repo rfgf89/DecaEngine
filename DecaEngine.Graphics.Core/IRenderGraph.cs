@@ -110,6 +110,18 @@ public interface IRenderGraph : IReleaseObject
 
 	void Compile();
 
+	/// <summary>
+	/// Forces the next <see cref="Execute"/> to recompile before running. Passes record their
+	/// commands (and capture the native resource references they transition, e.g.
+	/// <c>ForwardPass</c>'s color/depth target) only during <see cref="Compile"/>, then get frozen
+	/// and merely replayed on every subsequent <see cref="Execute"/> - so if a pinned resource is
+	/// disposed and recreated later (e.g. an off-screen render target resized to match its ImGui
+	/// panel), the frozen commands would otherwise keep referencing the stale, disposed object.
+	/// Call this after any such resource is resized/recreated so the graph re-records against the
+	/// new one.
+	/// </summary>
+	void Invalidate();
+
 	void Execute();
 
 	/// <summary>
