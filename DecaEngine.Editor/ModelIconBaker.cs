@@ -247,7 +247,10 @@ namespace DecaEngine.Editor
 					VertexShader = _editorSettings.DefaultVertexShader,
 					PixelShader = _editorSettings.DefaultPixelShader,
 					OptimizeMesh = false,
-					GenerateLods = false
+					GenerateLods = false,
+					// Иконка - крохотный офскрин-кадр; полноразмерные текстуры (Intel Sponza: сотни
+					// 4K) кладут VRAM ещё на стадии бейка, до открытия самого превью.
+					MaxTextureSize = 512
 				});
 				_statusHandle = EditorLoadingStatus.Begin($"Baking icon: {Path.GetFileName(modelPath)}");
 			}
@@ -284,7 +287,8 @@ namespace DecaEngine.Editor
 			try
 			{
 				var resident = new ResidentModel { Model = request.FinalizeOnMainThread() };
-				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, resident.Model, resident.MeshIdMap, resident.MaterialIdMap);
+				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, resident.Model, resident.MeshIdMap, resident.MaterialIdMap,
+					_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap);
 				// Помечаем модель резидентной только ПОСЛЕ успешной регистрации ресурсов - если
 				// RegisterModelResources упадёт на середине, MeshIdMap/MaterialIdMap останутся не
 				// полностью заполненными, и в кеш эта модель попадать не должна (см. StartNextJob).
@@ -455,9 +459,21 @@ namespace DecaEngine.Editor
 		private static void ApplyIconPreviewSettings(ModelLoader model, int stage)
 		{
 			var data = new PreviewSettingsData { Mode = stage == ModelIconCache.WholeModelIndex ? 0 : 1, Channel = 0 };
-			foreach (var material in model.materialObjects.Values)
+
+			// KHR_texture_transform - пер-материальный, а Textured-режим иконки сэмплирует _MainTex:
+			// без матрицы UV дерево/ткань в иконке тайлились бы не так, как в превью (см.
+			// MaterialPbrFactors.UvTransform).
+			for (int i = 0; i < model.materialObjects.Count; i++)
 			{
-				material.SetConstant("PreviewSettings", ref data, HandleAccess.Pixel);
+				var kvp = model.materialObjects.GetAt(i);
+
+				model.MaterialPbr.TryGetValue(kvp.Key, out var pbr);
+				data.UvOffset = pbr.UvOffset;
+				data.UvTransform = pbr.UvTransform;
+				data.UvHasTransform = pbr.HasUvTransform ? 1 : 0;
+				data.OcclusionUvSet = pbr.OcclusionUvSet;
+
+				kvp.Value.SetConstant("PreviewSettings", ref data, HandleAccess.Pixel);
 			}
 		}
 

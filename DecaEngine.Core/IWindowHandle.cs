@@ -8,6 +8,8 @@ public interface IWindowHandle : IReleaseObject
 
 	public Vector2 Size { get; set; }
 
+	public bool IsMinimized { get; set; }
+
 	public void Initialize(string title, int vsync, Vector2 size);
 
 	public void LoadAndSetIcon(string path);

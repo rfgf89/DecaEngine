@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Linq;
+using DecaEngine.Core;
 using DecaEngine.Core.Assets;
 using Engine.ImGui.Core;
 using Hexa.NET.ImGui;
@@ -14,6 +15,12 @@ public class SettingsWindow : ImGuiModalWindow
 		Editor,
 		Graphics
 	}
+
+	/// <summary>Поднимается после "OK", если менялись live-настройки графики превью -
+	/// ModelPreviewViewport подписан и применяет их без перезапуска (см. ApplyGraphicsSettings).
+	/// Статическое, потому что окно создаётся в MenuBarWindow, у которого нет ссылки на вьюпорт;
+	/// вьюпорт в редакторе один и живёт всю сессию, утечки подписки нет.</summary>
+	public static event Action PreviewGraphicsApplied;
 
 	private readonly EditorSettings _settings;
 	private readonly ImGuiRender _imGuiRenderRef;
@@ -151,6 +158,111 @@ public class SettingsWindow : ImGuiModalWindow
 		if (EditorRefPicker.Draw("Pixel Shader", ref pixelShader, ".hlsl"))
 		{
 			_settings.DefaultPixelShader = pixelShader;
+		}
+
+		ImGui.Spacing();
+		ImGui.Separator();
+		ImGui.Spacing();
+
+		DrawPreviewGraphicsSection();
+	}
+
+	/// <summary>Настройки графики превью моделей (см. ModelPreviewViewport/ModelViewportEnvironment).
+	/// Первая группа применяется сразу по "OK" (биты PreviewFeatureFlags + рантайм-тумблер теней),
+	/// вторая - пассы/таргеты, создающиеся вместе с окружением превью, вступают в силу после
+	/// перезапуска редактора; анизотропия - при следующей загрузке модели.</summary>
+	private void DrawPreviewGraphicsSection()
+	{
+		ImGui.TextColored(EditorSelectionStyle.Accent, "Model Preview");
+		ImGui.Separator();
+		ImGui.Spacing();
+
+		var normalMaps = _settings.PreviewNormalMaps;
+		if (ImGui.Checkbox("Normal maps", ref normalMaps))
+		{
+			_settings.PreviewNormalMaps = normalMaps;
+		}
+
+		var bakedAo = _settings.PreviewBakedOcclusion;
+		if (ImGui.Checkbox("Baked ambient occlusion", ref bakedAo))
+		{
+			_settings.PreviewBakedOcclusion = bakedAo;
+		}
+
+		var shadows = _settings.PreviewShadows;
+		if (ImGui.Checkbox("Shadows (sun light)", ref shadows))
+		{
+			_settings.PreviewShadows = shadows;
+		}
+
+		ImGui.Spacing();
+		ImGui.TextDisabled("Applied immediately (preview model reloads):");
+		ImGui.Spacing();
+
+		var ssao = _settings.PreviewSsao;
+		if (ImGui.Checkbox("Ambient occlusion (contact shading)", ref ssao))
+		{
+			_settings.PreviewSsao = ssao;
+		}
+
+		// Техника AO-пасса (см. AmbientOcclusionMode) - имеет смысл только при включённом AO.
+		if (ssao)
+		{
+			var aoModeLabels = new[] { "SSAO", "GTAO" };
+			var aoModeIndex = _settings.PreviewAoMode == AmbientOcclusionMode.Gtao ? 1 : 0;
+			ImGui.SetNextItemWidth(120 * _scale);
+			if (ImGui.Combo("AO technique", ref aoModeIndex, aoModeLabels, aoModeLabels.Length))
+			{
+				_settings.PreviewAoMode = aoModeIndex == 1 ? AmbientOcclusionMode.Gtao : AmbientOcclusionMode.Ssao;
+			}
+			if (ImGui.IsItemHovered())
+			{
+				ImGui.SetTooltip("SSAO - классическое спиральное затемнение.\nGTAO - горизонты + интеграл видимости: чище на плоскостях, чуть дороже.");
+			}
+		}
+
+		var ssgi = _settings.PreviewSsgi;
+		if (ImGui.Checkbox("Global illumination (SSGI)", ref ssgi))
+		{
+			_settings.PreviewSsgi = ssgi;
+		}
+		if (ImGui.IsItemHovered())
+		{
+			ImGui.SetTooltip("Экранная глобальная иллюминация: один отскок света из кадра\n(color bleeding - подсветка соседней геометрии отражённым цветом).");
+		}
+
+		var sky = _settings.PreviewSkyBackground;
+		if (ImGui.Checkbox("Environment sky background", ref sky))
+		{
+			_settings.PreviewSkyBackground = sky;
+		}
+
+		var aniso = _settings.PreviewAnisotropicFiltering;
+		if (ImGui.Checkbox("Anisotropic filtering", ref aniso))
+		{
+			_settings.PreviewAnisotropicFiltering = aniso;
+		}
+
+		int[] msaaOptions = [1, 2, 4, 8];
+		var msaaLabels = new[] { "Off", "2x", "4x", "8x" };
+		var msaaIndex = Math.Max(0, Array.IndexOf(msaaOptions, _settings.PreviewMsaaSamples));
+		ImGui.SetNextItemWidth(120 * _scale);
+		if (ImGui.Combo("MSAA", ref msaaIndex, msaaLabels, msaaLabels.Length))
+		{
+			_settings.PreviewMsaaSamples = msaaOptions[msaaIndex];
+		}
+
+		// Путь к HDR-панораме окружения (пусто = процедурное небо). Байтовый буфер по паттерну
+		// ImGui.InputText.
+		var hdrBuffer = _settings.PreviewEnvironmentHdr ?? string.Empty;
+		ImGui.SetNextItemWidth(280 * _scale);
+		if (ImGui.InputText("Environment HDR (.hdr path)", ref hdrBuffer, 512))
+		{
+			_settings.PreviewEnvironmentHdr = hdrBuffer;
+		}
+		if (ImGui.IsItemHovered())
+		{
+			ImGui.SetTooltip("Абсолютный путь или относительно EditorAssets/ (например env/studio.hdr).\nПусто - процедурное небо.");
 		}
 	}
 
@@ -506,6 +618,13 @@ public class SettingsWindow : ImGuiModalWindow
 		_settings.UiScalePercent = EditorSettings.AllowedUiScalePercents[Math.Clamp(_uiScaleIndex, 0, EditorSettings.AllowedUiScalePercents.Length - 1)];
 		_imGuiRenderRef.UiScaleMultiplier = _settings.UiScaleMultiplier;
 		EditorPalette.SaveTo(_settings);
+
+		PreviewGraphicsApplied?.Invoke();
 	}
+
+	// ВРЕМЕННЫЙ хук для PreviewLoopProbe (диагностика NRE в DiligentCommandBuffer) - вызывает тот
+	// же событийный путь, что и "OK" в окне настроек, без реального ImGui-окна. Удалить вместе с
+	// PreviewLoopProbe.cs после диагностики.
+	internal static void RaisePreviewGraphicsAppliedForTest() => PreviewGraphicsApplied?.Invoke();
 }
 

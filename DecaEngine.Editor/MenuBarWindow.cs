@@ -20,6 +20,8 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 	private OpenFolderDialog? _openFolderDialog;
 	private bool _autoLoadAttempted;
+	private bool _settingsAutoOpened;
+	private int _autoOpenFrame;
 
 	public MenuBarWindow(string title, DockLayout dockLayout, IWindowHandle windowHandle, ProjectSession projectSession, EditorSettings editorSettings, ImGuiRender imGuiRender) : base(title, imGuiRender)
 	{
@@ -43,6 +45,24 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 	protected override void OnRender(uint dockId)
 	{
 		TryAutoLoadLastProject();
+
+		// Диагностический авто-опен модалок (DECA_AUTO_OPEN_SETTINGS=1 - Settings, =2 - New Project)
+		// для headless-проверки UI скриншотом без кликов по меню. Задержка в кадрах - первые кадры
+		// редактора создают/фокусируют док-окна, и ImGui закрывает открытую в этот момент модалку.
+		if (!_settingsAutoOpened && ++_autoOpenFrame == 150)
+		{
+			var autoOpen = Environment.GetEnvironmentVariable("DECA_AUTO_OPEN_SETTINGS");
+			if (autoOpen == "1")
+			{
+				_settingsAutoOpened = true;
+				_settingsWindow.Show();
+			}
+			else if (autoOpen == "2")
+			{
+				_settingsAutoOpened = true;
+				_newProjectWindow.Show();
+			}
+		}
 
 		_newProjectWindow.Render(0);
 		_settingsWindow.Render(0);

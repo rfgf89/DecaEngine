@@ -1,7 +1,6 @@
 using System.Numerics;
+using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
-using DecaEngine.Graphics.Diligent;
-using Diligent;
 
 namespace DecaEngine.Core;
 
@@ -18,6 +17,11 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	private readonly Ref<Vector2> _viewPortRef;
 	private readonly IGpuTexture? _colorTarget;
 	private readonly IGpuTexture? _depthTarget;
+	private readonly IGpuTexture? _sceneCopy;
+	private readonly SkyPassResources? _sky;
+	private readonly SsaoPassResources? _ssao;
+	private readonly IGpuTexture? _msaaColorTarget;
+	private readonly IGpuTexture? _msaaDepthTarget;
 	private readonly Vector4 _clearColor;
 
 	public struct PassData
@@ -37,14 +41,37 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	/// this behaves exactly like the swap-chain-writing constructor above.
 	/// </summary>
 	public ForwardPass(IBatchRenderer batchRenderer, RenderCamerasData renderScene, Ref<Vector2> viewPortRef,
-		IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor)
+		IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor, IGpuTexture? sceneCopy = null,
+		SkyPassResources? sky = null, IGpuTexture? msaaColorTarget = null, IGpuTexture? msaaDepthTarget = null,
+		SsaoPassResources? ssao = null)
 	{
+		_sky = sky;
+
+		// AO рисуется инлайн МЕЖДУ opaque- и transmissive-дроу (см. SsaoPassResources.
+		// WriteInlineCommands): стекло преломляет уже затенённый фон, но само экранным AO не
+		// глушится - окклюзия рассеянного амбиента к преломлённому свету неприменима. Требует
+		// refraction-пути (sceneCopy: композит читает снапшот), поэтому для swap-chain-пути
+		// игнорируется вместе с ним.
+		_ssao = colorTarget is not null && sceneCopy is not null ? ssao : null;
+
+		// MSAA (опционально, только с офскрин-таргетом): геометрия рисуется в мультисемпловую пару,
+		// затем резолвится в colorTarget (его сэмплируют ImGui/readback). Оба таргета обязаны быть
+		// заданы вместе; без них - прежний одиночный путь.
+		if (colorTarget is not null && msaaColorTarget is not null && msaaDepthTarget is not null)
+		{
+			_msaaColorTarget = msaaColorTarget;
+			_msaaDepthTarget = msaaDepthTarget;
+		}
 		_batchRenderer = batchRenderer;
 		_renderScene = renderScene;
 		_viewPortRef = viewPortRef;
 		_colorTarget = colorTarget;
 		_depthTarget = depthTarget;
 		_clearColor = clearColor;
+
+		// Refraction-пасс имеет смысл только с явным офскрин-таргетом: back buffer свопчейна
+		// копировать нечем/незачем в этом движке, так что для swap-chain-пути sceneCopy игнорируется.
+		_sceneCopy = colorTarget is not null ? sceneCopy : null;
 	}
 
 	public override PassData Setup(IRenderGraphBuilder builder)
@@ -59,13 +86,18 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		_batchRenderer.CheckAndReallocateBuffers();
 		_batchRenderer.ClearIndirectDrawBuffers(cmd);
 
-		if (_colorTarget is not null)
+		// При включённом MSAA вся геометрия рисуется в мультисемпловую пару, а _colorTarget
+		// становится resolve-приёмником в конце кадра.
+		var renderColor = _msaaColorTarget ?? _colorTarget;
+		var renderDepth = _msaaColorTarget is not null ? _msaaDepthTarget : _depthTarget;
+
+		if (renderColor is not null)
 		{
-			cmd.SetRenderTarget(_colorTarget, _depthTarget);
-			cmd.ClearRenderTarget(_colorTarget, _clearColor);
-			if (_depthTarget is not null)
+			cmd.SetRenderTarget(renderColor, renderDepth);
+			cmd.ClearRenderTarget(renderColor, _clearColor);
+			if (renderDepth is not null)
 			{
-				cmd.ClearDepthStencil(_depthTarget, ClearDepthStencilFlags.Depth, 0.0f, 0);
+				cmd.ClearDepthStencil(renderDepth, ClearDepthStencilFlags.Depth, 0.0f, 0);
 			}
 		}
 		else
@@ -85,9 +117,74 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				_batchRenderer.SetupCullData(cmd, ref views.cullData.GetRef(i, false));
 				_batchRenderer.SetupLightData(cmd, ref views.lightData.GetRef(i, false));
 
+				// Фон-энвайронмент (см. SkyPassResources.Draw): в уже забинженный этим циклом render
+				// target, ДО геометрии.
+				_sky?.Draw(cmd);
+
 				var cullResult = _batchRenderer.ExecuteComputeCulling(cmd);
-				_batchRenderer.ExecuteDrawBatching(cmd, cullResult);
+
+				if (_sceneCopy is null)
+				{
+					_batchRenderer.ExecuteDrawBatching(cmd, cullResult);
+					continue;
+				}
+
+				// Refraction-пасс: сначала opaque-материалы, затем снимок цветового таргета в
+				// _sceneCopy, и только после - transmissive-материалы (см.
+				// IBatchRenderer.SetMaterialTransparent), сэмплирующие этот снимок как "сцену за
+				// стеклом" (_SceneColor в UnlitInstancedPS.hlsl). Копировать привязанный RT нельзя -
+				// таргет отвязывается на время копии и привязывается обратно. С MSAA снимок
+				// получается резолвом (мультисемпловую текстуру шейдер сэмплировать не может).
+				//
+				// Переход снимка в ShaderResource ДО opaque-дроу обязателен: _SceneColor статически
+				// привязан в SRB всех материалов (в т.ч. opaque), и в первом кадре текстура ещё в
+				// UNDEFINED - валидация Vulkan падает на самом первом дроу, не дойдя до копии.
+				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
+				_batchRenderer.ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.OpaqueOnly);
+
+				cmd.SetRenderTarget(null, null);
+				if (_msaaColorTarget is not null)
+				{
+					cmd.ResolveTexture(_msaaColorTarget, _sceneCopy);
+				}
+				else
+				{
+					cmd.CopyTexture(_colorTarget, _sceneCopy);
+				}
+				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
+
+				// Экранное AO - здесь, а не пост-пассом поверх готового кадра: оценка по opaque-депту,
+				// композит в render-таргет (читает свежий снапшот выше как _SceneTex), затем ПЕРЕ-съём
+				// снапшота - transmissive-материалы преломляют уже затенённую сцену, но их собственные
+				// вогнутости экранным AO не глушатся (см. SsaoPassResources.WriteInlineCommands).
+				if (_ssao is not null)
+				{
+					_ssao.WriteInlineCommands(cmd, renderColor!, renderDepth!, _viewPortRef);
+
+					cmd.SetRenderTarget(null, null);
+					if (_msaaColorTarget is not null)
+					{
+						cmd.ResolveTexture(_msaaColorTarget, _sceneCopy);
+					}
+					else
+					{
+						cmd.CopyTexture(_colorTarget, _sceneCopy);
+					}
+					cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
+				}
+
+				cmd.SetRenderTarget(renderColor, renderDepth);
+				cmd.SetViewport(_viewPortRef);
+				_batchRenderer.ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.TransparentOnly);
 			}
+		}
+
+		// Финальный резолв MSAA-кадра в одиночный _colorTarget - именно его сэмплируют
+		// ImGui/readback; без MSAA геометрия рисовалась прямо в него, и резолв не нужен.
+		if (_msaaColorTarget is not null)
+		{
+			cmd.SetRenderTarget(null, null);
+			cmd.ResolveTexture(_msaaColorTarget, _colorTarget);
 		}
 	}
 }

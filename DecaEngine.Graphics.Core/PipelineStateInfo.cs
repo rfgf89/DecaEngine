@@ -86,8 +86,12 @@ public struct GraphicsStateInfo
 	public RasterizerStateInfo RasterizerState;
 	public DepthStencilStateInfo DepthStencilState;
 
+	/// <summary>MSAA sample count PSO (обязан совпадать с sampleCount привязанных таргетов); 1 = без MSAA.</summary>
+	public uint SampleCount;
+
 	public GraphicsStateInfo()
 	{
+		SampleCount = 1;
 		PrimitiveTopology = PrimitiveTopologyType.TriangleList;
 		RasterizerState = new RasterizerStateInfo()
 		{

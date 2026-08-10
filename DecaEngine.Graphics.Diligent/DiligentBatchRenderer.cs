@@ -10,6 +10,8 @@ using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
+using ResourceState = DecaEngine.Core.ResourceState;
+using SetVertexBuffersFlags = DecaEngine.Core.SetVertexBuffersFlags;
 using TextureAddressMode = Diligent.TextureAddressMode;
 using ValueType = Diligent.ValueType;
 
@@ -69,6 +71,12 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private DiligentBufferHandle? _indirectArgsBuffers;
 
+	// Материалы, помеченные как transmissive/transparent (см. SetMaterialTransparent) - рисуются
+	// отдельной петлёй TransparentOnly после снятия копии колор-таргета (см. ForwardPass).
+	private readonly HashSet<int> _transparentMaterials = new();
+
+	private readonly uint _sampleCount = 1;
+
 	private readonly DiligentBufferHandle? _lightConstantsBuffer;
 	private readonly DiligentBufferHandle? _viewConstantsBuffer;
 	private readonly DiligentBufferHandle? _cullConstantsBuffer;
@@ -117,10 +125,13 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	public int ShadowCascadeCount => ShadowRenderer.MaxCascades;
 
-	public DiligentBatchRenderer(DiligentGraphicsApi api)
+	/// <param name="sampleCount">MSAA sample count целевых таргетов - пекётся во все PSO
+	/// (GetBaseState/GetTopologyState/GetWireframeState); 1 = без MSAA (главная сцена).</param>
+	public DiligentBatchRenderer(DiligentGraphicsApi api, uint sampleCount = 1)
 	{
 		_perMeshData = UnsafeList.Allocate<PerMeshData>(32);
 		_api = api;
+		_sampleCount = Math.Max(1u, sampleCount);
 		_deviceType = _api.Device.GetDeviceInfo().Type;
 		
 		_cullConstantsBuffer = CreateConstantsBuffer<CullData>("Cull Constants");
@@ -286,6 +297,14 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		SetAllCommandsDirty();
 	}
 
+	/// <summary>Привязывает общий View-кбуфер (обновляемый SetupViewData) к материалу, который НЕ
+	/// регистрируется как батч-материал - например, фуллскрин-скай превью (см. ForwardPass): ему
+	/// нужна камера, но Register() тянет за собой лишние ресурсы (инстанс-буферы, тени).</summary>
+	public void BindViewConstants(IMaterialObject material)
+	{
+		((DiligentMaterial)material).SetBuffer("View", _viewConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
+	}
+
 	public unsafe void SetupViewData(ICommandBuffer? cmd, ref ViewData viewData)
 	{
 		fixed(ViewData* ptr = &viewData)
@@ -409,6 +428,13 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				pmd.physicalCommandOffset = commandOffset;
 				UnsafeArray.Set(_perBatchData, batchIndex, pmd);
 
+#if DEBUG
+				if (Environment.GetEnvironmentVariable("DECA_BATCH_DEBUG") == "1")
+				{
+					Console.WriteLine($"[batch-debug] alloc batch={batchIndex} mesh={batch.mesh.meshId} mat={batch.material.materialId} offset={commandOffset} lodCount={pmd.lodCount} indexCount={meshInfo.IndexCount} firstInstance={_instancesSubset.countData[batchIndex]}");
+				}
+#endif
+
 				if (meshInfo.LodLevels != null && UnsafeArray.GetLength(meshInfo.LodLevels) > 0)
 				{
 					for (int lodIndex = 0; lodIndex < UnsafeArray.GetLength(meshInfo.LodLevels); lodIndex++)
@@ -497,6 +523,29 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	void IBatchRenderer.ExecuteDrawBatching(ICommandBuffer cmd, ICullResult cullResult) => ExecuteDrawBatching(cmd, (CullResult)cullResult);
 
+	void IBatchRenderer.ExecuteDrawBatching(ICommandBuffer cmd, ICullResult cullResult, BatchDrawFilter filter) =>
+		ExecuteDrawBatching(cmd, (CullResult)cullResult, filter);
+
+	/// <summary>См. <see cref="IBatchRenderer.SetMaterialTransparent"/>. Влияет только на выбор
+	/// диапазонов в <see cref="ExecuteDrawBatching(ICommandBuffer, CullResult, BatchDrawFilter)"/> -
+	/// PSO/стейты материала не трогает.</summary>
+	public void SetMaterialTransparent(MaterialId materialId, bool transparent) =>
+		SetMaterialTransparent(materialId.materialId, transparent);
+
+	public void SetMaterialTransparent(int materialId, bool transparent)
+	{
+		bool changed = transparent
+			? _transparentMaterials.Add(materialId)
+			: _transparentMaterials.Remove(materialId);
+
+		if (changed)
+		{
+			// Замороженные команды ForwardPass-а записаны с уже разбитыми на opaque/transparent
+			// петлями дроу - изменение принадлежности материала требует перезаписи.
+			SetAllCommandsDirty();
+		}
+	}
+
 	private void UpdateGpuMegaBuffers()
 	{
 		if (!_isMeshBuffersDirty) return;
@@ -510,8 +559,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_api.ImmediateContext.UploadBufferExt<Vertex>(_megaVertexBufferGPU.Buffer, _megaVertexBufferCPU.GetNative());
 		_api.ImmediateContext.UploadBufferExt<uint>(_megaIndexBufferGPU.Buffer, _megaIndexBufferCPU.GetNative());
 
-		_stateTracker.SetState(_megaVertexBufferGPU.Buffer, ResourceState.CopyDest);
-		_stateTracker.SetState(_megaIndexBufferGPU.Buffer, ResourceState.CopyDest);
+		// ResourceStateTracker - внутренняя кухня бэкенда, работает в нативных состояниях Diligent.
+		_stateTracker.SetState(_megaVertexBufferGPU.Buffer, global::Diligent.ResourceState.CopyDest);
+		_stateTracker.SetState(_megaIndexBufferGPU.Buffer, global::Diligent.ResourceState.CopyDest);
 
 		_isMeshBuffersDirty = false;
 		SetAllCommandsDirty();
@@ -557,6 +607,17 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_materialDrawRanges.Add(currentMaterialId.materialId, new MaterialDrawRange { FirstDrawIndex = firstDrawIndex, DrawCount = currentCommand - firstDrawIndex });
 		_isDrawRangesCacheDirty = false;
 		SetAllCommandsDirty();
+
+#if DEBUG
+		// Временная диагностика (см. PreviewProbe): раскладка индирект-диапазонов по материалам.
+		if (Environment.GetEnvironmentVariable("DECA_BATCH_DEBUG") == "1")
+		{
+			foreach (var kvp in _materialDrawRanges)
+			{
+				Console.WriteLine($"[batch-debug] range mat={kvp.Key} first={kvp.Value.FirstDrawIndex} count={kvp.Value.DrawCount}");
+			}
+		}
+#endif
 	}
 
 	public void ExecuteDrawShadows(ICommandBuffer cmd, CullResult cullResult, int cascadeIndex)
@@ -571,15 +632,21 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_shadowRenderer.ExecuteDrawShadows(cmd, _megaVertexBufferGPU, _megaIndexBufferGPU, cullResult, (uint)cascadeIndex);
 	}
 
-	public void ExecuteDrawBatching(ICommandBuffer cmd, CullResult cullResult)
+	public void ExecuteDrawBatching(ICommandBuffer cmd, CullResult cullResult) =>
+		ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.All);
+
+	public void ExecuteDrawBatching(ICommandBuffer cmd, CullResult cullResult, BatchDrawFilter filter)
 	{
 		if (_instancesSubset.instances.Length == 0 || _totalCommands == 0) return;
 
 		UpdateGpuMegaBuffers();
 		UpdateDrawRangesCache();
 
-		cmd.TransitionResource(_shadowRenderer.ShadowMapsTarget, ResourceState.ShaderResource);
+		// DepthRead, а не ShaderResource - см. комментарий в ShadowRenderer.ExecuteDrawShadows.
+		cmd.TransitionResource(_shadowRenderer.ShadowMapsTarget, ResourceState.DepthRead);
 
+		// VertexBuffer/IndirectArgument переходы не нужны: их вставляют сами SetVertexBuffers и
+		// DrawIndexedIndirect ниже. Инстанс-данные же читает вершинный шейдер через SRB.
 		cmd.TransitionResource(cullResult.FinallyInstancesBuffer, ResourceState.VertexBuffer);
 		cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);
 		cmd.TransitionResource(cullResult.IndirectArgsBuffers, ResourceState.IndirectArgument);
@@ -587,19 +654,27 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		cmd.SetVertexBuffers(0, [_megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 		cmd.SetIndexBuffer(_megaIndexBufferGPU, 0);
 
+		int drawnRanges = 0;
 		foreach (var kvp in cullResult.MaterialDrawRanges)
 		{
 			var materialId = kvp.Key;
 			var drawRange = kvp.Value;
 			if (drawRange.DrawCount == 0) continue;
 
+			if (filter != BatchDrawFilter.All)
+			{
+				bool transparent = _transparentMaterials.Contains(materialId);
+				if (transparent != (filter == BatchDrawFilter.TransparentOnly)) continue;
+			}
+
 			var material = _materialObjects[materialId];
 			cmd.SetPipelineState(material);
 			cmd.CommitShaderResources(material);
 			cmd.DrawIndexedIndirect(cullResult.IndirectArgsBuffers, drawRange, IndexType.UInt32);
+			drawnRanges++;
 		}
 
-		_batchRendererInfo.pipelineStateCount = cullResult.MaterialDrawRanges.Count;
+		_batchRendererInfo.pipelineStateCount = drawnRanges;
 	}
 
 	public IStateObject GetBaseState()
@@ -609,6 +684,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			Name = "Instancing PSO",
 			RenderTargetFormats = [_api.SwapChainColorFormat],
 			DepthStencilFormat = _api.SwapChainDepthFormat,
+			SampleCount = _sampleCount,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.Back },
 			DepthStencilState = new DepthStencilStateInfo { DepthEnable = true, DepthFunc = ComparisonFunctionType.Greater },
@@ -617,7 +693,40 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
-				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				// TEXCOORD_1 (Vertex.TexCoord1) - идёт последним в структуре вершины, поэтому и в
+				// объявлении слота 0 последний: Diligent пакует авто-оффсеты по порядку элементов.
+				new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
+			]
+		});
+	}
+
+	/// <summary>Вариант <see cref="GetBaseState"/> с другой примитивной топологией (точки/линии
+	/// glTF-примитивов, см. ModelLoader.MeshTopology*) и без backface culling - у точек и линий
+	/// нет лицевой стороны.</summary>
+	public IStateObject GetTopologyState(PrimitiveTopologyType topology)
+	{
+		return _api.CreateGraphicsState(new GraphicsStateInfo
+		{
+			Name = $"Instancing PSO ({topology})",
+			RenderTargetFormats = [_api.SwapChainColorFormat],
+			DepthStencilFormat = _api.SwapChainDepthFormat,
+			SampleCount = _sampleCount,
+			PrimitiveTopology = topology,
+			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
+			DepthStencilState = new DepthStencilStateInfo { DepthEnable = true, DepthFunc = ComparisonFunctionType.Greater },
+			InputLayout =
+			[
+				new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				// TEXCOORD_1 (Vertex.TexCoord1) - идёт последним в структуре вершины, поэтому и в
+				// объявлении слота 0 последний: Diligent пакует авто-оффсеты по порядку элементов.
+				new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
 			]
 		});
@@ -637,6 +746,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			Name = "Wireframe Overlay PSO",
 			RenderTargetFormats = [_api.SwapChainColorFormat],
 			DepthStencilFormat = _api.SwapChainDepthFormat,
+			SampleCount = _sampleCount,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None, FillMode = FillModeType.Wireframe },
 			DepthStencilState = new DepthStencilStateInfo { DepthEnable = true, DepthFunc = ComparisonFunctionType.GreaterEqual },
@@ -645,7 +755,11 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
-				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+				// TEXCOORD_1 (Vertex.TexCoord1) - идёт последним в структуре вершины, поэтому и в
+				// объявлении слота 0 последний: Diligent пакует авто-оффсеты по порядку элементов.
+				new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
 			]
 		});

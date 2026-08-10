@@ -15,9 +15,15 @@ public class DiligentShader : IShaderObject
 	public string FactoryPath { get; }
 	public string EntryPoint { get; }
 
-	public IShader NativeShader => _nativeShader ?? throw new NullReferenceException("Shader is not compiled.");
+	/// <summary>Ключевые слова варианта (см. IGraphicsApi.CreateShader с keywords): каждый уходит
+	/// в компиляцию макросом NAME=1. Пусто - базовый вариант.</summary>
+	public IReadOnlyList<string> Keywords { get; }
 
-	public DiligentShader(DiligentGraphicsApi api, string name, string factoryPath, string file, ShaderObjectType type, string entryPoint = "Main")
+	public IShader NativeShader => _nativeShader ?? throw new NullReferenceException(
+		$"Shader is not compiled: '{Name}' ({FactoryPath}/{FilePath}).");
+
+	public DiligentShader(DiligentGraphicsApi api, string name, string factoryPath, string file, ShaderObjectType type, string entryPoint = "Main",
+		IReadOnlyList<string> keywords = null)
 	{
 		_api = api ?? throw new ArgumentNullException(nameof(api));
 		Name = name;
@@ -25,6 +31,25 @@ public class DiligentShader : IShaderObject
 		FactoryPath = factoryPath;
 		Type = type;
 		EntryPoint = entryPoint;
+		Keywords = keywords ?? Array.Empty<string>();
+	}
+
+	/// <summary>Макросы компиляции: бэкенд-дефайн + ключевые слова варианта (каждое = 1).
+	/// DECA_VULKAN нужен для бэкенд-специфичных веток (например, [[vk::builtin("PointSize")]] в
+	/// UnlitInstancedPointVS.hlsl обязателен на Vulkan, но для FXC на D3D это синтаксическая
+	/// ошибка X3000 - шейдер оборачивает атрибут в #if DECA_VULKAN).</summary>
+	private ShaderMacro[] BuildMacros()
+	{
+		var macros = new ShaderMacro[Keywords.Count + 1];
+		macros[0] = new ShaderMacro("DECA_VULKAN",
+			_api.Device.GetDeviceInfo().Type == RenderDeviceType.Vulkan ? "1" : "0");
+
+		for (int i = 0; i < Keywords.Count; i++)
+		{
+			macros[i + 1] = new ShaderMacro(Keywords[i], "1");
+		}
+
+		return macros;
 	}
 
 	public void Compile()
@@ -60,10 +85,56 @@ public class DiligentShader : IShaderObject
 			CompileFlags = ShaderCompileFlags.PackMatrixRowMajor,
 			FilePath = FilePath,
 			ShaderSourceStreamFactory = shaderSourceFactory,
+			Macros = new ShaderMacroArray { Elements = BuildMacros() },
 		};
 
+		// Файл шейдера резолвится относительно ТЕКУЩЕЙ директории процесса - при запуске с "чужим"
+		// CWD (IDE с рабочей папкой проекта и т.п.) файл не находится, и без этой проверки наружу
+		// уходило только безликое "Shader is not compiled" из NativeShader.
+		var expectedPath = Path.Combine(Environment.CurrentDirectory, FactoryPath, FilePath);
+		if (!File.Exists(expectedPath))
+		{
+			throw new FileNotFoundException(
+				$"Shader source not found: '{expectedPath}' (shader '{Name}', CWD '{Environment.CurrentDirectory}'). " +
+				"Проверь, что EditorAssets скопированы в рабочую директорию процесса.", expectedPath);
+		}
+
 		_nativeShader = _api.Device.CreateShader(shaderCi, out var compilerOutput);
+
+		// Diligent при ошибке компиляции возвращает null и кладёт лог в compilerOutput - раньше он
+		// молча уничтожался, а наружу уходило только "Shader is not compiled" без причины.
+		if (_nativeShader == null)
+		{
+			string log = ReadCompilerOutput(compilerOutput);
+			compilerOutput?.Dispose();
+			throw new InvalidOperationException($"Shader '{Name}' ({FilePath}) failed to compile:\n{log}");
+		}
+
 		compilerOutput?.Dispose();
+	}
+
+	private static unsafe string ReadCompilerOutput(IDataBlob? blob)
+	{
+		if (blob == null)
+		{
+			return "<no compiler output>";
+		}
+
+		try
+		{
+			var size = (int)blob.GetSize();
+			if (size <= 0)
+			{
+				return "<empty compiler output>";
+			}
+
+			// Diligent кладёт в blob нуль-терминированный текст лога компилятора.
+			return System.Runtime.InteropServices.Marshal.PtrToStringAnsi(blob.GetDataPtr(), size).TrimEnd('\0', '\n', ' ');
+		}
+		catch
+		{
+			return "<failed to read compiler output>";
+		}
 	}
 
 	public void Release()

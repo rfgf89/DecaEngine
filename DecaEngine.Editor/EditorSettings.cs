@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using DecaEngine.Core;
 using DecaEngine.Core.Assets;
 
 namespace DecaEngine.Editor;
@@ -53,6 +55,47 @@ public class EditorSettings
 
 	/// <summary>Pixel shader used by ModelLoader to render loaded glTF models, relative to "EditorAssets/".</summary>
 	public EditorRef DefaultPixelShader { get; set; } = new("shader/UnlitInstancedPS.hlsl");
+
+	/// <summary>Equirect .hdr для IBL-окружения превью моделей (абсолютный путь или относительно
+	/// "EditorAssets/"). Пусто = процедурное небо. Применяется при старте редактора (энвайронмент
+	/// создаётся вместе с превью-вьюпортом).</summary>
+	public string PreviewEnvironmentHdr { get; set; } = "";
+
+	// --- Preview Graphics (см. SettingsWindow.DrawGraphicsSection) ---
+
+	/// <summary>Нормал-мапы в Lighting-превью (live-тумблер, бит PreviewFeatureFlags.NormalMaps).</summary>
+	public bool PreviewNormalMaps { get; set; } = true;
+
+	/// <summary>Запечённый AO (occlusionTexture) в Lighting-превью (live-тумблер).</summary>
+	public bool PreviewBakedOcclusion { get; set; } = true;
+
+	/// <summary>Тени мирового света в превью (live-тумблер: выключение убирает и теневой каскад,
+	/// и сэмплинг - свет откатывается на камерный риг).</summary>
+	public bool PreviewShadows { get; set; } = true;
+
+	/// <summary>SSAO-пасс превью. Применяется после перезапуска редактора (пасс создаётся вместе
+	/// с окружением превью).</summary>
+	public bool PreviewSsao { get; set; } = true;
+
+	/// <summary>Техника AO-пасса превью при включённом <see cref="PreviewSsao"/>: классический SSAO
+	/// или GTAO (см. <see cref="AmbientOcclusionMode"/>). Применяется пересозданием окружения, как
+	/// и остальные env-level опции. Строкой в json - чтобы settings-файл читался глазами.</summary>
+	[JsonConverter(typeof(JsonStringEnumConverter))]
+	public AmbientOcclusionMode PreviewAoMode { get; set; } = AmbientOcclusionMode.Ssao;
+
+	/// <summary>SSGI-пасс превью (экранная глобальная иллюминация: один отскок света из кадра,
+	/// color bleeding - см. SsgiCommon.hlsl). Применяется пересозданием окружения, как SSAO.</summary>
+	public bool PreviewSsgi { get; set; } = true;
+
+	/// <summary>MSAA превью (1/2/4/8). Применяется после перезапуска редактора.</summary>
+	public int PreviewMsaaSamples { get; set; } = 4;
+
+	/// <summary>Скай-фон (энвайронмент как фон кадра). Применяется после перезапуска.</summary>
+	public bool PreviewSkyBackground { get; set; } = true;
+
+	/// <summary>Анизотропная фильтрация текстур моделей (8x). Применяется при следующей загрузке
+	/// модели в превью.</summary>
+	public bool PreviewAnisotropicFiltering { get; set; } = true;
 
 
 	public static EditorSettings Load()

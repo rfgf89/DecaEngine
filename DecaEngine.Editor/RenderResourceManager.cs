@@ -144,6 +144,7 @@ public class RenderResourceManager
 
 		if (batchId.batchId >= 0 && batchId.batchId >= _batchCounts.Length)
 		{
+			int oldBatchCountsLength = _batchCounts.Length;
 			int newBatchCountsLength = _batchCounts.Length == 0 ? 128 : _batchCounts.Length;
 			while (batchId.batchId >= newBatchCountsLength)
 			{
@@ -157,6 +158,23 @@ public class RenderResourceManager
 			{
 				NativeArray<int>.Copy(_renderSubset.countData, newCountData);
 				_renderSubset.countData.Dispose();
+			}
+
+			// countData - префикс-сумма (стартовый слот инстансов батча i = число инстансов у
+			// батчей с id < i). НОВЫЕ хвостовые записи обязаны стартовать с текущей суммарной
+			// заселённости, а не с нуля: нулевой хвост означал бы, что батчи с id >= старой
+			// ёмкости получают офсеты, НАЛОЖЕННЫЕ на диапазоны первых батчей - куллинг-шейдер
+			// писал бы их инстансы поверх чужих, а индирект-дроу читал бы чужие слоты (виден был
+			// бы случайный поднабор сцены; вылезло на PrimitiveModeNormalsTest - 25 батчей при
+			// стартовой ёмкости 16, см. ModelViewportEnvironment).
+			int registeredTotal = 0;
+			for (int i = 0; i < oldBatchCountsLength; i++)
+			{
+				registeredTotal += _batchCounts[i];
+			}
+			for (int i = oldBatchCountsLength; i < newBatchCountsLength; i++)
+			{
+				newCountData.GetRef(i) = registeredTotal;
 			}
 
 			_renderSubset.countData = newCountData;

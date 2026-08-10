@@ -210,6 +210,30 @@ namespace DecaEngine.Editor
 				RenderModelPreviewModeToolbar();
 			}
 
+			// Поворот мирового ключевого света (см. ModelPreviewViewport.SetLightRotation) -
+			// применяется live: яв вращает свет/тени вместе с небом и IBL-отражениями, высота
+			// поднимает/опускает солнце (только свет - equirect-панораму по высоте не повернуть).
+			// Оба значения - смещения от базового положения солнца энвайронмента (0 = как было).
+			if (_modelPreview.HasModel)
+			{
+				float lightYaw = _modelPreview.LightYawDegrees;
+				float lightElevation = _modelPreview.LightElevationDegrees;
+				bool lightChanged = false;
+
+				ImGui.SetNextItemWidth(160f * _scale);
+				lightChanged |= ImGui.SliderFloat("Light Yaw", ref lightYaw, -180f, 180f, "%.0f deg");
+
+				ImGui.SameLine();
+
+				ImGui.SetNextItemWidth(160f * _scale);
+				lightChanged |= ImGui.SliderFloat("Height", ref lightElevation, -60f, 60f, "%.0f deg");
+
+				if (lightChanged)
+				{
+					_modelPreview.SetLightRotation(lightYaw, lightElevation);
+				}
+			}
+
 			ImGui.Separator();
 
 			var avail = ImGui.GetContentRegionAvail();
@@ -224,13 +248,13 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		private static readonly string[] ModelPreviewViewModeLabels = { "Highlight", "Channel" };
+		private static readonly string[] ModelPreviewViewModeLabels = { "Highlight", "Channel", "Lighting" };
 		private static readonly string[] ModelPreviewChannelLabels = { "Normal", "UV", "Tangent" };
 
 		/// <summary>Sub-mesh-view-only "View Mode" / "Wireframe" / "Channel" controls (see
 		/// <see cref="ModelPreviewViewport.SetSubMeshViewMode"/>/<see cref="ModelPreviewViewport.SetWireframeEnabled"/>/
 		/// <see cref="ModelPreviewViewport.SetPreviewChannel"/>) - only shown while a single sub-mesh is
-		/// isolated (see <see cref="RenderModelPreview"/>); the whole-model view is always Textured.
+		/// isolated (see <see cref="RenderModelPreview"/>); the whole-model view is always Lighting (PBR).
 		/// Wireframe is an independent toggle, combinable with either Highlight or Channel.</summary>
 		private void RenderModelPreviewModeToolbar()
 		{

@@ -1,0 +1,4 @@
+Assemblies loaded: 148, duration: 9 ms, engine-dependants: [Friflo.Engine.ECS (9),  DecaEngine.Core (1),  DecaEngine.Graphics.Core (0),  DecaEngine.Editor (9)]
+[modal] OpenPopup('Settings') issued, IsPopupOpen=True
+[modal] 'Settings' BeginPopupModal=True, shown=True, IsPopupOpen=False
+[modal] 'Settings' BeginPopupModal=False, shown=False, IsPopupOpen=False

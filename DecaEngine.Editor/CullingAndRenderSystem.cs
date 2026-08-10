@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Graphics;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;

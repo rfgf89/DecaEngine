@@ -9,6 +9,41 @@ public static class EditorMain
 
 	private static void Main(string[] args)
 	{
+		if (args.Length > 0 && args[0] == "--preview-probe")
+		{
+			DiligentGraphicsApi.DebugMessage += (severity, message, function, file, line) =>
+			{
+				var text = severity.ToString();
+				if (text.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+				    text.Contains("Fatal", StringComparison.OrdinalIgnoreCase))
+				{
+					Console.WriteLine($"[diligent-{severity}] {message}");
+				}
+			};
+			PreviewProbe.Run(args);
+			return;
+		}
+
+		if (args.Length > 0 && args[0] == "--preview-loop")
+		{
+			DiligentGraphicsApi.DebugMessage += (severity, message, function, file, line) =>
+			{
+				Console.WriteLine($"[diligent-{severity}] {message} ({function}: {file}, {line})");
+			};
+			PreviewLoopProbe.Run(args);
+			return;
+		}
+
+		if (args.Length > 0 && args[0] == "--full-loop")
+		{
+			DiligentGraphicsApi.DebugMessage += (severity, message, function, file, line) =>
+			{
+				Console.WriteLine($"[diligent-{severity}] {message} ({function}: {file}, {line})");
+			};
+			FullLoopProbe.Run(args);
+			return;
+		}
+
 		EditorConsoleLog.Install();
 
 		DiligentGraphicsApi.DebugMessage += OnDiligentDebugMessage;
@@ -36,6 +71,7 @@ public static class EditorMain
 			? message
 			: $"{message} ({function}: {file}, {line})";
 
+		Console.WriteLine(formatted);
 		EditorConsoleLog.AddNative(level, formatted);
 	}
 }

@@ -5,6 +5,7 @@ public abstract class ImGuiModalWindow : ImGuiWindow
 {
 	private bool windowEnded;
 	private bool signalShow;
+	private bool _lastBeganLogged;
 	protected bool signalClose;
 	protected bool shown;
 
@@ -23,8 +24,13 @@ public abstract class ImGuiModalWindow : ImGuiWindow
 			return;
 		}
 
-		Vector2 size = ImGui.GetMainViewport().Size * 0.75f;
-		ImGui.SetNextWindowPos(ImGui.GetWindowPos() + ImGui.GetMainViewport().Size / 2 - (size / 2));
+		// Центр ГЛАВНОГО ВЬЮПОРТА (viewport.Pos + половина остатка), а не "позиция окна-хозяина +
+		// полвьюпорта": прежняя формула складывала скрин-координаты менюбара с размером вьюпорта и
+		// уводила модалку за пределы окна редактора (невидимое "открытое" окно настроек - особенно
+		// на сдвинутом окне или мульти-мониторе).
+		var viewport = ImGui.GetMainViewport();
+		Vector2 size = viewport.Size * 0.75f;
+		ImGui.SetNextWindowPos(viewport.Pos + (viewport.Size - size) * 0.5f);
 		ImGui.SetNextWindowSize(size);
 
 		if (signalShow)
@@ -32,9 +38,17 @@ public abstract class ImGuiModalWindow : ImGuiWindow
 			shown = true;
 			ImGui.OpenPopup(_title, ImGuiPopupFlags.None);
 			signalShow = false;
+			Console.WriteLine($"[modal] OpenPopup('{_title}') issued, IsPopupOpen={ImGui.IsPopupOpen(_title)}");
 		}
 
-		if (!ImGui.BeginPopupModal(_title, ref shown, ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize))
+		bool began = ImGui.BeginPopupModal(_title, ref shown, ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize);
+		if (began != _lastBeganLogged)
+		{
+			_lastBeganLogged = began;
+			Console.WriteLine($"[modal] '{_title}' BeginPopupModal={began}, shown={shown}, IsPopupOpen={ImGui.IsPopupOpen(_title)}");
+		}
+
+		if (!began)
 		{
 			return;
 		}

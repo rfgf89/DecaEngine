@@ -1,7 +1,7 @@
-using System;
+using DecaEngine.Graphics.Diligent;
 using UnsafeCollections.Collections.Native;
 
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Graphics;
 
 public struct RenderCamerasData
 {

@@ -6,9 +6,11 @@ using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
-using Diligent;
 using SharpGLTF.Schema2;
 using StbImageSharp;
+// Прямая работа с нативным контекстом - состояния здесь Diligent-овские, не из ICommandBuffer.
+using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
+using ResourceState = Diligent.ResourceState;
 using TextureInfo = DecaEngine.Graphics.Core.TextureInfo;
 using Version = Diligent.Version;
 
@@ -117,6 +119,11 @@ namespace DecaEngine
 			return new DiligentShader(this, name, factoryPath, filePath, type, entryPoint);
 		}
 
+		public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type, string entryPoint, IReadOnlyList<string> keywords)
+		{
+			return new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords);
+		}
+
 		private static TextureAddressMode ToDiligent(TextureAddress mode)
 		{
 			return mode switch
@@ -156,6 +163,9 @@ namespace DecaEngine
 				AddressU = ToDiligent(address),
 				AddressV = ToDiligent(address),
 				AddressW = ToDiligent(address),
+				// Без MaxAnisotropy анизотропный фильтр вырождается в обычный линейный - дефолт
+				// дескриптора 0.
+				MaxAnisotropy = filter == TextureFilter.Anisotropic ? 8u : 0u,
 				Name = name,
 			};
 
@@ -185,6 +195,11 @@ namespace DecaEngine
 				height = imageResult.Height;
 			}
 
+			// Полная мип-цепочка (GenerateMips на GPU): без неё минификация шумит, а анизотропный
+			// сэмплер не работает. Требует Default-usage + RT-bind; 1x1 и запрошенные без мипов
+			// текстуры идут старым immutable-путём.
+			bool generateMips = data.GenerateMips && width > 1 && height > 1;
+
 			var desc = new TextureDesc
 			{
 				Name = data.Name,
@@ -192,9 +207,10 @@ namespace DecaEngine
 				Width = (uint)width,
 				Height = (uint)height,
 				Format = TextureFormat.RGBA8_UNorm,
-				BindFlags = BindFlags.ShaderResource,
-				Usage = Usage.Immutable,
-				MipLevels = 1,
+				BindFlags = generateMips ? BindFlags.ShaderResource | BindFlags.RenderTarget : BindFlags.ShaderResource,
+				Usage = generateMips ? Usage.Default : Usage.Immutable,
+				MipLevels = generateMips ? 0u : 1u,
+				MiscFlags = generateMips ? MiscTextureFlags.GenerateMips : MiscTextureFlags.None,
 			};
 
 			ITexture nativeTexture;
@@ -204,8 +220,32 @@ namespace DecaEngine
 				{
 					Data = (IntPtr)pData, Stride = (uint)(width * 4)
 				};
-				var textureData = new TextureData { SubResources = [subResource], Context = ImmediateContext };
-				nativeTexture = Device.CreateTexture(desc, textureData);
+
+				if (generateMips)
+				{
+					nativeTexture = Device.CreateTexture(desc);
+					// При нехватке VRAM Diligent возвращает null (лог уже содержит его ошибку), а
+					// UpdateTexture по null-хендлу - это AV, убивающий процесс без managed-исключения.
+					if (nativeTexture == null)
+					{
+						throw new InvalidOperationException(
+							$"Failed to create texture '{data.Name}' ({width}x{height}, mips) - likely out of GPU memory.");
+					}
+					var box = new Box { MaxX = (uint)width, MaxY = (uint)height, MaxZ = 1 };
+					ImmediateContext.UpdateTexture(nativeTexture, 0, 0, box, subResource,
+						ResourceStateTransitionMode.Transition, ResourceStateTransitionMode.Transition);
+					ImmediateContext.GenerateMips(nativeTexture.GetDefaultView(TextureViewType.ShaderResource));
+				}
+				else
+				{
+					var textureData = new TextureData { SubResources = [subResource], Context = ImmediateContext };
+					nativeTexture = Device.CreateTexture(desc, textureData);
+					if (nativeTexture == null)
+					{
+						throw new InvalidOperationException(
+							$"Failed to create texture '{data.Name}' ({width}x{height}) - likely out of GPU memory.");
+					}
+				}
 			}
 
 			// Add a transition to ShaderResource. Diligent's engine doesn't automatically transition
@@ -232,6 +272,78 @@ namespace DecaEngine
 			};
 
 			return new DiligentGpuTexture(data.Name, textureInfo, nativeTexture);
+		}
+
+		/// <summary>См. <see cref="IGraphicsApi.CreateTexture2DWithMips"/>.</summary>
+		public unsafe IGpuTexture CreateTexture2DWithMips(string name, IReadOnlyList<byte[]> mipPixels, int width, int height, bool floatFormat = false)
+		{
+			int bytesPerPixel = floatFormat ? 8 : 4;
+
+			var desc = new TextureDesc
+			{
+				Name = name,
+				Type = ResourceDimension.Tex2d,
+				Width = (uint)width,
+				Height = (uint)height,
+				Format = floatFormat ? TextureFormat.RGBA16_Float : TextureFormat.RGBA8_UNorm,
+				BindFlags = BindFlags.ShaderResource,
+				Usage = Usage.Immutable,
+				MipLevels = (uint)mipPixels.Count,
+			};
+
+			var handles = new GCHandle[mipPixels.Count];
+			var subResources = new TextureSubResData[mipPixels.Count];
+			ITexture nativeTexture;
+
+			try
+			{
+				for (int i = 0; i < mipPixels.Count; i++)
+				{
+					int mipWidth = Math.Max(1, width >> i);
+					handles[i] = GCHandle.Alloc(mipPixels[i], GCHandleType.Pinned);
+					subResources[i] = new TextureSubResData
+					{
+						Data = handles[i].AddrOfPinnedObject(),
+						Stride = (uint)(mipWidth * bytesPerPixel),
+					};
+				}
+
+				var textureData = new TextureData { SubResources = subResources, Context = ImmediateContext };
+				nativeTexture = Device.CreateTexture(desc, textureData);
+			}
+			finally
+			{
+				foreach (var handle in handles)
+				{
+					if (handle.IsAllocated)
+					{
+						handle.Free();
+					}
+				}
+			}
+
+			// Тот же явный переход в ShaderResource, что и в CreateTexture выше - см. комментарий там.
+			ImmediateContext.TransitionResourceStates(
+			[
+				new StateTransitionDesc()
+				{
+					Resource = nativeTexture,
+					OldState = ResourceState.Unknown,
+					NewState = ResourceState.ShaderResource,
+					Flags = StateTransitionFlags.UpdateState
+				}
+			]);
+
+			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			{
+				name = name,
+				width = (uint)width,
+				height = (uint)height,
+				format = floatFormat ? TextureObjectFormat.R16G16B16A16Float : TextureObjectFormat.R8G8B8A8UNorm,
+				type = TextureType.Texture2D,
+			};
+
+			return new DiligentGpuTexture(name, textureInfo, nativeTexture);
 		}
 
 		public IRenderTarget CreateRenderTarget(TextureInfo info)
@@ -280,6 +392,7 @@ namespace DecaEngine
 
 		public void Initialize(GraphicsBackend backend)
 		{
+			DiligentEnumMapping.Backend = backend;
 			switch (backend)
 			{
 				case GraphicsBackend.D3D11:
@@ -295,7 +408,11 @@ namespace DecaEngine
 					throw new ArgumentOutOfRangeException(nameof(backend), backend, null);
 			}
 
-			PsoManager = new DiligentPsoManager(Device, Path.Combine(Environment.CurrentDirectory, "cache.pso"));
+			// Имя файла кэша - пер-бэкендное: D3D12 pipeline library и Vulkan pipeline cache
+			// бинарно несовместимы, а редактор (D3D12) и CLI-пробы (Vulkan) стартуют из одной
+			// рабочей директории (см. DiligentPsoManager).
+			PsoManager = new DiligentPsoManager(Device,
+				Path.Combine(Environment.CurrentDirectory, $"cache.{backend.ToString().ToLowerInvariant()}.pso"));
 			WindowHandle.OnWindowResize += OnWindowHandleResize;
 
 			void SetupD3D11()
@@ -483,6 +600,13 @@ namespace DecaEngine
 
 		private void OnWindowHandleResize()
 		{
+			// GPU must be idle before ResizeBuffers-style calls: the OS resize event can land mid-frame,
+			// while commands referencing the current back buffer are still in flight. Resizing out from
+			// under them leaves the device in a broken state, and every texture creation afterwards
+			// starts failing (see the offscreen-target resize sites, which follow the same rule).
+			ImmediateContext.Flush();
+			ImmediateContext.WaitForIdle();
+
 			SwapChain.Resize((uint)WindowHandle.Size.X, (uint)WindowHandle.Size.Y, SurfaceTransform.Identity);
 		}
 
@@ -530,16 +654,26 @@ namespace DecaEngine
 
 		public void Present()
 		{
-			SwapChain.Present(0);
-			
-			// Frame synchronization: limit to 2 frames in flight
-			/*var fenceValue = _nextFrameValue++;
+			// SyncInterval 1 (vsync/FIFO), не 0: с MAILBOX на бескапном фреймрейте презентованные
+			// кадры не успевают реаквайриться, и свопчейн Diligent переиспользует их семафоры
+			// (валидация: VUID-vkQueueSubmit-pSignalSemaphores-00067, затем каскад по фенсам и
+			// командным буферам). Редактору бескапный фреймрейт и не нужен.
+			SwapChain.Present(1);
+
+			// Ограничение в 2 кадра в полёте. Без него (vsync = 0) CPU сабмитит кадры без
+			// ограничений и убегает от GPU на десятки кадров: кольцевой DynamicHeap Diligent
+			// обязан держать данные ВСЕХ кадров в полёте и исчерпывается ("Space in dynamic
+			// heap is almost exhausted. Allocation forced idling the GPU"), пул командных
+			// буферов переиспользует ещё исполняющиеся буферы (валидация Vulkan:
+			// VUID-vkResetCommandBuffer-commandBuffer-00045 и компания), а на D3D12 latency
+			// waitable свопчейна отваливается по таймауту.
+			var fenceValue = _nextFrameValue++;
 			ImmediateContext.EnqueueSignal(_frameFence, fenceValue);
-			
+
 			if (fenceValue > 2)
 			{
-				_frameFence.Wait(fenceValue - 2);
-			}*/
+				_frameFence!.Wait(fenceValue - 2);
+			}
 		}
 
 		public void Release()

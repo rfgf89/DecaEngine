@@ -134,6 +134,7 @@ public class EditorBuilder
 		                using System.Numerics;
 		                using DecaEngine;
 		                using DecaEngine.Core;
+		                using DecaEngine.Graphics.Core;
 
 		                namespace {{rootNamespace}};
 
@@ -158,9 +159,9 @@ public class EditorBuilder
 		                			var cmd = Context.GraphicsApi.CreateCommandBuffer();
 		                			cmd.BeginRecording();
 
-		                			if (Context.RenderHandle is DiligentRenderHandle dilHandle)
+		                			if (Context.RenderHandle is IGpuTexture handleTexture)
 		                			{
-		                				cmd.ClearRenderTarget(dilHandle.RTV, new Vector4(color, 1.0f));
+		                				cmd.ClearRenderTarget(handleTexture, new Vector4(color, 1.0f));
 		                			}
 		                			else
 		                			{

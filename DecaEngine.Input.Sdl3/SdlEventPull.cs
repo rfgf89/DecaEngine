@@ -33,6 +33,7 @@ public unsafe class SdlEventPull : IInputEventPull
 	{
 		SDL_Event evt;
 		SDL3.SDL_StartTextInput(_windowOutput.Window);
+
 		while (SDL3.SDL_PollEvent(&evt))
 		{
 			switch (evt.type)
@@ -45,6 +46,18 @@ public unsafe class SdlEventPull : IInputEventPull
 				{
 					var windowSize = WindowSize;
 					OnSurfaceResize?.Invoke(windowSize);
+					break;
+				}
+				case (uint)SDL_EventType.SDL_EVENT_WINDOW_MINIMIZED:
+				{
+					_windowHandle.IsMinimized = true;
+					break;
+				}
+				case (uint)SDL_EventType.SDL_EVENT_WINDOW_RESTORED:
+				case (uint)SDL_EventType.SDL_EVENT_WINDOW_MAXIMIZED:
+				case (uint)SDL_EventType.SDL_EVENT_WINDOW_SHOWN:
+				{
+					_windowHandle.IsMinimized = false;
 					break;
 				}
 				case (uint)SDL_EventType.SDL_EVENT_KEY_DOWN:

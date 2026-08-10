@@ -25,12 +25,14 @@ namespace DecaEngine.Editor
 	{
 		/// <summary>Sub-mesh view mode, selectable from the Inspector while a single sub-mesh is isolated
 		/// (see <see cref="InspectorWindow.RenderModelPreview"/>). Irrelevant for the whole-model view,
-		/// which is always rendered Textured (see <see cref="ApplyPreviewSettingsToMaterials"/>). Orthogonal
-		/// to <see cref="WireframeEnabled"/> - the wireframe overlay can be toggled on top of either mode.</summary>
+		/// which is always rendered in Lighting/PBR (see <see cref="ApplyPreviewSettingsToMaterials"/>).
+		/// Orthogonal to <see cref="WireframeEnabled"/> - the wireframe overlay can be toggled on top of
+		/// either mode.</summary>
 		public enum SubMeshPreviewMode
 		{
 			Highlight,
 			Channel,
+			Lighting,
 		}
 
 		/// <summary>Debug channel visualized in <see cref="SubMeshPreviewMode.Channel"/>.</summary>
@@ -56,7 +58,26 @@ namespace DecaEngine.Editor
 
 		private readonly IGraphicsApi _graphicsApi;
 		private readonly EditorSettings _editorSettings;
-		private readonly ModelViewportEnvironment _env;
+		private ModelViewportEnvironment _env;
+
+		// Конфигурация, с которой создано ТЕКУЩЕЕ окружение (env-level опции пекутся в его
+		// таргеты/пассы/PSO): диф с настройками в OnGraphicsSettingsChanged решает, нужно ли
+		// пересоздание (см. RecreateEnvironment).
+		private bool _appliedSsao;
+		private AmbientOcclusionMode _appliedAoMode;
+		private bool _appliedSsgi;
+		private uint _appliedMsaa;
+		private bool _appliedSky;
+		private string _appliedHdrPath = "";
+		private bool _appliedAniso;
+
+		// Последний ImGuiRender из Render() - RecreateEnvironment должен отвязать ImGui-биндинг
+		// старого таргета до его освобождения (см. ResizeTargets - тот же порядок).
+		private ImGuiRender? _lastImGuiRender;
+
+		// Заявка на пересоздание окружения из OnGraphicsSettingsChanged; исполняется в начале
+		// Update() - до записи кадра, когда старые биндинги ещё нигде не задействованы.
+		private bool _pendingEnvironmentRecreate;
 
 		private readonly List<Entity> _instanceEntities = new();
 
@@ -68,6 +89,10 @@ namespace DecaEngine.Editor
 		private ModelLoader.ModelLoadRequest? _loadRequest;
 		private EditorLoadingStatus.Handle? _loadHandle;
 		private CancellationTokenSource? _loadCts;
+
+		// Радиус, посчитанный последним FrameAll (см. его комментарий) - PollPendingLoad пушит AO
+		// world-range из него сам, ПОСЛЕ своего Flush()+WaitForIdle() барьера.
+		private float _framedRadius;
 
 		// Резидентная модель: тот же .gltf/.glb, что уже полностью распарсен и зарегистрирован в
 		// _env.BatchRenderer с предыдущего LoadModel - переключение сабмеша той же модели (см.
@@ -94,6 +119,75 @@ namespace DecaEngine.Editor
 
 		private SubMeshPreviewMode _viewMode = SubMeshPreviewMode.Highlight;
 		private PreviewChannel _previewChannel = PreviewChannel.Normal;
+
+		/// <summary>Глобальные тумблеры фич Lighting-превью (см. <see cref="PreviewFeatureFlags"/>) -
+		/// задел под настройки графики. Меняются через <see cref="SetFeatureFlags"/>.</summary>
+		private PreviewFeatureFlags _featureFlags = PreviewFeatureFlags.All;
+
+		/// <summary>Текущие тумблеры фич - см. <see cref="SetFeatureFlags"/>.</summary>
+		public PreviewFeatureFlags FeatureFlags => _featureFlags;
+
+		/// <summary>Включает/выключает фичи Lighting-превью (нормал-мапы, AO и т.д.) - применяется к
+		/// текущей резидентной модели немедленно.</summary>
+		public void SetFeatureFlags(PreviewFeatureFlags flags)
+		{
+			if (_featureFlags == flags)
+			{
+				return;
+			}
+
+			_featureFlags = flags;
+			ApplyPreviewSettingsToMaterials();
+		}
+
+		/// <summary>Смещения ползунков света в градусах ОТ базового положения солнца энвайронмента
+		/// (яв вокруг Y / высота над горизонтом, см. <see cref="SetLightRotation"/>). Хранятся здесь,
+		/// а не в ShadowSettings, чтобы переживать пересоздание окружения (см.
+		/// <see cref="RecreateEnvironment"/>).</summary>
+		private float _lightYawOffsetDegrees;
+		private float _lightElevationOffsetDegrees;
+
+		/// <summary>Абсолютная высота солнца клампится в эти пределы: у горизонта/зенита ортокамера
+		/// каскада вырождается (см. BuildLightData - up-вектор, растянутая проекция).</summary>
+		private const float LightElevationMinDegrees = -85f;
+		private const float LightElevationMaxDegrees = 85f;
+
+		/// <summary>Текущие смещения ползунков света - см. <see cref="SetLightRotation"/>.</summary>
+		public float LightYawDegrees => _lightYawOffsetDegrees;
+		public float LightElevationDegrees => _lightElevationOffsetDegrees;
+
+		/// <summary>Поворачивает мировой ключевой свет («солнце» энвайронмента): яв вокруг Y + высота
+		/// над горизонтом, оба - смещения от базового положения солнца. Применяется live: направление
+		/// читается системой рендера каждый кадр (см. SimpleCullingAndRenderSystem.BuildLightData), а
+		/// поворот по яву дополнительно уходит в шейдеры неба/IBL (см. <see cref="ApplyLightRotation"/>),
+		/// чтобы фон и отражения вращались вместе со светом.</summary>
+		public void SetLightRotation(float yawOffsetDegrees, float elevationOffsetDegrees)
+		{
+			_lightYawOffsetDegrees = yawOffsetDegrees;
+			_lightElevationOffsetDegrees = elevationOffsetDegrees;
+			ApplyLightRotation();
+		}
+
+		/// <summary>Применяет текущие смещения ползунков к окружению: направление света/теней
+		/// (ShadowSettings), поворот фонового неба (SkyPassResources) и IBL-отражений материалов
+		/// (PreviewSettings-кбуфер, см. <see cref="ApplyPreviewSettingsToMaterials"/>). Высота на
+		/// equirect-карту не переносится - вращать панораму дёшево только вокруг Y.</summary>
+		private void ApplyLightRotation()
+		{
+			var shadowSettings = _env.ShadowSettings;
+			if (shadowSettings == null)
+			{
+				return;
+			}
+
+			shadowSettings.SetAngles(
+				shadowSettings.BaseYawDegrees + _lightYawOffsetDegrees,
+				Math.Clamp(shadowSettings.BaseElevationDegrees + _lightElevationOffsetDegrees,
+					LightElevationMinDegrees, LightElevationMaxDegrees));
+
+			_env.Pipeline.SkyResources?.SetEnvironmentYaw(shadowSettings.EnvYawRadians);
+			ApplyPreviewSettingsToMaterials();
+		}
 
 		private Vector3 _orbitTarget = Vector3.Zero;
 		private float _yaw = -0.6f;
@@ -141,8 +235,152 @@ namespace DecaEngine.Editor
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
 
-			_env = new ModelViewportEnvironment(graphicsApi, InitialWidth, InitialHeight,
-				"Model Preview Color", "Model Preview Depth");
+			_env = CreateEnvironment();
+			ApplyGraphicsSettings();
+
+			// Настройки из окна Settings (см. SettingsWindow.PreviewGraphicsApplied): вьюпорт
+			// один и живёт всю сессию редактора, отписка не требуется.
+			SettingsWindow.PreviewGraphicsApplied += OnGraphicsSettingsChanged;
+		}
+
+		/// <summary>Создаёт превью-окружение по текущим настройкам и запоминает применённую
+		/// env-level конфигурацию (для дифа в <see cref="OnGraphicsSettingsChanged"/>). Тени
+		/// создаются всегда: их пасс дёшев и no-op-ится live через ShadowSettings.Enabled.</summary>
+		private ModelViewportEnvironment CreateEnvironment()
+		{
+			_appliedSsao = _editorSettings.PreviewSsao;
+			_appliedAoMode = _editorSettings.PreviewAoMode;
+			_appliedSsgi = _editorSettings.PreviewSsgi;
+			_appliedMsaa = (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8);
+			_appliedSky = _editorSettings.PreviewSkyBackground;
+			_appliedHdrPath = ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "";
+			_appliedAniso = _editorSettings.PreviewAnisotropicFiltering;
+
+			return new ModelViewportEnvironment(_graphicsApi, InitialWidth, InitialHeight,
+				"Model Preview Color", "Model Preview Depth",
+				skyBackground: _appliedSky,
+				environmentHdrPath: _appliedHdrPath.Length > 0 ? _appliedHdrPath : null,
+				msaaSamples: _appliedMsaa,
+				ssao: _appliedSsao,
+				shadows: true,
+				aoMode: _appliedAoMode,
+				ssgi: _appliedSsgi);
+		}
+
+		/// <summary>Обработчик "OK" окна настроек: env-level опции (SSAO/MSAA/скай/HDR/анизотропия)
+		/// при изменении применяются пересозданием окружения с перезагрузкой текущей модели,
+		/// live-биты - как обычно. Ничего не изменилось - ничего и не пересоздаётся.</summary>
+		private void OnGraphicsSettingsChanged()
+		{
+			bool needsRecreate =
+				_appliedSsao != _editorSettings.PreviewSsao ||
+				_appliedAoMode != _editorSettings.PreviewAoMode ||
+				_appliedSsgi != _editorSettings.PreviewSsgi ||
+				_appliedMsaa != (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8) ||
+				_appliedSky != _editorSettings.PreviewSkyBackground ||
+				_appliedHdrPath != (ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "") ||
+				_appliedAniso != _editorSettings.PreviewAnisotropicFiltering;
+
+			// Пересоздание ОТКЛАДЫВАЕТСЯ до начала следующего Update: "OK" настроек срабатывает
+			// посреди ImGui-кадра, когда превью-картинка со старым биндингом уже может лежать в
+			// draw list-е - освобождение таргета здесь обратилось бы к нему из ImGui-рендера.
+			_pendingEnvironmentRecreate |= needsRecreate;
+
+			ApplyGraphicsSettings();
+		}
+
+		/// <summary>Пересоздаёт превью-окружение под новые env-level опции и перезагружает текущую
+		/// модель. Порядок обязателен: дождаться GPU -> отвязать ImGui-биндинг таргета -> освободить
+		/// окружение -> создать новое -> сбросить резидентный кеш (он ссылался на старый батч-рендерер)
+		/// -> перезагрузить модель с диска.</summary>
+		private void RecreateEnvironment()
+		{
+			var reloadPath = _loadedPath ?? _loadingPath;
+			var reloadSubMesh = _loadedPath != null ? _loadedSubMesh : _loadingSubMesh;
+
+			CancelPendingLoad();
+
+			// Кадры с ресурсами старого окружения могут быть в полёте - без ожидания GPU
+			// освобождение роняет драйвер (та же дисциплина, что в ResizeTargets).
+			_env.DilApi.ImmediateContext.Flush();
+			_env.DilApi.ImmediateContext.WaitForIdle();
+
+			if (_textureBound && _lastImGuiRender != null)
+			{
+				_lastImGuiRender.ReleaseRenderTargetBinding(_textureRef.GetTexID());
+				_textureBound = false;
+			}
+
+			_env.Release();
+
+			// Резидентный кеш и вся геометрия жили в старом батч-рендерере/EntityStore - обнуляем
+			// ссылки, новое окружение наполнится перезагрузкой модели.
+			_instanceEntities.Clear();
+			_wireframeEntities.Clear();
+			_wireframeMaterial = null;
+			_wireframeMaterialId = null;
+			_wireframeBatchCache.Clear();
+			_batchCache.Clear();
+			_meshIdMap.Clear();
+			_materialIdMap.Clear();
+			_residentModel = null;
+			_residentPath = null;
+			_loadedPath = null;
+			_loadedSubMesh = -1;
+			_loadError = null;
+
+			_env = CreateEnvironment();
+			ApplyLightRotation();
+
+			if (reloadPath != null)
+			{
+				LoadModel(reloadPath, reloadSubMesh);
+			}
+		}
+
+		/// <summary>Применяет live-настройки графики превью из <see cref="EditorSettings"/> (см.
+		/// SettingsWindow): биты фич и рантайм-тумблер теней. Вызывается при создании и после "OK"
+		/// в окне настроек; рестарт-левел опции (MSAA/SSAO/скай/HDR) считываются конструктором.</summary>
+		public void ApplyGraphicsSettings()
+		{
+			var flags = PreviewFeatureFlags.None;
+			if (_editorSettings.PreviewNormalMaps)
+			{
+				flags |= PreviewFeatureFlags.NormalMaps;
+			}
+			if (_editorSettings.PreviewBakedOcclusion)
+			{
+				flags |= PreviewFeatureFlags.Occlusion;
+			}
+			if (_editorSettings.PreviewShadows)
+			{
+				flags |= PreviewFeatureFlags.Shadows;
+			}
+
+			SetFeatureFlags(flags);
+
+			if (_env.ShadowSettings != null)
+			{
+				_env.ShadowSettings.Enabled = _editorSettings.PreviewShadows;
+			}
+		}
+
+		/// <summary>Резолвит путь HDR-окружения из настроек: абсолютный - как есть, относительный -
+		/// от "EditorAssets/", пусто/не найден - null (процедурное небо).</summary>
+		private static string ResolveEnvironmentHdrPath(string configured)
+		{
+			if (string.IsNullOrWhiteSpace(configured))
+			{
+				return null;
+			}
+
+			if (File.Exists(configured))
+			{
+				return configured;
+			}
+
+			var relative = Path.Combine("EditorAssets", configured);
+			return File.Exists(relative) ? relative : configured;
 		}
 
 		/// <summary>Switches the sub-mesh view mode (see <see cref="InspectorWindow"/>'s View Mode combo).
@@ -197,8 +435,8 @@ namespace DecaEngine.Editor
 		/// <summary>
 		/// Pushes the current view mode/channel to every material of the resident model via
 		/// <see cref="IMaterialObject.SetConstant{T}"/> (see UnlitInstancedPS.hlsl's PreviewSettings
-		/// cbuffer). The whole-model view (<see cref="IsSubMeshView"/> false) always maps to Textured
-		/// (Mode 0) regardless of <see cref="ViewMode"/> - that combo is only shown/meaningful for
+		/// cbuffer). The whole-model view (<see cref="IsSubMeshView"/> false) always maps to Lighting
+		/// (Mode 3) regardless of <see cref="ViewMode"/> - that combo is only shown/meaningful for
 		/// sub-mesh view (see <see cref="InspectorWindow.RenderModelPreview"/>).
 		/// </summary>
 		private void ApplyPreviewSettingsToMaterials()
@@ -208,13 +446,67 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			int mode = !IsSubMeshView ? 0 : (_viewMode == SubMeshPreviewMode.Channel ? 2 : 1);
-
-			var data = new PreviewSettingsData { Mode = mode, Channel = (int)_previewChannel };
-
-			foreach (var material in _residentModel.materialObjects.Values)
+			// The whole-model view always renders in Lighting (PBR) mode; the View Mode combo only
+			// exists for an isolated sub-mesh (see InspectorWindow.RenderModelPreview).
+			int mode = !IsSubMeshView ? 3 : _viewMode switch
 			{
-				material.SetConstant("PreviewSettings", ref data, HandleAccess.Pixel);
+				SubMeshPreviewMode.Channel => 2,
+				SubMeshPreviewMode.Lighting => 3,
+				_ => 1,
+			};
+
+			var data = new PreviewSettingsData
+			{
+				Mode = mode,
+				Channel = (int)_previewChannel,
+				EnvYawRadians = _env.ShadowSettings?.EnvYawRadians ?? 0f,
+			};
+
+			// Unlike Mode/Channel, the PBR factors are per material (glTF metallic/roughness/baseColor,
+			// see ModelLoader.MaterialPbr), so the constant push has to walk key-value pairs rather than
+			// blast one shared struct at every material.
+			for (int i = 0; i < _residentModel.materialObjects.Count; i++)
+			{
+				var kvp = _residentModel.materialObjects.GetAt(i);
+
+				if (!_residentModel.MaterialPbr.TryGetValue(kvp.Key, out var pbr))
+				{
+					pbr = new MaterialPbrFactors
+					{
+						BaseColorFactor = Vector4.One,
+						MetallicFactor = 0f,
+						RoughnessFactor = 0.6f,
+						HasBaseColorTexture = false,
+						Ior = 1.5f,
+						VolumeAttenuation = new Vector4(1f, 1f, 1f, 0f),
+						NormalScale = 1f,
+						OcclusionStrength = 1f,
+						SpecularColorFactor = Vector4.One
+					};
+				}
+
+				data.Metallic = pbr.MetallicFactor;
+				data.Roughness = pbr.RoughnessFactor;
+				data.BaseColor = pbr.BaseColorFactor;
+				data.HasBaseColorTexture = pbr.HasBaseColorTexture ? 1 : 0;
+				data.AlphaCutoff = pbr.AlphaCutoff;
+				data.HasMetallicRoughnessTexture = pbr.HasMetallicRoughnessTexture ? 1 : 0;
+				data.Transmission = pbr.TransmissionFactor;
+				data.Dispersion = pbr.Dispersion;
+				data.Ior = pbr.Ior;
+				data.VolumeAttenuation = pbr.VolumeAttenuation;
+				data.ThicknessWorld = pbr.ThicknessWorld;
+				data.FeatureFlags = (int)_featureFlags;
+				data.NormalScale = pbr.NormalScale;
+				data.OcclusionStrength = pbr.OcclusionStrength;
+				data.UvOffset = pbr.UvOffset;
+				data.UvTransform = pbr.UvTransform;
+				data.UvHasTransform = pbr.HasUvTransform ? 1 : 0;
+				data.OcclusionUvSet = pbr.OcclusionUvSet;
+				data.SheenColorRoughness = pbr.SheenColorRoughness;
+				data.SpecularColorFactor = pbr.SpecularColorFactor;
+
+				kvp.Value.SetConstant("PreviewSettings", ref data, HandleAccess.Pixel);
 			}
 		}
 
@@ -366,6 +658,11 @@ namespace DecaEngine.Editor
 					_env.DilApi.ImmediateContext.WaitForIdle();
 					_env.Pipeline.InvalidateGraph();
 
+					// AO/GI world-range (см. FrameAll) - только теперь, после барьера выше, той же
+					// причине, что и в PollPendingLoad.
+					_env.SetAoWorldRange(_framedRadius * ModelViewportEnvironment.AoRangeOfBoundsRadius);
+					_env.SetGiWorldRange(_framedRadius * ModelViewportEnvironment.GiRangeOfBoundsRadius);
+
 					_loadedPath = modelPath;
 					_loadedSubMesh = subMeshIndex;
 					_loadError = null;
@@ -397,7 +694,8 @@ namespace DecaEngine.Editor
 					VertexShader = _editorSettings.DefaultVertexShader,
 					PixelShader = _editorSettings.DefaultPixelShader,
 					OptimizeMesh = false,
-					GenerateLods = false
+					GenerateLods = false,
+					AnisotropicFiltering = _editorSettings.PreviewAnisotropicFiltering
 				}, cancellationToken: cts.Token);
 				_loadCts = cts;
 				_loadingPath = modelPath;
@@ -454,25 +752,50 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			var request = _loadRequest;
-			var modelPath = _loadingPath!;
-			var subMeshIndex = _loadingSubMesh;
-			EditorLoadingStatus.End(_loadHandle);
-			_loadHandle = null;
-			_loadRequest = null;
-			_loadingPath = null;
-			_loadingSubMesh = -1;
-			_loadCts?.Dispose();
-			_loadCts = null;
-
-			if (request.PrepareTask.IsCompletedSuccessfully)
+			if (_loadRequest.PrepareTask.IsCompletedSuccessfully)
 			{
+				// Покадровая финализация: заливка всех GPU-ресурсов модели одним кадром раздувает
+				// upload-хип Diligent на весь её размер (страницы возвращаются в пул только на
+				// Present) - FinalizeChunk создаёт ресурсы порциями и возвращает null, пока не
+				// закончит; состояние _loadRequest/_loadHandle живёт между кадрами. Внимание:
+				// CancelPendingLoad, вызванный между чанками (новый выбор в Asset Browser), бросит
+				// уже созданные GPU-ресурсы недостроенной модели - у ModelLoader нет Release,
+				// принимаем утечку как редкий и ограниченный случай.
+				ModelLoader scene;
+				try
+				{
+					scene = _loadRequest.FinalizeChunk();
+				}
+				catch (Exception ex)
+				{
+					var failedPath = _loadingPath!;
+					CancelPendingLoad();
+					_loadedPath = null;
+					_loadError = ex.Message;
+					EditorConsoleLog.Add(LogLevel.Error, $"Model preview: failed to load '{failedPath}': {ex.Message}");
+					return;
+				}
+
+				if (scene == null)
+				{
+					return;
+				}
+
+				var modelPath = _loadingPath!;
+				var subMeshIndex = _loadingSubMesh;
+				EditorLoadingStatus.End(_loadHandle);
+				_loadHandle = null;
+				_loadRequest = null;
+				_loadingPath = null;
+				_loadingSubMesh = -1;
+				_loadCts?.Dispose();
+				_loadCts = null;
+
 				ClearInstances();
 
 				try
 				{
 					ResetPreviewModeForNewSelection();
-					var scene = request.FinalizeOnMainThread();
 					PopulateFromScene(scene, subMeshIndex);
 
 					// New batches were just registered in _batchRenderer for this model/sub-mesh, but
@@ -490,6 +813,12 @@ namespace DecaEngine.Editor
 					_env.DilApi.ImmediateContext.WaitForIdle();
 					_env.Pipeline.InvalidateGraph();
 
+					// AO/GI world-range (см. FrameAll) - только теперь, после барьера выше: SetConstant
+					// трогает ImmediateContext и метит AoMaterial dirty (пересборка PSO на следующий
+					// draw), это небезопасно, пока предыдущий кадр ещё может быть в полёте.
+					_env.SetAoWorldRange(_framedRadius * ModelViewportEnvironment.AoRangeOfBoundsRadius);
+					_env.SetGiWorldRange(_framedRadius * ModelViewportEnvironment.GiRangeOfBoundsRadius);
+
 					_loadedPath = modelPath;
 					_loadedSubMesh = subMeshIndex;
 					_residentPath = modelPath;
@@ -505,10 +834,12 @@ namespace DecaEngine.Editor
 			}
 			else
 			{
-				var message = request.PrepareTask.Exception?.GetBaseException().Message ?? "Unknown error";
+				var message = _loadRequest.PrepareTask.Exception?.GetBaseException().Message ?? "Unknown error";
+				var failedPath = _loadingPath!;
+				CancelPendingLoad();
 				_loadedPath = null;
 				_loadError = message;
-				EditorConsoleLog.Add(LogLevel.Error, $"Model preview: failed to load '{modelPath}': {message}");
+				EditorConsoleLog.Add(LogLevel.Error, $"Model preview: failed to load '{failedPath}': {message}");
 			}
 		}
 
@@ -529,7 +860,8 @@ namespace DecaEngine.Editor
 				_meshIdMap.Clear();
 				_materialIdMap.Clear();
 				_batchCache.Clear();
-				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, modelLoader, _meshIdMap, _materialIdMap);
+				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, modelLoader, _meshIdMap, _materialIdMap,
+					_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap);
 			}
 
 			var instances = new List<InstanceData>(modelLoader.instances.Count);
@@ -607,6 +939,7 @@ namespace DecaEngine.Editor
 				_distance = 4f;
 				_yaw = -0.6f;
 				_pitch = 0.35f;
+				_framedRadius = 0f;
 				return;
 			}
 
@@ -615,6 +948,24 @@ namespace DecaEngine.Editor
 			// Half-diagonal of the (mesh-bounds-based, see PopulateFromScene) AABB, used as a
 			// bounding-sphere radius around _orbitTarget - simple and good enough for auto-framing.
 			var radius = MathF.Max(0.05f, (max - min).Length() * 0.5f);
+
+			// Те же баунды питают ортокамеру мирового света (см.
+			// SimpleCullingAndRenderSystem.BuildLightData) - тени пересчитаются со следующего кадра.
+			if (_env.ShadowSettings != null)
+			{
+				_env.ShadowSettings.BoundsCenter = _orbitTarget;
+				_env.ShadowSettings.BoundsRadius = radius;
+			}
+
+			// Радиус AO в мировых единицах от габаритов модели (см. SsaoPassResources.SetWorldRange):
+			// с экранным радиусом контактная тень под нависающей геометрией (корона ферзя и т.п.)
+			// схлопывалась при приближении камеры - нависание выпадало из радиуса поиска. НЕ пушим
+			// его отсюда - FrameAll выполняется из PopulateFromScene ДО Flush()+WaitForIdle() в
+			// PollPendingLoad, а SetConstant трогает GPU-буфер и помечает AoMaterial dirty (следующий
+			// draw пересоберёт его PSO) на ImmediateContext, которым в этот момент может ещё
+			// пользоваться предыдущий, ещё не дождавшийся кадр - гонка с рендером основной сцены (см.
+			// PollPendingLoad, который пушит его сам, уже после барьера).
+			_framedRadius = radius;
 
 			// Distance at which a sphere of this radius exactly fills the vertical FOV, plus a
 			// small margin so the model isn't touching the viewport edges.
@@ -631,6 +982,12 @@ namespace DecaEngine.Editor
 		/// </summary>
 		public void Update(float deltaTime, float time)
 		{
+			if (_pendingEnvironmentRecreate)
+			{
+				_pendingEnvironmentRecreate = false;
+				RecreateEnvironment();
+			}
+
 			PollPendingLoad();
 
 			if (!HasModel)
@@ -668,6 +1025,8 @@ namespace DecaEngine.Editor
 		/// </summary>
 		public void Render(ImGuiRender imGuiRender, Vector2 size)
 		{
+			_lastImGuiRender = imGuiRender;
+
 			if (size.X <= 1f || size.Y <= 1f)
 			{
 				return;
@@ -691,6 +1050,20 @@ namespace DecaEngine.Editor
 			}
 
 			var cursor = ImGui.GetCursorScreenPos();
+
+			// Вертикальный градиент-подложка в духе glTF Sample Viewer: сам оффскрин-таргет
+			// очищается с alpha 0 (см. ModelViewportEnvironment), так что фон картинки прозрачен и
+			// ImGui-блендинг кладёт модель поверх этого прямоугольника. Цвета - строго нейтральные
+			// (R=G=B): тонированные значения здесь выходили на экран с перекошенным оттенком
+			// (тёплый низ вместо холодного - похоже на R/B-swap в цветовом пути ImGui-бэкенда),
+			// а нейтральному серому перестановка каналов безразлична. Должны совпадать с backdrop
+			// в UnlitInstancedPS.hlsl (просвет стекла) и PreviewProbe.CompositeOverBackdrop.
+			var backdropDrawList = ImGui.GetWindowDrawList();
+			uint backdropTop = ImGui.GetColorU32(new Vector4(0.55f, 0.55f, 0.55f, 1f));
+			uint backdropBottom = ImGui.GetColorU32(new Vector4(0.26f, 0.26f, 0.26f, 1f));
+			backdropDrawList.AddRectFilledMultiColor(cursor, cursor + size,
+				backdropTop, backdropTop, backdropBottom, backdropBottom);
+
 			ImGui.Image(_textureRef, size);
 
 			bool hovered = ImGui.IsItemHovered();
@@ -767,6 +1140,23 @@ namespace DecaEngine.Editor
 
 			_env.ColorTarget.Resize(newSize);
 			_env.DepthTarget.Resize(newSize);
+
+			// Снимок сцены обязан совпадать по размеру с ColorTarget (CopyTexture копирует 1:1), а
+			// после Resize это уже ДРУГАЯ нативная текстура - резидентным материалам нужно перепривязать
+			// _SceneColor, иначе они продолжат сэмплировать уничтоженную (см. RegisterModelResources).
+			_env.SceneCopyTarget.Resize(newSize);
+			_env.MsaaColorTarget?.Resize(newSize);
+			_env.MsaaDepthTarget?.Resize(newSize);
+			_env.AoTarget?.Resize(newSize);
+			_env.GiTarget?.Resize(newSize);
+			_env.RebindPostProcessTargets();
+			if (_residentModel != null)
+			{
+				foreach (var material in _residentModel.materialObjects.Values)
+				{
+					material.SetTexture("_SceneColor", _env.SceneCopyTarget);
+				}
+			}
 
 			// Must happen immediately after Resize(), before any code below that could throw (e.g.
 			// GetComponent/RecalculateProjection) - Resize() already disposed the old GPU

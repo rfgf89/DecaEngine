@@ -1,6 +1,5 @@
 using System.Numerics;
 using DecaEngine.Graphics.Core;
-using Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
 
@@ -8,10 +7,18 @@ namespace DecaEngine.Core;
 
 public interface ICommandBuffer
 {
-	void TransitionResource(ISamplerObject buffer, ResourceState newState);
 	void TransitionResource(IBufferHandle buffer, ResourceState newState);
 	void TransitionResource(IGpuTexture texture, ResourceState newState);
-	void TransitionResource(IGpuTexture texture, ResourceState newState, uint slice);
+
+	/// <summary>Полная копия текстуры (все мипы/слои, форматы должны совпадать) - например, снятие
+	/// сэмплируемой копии color-таргета между opaque- и transmissive-дроу для рефракции (см.
+	/// <see cref="ForwardPass"/>). Переходы состояний src→CopySource / dst→CopyDest берёт на себя.</summary>
+	void CopyTexture(IGpuTexture src, IGpuTexture dst);
+
+	/// <summary>Резолв MSAA-таргета в одиночный (усреднение сэмплов) - завершение MSAA-кадра
+	/// превью (см. <see cref="ForwardPass"/>). Форматы должны совпадать; переходы состояний
+	/// берёт на себя.</summary>
+	void ResolveTexture(IGpuTexture src, IGpuTexture dst);
 
 	void SetBackBufferTarget(IGraphicsApi api);
 	void SetRenderTarget(IGpuTexture rtv, IGpuTexture dsv, uint rtvSlice = 0, uint dsvSlice = 0);
@@ -19,8 +26,6 @@ public interface ICommandBuffer
 	void ClearDepthStencil(IGpuTexture dsv, ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0);
 
 	void ClearBackBufferTarget(IGraphicsApi api, Vector4 clearColor);
-	void ClearRenderTarget(ITextureView rtv, Vector4 color);
-	void ClearDepthStencil(ITextureView dsv, ClearDepthStencilFlags flags, float depth, byte stencil);
 
 	void SetVertexBuffers(uint startSlot, IBufferHandle[] buffers, ulong[] offsets, SetVertexBuffersFlags flags = SetVertexBuffersFlags.None);
 	void SetIndexBuffer(IBufferHandle buffer, ulong byteOffset = 0);

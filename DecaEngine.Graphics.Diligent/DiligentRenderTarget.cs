@@ -62,9 +62,12 @@ namespace DecaEngine.Graphics.Diligent
 				Height = _info.height,
 				ArraySizeOrDepth = _info.arraySize,
 				Format = dilFormat,
+				// ShaderResource остаётся и у MSAA-таргетов: депт читается SSAO-пассом через
+				// Texture2DMS.Load (см. SsaoMsaaPS.hlsl).
 				BindFlags = bindFlags,
 				Usage = Usage.Default,
 				MipLevels = 1,
+				SampleCount = Math.Max(1, _info.sampleCount),
 			};
 
 			_texture = _device.CreateTexture(desc);

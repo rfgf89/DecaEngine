@@ -18,7 +18,7 @@ namespace DecaEngine.Editor;
 
 public enum WindowType
 {
-	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView
+	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView, Settings
 }
 
 public class EditorManager : TimeLoopCore
@@ -70,7 +70,7 @@ public class EditorManager : TimeLoopCore
 		{
 			setupInfo.contextCount = 4;
 			if (setupInfo.backend == GraphicsBackend.D3D12) { setupInfo.dynamicHeapPageSize = 26 << 20; }
-			else if (setupInfo.backend == GraphicsBackend.Vulkan) { setupInfo.dynamicHeapSize = 26 << 20; }
+			else if (setupInfo.backend == GraphicsBackend.Vulkan) { setupInfo.dynamicHeapSize = 500000 << 20; }
 		};
 		
 		this.Run();
@@ -84,7 +84,7 @@ public class EditorManager : TimeLoopCore
 		{
 			_windowHandle.Initialize("DecaEngine Editor", 0, new Vector2(1920, 1080));
 			_windowHandle.LoadAndSetIcon(Path.Combine(Environment.CurrentDirectory, "EditorAssets/Icons", "download (6).jpg"));
-			_graphicsApi.Initialize(GraphicsBackend.D3D12);
+			_graphicsApi.Initialize(GraphicsBackend.Vulkan);
 
 			_imGuiManager.Initialize();
 
@@ -147,10 +147,21 @@ public class EditorManager : TimeLoopCore
 		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache);
 		var inspectorWindow = new InspectorWindow("Inspector", _modelPreviewViewport, _imGuiManager.ImGuiRender);
 		inspectorWindow.Show();
+
+		// ВРЕМЕННО: DECA_AUTOLOAD_MODEL=<путь> грузит модель в превью сразу при старте - для
+		// автоматизированного репро багов загрузки/AO без ручных кликов по Asset Browser-у.
+		var autoLoadModel = Environment.GetEnvironmentVariable("DECA_AUTOLOAD_MODEL");
+		if (!string.IsNullOrEmpty(autoLoadModel))
+		{
+			_modelPreviewViewport.LoadModel(autoLoadModel);
+		}
 		_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.SceneView, () => new SceneViewWindow("Scene View", inspectorWindow, _imGuiManager.ImGuiRender));
 		new SceneViewWindow("Scene View", inspectorWindow, _imGuiManager.ImGuiRender).Show();
 		new HierarchyWindow("Hierarchy", _imGuiManager.ImGuiRender).Show();
 			new ConsoleWindow("Console", _imGuiManager.ImGuiRender).Show();
+
+			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Settings,
+				() => new SettingsWindow("Settings", _editorSettings, _imGuiManager.ImGuiRender));
 			new AssetBrowserWindow("Asset Browser", _projectSession, inspectorWindow, _modelIconCache, _modelIconBaker, _imGuiManager.ImGuiRender).Show();
 			projectWindow.Show();
 			//_debugWindow = new DebugWindow("Debug", _ecsWorld, _batchRenderer, _imGuiManager.ImGuiRender);
@@ -193,11 +204,18 @@ public class EditorManager : TimeLoopCore
 			return;
 		}
 
-		EditorLoadingStatus.End(_defaultSceneLoadHandle);
-
 		if (_defaultSceneLoadRequest.PrepareTask.IsCompletedSuccessfully)
 		{
-			_modelLoader = _defaultSceneLoadRequest.FinalizeOnMainThread();
+			// Покадровая финализация: страницы upload-хипа Diligent возвращает только на Present,
+			// так что заливка всей сцены одним кадром раздувала host-visible память до 2.5+ GB
+			// («upload heap peak frame size»). null = бюджет кадра исчерпан, продолжим на следующем.
+			var loader = _defaultSceneLoadRequest.FinalizeChunk();
+			if (loader == null)
+			{
+				return;
+			}
+
+			_modelLoader = loader;
 			CreateTestSceneEntities();
 		}
 		else
@@ -206,11 +224,26 @@ public class EditorManager : TimeLoopCore
 				$"Failed to load default scene: {_defaultSceneLoadRequest.PrepareTask.Exception?.GetBaseException().Message}");
 		}
 
+		EditorLoadingStatus.End(_defaultSceneLoadHandle);
 		_defaultSceneLoadRequest = null;
 	}
 
 	private void CreateTestSceneEntities()
 	{
+		// UnlitInstancedPS статически использует PreviewSettings и _EnvMap, поэтому дескрипторы
+		// обязаны быть привязаны и у материалов главной сцены (иначе Vulkan-валидация:
+		// VUID-vkCmdDrawIndexedIndirect-None-08114 "has never been updated", а на части драйверов -
+		// чтение мусора). Zero-init PreviewSettings = Textured-режим, в нём _EnvMap не читается,
+		// но дескриптор всё равно должен указывать на живую текстуру.
+		var environment = PreviewEnvironmentMap.Create(_graphicsApi);
+		var environmentSampler = _graphicsApi.CreateSampler(
+			name: "_EnvMap_Sampler",
+			filter: TextureFilter.Linear,
+			address: TextureAddress.Wrap,
+			comparisonFunction: CompFunction.Always,
+			border: Vector4.Zero);
+		var previewDefaults = new PreviewSettingsData();
+
 		var baseMaterialState = _batchRenderer.GetBaseState();
 		var materialIdMap = new Dictionary<int, MaterialId>();
 		for (int i = 0; i < _modelLoader.materialObjects.Count; i++)
@@ -221,6 +254,10 @@ public class EditorManager : TimeLoopCore
 
 			var matId = _batchRenderer.Register(materialObj);
 			materialIdMap.Add(kvp.Key, matId);
+
+			materialObj.SetConstant("PreviewSettings", ref previewDefaults, HandleAccess.Pixel);
+			materialObj.SetTexture("_EnvMap", environment.Texture);
+			materialObj.SetImmutableSampler("_EnvMap", environmentSampler);
 		}
 
 		var meshIdMap = new Dictionary<int, MeshId>();
@@ -287,6 +324,15 @@ public class EditorManager : TimeLoopCore
 		{
 			Quit();
 		}
+
+		/*if (_windowHandle.IsMinimized)
+		{
+			// The DXGI/D3D12 swap chain's frame-latency waitable object never gets signaled while
+			// the window is minimized (DWM stops presenting it), so calling Present() here spams
+			// "Timeout elapsed while waiting for the frame waitable object" until the window returns.
+			Thread.Sleep(50);
+			return;
+		}*/
 
 		StyleEditorManager.SetDarkThemeColors(_windowHandle.GetScale() * _imGuiManager.ImGuiRender.UiScaleMultiplier);
 

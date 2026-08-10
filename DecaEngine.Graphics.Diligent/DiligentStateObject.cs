@@ -62,7 +62,8 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 				PrimitiveTopology = ToNativeTopology(info.PrimitiveTopology),
 				RasterizerDesc = ToNativeRasterizerDesc(info.RasterizerState),
 				DepthStencilDesc = ToNativeDepthStencilDesc(info.DepthStencilState),
-				InputLayout = ToNativeInputLayout(info.InputLayout)
+				InputLayout = ToNativeInputLayout(info.InputLayout),
+				SmplDesc = new SampleDesc { Count = (byte)Math.Max(1, info.SampleCount), Quality = 0 },
 			}
 		};
 	}

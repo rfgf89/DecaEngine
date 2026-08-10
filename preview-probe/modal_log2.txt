@@ -1,0 +1,4 @@
+Assemblies loaded: 148, duration: 8 ms, engine-dependants: [Friflo.Engine.ECS (9),  DecaEngine.Core (1),  DecaEngine.Graphics.Core (0),  DecaEngine.Editor (9)]
+[modal] OpenPopup('New Project') issued, IsPopupOpen=True
+[modal] 'New Project' BeginPopupModal=True, shown=True, IsPopupOpen=False
+[modal] 'New Project' BeginPopupModal=False, shown=False, IsPopupOpen=False

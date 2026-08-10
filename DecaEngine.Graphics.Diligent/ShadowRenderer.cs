@@ -6,6 +6,9 @@ using DecaEngine.Core;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
+using ClearDepthStencilFlags = DecaEngine.Core.ClearDepthStencilFlags;
+using ResourceState = DecaEngine.Core.ResourceState;
+using SetVertexBuffersFlags = DecaEngine.Core.SetVertexBuffersFlags;
 using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent
@@ -105,7 +108,7 @@ namespace DecaEngine.Graphics.Diligent
 			cmd.TransitionResource(cullResult.FinallyInstancesBuffer, ResourceState.VertexBuffer);
 			cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);
 			cmd.TransitionResource(cullResult.IndirectArgsBuffers, ResourceState.IndirectArgument);
-			
+
 			cmd.SetRenderTarget(null, _shadowMaps, 0, cascadeIndex);
 			cmd.SetViewport(ShadowMapSize, ShadowMapSize);
 			// Clear depth to 0.0 for reversed-Z
@@ -125,7 +128,9 @@ namespace DecaEngine.Graphics.Diligent
 
 			cmd.DrawIndexedIndirect(cullResult.IndirectArgsBuffers, drawRange, IndexType.UInt32);
 
-			cmd.TransitionResource(_shadowMaps, ResourceState.ShaderResource);
+			// DepthRead, а не общий ShaderResource: SRV депт-текстуры на Vulkan биндится с лейаутом
+			// DEPTH_STENCIL_READ_ONLY_OPTIMAL (VUID-VkDescriptorImageInfo-imageLayout-00344).
+			cmd.TransitionResource(_shadowMaps, ResourceState.DepthRead);
 		}
 
 		private GraphicsStateInfo GetBaseState()
@@ -153,9 +158,11 @@ namespace DecaEngine.Graphics.Diligent
 					// Unused by ShadowVS.hlsl (it only reads position), but must still be declared: this
 					// PSO reads from the same mega vertex buffer as DiligentBatchRenderer's (see
 					// GetBaseState there), and Diligent auto-computes each buffer slot's stride from its
-					// declared layout elements - omitting Tangent here would under-report slot 0's true
-					// per-vertex stride and misalign every vertex after the first.
-					new InputLayoutElementInfo { InputIndex = 4, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					// declared layout elements - omitting Tangent/Color here would under-report slot 0's
+					// true per-vertex stride and misalign every vertex after the first.
+					new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
+					new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo
 					{
 						InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32,

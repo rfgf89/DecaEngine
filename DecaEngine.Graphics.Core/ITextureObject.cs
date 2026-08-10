@@ -17,6 +17,11 @@ namespace DecaEngine.Graphics.Core
 		public TextureObjectFormat format;
 		public HandleAccess access;
 		public bool dynamic;
+
+		/// <summary>MSAA sample count (0/1 = без мультисемплинга). Мультисемпловый таргет нельзя
+		/// сэмплировать обычным шейдером - перед использованием он резолвится в одиночный
+		/// (см. ICommandBuffer.ResolveTexture).</summary>
+		public uint sampleCount;
 	}
 
 	public enum TextureType : int
@@ -59,6 +64,12 @@ namespace DecaEngine.Graphics.Core
 		public byte[] DecodedPixels { get; set; }
 		public int DecodedWidth { get; set; }
 		public int DecodedHeight { get; set; }
+
+		/// <summary>Сгенерировать полную мип-цепочку на GPU при создании (см.
+		/// DiligentGraphicsApi.CreateTexture). Без мипов любая минификация (доска под острым
+		/// углом) шумит и мылится, а анизотропная фильтрация не работает вовсе. 1x1-филлеры
+		/// пропускаются автоматически.</summary>
+		public bool GenerateMips { get; set; } = true;
 	}
 
 	public interface IGpuTexture : IReleaseObject

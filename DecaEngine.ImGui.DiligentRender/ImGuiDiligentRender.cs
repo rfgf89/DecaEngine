@@ -7,6 +7,8 @@ using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 using Hexa.NET.ImGui;
+// Рендерит через нативный контекст напрямую, а не через ICommandBuffer - флаги Diligent-овские.
+using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using TextureFormat = Diligent.TextureFormat;
 using ValueType = Diligent.ValueType;
 

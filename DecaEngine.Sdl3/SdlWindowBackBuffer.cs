@@ -22,6 +22,8 @@ public class SdlWindowHandle : IWindowHandle
 
 	public event Action OnWindowResize;
 
+	public bool IsMinimized { get; set; }
+
 	public unsafe SDL_Window* Window { get; private set; }
 
 	public unsafe void Initialize(string title, int vsync, Vector2 size)

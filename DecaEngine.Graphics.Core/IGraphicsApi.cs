@@ -1,4 +1,5 @@
 ﻿using System.Numerics;
+using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
@@ -81,6 +82,12 @@ public interface IGraphicsApi : IReleaseObject
 	public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type);
 	public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type, string entryPoint);
 
+	/// <summary>Вариант шейдера с ключевыми словами (shader keywords): каждый ключ уходит в
+	/// компиляцию макросом со значением 1, шейдер вырезает выключенные эффекты через #if - в
+	/// отличие от рантайм-веток по cbuffer-флагам, выключенный эффект не стоит ни регистров, ни
+	/// привязок. Кэширование вариантов - на совести вызывающего (см. ModelLoader).</summary>
+	public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type, string entryPoint, IReadOnlyList<string> keywords);
+
 	/// <summary>
 	/// Создает abstract Graphics Pipeline State (<see cref="PipelineStateType.Graphics"/>) из
 	/// backend-независимого описания <see cref="GraphicsStateInfo"/>. Конкретный backend
@@ -95,6 +102,15 @@ public interface IGraphicsApi : IReleaseObject
 	public IStateObject CreateComputeState(ComputeStateInfo info);
 
 	public IGpuTexture CreateTexture(CpuTextureData data);
+
+	/// <summary>Immutable 2D-текстура с ЯВНОЙ мип-цепочкой: mipPixels[0] - базовый уровень
+	/// width x height, каждый следующий вдвое меньше (min 1). Нужна там, где мипы несут смысловую
+	/// нагрузку, а не просто уменьшение - например, префильтрованный по roughness энвайронмент
+	/// превью (см. PreviewEnvironmentMap): SampleLevel(mip = f(roughness)).
+	/// floatFormat = true - RGBA16Float (байты - little-endian half4 на пиксель, stride w*8) для
+	/// HDR-содержимого; false - RGBA8 (stride w*4).</summary>
+	public IGpuTexture CreateTexture2DWithMips(string name, IReadOnlyList<byte[]> mipPixels, int width, int height, bool floatFormat = false);
+
 	public IRenderTarget CreateRenderTarget(TextureInfo info);
 
 	/// <summary>Creates a new, backend-specific <see cref="ICommandBuffer"/> ready for recording.</summary>

@@ -5,9 +5,13 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
 using DecaEngine.Graphics.Core;
+using DecaEngine.Graphics.Diligent;
 using Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
+using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
+using ResourceState = Diligent.ResourceState;
+using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent.RenderGraph
@@ -34,7 +38,9 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             DispatchCompute,
             TransitionResource,
             UpdateBuffer,
-            ClearBackBufferTarget
+            ClearBackBufferTarget,
+            CopyTexture,
+            ResolveTexture
         }
 
         private const int MaxVertexBuffers = 4;
@@ -143,47 +149,59 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             }
         }
 
-        public void TransitionResource(ISamplerObject buffer, ResourceState newState)
+        public void TransitionResource(IBufferHandle buffer, DecaEngine.Core.ResourceState newState)
         {
-            var res = ((DiligentSamplerObject)buffer).Sampler;
-            AddTransitionInternal(res, newState, true);
-            if (!_isRecording) return;
-            ref var cmd = ref NextCommand(CommandType.TransitionResource);
-            cmd.Obj1 = res;
-            cmd.U1 = (uint)newState;
-        }
-
-        public void TransitionResource(IBufferHandle buffer, ResourceState newState)
-        {
+            var nativeState = newState.ToNative();
             var res = ((DiligentBufferHandle)buffer).Buffer;
-            AddTransitionInternal(res, newState, true);
+            AddTransitionInternal(res, nativeState, true);
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.TransitionResource);
-            cmd.Obj1 = res; cmd.U1 = (uint)newState;
+            cmd.Obj1 = res; cmd.U1 = (uint)nativeState;
         }
 
-        public void TransitionResource(IGpuTexture texture, ResourceState newState)
+        public void TransitionResource(IGpuTexture texture, DecaEngine.Core.ResourceState newState)
         {
+            var nativeState = newState.ToNative();
             IDeviceObject res = GetNativeTexture(texture);
-            AddTransitionInternal(res, newState, true);
+            AddTransitionInternal(res, nativeState, true);
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.TransitionResource);
-            cmd.Obj1 = res; cmd.U1 = (uint)newState;
+            cmd.Obj1 = res; cmd.U1 = (uint)nativeState;
         }
-        
-        public void TransitionResource(IGpuTexture texture, ResourceState newState, uint slice)
+
+        public void CopyTexture(IGpuTexture src, IGpuTexture dst)
         {
-            var view = GetTextureView(texture, TextureViewType.ShaderResource, slice);
-            AddTransitionInternal(view, newState, true);
+            ITexture srcTex = GetNativeTexture(src);
+            ITexture dstTex = GetNativeTexture(dst);
+
+            // Не-explicit транзишены: при записи они лягут в буфер ПЕРЕД командой копии и при
+            // реплее пройдут через state tracker, как у SetRenderTarget.
+            AddTransitionInternal(srcTex, ResourceState.CopySource);
+            AddTransitionInternal(dstTex, ResourceState.CopyDest);
+
             if (!_isRecording) return;
-            ref var cmd = ref NextCommand(CommandType.TransitionResource);
-            cmd.Obj1 = view; cmd.U1 = (uint)newState;
+            ref var cmd = ref NextCommand(CommandType.CopyTexture);
+            cmd.Obj1 = srcTex; cmd.Obj2 = dstTex;
+        }
+
+        public void ResolveTexture(IGpuTexture src, IGpuTexture dst)
+        {
+            ITexture srcTex = GetNativeTexture(src);
+            ITexture dstTex = GetNativeTexture(dst);
+
+            AddTransitionInternal(srcTex, ResourceState.ResolveSource);
+            AddTransitionInternal(dstTex, ResourceState.ResolveDest);
+
+            if (!_isRecording) return;
+            ref var cmd = ref NextCommand(CommandType.ResolveTexture);
+            cmd.Obj1 = srcTex; cmd.Obj2 = dstTex;
         }
 
         private ITexture GetNativeTexture(IGpuTexture texture)
         {
             if (texture is DiligentGpuTexture dilTex) return dilTex.Texture;
             if (texture is DiligentRenderTarget dilRT) return dilRT.Texture;
+            if (texture is DiligentRenderHandle dilHandle) return dilHandle.Texture;
             return null;
         }
 
@@ -191,6 +209,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         {
             if (texture is DiligentGpuTexture dilTex) return dilTex.GetView(type, slice);
             if (texture is DiligentRenderTarget dilRT) return dilRT.GetView(type, slice);
+            if (texture is DiligentRenderHandle dilHandle) return dilHandle.GetView(type, slice);
             return null;
         }
 
@@ -230,32 +249,16 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             cmd.Obj1 = rtvView; cmd.Vec = color;
         }
 
-        public void ClearDepthStencil(IGpuTexture dsv, ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0)
+        public void ClearDepthStencil(IGpuTexture dsv, DecaEngine.Core.ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0)
         {
             var dsvView = GetTextureView(dsv, TextureViewType.DepthStencil, slice);
             AddTransitionInternal(dsvView?.GetTexture(), ResourceState.DepthWrite);
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.ClearDepthStencil);
-            cmd.Obj1 = dsvView; cmd.U1 = (uint)flags; cmd.F1 = depth; cmd.U2 = stencil;
+            cmd.Obj1 = dsvView; cmd.U1 = (uint)flags.ToNative(); cmd.F1 = depth; cmd.U2 = stencil;
         }
 
-        public void ClearRenderTarget(ITextureView rtv, Vector4 color)
-        {
-            AddTransitionInternal(rtv?.GetTexture(), ResourceState.RenderTarget);
-            if (!_isRecording) return;
-            ref var cmd = ref NextCommand(CommandType.ClearRenderTarget);
-            cmd.Obj1 = rtv; cmd.Vec = color;
-        }
-
-        public void ClearDepthStencil(ITextureView dsv, ClearDepthStencilFlags flags, float depth, byte stencil)
-        {
-            AddTransitionInternal(dsv?.GetTexture(), ResourceState.DepthWrite);
-            if (!_isRecording) return;
-            ref var cmd = ref NextCommand(CommandType.ClearDepthStencil);
-            cmd.Obj1 = dsv; cmd.U1 = (uint)flags; cmd.F1 = depth; cmd.U2 = stencil;
-        }
-
-        public void SetVertexBuffers(uint startSlot, IBufferHandle[] bufferHandles, ulong[] offsets, SetVertexBuffersFlags flags = SetVertexBuffersFlags.None)
+        public void SetVertexBuffers(uint startSlot, IBufferHandle[] bufferHandles, ulong[] offsets, DecaEngine.Core.SetVertexBuffersFlags flags = DecaEngine.Core.SetVertexBuffersFlags.None)
         {
             IBuffer[] buffersForCmd = null;
             if (_isRecording)
@@ -274,9 +277,9 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
 
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.SetVertexBuffers);
-            cmd.U1 = startSlot; 
-            cmd.Obj1 = buffersForCmd; 
-            cmd.U2 = (uint)flags;
+            cmd.U1 = startSlot;
+            cmd.Obj1 = buffersForCmd;
+            cmd.U2 = (uint)flags.ToNative();
             cmd.U3 = (uint)count;
             
             for (int i = 0; i < count; i++)
@@ -390,6 +393,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             AddTransitionInternal(res, ResourceState.CopyDest);
             if (!_isRecording)
             {
+                DiligentGraphicsUtility.LogLargeUpload(res, size, "CommandBuffer.UpdateBuffer");
                 _context.UpdateBuffer(res, offset, size, data, ResourceStateTransitionMode.None);
                 return;
             }
@@ -480,6 +484,23 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                     case CommandType.ClearRenderTarget:
                         _context.ClearRenderTarget((ITextureView)cmd.Obj1, cmd.Vec, ResourceStateTransitionMode.None);
                         break;
+                    case CommandType.CopyTexture:
+                        _context.CopyTexture(new CopyTextureAttribs
+                        {
+                            SrcTexture = (ITexture)cmd.Obj1,
+                            SrcTextureTransitionMode = ResourceStateTransitionMode.None,
+                            DstTexture = (ITexture)cmd.Obj2,
+                            DstTextureTransitionMode = ResourceStateTransitionMode.None,
+                        });
+                        break;
+                    case CommandType.ResolveTexture:
+                        _context.ResolveTextureSubresource((ITexture)cmd.Obj1, (ITexture)cmd.Obj2,
+                            new ResolveTextureSubresourceAttribs
+                            {
+                                SrcTextureTransitionMode = ResourceStateTransitionMode.None,
+                                DstTextureTransitionMode = ResourceStateTransitionMode.None,
+                            });
+                        break;
                     case CommandType.ClearDepthStencil:
                         _context.ClearDepthStencil((ITextureView)cmd.Obj1, (ClearDepthStencilFlags)cmd.U1, cmd.F1, (byte)cmd.U2, ResourceStateTransitionMode.None);
                         break;
@@ -553,6 +574,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                         break;
                     case CommandType.UpdateBuffer:
                         {
+                            DiligentGraphicsUtility.LogLargeUpload((IBuffer)cmd.Obj1, cmd.U2, "CommandBuffer.Replay");
                             _context.UpdateBuffer(
                                 (IBuffer)cmd.Obj1,
                                 cmd.U1,

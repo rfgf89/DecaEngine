@@ -3,6 +3,10 @@ using System.Runtime.CompilerServices;
 using DecaEngine;
 using DecaEngine.Core;
 using Diligent;
+// Сэмпл работает с нативным контекстом напрямую - состояния Diligent-овские, не из ICommandBuffer.
+using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
+using ResourceState = Diligent.ResourceState;
+using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using ValueType = Diligent.ValueType;
 
 namespace DiligentEngineNET.Samples;

@@ -6,11 +6,25 @@ using System.Runtime.InteropServices;
 using DecaEngine.Core;
 using Diligent;
 using UnsafeCollections.Collections.Unsafe;
+// Прямая работа с нативным контекстом - состояния здесь Diligent-овские, не из ICommandBuffer.
+using ResourceState = Diligent.ResourceState;
 
 namespace DecaEngine.Graphics.Diligent;
 
 public static unsafe class DiligentGraphicsUtility
 {
+	// Временная диагностика (DECA_UPLOAD_DEBUG=1): лог крупных UpdateBuffer-аплоадов - на D3D12
+	// каждый такой вызов берёт staging из динамического хипа контекста, и повторяющийся большой
+	// аплоад каждый кадр раздувает хип (симптом: "Created dynamic memory page" каждый кадр).
+	private static readonly bool UploadDebugEnabled = Environment.GetEnvironmentVariable("DECA_UPLOAD_DEBUG") == "1";
+	private const uint UploadDebugThreshold = 1u * 1024 * 1024;
+
+	public static void LogLargeUpload(IBuffer buffer, uint size, string origin)
+	{
+		if (!UploadDebugEnabled || size < UploadDebugThreshold || buffer == null) return;
+		Console.WriteLine($"[upload-debug] {origin}: '{buffer.GetDesc().Name}' {size / (1024.0 * 1024.0):F1} MB");
+	}
+
 	public static ShaderType AccessToShaderType(HandleAccess access)
 	{
 		ShaderType shaderType = ShaderType.Unknown;
@@ -58,6 +72,7 @@ public static unsafe class DiligentGraphicsUtility
 			uint size = (uint)(UnsafeArray.GetLength(array) * Unsafe.SizeOf<T>());
 			if (size > 0)
 			{
+				LogLargeUpload(buffer, size, "UploadBufferExt(UnsafeArray)");
 				ctx.UpdateBuffer(buffer, 0, size, new IntPtr(UnsafeArray.GetPtr<T>(array, 0)),
 					ResourceStateTransitionMode.Transition);
 			}
@@ -85,6 +100,7 @@ public static unsafe class DiligentGraphicsUtility
 			uint size = (uint)(UnsafeList.GetCount(list) * Unsafe.SizeOf<T>());
 			if (size > 0)
 			{
+				LogLargeUpload(buffer, size, "UploadBufferExt(UnsafeList)");
 				ctx.UpdateBuffer(buffer, 0, size, new IntPtr(UnsafeList.GetPtr<T>(list, 0)), ResourceStateTransitionMode.Transition);
 			}
 			return;
@@ -122,6 +138,7 @@ public static unsafe class DiligentGraphicsUtility
 
 		if ((buffer.GetDesc().BindFlags & BindFlags.UniformBuffer) == 0 || buffer.GetDesc().Usage != Usage.Dynamic)
 		{
+			LogLargeUpload(buffer, (uint)(value.Length * Unsafe.SizeOf<T>()), "UploadBufferExt(T[])");
 			fixed (T* ptr = value)
 			{
 				ctx.UpdateBuffer(buffer, 0, (uint)(value.Length * Unsafe.SizeOf<T>()), new IntPtr(ptr), ResourceStateTransitionMode.Transition);

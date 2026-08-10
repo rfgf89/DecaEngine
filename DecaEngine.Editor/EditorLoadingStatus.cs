@@ -90,7 +90,14 @@ namespace DecaEngine.Editor
 			// кадр - поэтому ImGui не считает её "новым" окном при повторном появлении и не поднимает
 			// её в топ z-порядка сама. Без явного фокуса любой клик по докнутым окнам редактора поднимал
 			// их группу выше, и бар пропадал за основным UI.
-			ImGui.SetNextWindowFocus();
+			//
+			// НО: при ОТКРЫТОМ попапе фокус красть нельзя - ImGui закрывает модалку в тот же кадр,
+			// когда фокус уходит окну вне попап-стека. Пока шла любая загрузка (бейк иконок, превью),
+			// бар «убивал» Settings/New Project мгновенно после открытия - окна просто не появлялись.
+			if (!ImGui.IsPopupOpen("", ImGuiPopupFlags.AnyPopupId | ImGuiPopupFlags.AnyPopupLevel))
+			{
+				ImGui.SetNextWindowFocus();
+			}
 
 			const ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoMove |
 				ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoDocking |

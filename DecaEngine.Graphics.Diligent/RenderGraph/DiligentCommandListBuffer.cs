@@ -2,9 +2,13 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using DecaEngine.Core;
 using DecaEngine.Graphics.Core;
+using DecaEngine.Graphics.Diligent;
 using Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
+using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
+using ResourceState = Diligent.ResourceState;
+using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent.RenderGraph
@@ -142,30 +146,53 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _stateTracker.Flush(_deferredContext);
         }
 
-        public void TransitionResource(ISamplerObject buffer, ResourceState newState)
+        public void TransitionResource(IBufferHandle buffer, DecaEngine.Core.ResourceState newState)
         {
-            TransitionAndFlush(((DiligentSamplerObject)buffer).Sampler, newState);
+            TransitionAndFlush(((DiligentBufferHandle)buffer).Buffer, newState.ToNative());
         }
 
-        public void TransitionResource(IBufferHandle buffer, ResourceState newState)
+        public void TransitionResource(IGpuTexture texture, DecaEngine.Core.ResourceState newState)
         {
-            TransitionAndFlush(((DiligentBufferHandle)buffer).Buffer, newState);
+            TransitionAndFlush(GetNativeTexture(texture), newState.ToNative());
         }
 
-        public void TransitionResource(IGpuTexture texture, ResourceState newState)
+        public void ResolveTexture(IGpuTexture src, IGpuTexture dst)
         {
-            TransitionAndFlush(GetNativeTexture(texture), newState);
+            var srcTex = GetNativeTexture(src);
+            var dstTex = GetNativeTexture(dst);
+
+            TransitionAndFlush(srcTex, ResourceState.ResolveSource);
+            TransitionAndFlush(dstTex, ResourceState.ResolveDest);
+
+            _deferredContext.ResolveTextureSubresource(srcTex, dstTex, new ResolveTextureSubresourceAttribs
+            {
+                SrcTextureTransitionMode = ResourceStateTransitionMode.None,
+                DstTextureTransitionMode = ResourceStateTransitionMode.None,
+            });
         }
 
-        public void TransitionResource(IGpuTexture texture, ResourceState newState, uint slice)
+        public void CopyTexture(IGpuTexture src, IGpuTexture dst)
         {
-            TransitionAndFlush(GetTextureView(texture, TextureViewType.ShaderResource, slice), newState);
+            var srcTex = GetNativeTexture(src);
+            var dstTex = GetNativeTexture(dst);
+
+            TransitionAndFlush(srcTex, ResourceState.CopySource);
+            TransitionAndFlush(dstTex, ResourceState.CopyDest);
+
+            _deferredContext.CopyTexture(new CopyTextureAttribs
+            {
+                SrcTexture = srcTex,
+                SrcTextureTransitionMode = ResourceStateTransitionMode.None,
+                DstTexture = dstTex,
+                DstTextureTransitionMode = ResourceStateTransitionMode.None,
+            });
         }
 
         private static ITexture? GetNativeTexture(IGpuTexture texture)
         {
             if (texture is DiligentGpuTexture dilTex) return dilTex.Texture;
             if (texture is DiligentRenderTarget dilRt) return dilRt.Texture;
+            if (texture is DiligentRenderHandle dilHandle) return dilHandle.Texture;
             return null;
         }
 
@@ -173,6 +200,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         {
             if (texture is DiligentGpuTexture dilTex) return dilTex.GetView(type, slice);
             if (texture is DiligentRenderTarget dilRt) return dilRt.GetView(type, slice);
+            if (texture is DiligentRenderHandle dilHandle) return dilHandle.GetView(type, slice);
             return null;
         }
 
@@ -227,28 +255,16 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _deferredContext.ClearRenderTarget(rtvView, color, ResourceStateTransitionMode.None);
         }
 
-        public void ClearDepthStencil(IGpuTexture dsv, ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0)
+        public void ClearDepthStencil(IGpuTexture dsv, DecaEngine.Core.ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0)
         {
             var dsvView = GetTextureView(dsv, TextureViewType.DepthStencil, slice);
             TransitionAndFlush(dsvView?.GetTexture(), ResourceState.DepthWrite);
-            _deferredContext.ClearDepthStencil(dsvView, flags, depth, stencil, ResourceStateTransitionMode.None);
-        }
-
-        public void ClearRenderTarget(ITextureView rtv, Vector4 color)
-        {
-            TransitionAndFlush(rtv?.GetTexture(), ResourceState.RenderTarget);
-            _deferredContext.ClearRenderTarget(rtv, color, ResourceStateTransitionMode.None);
-        }
-
-        public void ClearDepthStencil(ITextureView dsv, ClearDepthStencilFlags flags, float depth, byte stencil)
-        {
-            TransitionAndFlush(dsv?.GetTexture(), ResourceState.DepthWrite);
-            _deferredContext.ClearDepthStencil(dsv, flags, depth, stencil, ResourceStateTransitionMode.None);
+            _deferredContext.ClearDepthStencil(dsvView, flags.ToNative(), depth, stencil, ResourceStateTransitionMode.None);
         }
 
         // ---- Vertex/index buffers ----------------------------------------------------
 
-        public void SetVertexBuffers(uint startSlot, IBufferHandle[] bufferHandles, ulong[] offsets, SetVertexBuffersFlags flags = SetVertexBuffersFlags.None)
+        public void SetVertexBuffers(uint startSlot, IBufferHandle[] bufferHandles, ulong[] offsets, DecaEngine.Core.SetVertexBuffersFlags flags = DecaEngine.Core.SetVertexBuffersFlags.None)
         {
             int count = Math.Min(bufferHandles.Length, MaxVertexBuffers);
             for (int i = 0; i < count; i++)
@@ -259,7 +275,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                 TransitionAndFlush(buf, ResourceState.VertexBuffer);
             }
 
-            _deferredContext.SetVertexBuffers(startSlot, _vbHelper, _offsetHelper, ResourceStateTransitionMode.None, flags);
+            _deferredContext.SetVertexBuffers(startSlot, _vbHelper, _offsetHelper, ResourceStateTransitionMode.None, flags.ToNative());
         }
 
         public void SetIndexBuffer(IBufferHandle bufferHandle, ulong byteOffset = 0)
@@ -369,6 +385,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         {
             var res = ((DiligentBufferHandle)buffer).Buffer;
             TransitionAndFlush(res, ResourceState.CopyDest);
+            DiligentGraphicsUtility.LogLargeUpload(res, size, "CommandListBuffer.UpdateBuffer");
             _deferredContext.UpdateBuffer(res, offset, size, data, ResourceStateTransitionMode.None);
         }
 

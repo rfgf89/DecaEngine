@@ -36,7 +36,9 @@ public class ModelIconCache
 	/// v2: до фикса RenderResourceManager.DrawInstanceCount бейк сабмешей, шедший после бейка целой
 	/// модели, обходил пустой префикс массива инстансов и писал на диск ПУСТЫЕ (цвета фона) PNG -
 	/// они валидны по времени изменения исходника и без бампа версии остались бы навсегда.
-	private const int BakeVersion = 2;
+	/// v3: ModelLoader начал конвертировать RH->LH (зеркалирование Z) - все ранее забейканные
+	/// иконки отражены и должны перебейкаться.
+	private const int BakeVersion = 3;
 
 	public sealed class Manifest
 	{
