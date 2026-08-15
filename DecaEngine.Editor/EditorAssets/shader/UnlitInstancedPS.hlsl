@@ -992,16 +992,44 @@ PSOutput Main(in PSInput input)
                             shadowSlice += toFrag.z > 0.0 ? 4 : 5;
                     }
 
-                    float4 shadowClip = mul(float4(input.worldPos, 1.0), PunctualShadowMatrices[shadowSlice]);
+                    // Normal-offset bias (аналог SampleWorldLightShadow выше): сдвиг точки сэмплирования
+                    // вдоль нормали на ~1.5 текселя перспективного слайса В МИРОВЫХ единицах. В отличие
+                    // от орто-каскадов тексель здесь растёт с глубиной: 2*tan(halfFov)*z/1024. Точная
+                    // view-space глубина известна только ПОСЛЕ трансформации, поэтому для размера текселя
+                    // берём дистанцию до света punctualDist - для маленького bias-сдвига этого достаточно.
+                    // tan(halfFov) слайса: у спота - из внешнего конуса (SpotAngles.z/.x = sin/cos
+                    // внешнего полуугла), у точечного каждая грань куба ~90 градусов -> tan(45) = 1.
+                    float shadowTanHalfFov = punctual.DirectionType.w > 0.5
+                        ? punctual.SpotAngles.z / max(punctual.SpotAngles.x, 1e-4)
+                        : 1.0;
+                    float shadowTexelWorld = 2.0 * shadowTanHalfFov * punctualDist / 1024.0;
+                    float3 shadowSamplePos = input.worldPos + N * shadowTexelWorld * 1.5;
+
+                    float4 shadowClip = mul(float4(shadowSamplePos, 1.0), PunctualShadowMatrices[shadowSlice]);
                     if (shadowClip.w > 1e-4)
                     {
                         float3 shadowNdc = shadowClip.xyz / shadowClip.w;
                         float2 shadowUv = shadowNdc.xy * float2(0.5, -0.5) + 0.5;
                         if (all(shadowUv >= 0.0) && all(shadowUv <= 1.0) && shadowNdc.z < 1.0)
                         {
-                            // Склоновый bias по углу к свету давит акне перспективной карты; PCF -
-                            // аппаратным сравнением (LessEqual, обычный Z: ближе к свету = меньше).
-                            float shadowBias = max(0.002 * (1.0 - dot(N, punctualL)), 0.0004);
+                            // Депф-bias перспективного слайса. Каскады солнца - орто, там NDC-глубина
+                            // ЛИНЕЙНА по view-Z, и константа в NDC-единицах работает на любой дистанции.
+                            // Здесь проекция перспективная (PunctualShadowScheduler.AddSlice,
+                            // CreatePerspectiveFieldOfViewLeftHanded): ndc = f/(f-n) - n*f/((f-n)*z),
+                            // так что та же NDC-константа на разной глубине z стоит РАЗНОЕ число метров -
+                            // близко к свету это мало, а у границы дальности разгоняется до целого
+                            // метра просадки тени под объект (peter-panning). Вместо этого bias задаётся
+                            // в МИРОВЫХ единицах (склон по углу к свету + пол, как у каскадов) и
+                            // переводится в NDC локальной производной d(ndc)/dz = n*f/((f-n)*z^2) в точке
+                            // приёмника (z = shadowClip.w - view-space глубина вдоль оси света).
+                            float shadowFar = punctual.PositionRange.w;
+                            float shadowNear = max(0.05, shadowFar * 0.001);
+                            float shadowZ = max(shadowClip.w, shadowNear);
+                            float shadowWorldBias = max(0.05 * (1.0 - dot(N, punctualL)), 0.005);
+                            float shadowNdcPerWorld = shadowNear * shadowFar
+                                / max((shadowFar - shadowNear) * shadowZ * shadowZ, 1e-6);
+                            float shadowBias = shadowWorldBias * shadowNdcPerWorld;
+
                             float shadowLit = PunctualShadowMaps.SampleCmpLevelZero(
                                 PunctualShadowMaps_sampler,
                                 float3(shadowUv, shadowSlice), shadowNdc.z - shadowBias);
