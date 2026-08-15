@@ -149,7 +149,7 @@ namespace DecaEngine.Editor
 			}
 
 			ImGui.SameLine();
-			ImGui.TextDisabled("RMB orbit / MMB pan / wheel zoom");
+			ImGui.TextDisabled("RMB fly (WASD/QE, Shift/Ctrl) / Alt+LMB orbit / MMB pan / wheel dolly / F focus");
 
 			ImGui.EndMenuBar();
 		}

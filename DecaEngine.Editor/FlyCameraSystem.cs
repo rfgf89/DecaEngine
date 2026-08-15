@@ -4,6 +4,7 @@ using DecaEngine.Core;
 using DecaEngine.Editor.ECS;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using Hexa.NET.ImGui;
 
 namespace DecaEngine.Editor
 {
@@ -79,6 +80,32 @@ namespace DecaEngine.Editor
                     };
                 }
 
+                return;
+            }
+
+            // Гейт: эта система читает WASD/RMB НАПРЯМУЮ с устройств DecaEngine.Input.Core, в обход
+            // ImGui - раньше это значило, что WASD двигало камеру Game View ВСЕГДА, независимо от того,
+            // какое окно редактора активно (в т.ч. одновременно с новым fly-режимом Scene View, см.
+            // SceneCamera, который слушает ТЕ ЖЕ клавиши через ImGui).
+            //
+            // WantCaptureKeyboard - минимально-достаточный сигнал "ImGui сейчас распоряжается
+            // клавиатурой": с ImGuiConfigFlags.NavEnableKeyboard (см. ImGuiManager) он становится true,
+            // как только у любого ImGui-окна есть nav-фокус - то есть почти всегда после первого клика
+            // куда-либо в редакторе, ВКЛЮЧАЯ саму Game View (клик по ней тоже фокусирует её как
+            // ImGui-окно). Из-за этого чистая проверка "!WantCaptureKeyboard" гасила бы fly-камеру Game
+            // View даже тогда, когда именно она и должна её слушать.
+            //
+            // Точная развязка требует знать, какое ИМЕННО docked-окно сейчас в фокусе (GameViewWindow
+            // или нет) - это состояние сегодня нигде не публикуется (ImGuiDockingWindow/GameViewWindow
+            // вне списка файлов этой задачи, публичный флаг фокуса добавлять сюда не стали). Поэтому
+            // сознательно взят более простой и консервативный вариант: система молчит всегда, когда
+            // ImGui вообще что-то делает с клавиатурой, что убирает исходный баг (WASD дёргает Game View
+            // камеру ПОВЕРХ ввода в любом другом окне/поле редактора, включая Scene View), ценой того что
+            // сама Game View тоже требует, чтобы по ней сначала кликнули мышью (обычное поведение фокуса
+            // окна) - см. TODO по нормальной развязке через публичный флаг фокуса окна.
+            if (ImGui.GetIO().WantCaptureKeyboard)
+            {
+                _mouseDelta = Vector2.Zero;
                 return;
             }
 

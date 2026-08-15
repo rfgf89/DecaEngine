@@ -262,12 +262,10 @@ namespace DecaEngine.Editor
 		private float _lightYawOffsetDegrees;
 		private float _lightElevationOffsetDegrees;
 
-		private Vector3 _orbitTarget = Vector3.Zero;
-		private float _yaw = -0.6f;
-		private float _pitch = 0.35f;
-		private float _distance = 8f;
-		private bool _orbiting;
-		private bool _panning;
+		// Полёт/орбита/пан/фокус - см. SceneCamera. Заменяет прежние _orbitTarget/_yaw/_pitch/_distance/
+		// _orbiting/_panning; ModelPreviewViewport оставлен на старой орбитальной камере намеренно -
+		// там она правильная (см. задачу).
+		private readonly SceneCamera _camera;
 		private bool _framePending = true;
 
 		private ImTextureRef _textureRef;
@@ -336,6 +334,8 @@ namespace DecaEngine.Editor
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
 			_projectSession = projectSession;
+
+			_camera = new SceneCamera(_editorSettings.SceneCameraSpeed);
 
 			_env = CreateEnvironment();
 
@@ -620,20 +620,48 @@ namespace DecaEngine.Editor
 		{
 			if (!TryComputeSceneBounds(out var min, out var max))
 			{
-				_orbitTarget = Vector3.Zero;
-				_distance = 8f;
-				_yaw = -0.6f;
-				_pitch = 0.35f;
+				_camera.ResetToDefaults();
 				_framePending = true;
 				return;
 			}
 
 			_framePending = false;
-			_orbitTarget = (min + max) * 0.5f;
+			var center = (min + max) * 0.5f;
 			var radius = MathF.Max(0.05f, (max - min).Length() * 0.5f);
-			_distance = ModelViewportGeometry.ComputeFramingDistance(radius, CameraFovDegrees);
-			_yaw = -0.6f;
-			_pitch = 0.35f;
+			_camera.Frame(center, radius, CameraFovDegrees, resetAngle: true);
+			RequestMotionVectorHistoryReset();
+		}
+
+		/// <summary>Кадрирует камеру на сущность (её баунды + баунды детей): F в Scene View. Направление
+		/// взгляда СОХРАНЯЕТСЯ (resetAngle: false) - в отличие от Frame All, это не «дай мне красивый
+		/// обзорный ракурс», а «подъедь поближе к тому, на что я уже смотрю». Пусто выделение - тот же
+		/// Frame All по всей сцене (см. задачу).</summary>
+		public void FrameSelection(Entity? selected)
+		{
+			if (!selected.HasValue || selected.Value.IsNull)
+			{
+				FrameAll();
+				return;
+			}
+
+			if (!TryComputeEntityBounds(selected.Value, out var min, out var max))
+			{
+				FrameAll();
+				return;
+			}
+
+			var center = (min + max) * 0.5f;
+			var radius = MathF.Max(0.05f, (max - min).Length() * 0.5f);
+			_camera.Frame(center, radius, CameraFovDegrees, resetAngle: false);
+			RequestMotionVectorHistoryReset();
+		}
+
+		/// <summary>Сбрасывает историю векторов движения - камера телепортировалась (F-фокус/Frame All),
+		/// и без сброса TAA/апскейлер поймал бы один кадр огромного смещения и размазал бы его (см.
+		/// MotionVectorPassResources.ResetHistory). No-op, если векторы движения выключены.</summary>
+		private void RequestMotionVectorHistoryReset()
+		{
+			_env.Pipeline.MotionVectorResources?.ResetHistory();
 		}
 
 		/// <summary>
@@ -688,9 +716,8 @@ namespace DecaEngine.Editor
 
 			try
 			{
-				var eye = ModelViewportGeometry.ComputeOrbitEye(_orbitTarget, _distance, _yaw, _pitch);
-				_lastEye = eye;
-				_env.SetCameraTransform(eye, _orbitTarget);
+				_lastEye = _camera.Eye;
+				_env.SetCameraTransform(_camera.Eye, _camera.Target);
 
 				// Солнце-сущность (направление света + дистанции каскадов) - ДО Root.Update, где
 				// CullingAndRenderSystem раскладывает каскады.
@@ -730,8 +757,9 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>
-		/// Рисует кадр сцены как ImGui.Image, обрабатывает orbit/pan/zoom и гизмо выделенной
-		/// сущности поверх кадра. Возвращает true, если трансформ выделенной сущности изменён гизмо.
+		/// Рисует кадр сцены как ImGui.Image, обрабатывает ввод камеры (см. SceneCamera) и гизмо
+		/// выделенной сущности поверх кадра. Возвращает true, если трансформ выделенной сущности
+		/// изменён гизмо.
 		/// </summary>
 		public bool Render(ImGuiRender imGuiRender, Entity root, Entity? selected, Vector2 size, out PickResult pick)
 		{
@@ -774,7 +802,23 @@ namespace DecaEngine.Editor
 			drawList.AddRectFilledMultiColor(cursor, cursor + size, backdropTop, backdropTop, backdropBottom, backdropBottom);
 			drawList.AddImage(_textureRef, cursor, cursor + size);
 
-			HandleCameraInput(hovered);
+			_camera.HandleInput(hovered, ImGui.GetIO().DeltaTime);
+
+			// Колесо при зажатой RMB (см. SceneCamera.HandleInput) меняет базовую скорость полёта -
+			// персистим в EditorSettings ТОЛЬКО когда она реально изменилась, а не каждый кадр: запись
+			// в EditorSettings тут в памяти дёшева, но незачем дёргать её без нужды на каждый Render.
+			if (_camera.FlySpeed != _editorSettings.SceneCameraSpeed)
+			{
+				_editorSettings.SceneCameraSpeed = _camera.FlySpeed;
+			}
+
+			// F - кадрирование на выделение (см. FrameSelection); не ворует хоткей у текстовых полей
+			// (см. задачу) и молчит, пока курсор не над вьюпортом - иначе F, набранный в любом текстовом
+			// поле редактора, дёргал бы камеру сцены просто потому, что окно Scene View где-то открыто.
+			if (hovered && !ImGui.GetIO().WantTextInput && ImGui.IsKeyPressed(ImGuiKey.F))
+			{
+				FrameSelection(selected);
+			}
 
 			// Сцена (небо окружения) рендерится и без единого объекта - текст поверх только про
 			// реальные события: идущие загрузки или ошибки.
@@ -788,10 +832,13 @@ namespace DecaEngine.Editor
 			bool gizmoChanged = RenderGizmo(drawList, cursor, size, selected);
 
 			// Пикинг ЛКМ - после гизмо, когда его состояние за этот кадр актуально: клик по самому
-			// гизмо (или во время манипуляции) выделение не трогает.
+			// гизмо (или во время манипуляции) выделение не трогает. Alt+ЛКМ - орбита камеры (см.
+			// SceneCamera.HandleInput), не пикинг: без этой проверки орбита кликом по объекту ещё и
+			// меняла бы выделение.
 			bool gizmoBusy = selected.HasValue && !selected.Value.IsNull &&
 				(ImGuizmo.IsUsing() || ImGuizmo.IsOver());
-			if (hovered && !gizmoBusy && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+			bool altDown = ImGui.IsKeyDown(ImGuiKey.LeftAlt);
+			if (hovered && !altDown && !gizmoBusy && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
 			{
 				pick = new PickResult
 				{
@@ -813,7 +860,7 @@ namespace DecaEngine.Editor
 				return false;
 			}
 
-			var view = Matrix4x4.CreateLookAtLeftHanded(_lastEye, _orbitTarget, Vector3.UnitY);
+			var view = Matrix4x4.CreateLookAtLeftHanded(_lastEye, _camera.Target, Vector3.UnitY);
 			var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(
 				CameraFovDegrees * (MathF.PI / 180f), size.X / size.Y, CameraNear, CameraFar);
 
@@ -1443,7 +1490,7 @@ namespace DecaEngine.Editor
 			float v = 1f - (mouse.Y - cursor.Y) / size.Y * 2f;
 			float tanHalf = MathF.Tan(CameraFovDegrees * (MathF.PI / 180f) * 0.5f);
 
-			var view = Matrix4x4.CreateLookAtLeftHanded(_lastEye, _orbitTarget, Vector3.UnitY);
+			var view = Matrix4x4.CreateLookAtLeftHanded(_lastEye, _camera.Target, Vector3.UnitY);
 			if (!Matrix4x4.Invert(view, out var invView))
 			{
 				return null;
@@ -1778,7 +1825,7 @@ namespace DecaEngine.Editor
 		///
 		/// Перецентровка - это не сдвиг, а полное пересоздание объёма: Dispose GPU-раунда, Release
 		/// атласов, Flush + WaitForIdle (полный стоп GPU на потоке рендера) и новая сессия с
-		/// обнулённым полем. За один драг средней кнопки (пан камеры двигает _orbitTarget) порог
+		/// обнулённым полем. За один драг средней кнопки (пан камеры двигает _camera.Target) порог
 		/// смещения пересекается многократно, и всё это происходило по нескольку раз подряд - отсюда
 		/// и рывки, и «все пробы перестраиваются» на ровном месте.
 		///
@@ -1792,9 +1839,9 @@ namespace DecaEngine.Editor
 		private void PollSceneCascadeRecenter(float deltaTime)
 		{
 			// Камера ещё движется - ждём (см. док выше).
-			if (_orbitTarget != _cascadeRecenterTarget)
+			if (_camera.Target != _cascadeRecenterTarget)
 			{
-				_cascadeRecenterTarget = _orbitTarget;
+				_cascadeRecenterTarget = _camera.Target;
 				_cascadeRecenterIdle = 0f;
 				return;
 			}
@@ -1815,7 +1862,7 @@ namespace DecaEngine.Editor
 			{
 				int index = j + 1;
 				var half = SceneCascadeHalfExtent(index);
-				var desired = ClampSceneCascadeCenter(_orbitTarget, half);
+				var desired = ClampSceneCascadeCenter(_camera.Target, half);
 				if (!ProbeGiViewportShared.NeedsRecenter(_sceneCascades[j].Center, desired, half))
 				{
 					continue;
@@ -1830,7 +1877,7 @@ namespace DecaEngine.Editor
 					_sceneCascades[j].Gpu.Dispose();
 					_sceneCascades[j].Textures.Release();
 
-					_sceneCascades[j] = CreateSceneCascade(index, _orbitTarget);
+					_sceneCascades[j] = CreateSceneCascade(index, _camera.Target);
 					ApplyMaterialSettings();
 				}
 				catch (Exception ex)
@@ -1946,7 +1993,7 @@ namespace DecaEngine.Editor
 					: 1;
 				for (int i = 1; i < cascades; i++)
 				{
-					_sceneCascades.Add(CreateSceneCascade(i, _orbitTarget));
+					_sceneCascades.Add(CreateSceneCascade(i, _camera.Target));
 				}
 			}
 			catch (Exception ex)
@@ -2336,39 +2383,91 @@ namespace DecaEngine.Editor
 
 			foreach (var record in _rendered.Values)
 			{
-				if (!record.Instantiated || string.IsNullOrEmpty(record.ResolvedPath) ||
-					!_models.TryGetValue(record.ResolvedPath, out var state) || state.Model == null)
+				any |= AccumulateRecordBounds(record, ref min, ref max);
+			}
+
+			return FinalizeBounds(any, ref min, ref max);
+		}
+
+		/// <summary>AABB одной сущности префаба И её поддерева - фокус по F на выделении (см.
+		/// SceneCamera.Frame / FrameSelection). Сущности без своей записи в _rendered (света, группы,
+		/// пустышки) в баунды геометрии не попадают - если во всём поддереве не нашлось НИ ОДНОЙ
+		/// модели, фолбэком идёт мировая позиция сущности с условным радиусом (иначе F на пустышке
+		/// был бы неотличим от щелчка мимо и просто ничего не делал бы).</summary>
+		private bool TryComputeEntityBounds(Entity entity, out Vector3 min, out Vector3 max)
+		{
+			min = new Vector3(float.PositiveInfinity);
+			max = new Vector3(float.NegativeInfinity);
+			bool any = AccumulateEntityBounds(entity, ref min, ref max);
+
+			if (!any)
+			{
+				const float fallbackRadius = 0.5f;
+				var center = ComputeWorldMatrix(entity).Translation;
+				min = center - new Vector3(fallbackRadius);
+				max = center + new Vector3(fallbackRadius);
+				any = true;
+			}
+
+			return FinalizeBounds(any, ref min, ref max);
+		}
+
+		private bool AccumulateEntityBounds(Entity entity, ref Vector3 min, ref Vector3 max)
+		{
+			bool any = _rendered.TryGetValue(entity.Id, out var record) &&
+				AccumulateRecordBounds(record, ref min, ref max);
+
+			foreach (var child in entity.ChildEntities)
+			{
+				any |= AccumulateEntityBounds(child, ref min, ref max);
+			}
+
+			return any;
+		}
+
+		/// <summary>Общий накопитель AABB одной записи _rendered - сферы мешей её инстансов в мировом
+		/// пространстве; общий код TryComputeSceneBounds и TryComputeEntityBounds.</summary>
+		private bool AccumulateRecordBounds(RenderedModel record, ref Vector3 min, ref Vector3 max)
+		{
+			if (!record.Instantiated || string.IsNullOrEmpty(record.ResolvedPath) ||
+				!_models.TryGetValue(record.ResolvedPath, out var state) || state.Model == null)
+			{
+				return false;
+			}
+
+			var model = state.Model;
+			bool any = false;
+			for (int i = 0; i < record.EnvEntities.Count; i++)
+			{
+				var instance = model.instances[record.InstanceIndices[i]];
+				if (instance.meshId < 0 || instance.meshId >= model.Meshes.Count)
 				{
 					continue;
 				}
 
-				var model = state.Model;
-				for (int i = 0; i < record.EnvEntities.Count; i++)
-				{
-					var instance = model.instances[record.InstanceIndices[i]];
-					if (instance.meshId < 0 || instance.meshId >= model.Meshes.Count)
-					{
-						continue;
-					}
+				var mesh = model.Meshes[instance.meshId];
+				var t = ComposeInstanceTransform(instance.transform, record.LastWorld);
+				var worldCenter = Vector3.Transform(mesh.Center * t.scale, t.rotation) + t.position;
+				var maxScale = MathF.Max(MathF.Abs(t.scale.X), MathF.Max(MathF.Abs(t.scale.Y), MathF.Abs(t.scale.Z)));
+				var radius = mesh.Radius * maxScale;
 
-					var mesh = model.Meshes[instance.meshId];
-					var t = ComposeInstanceTransform(instance.transform, record.LastWorld);
-					var worldCenter = Vector3.Transform(mesh.Center * t.scale, t.rotation) + t.position;
-					var maxScale = MathF.Max(MathF.Abs(t.scale.X), MathF.Max(MathF.Abs(t.scale.Y), MathF.Abs(t.scale.Z)));
-					var radius = mesh.Radius * maxScale;
-
-					min = Vector3.Min(min, worldCenter - new Vector3(radius));
-					max = Vector3.Max(max, worldCenter + new Vector3(radius));
-					any = true;
-				}
+				min = Vector3.Min(min, worldCenter - new Vector3(radius));
+				max = Vector3.Max(max, worldCenter + new Vector3(radius));
+				any = true;
 			}
 
+			return any;
+		}
+
+		/// <summary>NaN/Infinity в трансформах не должны ронять кадрирование - общий хвост
+		/// TryComputeSceneBounds/TryComputeEntityBounds.</summary>
+		private static bool FinalizeBounds(bool any, ref Vector3 min, ref Vector3 max)
+		{
 			if (!any)
 			{
 				return false;
 			}
 
-			// NaN/Infinity в трансформах не должны ронять кадрирование.
 			if (float.IsNaN(min.X) || float.IsInfinity(min.X) || float.IsNaN(max.X) || float.IsInfinity(max.X) ||
 				float.IsNaN(min.Y) || float.IsInfinity(min.Y) || float.IsNaN(max.Y) || float.IsInfinity(max.Y) ||
 				float.IsNaN(min.Z) || float.IsInfinity(min.Z) || float.IsNaN(max.Z) || float.IsInfinity(max.Z))
@@ -2736,49 +2835,7 @@ namespace DecaEngine.Editor
 		}
 
 		// --- Камера/ресайз --------------------------------------------------------------------------
-
-		private void HandleCameraInput(bool hovered)
-		{
-			var io = ImGui.GetIO();
-
-			if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
-			{
-				_orbiting = true;
-			}
-			if (_orbiting && ImGui.IsMouseReleased(ImGuiMouseButton.Right))
-			{
-				_orbiting = false;
-			}
-
-			if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Middle))
-			{
-				_panning = true;
-			}
-			if (_panning && ImGui.IsMouseReleased(ImGuiMouseButton.Middle))
-			{
-				_panning = false;
-			}
-
-			if (_orbiting)
-			{
-				var delta = io.MouseDelta;
-				_yaw -= delta.X * 0.01f;
-				_pitch = Math.Clamp(_pitch - delta.Y * 0.01f, -1.5f, 1.5f);
-			}
-			else if (_panning)
-			{
-				var delta = io.MouseDelta;
-				var right = new Vector3(MathF.Cos(_yaw), 0f, -MathF.Sin(_yaw));
-				var panScale = MathF.Max(0.01f, _distance * 0.001f);
-				_orbitTarget -= right * delta.X * panScale;
-				_orbitTarget += Vector3.UnitY * delta.Y * panScale;
-			}
-
-			if (hovered && io.MouseWheel != 0f)
-			{
-				_distance = Math.Clamp(_distance + io.MouseWheel * _distance * 0.1f, 0.2f, 1500f);
-			}
-		}
+		// Ввод камеры - см. SceneCamera.HandleInput (вызывается из Render); здесь остался только ресайз.
 
 		/// <summary>Дебаунс ресайза таргетов - см. ModelPreviewViewport.TrackAndApplyResize.</summary>
 		private bool TrackAndApplyResize(ImGuiRender imGuiRender, Vector2 imGuiSize)

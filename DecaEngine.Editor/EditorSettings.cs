@@ -431,6 +431,11 @@ public class EditorSettings
 	/// пересоздаёт своё окружение, резидентные модели переезжают в него без перечитывания с диска.</summary>
 	public bool SceneViewHdr { get; set; } = false;
 
+	/// <summary>Базовая скорость полёта камеры Scene View (единиц/сек, см. SceneCamera.FlySpeed) -
+	/// колесо мыши при зажатой RMB крутит именно её. Персистится между сессиями редактора: подобранная
+	/// под масштаб конкретного проекта скорость не должна сбрасываться при каждом перезапуске.</summary>
+	public float SceneCameraSpeed { get; set; } = SceneCamera.DefaultFlySpeed;
+
 	/// <summary>Key value: средняя яркость, к которой экспозиция приводит кадр. 0.18 - классический
 	/// «средне-серый» фотографии. Live (кбуферы EyeAdaptation/TonemapConstants).</summary>
 	public float EyeAdaptationKey { get; set; } = 0.18f;
