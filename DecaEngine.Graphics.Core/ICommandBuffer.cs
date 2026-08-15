@@ -55,6 +55,17 @@ public interface ICommandBuffer
 	/// (InvalidateState) - это забота самого колбэка.</summary>
 	void Callback(Action callback);
 
+	/// <summary>Условно реплеит чужой ЗАМОРОЖЕННЫЙ буфер <paramref name="nested"/> - ТОЛЬКО если
+	/// <c>schedule.ShouldRender(cascadeIndex)</c> на момент реплея ЭТОГО буфера (см.
+	/// <see cref="ShadowPass"/>/<see cref="ShadowCascadeSchedule"/>). Это ЯВНАЯ команда, а не
+	/// колбэк-замыкание над внешним массивом: <paramref name="nested"/>, <paramref name="schedule"/>
+	/// и <paramref name="cascadeIndex"/> хранятся как данные внутри записи команды, поэтому
+	/// переживают ровно столько же, сколько любая другая команда этого буфера - не дольше. Если
+	/// вызывающий пасс не перезапишет эту команду при следующей <c>WriteCommands</c>, она не может
+	/// остаться в буфере как-то иначе, чем вместе со всем остальным его содержимым (тот же выбор
+	/// заморозить/перезаписать, что у <see cref="SetPipelineState(IMaterialObject)"/> и прочих).</summary>
+	void ExecuteNested(ICommandBuffer nested, ShadowCascadeSchedule schedule, int cascadeIndex);
+
 	void BeginRecording();
 	void EndRecording();
 	void Execute();

@@ -177,6 +177,11 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         public void Callback(Action callback) =>
             throw new NotSupportedException("Callback commands are only supported by the frozen immediate-context buffer.");
 
+        /// <summary>Как <see cref="Callback"/>: замороженный реплей на immediate-контексте здесь не
+        /// поддержан - см. class remarks у <see cref="Freeze"/>.</summary>
+        public void ExecuteNested(ICommandBuffer nested, ShadowCascadeSchedule schedule, int cascadeIndex) =>
+            throw new NotSupportedException("ExecuteNested commands are only supported by the frozen immediate-context buffer.");
+
         public void CopyTexture(IGpuTexture src, IGpuTexture dst)
         {
             var srcTex = GetNativeTexture(src);

@@ -20,12 +20,18 @@ public sealed class ShadowCascadeSchedule
 
 	/// <summary>Стаггеринг ВЫКЛЮЧЕН по умолчанию: DECA_SHADOW_STAGGER=1 включает его, всё остальное
 	/// оставляет прежнее поведение "все каскады каждый кадр" (запись команд ShadowPass прямо в буфер
-	/// графа, без суб-буферов и колбэка).
+	/// графа, без суб-буферов).
 	///
 	/// Причина: путь с суб-буферами падал с AV в DiligentMaterial.SetPipelineState при переключении
-	/// между вьюпортами превью и сцены - замороженные суб-буферы переживают освобождение материалов
-	/// модели, тогда как буфер графа на том же событии перезаписывается. Пока время жизни не
-	/// починено, дефолт - проверенный путь.</summary>
+	/// между вьюпортами превью и сцены. Гейт каскада теперь ЯВНАЯ команда (ICommandBuffer.ExecuteNested)
+	/// вместо колбэка-замыкания над внешним массивом суб-буферов - убирает лишний слой косвенности
+	/// (тот самый `<WriteCommands>b__0` из стека падения), но НЕ доказано, что это устраняет саму
+	/// гонку: буфер графа и суб-буферы этого пасса перезаписываются АТОМАРНО в одном WriteCommands,
+	/// так что при повторном изучении не нашлось сценария, где заморожен буфер графа переживает
+	/// перекомпиляцию, а суб-буфер - нет (или наоборот) чисто на стороне рендер-графа. Подозрение -
+	/// гонка на стороне жизненного цикла окружения превью (ModelViewportEnvironment/ModelPreviewViewport):
+	/// освобождение материалов модели БЕЗ гарантированного Invalidate/Compile ДО следующего Execute.
+	/// Дефолт остаётся выключенным, пока это не подтверждено и не починено на той стороне.</summary>
 	public static readonly bool StaggerEnabled =
 		Environment.GetEnvironmentVariable("DECA_SHADOW_STAGGER") == "1";
 
@@ -124,24 +130,15 @@ public sealed class ShadowPass : RenderGraphPass<ShadowPass.PassData>
 			sub.BeginRecording();
 			WriteCascadeCommands(sub, i);
 			sub.Freeze();
-		}
 
-		// Единственная команда пасса в буфере графа: гейт каскадов на КАЖДОМ реплее. Условно
-		// пропустить уже записанную команду замороженный буфер не умеет - зато Callback (тот же
-		// механизм, что у нативного апскейлера, см. NativeUpscalePass) исполняется в позиции
-		// записи и волен целиком не играть суб-буфер пропущенного каскада.
-		var schedule = _schedule;
-		var cascadeCmds = _cascadeCmds;
-		cmd.Callback(() =>
-		{
-			for (int i = 0; i < cascadeCmds.Length; i++)
-			{
-				if (schedule.ShouldRender(i))
-				{
-					cascadeCmds[i]!.Execute();
-				}
-			}
-		});
+			// Гейт каскада - ЯВНАЯ команда в буфере графа (ICommandBuffer.ExecuteNested), а не
+			// колбэк-замыкание над _cascadeCmds: sub/_schedule/i лежат как данные внутри записи
+			// команды и потому обновляются той же дисциплиной BeginRecording/перезаписи, что и
+			// SetPipelineState чуть выше в WriteCascadeCommands - если этот WriteCommands не
+			// перезапишет их на следующей компиляции, они не переживут её ни в каком виде (см.
+			// ICommandBuffer.ExecuteNested).
+			cmd.ExecuteNested(sub, _schedule, i);
+		}
 	}
 
 	private void WriteCascadeCommands(ICommandBuffer cmd, int cascadeIndex)

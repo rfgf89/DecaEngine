@@ -41,7 +41,8 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             ClearBackBufferTarget,
             CopyTexture,
             ResolveTexture,
-            Callback
+            Callback,
+            ExecuteNested
         }
 
         private const int MaxVertexBuffers = 4;
@@ -176,6 +177,18 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.Callback);
             cmd.Obj1 = callback;
+        }
+
+        /// <summary>См. <see cref="ICommandBuffer.ExecuteNested"/>. Данные, не замыкание: тот же
+        /// choke point (BeginRecording/Reset), что у любой другой команды - живёт ровно один
+        /// цикл записи этого буфера.</summary>
+        public void ExecuteNested(ICommandBuffer nested, ShadowCascadeSchedule schedule, int cascadeIndex)
+        {
+            if (!_isRecording) return;
+            ref var cmd = ref NextCommand(CommandType.ExecuteNested);
+            cmd.Obj1 = nested;
+            cmd.Obj2 = schedule;
+            cmd.U1 = (uint)cascadeIndex;
         }
 
         public void CopyTexture(IGpuTexture src, IGpuTexture dst)
@@ -508,6 +521,32 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                         // InvalidateState; наш трекер сбрасываем здесь же.
                         ((Action)cmd.Obj1).Invoke();
                         _stateTracker.Clear();
+                        break;
+                    case CommandType.ExecuteNested:
+                        {
+                            var schedule = (ShadowCascadeSchedule)cmd.Obj2;
+                            if (schedule.ShouldRender((int)cmd.U1))
+                            {
+                                // Ретаргет на КАЖДЫЙ реплей - на всякий случай, той же дисциплиной,
+                                // что DiligentRenderGraphContext.Execute у буфера графа: суб-буфер
+                                // заведён под ImmediateContext один раз при создании, но привязку
+                                // лучше не предполагать неизменной.
+                                if (cmd.Obj1 is DiligentCommandBuffer nested)
+                                {
+                                    nested.Retarget(_context);
+                                    nested.Execute();
+                                }
+                                else
+                                {
+                                    ((ICommandBuffer)cmd.Obj1).Execute();
+                                }
+
+                                // Суб-буфер сам расставил свои переходы состояний через СВОЙ трекер
+                                // и мог тронуть ресурсы, общие с этим буфером (shadow map слайсы) -
+                                // наш кэш состояний после этого недостоверен, как и после Callback.
+                                _stateTracker.Clear();
+                            }
+                        }
                         break;
                     case CommandType.ResolveTexture:
                         _context.ResolveTextureSubresource((ITexture)cmd.Obj1, (ITexture)cmd.Obj2,
