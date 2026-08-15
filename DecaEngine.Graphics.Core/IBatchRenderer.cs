@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using DecaEngine.Graphics.Diligent;
 using UnsafeCollections.Collections.Unsafe;
 
@@ -119,5 +120,10 @@ public interface IBatchRenderer
 	/// <summary>Marks a registered material as transparent/transmissive for <see cref="BatchDrawFilter"/>
 	/// purposes (raw material id - <c>MaterialId.materialId</c>). Materials default to opaque.</summary>
 	void SetMaterialTransparent(int materialId, bool transparent);
+
+	// Партиционное снятие ОДНОЙ модели (DiligentBatchRenderer.UnregisterModel) здесь НЕ объявлено:
+	// оно оперирует BatchId/MaterialId/MeshId, а те живут в проекте Graphics.Diligent, на который
+	// Graphics.Core не ссылается. Потребители (ModelStreamer) держат конкретный DiligentBatchRenderer
+	// (см. ModelViewportEnvironment.BatchRenderer) и зовут метод напрямую.
 }
 

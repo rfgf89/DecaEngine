@@ -34,6 +34,16 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	public readonly OrderedDictionary<int, MaterialDrawRange> _materialDrawRanges = new();
 	private bool _isDrawRangesCacheDirty = true;
 
+	// Батчи, отсортированные по materialId - раньше пересчитывались LINQ OrderBy в
+	// CheckAndReallocateBuffers И ОТДЕЛЬНО в UpdateDrawRangesCache на каждый вызов, где нужен был
+	// порядок (CheckAndReallocateBuffers дёргается КАЖДЫЙ кадр из ForwardPass/ShadowPass, а его
+	// OrderBy срабатывал всякий раз, когда менялось содержимое инстансов - т.е. почти каждый кадр
+	// во время стриминга - а не только когда менялся сам набор батчей). Общий кэш + грязный флаг,
+	// который трогают только CreateBatch/Remove/ResetRegistrations, убирает и сам пересчёт (кроме
+	// как при реальном изменении набора), и аллокацию List на каждый вызов.
+	private readonly List<KeyValuePair<int, IndirectBatch>> _sortedBatchesCache = new();
+	private bool _isSortedBatchesCacheDirty = true;
+
 	private NativeList<Vertex> _megaVertexBufferCPU;
 	private NativeList<uint> _megaIndexBufferCPU;
 	private readonly OrderedDictionary<int, MeshInfo> _meshInfos = new();
@@ -41,6 +51,17 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private DiligentBufferHandle? _megaVertexBufferGPU;
 	private DiligentBufferHandle? _megaIndexBufferGPU;
+
+	// Ёмкость (в элементах) GPU-буферов и то, сколько CPU-элементов УЖЕ залито в них - суб-аллокация
+	// с запасом по хвосту, как у инстанс-буферов (см. _instanceBufferSectorCapacity): без этого
+	// UpdateGpuMegaBuffers пересоздавал и перезаливал ВЕСЬ мега-буфер целиком на регистрацию КАЖДОГО
+	// меша, даже если добавился один маленький меш к сцене, где уже миллионы вершин - именно это и
+	// вызывало хитчи стриминга. Растим капасити редко (x2, см. UpdateMegaBufferRange), а в обычном
+	// случае заливаем только НОВЫЙ хвост (uploadedCount..currentCount).
+	private int _megaVertexBufferCapacity;
+	private int _megaIndexBufferCapacity;
+	private int _megaVertexUploadedCount;
+	private int _megaIndexUploadedCount;
 
 	private readonly OrderedDictionary<int, DiligentMaterial> _materialObjects = new();
 	private readonly OrderedDictionary<int, IndirectBatch> _indirectBatches = new();
@@ -369,6 +390,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		var batchIndex = gBatchIndex;
 		_indirectBatches.Add(batchIndex, new IndirectBatch(meshId, materialId));
 		_isDrawRangesCacheDirty = true;
+		_isSortedBatchesCacheDirty = true;
 		SetAllCommandsDirty();
 		gBatchIndex++;
 		return new BatchId(batchIndex);
@@ -377,21 +399,51 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	public void Remove(int batchId)
 	{
 		_isDrawRangesCacheDirty = true;
+		_isSortedBatchesCacheDirty = true;
 		SetAllCommandsDirty();
+	}
+
+	/// <summary>Кэш _indirectBatches, отсортированный по materialId (см. <see cref="_sortedBatchesCache"/>).
+	/// Пересчитывается только когда меняется НАБОР батчей; переупорядочение/добавление ИНСТАНСОВ
+	/// существующих батчей его не трогает. Тай-брейк по ключу (индексу батча) воспроизводит порядок
+	/// прежнего `_indirectBatches.OrderBy(...)` - OrderBy стабилен, а OrderedDictionary итерируется в
+	/// порядке добавления, то есть по возрастанию индекса батча.</summary>
+	private List<KeyValuePair<int, IndirectBatch>> GetSortedBatches()
+	{
+		if (_isSortedBatchesCacheDirty)
+		{
+			_sortedBatchesCache.Clear();
+			foreach (var kvp in _indirectBatches)
+			{
+				_sortedBatchesCache.Add(kvp);
+			}
+
+			_sortedBatchesCache.Sort(static (a, b) =>
+			{
+				int cmp = a.Value.material.materialId.CompareTo(b.Value.material.materialId);
+				return cmp != 0 ? cmp : a.Key.CompareTo(b.Key);
+			});
+
+			_isSortedBatchesCacheDirty = false;
+		}
+
+		return _sortedBatchesCache;
 	}
 
 	/// <summary>Выбрасывает ВСЕ регистрации меша/материала/батча и накопленную геометрию, возвращая
 	/// рендерер в состояние сразу после создания.
 	///
-	/// Нужен потому, что снять регистрацию ПОШТУЧНО нельзя: MeshId/MaterialId/BatchId - плотные
-	/// монотонные индексы, по которым размеряются GPU-буферы (см. комментарий у _meshBatchDataBuffer:
-	/// «batch ids are dense 0..gBatchIndex-1 and never removed»), и удаление одного сдвинуло бы все
-	/// последующие. Потребителю, который показывает ОДНУ модель за раз (превью, бейкер иконок), сброс
-	/// - ровно то, что нужно; сцене с множеством моделей он противопоказан.
+	/// Для СЦЕНЫ с несколькими резидентными моделями снятие ОДНОЙ модели без трогания остальных
+	/// делает <see cref="UnregisterModel"/> - id плотные и никогда не переиспользуются, так что
+	/// удаление подмножества id других не сдвигает. Этот же (полный) сброс остаётся нужен
+	/// потребителю, который держит ровно ОДНУ модель за раз (превью, бейкер иконок): дешевле
+	/// обнулить счётчики id и мега-буферы CPU целиком, чем гонять UnregisterModel по всем
+	/// когда-либо зарегистрированным id, и он же переиспользуется в ClearAll как более грубый, но
+	/// проверенный путь.
 	///
-	/// Без него геометрия каждой открытой модели навсегда оставалась в мега-буферах, а те на любое
-	/// изменение пересоздаются и заливаются ЦЕЛИКОМ (см. UpdateGpuMegaBuffers) - то есть открытие
-	/// N-й модели стоило O(вся геометрия, когда-либо загруженная), и по памяти, и по заливке.
+	/// Мега-буферы GPU у этого пути ПОЛНОСТЬЮ пересоздаются на следующий UpdateGpuMegaBuffers (см.
+	/// сброс капасити/uploaded-счётчиков ниже) - в отличие от обычной регистрации, которая теперь
+	/// доливает только новый хвост (см. UpdateMegaBufferRange).
 	///
 	/// Вызывающий ОБЯЗАН сперва дождаться GPU (Flush + WaitForIdle) и пересобрать граф: старые
 	/// MeshId/MaterialId/BatchId становятся недействительными, а замороженные команды на них
@@ -420,12 +472,21 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_megaIndexBufferGPU?.Release();
 		_megaIndexBufferGPU = null;
 
+		// Капасити/uploaded-счётчики суб-аллокатора мега-буферов (см. поля выше) - без сброса первая
+		// же регистрация новой модели унаследовала бы капасити прошлой сцены (не баг, просто лишний
+		// запас памяти на один цикл роста).
+		_megaVertexBufferCapacity = 0;
+		_megaIndexBufferCapacity = 0;
+		_megaVertexUploadedCount = 0;
+		_megaIndexUploadedCount = 0;
+
 		// Сброс обязан быть ПОЛНЫМ: оставь любую из коллекций непустой - и её ключи разойдутся с
 		// заново выданными с нуля индексами.
 		_meshInfos.Clear();
 		_materialObjects.Clear();
 		_indirectBatches.Clear();
 		_materialDrawRanges.Clear();
+		_sortedBatchesCache.Clear();
 		UnsafeList.Clear(_perMeshData);
 
 		gMeshIndex = 0;
@@ -434,7 +495,51 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		_isMeshBuffersDirty = true;
 		_isDrawRangesCacheDirty = true;
+		_isSortedBatchesCacheDirty = true;
 		_isDrawBatchCmdDirty = true;
+		SetAllCommandsDirty();
+	}
+
+	/// <summary>См. <see cref="DiligentBatchRenderer.UnregisterModel"/>: партиционное выселение ОДНОЙ модели.
+	/// mesh/material/batch id плотные и никогда не переиспользуются (см. комментарий у
+	/// <see cref="ResetRegistrations"/>), поэтому снятие id из соответствующих словарей не требует
+	/// сдвига чужих id - ничего их не переиндексирует. Материалы явно Release-ятся (SRB/PSO/свои
+	/// константные буферы - НЕ общие View/Light/GPURenderInstances и т.п., они у материала не в
+	/// собственности, см. DiligentMaterial.SetBuffer/Release); геометрия снятых мешей в мега-буфере
+	/// НЕ освобождается - её диапазон просто больше ни на один батч не ссылается, до суб-аллокатора
+	/// это неиспользуемая, но безопасная память.
+	///
+	/// Вызывающий ОБЯЗАН снять инстанс-сущности, ссылающиеся на удаляемые batchId, ДО этого вызова
+	/// (см. интерфейсный комментарий) - иначе на следующем CheckAndReallocateBuffers индирект-буферы
+	/// пересоздадутся под уменьшившийся _totalCommands/batchCount, а старые инстансы будут указывать
+	/// на офсеты вне их границ.</summary>
+	public void UnregisterModel(IEnumerable<BatchId> batchIds, IEnumerable<MaterialId> materialIds,
+		IEnumerable<MeshId> meshIds)
+	{
+		foreach (var batchId in batchIds)
+		{
+			if (_indirectBatches.Remove(batchId.batchId))
+			{
+				_isDrawRangesCacheDirty = true;
+				_isSortedBatchesCacheDirty = true;
+			}
+		}
+
+		foreach (var materialId in materialIds)
+		{
+			if (_materialObjects.Remove(materialId.materialId, out var material))
+			{
+				material.Release();
+			}
+
+			_transparentMaterials.Remove(materialId.materialId);
+		}
+
+		foreach (var meshId in meshIds)
+		{
+			_meshInfos.Remove(meshId.meshId);
+		}
+
 		SetAllCommandsDirty();
 	}
 
@@ -594,7 +699,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			ctx.UploadBufferExt<DrawData>(_instanceDrawDataBuffer.Buffer, _instancesSubset.drawData.GetNative());
 			ctx.UploadBufferExt<GPURenderInstance>(_gpuInstancesDataBuffer.Buffer, _instancesSubset.gpuData.GetNative());
 
-			var sortedBatches = _indirectBatches.OrderBy(p => p.Value.material.materialId).ToList();
+			var sortedBatches = GetSortedBatches();
 			uint commandOffset = 0;
 			for (var i = 0; i < sortedBatches.Count; i++)
 			{
@@ -788,25 +893,85 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		}
 	}
 
+	/// <summary>Раньше пересоздавала и заливала ОБА мега-буфера ЦЕЛИКОМ на любую регистрацию меша -
+	/// то есть открытие N-й модели во время стриминга стоило O(вся геометрия, когда-либо
+	/// зарегистрированная), и по аллокации GPU-памяти, и по копированию. Теперь - суб-аллокация с
+	/// запасом по хвосту (см. <see cref="UpdateMegaBufferRange{T}"/>): буфер растёт редко (x2), а
+	/// обычная регистрация мешей просто доливает свой хвост в уже готовый буфер.</summary>
 	private void UpdateGpuMegaBuffers()
 	{
 		if (!_isMeshBuffersDirty) return;
 
-		_megaVertexBufferGPU?.Release();
-		_megaIndexBufferGPU?.Release();
+		if (_megaVertexBufferCPU.IsCreated)
+		{
+			UpdateMegaBufferRange<Vertex>(ref _megaVertexBufferGPU, ref _megaVertexBufferCapacity,
+				ref _megaVertexUploadedCount, _megaVertexBufferCPU.Count, _megaVertexBufferCPU.GetNative(),
+				BufferHandleType.Vertex, "Mega Vertex Buffer");
+		}
 
-		_megaVertexBufferGPU = (DiligentBufferHandle)_api.CreateBuffer<Vertex>(_megaVertexBufferCPU.Count, new BufferInfo { name = "Mega Vertex Buffer", type = BufferHandleType.Vertex });
-		_megaIndexBufferGPU = (DiligentBufferHandle)_api.CreateBuffer<uint>(_megaIndexBufferCPU.Count, new BufferInfo { name = "Mega Index Buffer", type = BufferHandleType.Index });
-
-		_api.ImmediateContext.UploadBufferExt<Vertex>(_megaVertexBufferGPU.Buffer, _megaVertexBufferCPU.GetNative());
-		_api.ImmediateContext.UploadBufferExt<uint>(_megaIndexBufferGPU.Buffer, _megaIndexBufferCPU.GetNative());
-
-		// ResourceStateTracker - внутренняя кухня бэкенда, работает в нативных состояниях Diligent.
-		_stateTracker.SetState(_megaVertexBufferGPU.Buffer, global::Diligent.ResourceState.CopyDest);
-		_stateTracker.SetState(_megaIndexBufferGPU.Buffer, global::Diligent.ResourceState.CopyDest);
+		if (_megaIndexBufferCPU.IsCreated)
+		{
+			UpdateMegaBufferRange<uint>(ref _megaIndexBufferGPU, ref _megaIndexBufferCapacity,
+				ref _megaIndexUploadedCount, _megaIndexBufferCPU.Count, _megaIndexBufferCPU.GetNative(),
+				BufferHandleType.Index, "Mega Index Buffer");
+		}
 
 		_isMeshBuffersDirty = false;
+
+		// Заливка мега-буферов идёт МИМО замороженного графа (через ImmediateContext, см.
+		// UpdateMegaBufferRange) прямо перед реплеем текущего кадра, так что перезаписывать
+		// SetVertexBuffers/SetIndexBuffer нужно только когда сменился САМ ОБЪЕКТ буфера (редкий путь
+		// роста в UpdateMegaBufferRange). Но раньше буфер пересоздавался ВСЕГДА - на всякий случай
+		// сохраняем прежнюю (более консервативную) гарантию инвалидации графа для обоих путей: цена
+		// лишней перезаписи команд на порядки меньше цены лишней перезаливки мега-буфера, которую мы
+		// как раз и убираем.
 		SetAllCommandsDirty();
+	}
+
+	/// <summary>Суб-аллокация одного мега-буфера (вершин или индексов) с запасом по хвосту - тот же
+	/// приём, что у инстанс-буферов (см. _instanceBufferSectorCapacity). <paramref name="cpuList"/>
+	/// уже содержит ВСЮ накопленную геометрию (старую и новую) - Register() только аппендит в него.
+	///
+	/// Рост капасити (буфера ещё нет или он стал мал) - редкий путь: пересоздаёт GPU-буфер В ЗАПАС
+	/// (x2) и заливает CPU-список ЦЕЛИКОМ. Старый буфер отпускается обычным Release (не разделяемая
+	/// память, на которую ссылались бы замороженные команды поверх ссылки на объект - см.
+	/// UpdateGpuMegaBuffers) - лишнего WaitForIdle здесь не требуется. Обычный путь (капасити хватает)
+	/// заливает ТОЛЬКО новый хвост (<paramref name="uploadedCount"/>..<paramref name="currentCount"/>) -
+	/// именно это убирает перезаливку всей когда-либо загруженной геометрии на каждую регистрацию.</summary>
+	private unsafe void UpdateMegaBufferRange<T>(ref DiligentBufferHandle? gpuBuffer, ref int capacity,
+		ref int uploadedCount, int currentCount, UnsafeList* cpuList, BufferHandleType bufferType, string name)
+		where T : unmanaged
+	{
+		if (gpuBuffer == null || currentCount > capacity)
+		{
+			int newCapacity = Math.Max(currentCount, Math.Max(64, capacity * 2));
+
+			gpuBuffer?.Release();
+			gpuBuffer = (DiligentBufferHandle)_api.CreateBuffer<T>(newCapacity, new BufferInfo { name = name, type = bufferType });
+
+			if (currentCount > 0)
+			{
+				_api.ImmediateContext.UpdateBuffer(gpuBuffer.Buffer, 0, (uint)(currentCount * Unsafe.SizeOf<T>()),
+					new IntPtr(UnsafeList.GetPtr<T>(cpuList, 0)), ResourceStateTransitionMode.Transition);
+			}
+
+			capacity = newCapacity;
+			uploadedCount = currentCount;
+		}
+		else if (currentCount > uploadedCount)
+		{
+			_api.ImmediateContext.UpdateBuffer(gpuBuffer.Buffer, (uint)(uploadedCount * Unsafe.SizeOf<T>()),
+				(uint)((currentCount - uploadedCount) * Unsafe.SizeOf<T>()),
+				new IntPtr(UnsafeList.GetPtr<T>(cpuList, uploadedCount)), ResourceStateTransitionMode.Transition);
+			uploadedCount = currentCount;
+		}
+		else
+		{
+			return;
+		}
+
+		// ResourceStateTracker - внутренняя кухня бэкенда, работает в нативных состояниях Diligent.
+		_stateTracker.SetState(gpuBuffer.Buffer, global::Diligent.ResourceState.CopyDest);
 	}
 
 	private void UpdateDrawRangesCache()
@@ -821,7 +986,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			_isDrawRangesCacheDirty = false; return;
 		}
 
-		var sortedPairs = _indirectBatches.OrderBy(p => p.Value.material.materialId).ToList();
+		var sortedPairs = GetSortedBatches();
 		if (sortedPairs.Count == 0)
 		{
 			_isDrawRangesCacheDirty = false; return;

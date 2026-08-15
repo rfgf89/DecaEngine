@@ -97,6 +97,12 @@ namespace DecaEngine.Editor.ECS
 		private readonly List<(IGpuTexture Texture, int TicksLeft)> _retiredTextures = new();
 		private const int RetireTicks = 8;
 
+		/// <summary>Модели, выселенные партиционным <see cref="ResetResidency"/> (см. его комментарий) и
+		/// ждущие отложенного ModelLoader.Release - тем же приёмом, что и <see cref="_retiredTextures"/>:
+		/// партиционное выселение больше не делает Flush/WaitForIdle, поэтому GPU может ещё доигрывать
+		/// кадры, читающие текстуры/буферы модели.</summary>
+		private readonly List<(ModelLoader Model, int TicksLeft)> _retiredModels = new();
+
 		/// <summary>Множитель ступени качества текстур: 64 -> 256 -> 1024 -> целевой размер.</summary>
 		public int TextureStepFactor { get; set; } = 4;
 
@@ -138,13 +144,18 @@ namespace DecaEngine.Editor.ECS
 		/// <summary>Модель догрузилась и зарегистрирована в батч-рендерере - можно инстанцировать.</summary>
 		public event Action<Resident>? ModelReady;
 
-		/// <summary>Сейчас будут сброшены ВСЕ регистрации батч-рендерера (выселение/очистка):
-		/// подписчик обязан снять свои инстанс-сущности (UnregisterRenderable + DeleteEntity),
-		/// пока BatchId-ы ещё валидны.</summary>
+		/// <summary>Сейчас будут сняты регистрации батч-рендерера какой-то части резидентов (выселение
+		/// простаивающих моделей, ResetResidency) или вообще всех (полная очистка, ClearAll):
+		/// подписчик обязан снять свои инстанс-сущности (UnregisterRenderable + DeleteEntity), пока
+		/// BatchId-ы ещё валидны. Событие не сообщает, КАКИЕ именно модели выселяются - выселение
+		/// одной простаивающей модели больше НЕ трогает MeshId/MaterialId/BatchId выживших (см.
+		/// ResetResidency), но подписчик всё равно узнаёт об этом заранее и волен снять только то,
+		/// что реально ссылается на выселяемых резидентов.</summary>
 		public event Action? ResidencyResetting;
 
-		/// <summary>Сброс завершён, выжившие модели перерегистрированы (их словари Id перезаполнены) -
-		/// подписчик может инстанцировать заново.</summary>
+		/// <summary>Сброс завершён - подписчик может инстанцировать заново. Для партиционного
+		/// выселения (ResetResidency) словари Id выживших моделей НЕ перезаполняются - они и не
+		/// менялись; для полной очистки (ClearAll) это по-прежнему полный ResetRegistrations.</summary>
 		public event Action? ResidencyReset;
 
 		public ModelStreamer(ModelViewportEnvironment env, IGraphicsApi graphicsApi,
@@ -237,6 +248,7 @@ namespace DecaEngine.Editor.ECS
 			PollLoads();
 			PumpTextureUpgrades();
 			AgeRetiredTextures();
+			AgeRetiredModels();
 			EvictIdle(deltaTime);
 		}
 
@@ -681,8 +693,38 @@ namespace DecaEngine.Editor.ECS
 			}
 		}
 
+		private void AgeRetiredModels()
+		{
+			for (int i = _retiredModels.Count - 1; i >= 0; i--)
+			{
+				var (model, ticksLeft) = _retiredModels[i];
+				if (ticksLeft <= 1)
+				{
+					model.Release();
+					_retiredModels.RemoveAt(i);
+				}
+				else
+				{
+					_retiredModels[i] = (model, ticksLeft - 1);
+				}
+			}
+		}
+
+		/// <summary>Немедленный Release всей отложенной очереди выселенных моделей - только из точек,
+		/// где GPU уже дождались (см. FlushRetiredTextures).</summary>
+		private void FlushRetiredModels()
+		{
+			foreach (var (model, _) in _retiredModels)
+			{
+				model.Release();
+			}
+
+			_retiredModels.Clear();
+		}
+
 		/// <summary>Немедленный Release всей отложенной очереди - только из точек, где GPU уже
-		/// дождались (ClearAll/ResetResidency/MigrateEnvironment).</summary>
+		/// дождались (ClearAll/MigrateEnvironment; ResetResidency больше не барьерится - см. его
+		/// комментарий - и в отложенную очередь только кладёт, не сливает).</summary>
 		private void FlushRetiredTextures()
 		{
 			foreach (var (texture, _) in _retiredTextures)
@@ -751,54 +793,39 @@ namespace DecaEngine.Editor.ECS
 			ResetResidency(_evictScratch);
 		}
 
-		/// <summary>Выселение с GPU: снять инстансы (событие) -> дождаться GPU -> сбросить регистрации
-		/// -> освободить выселяемые модели -> перерегистрировать выживших -> пересобрать граф ->
-		/// событие на переинстанцирование. Мега-буферы батч-рендерера не умеют частичного удаления
-		/// (пересоздаются целиком), поэтому выселение даже одной модели - полный сброс.</summary>
+		/// <summary>Выселение с GPU одной или нескольких простаивающих моделей: снять инстансы
+		/// (событие) -> партиционно снять ИХ батчи/материалы/меши в батч-рендерере (см.
+		/// <see cref="DiligentBatchRenderer.UnregisterModel"/>) -> пересобрать граф -> событие на
+		/// переинстанцирование. Выжившие резиденты не трогаются вовсе: их MeshId/MaterialId/BatchId
+		/// плотные и никогда не переиспользуются, так что снятие чужого id их не сдвигает - в
+		/// отличие от старого протокола (полный ResetRegistrations + Flush/WaitForIdle + перерегистрация
+		/// КАЖДОЙ выжившей модели), выселение больше не стоит O(всех резидентных моделей).
+		///
+		/// GPU не ждём: ResidencyResetting выше уже гарантирует, что подписчики сняли ВСЕ ссылающиеся
+		/// на выселяемые батчи инстанс-сущности (UnregisterRenderable, пока BatchId ещё валиден) -
+		/// удалять сами batchId после этого безопасно. Сами модели (текстуры и GPU-ресурсы
+		/// ModelLoader) освобождаются не сразу, а отложенно через <see cref="_retiredModels"/> - тем
+		/// же приёмом, что и retired-текстуры апгрейда: без барьера GPU может ещё доигрывать кадры,
+		/// отправленные до выселения и читающие эти ресурсы.</summary>
 		private void ResetResidency(List<Resident> evicted)
 		{
 			ResidencyResetting?.Invoke();
 
-			_env.DilApi.ImmediateContext.Flush();
-			_env.DilApi.ImmediateContext.WaitForIdle();
-			_env.BatchRenderer.ResetRegistrations();
-
-			// Апгрейд-очередь текстур: GPU уже дождались - отложенные Release можно исполнить сразу;
-			// незавершённый декод сам обнаружит смерть модели (alive-проверка в PumpTextureUpgrades).
-			FlushRetiredTextures();
-
 			foreach (var resident in evicted)
 			{
 				_models.Remove(resident.Path);
-				resident.Model?.Release();
+
+				if (resident.Model != null)
+				{
+					_env.BatchRenderer.UnregisterModel(resident.BatchCache.Values, resident.MaterialIds.Values,
+						resident.MeshIds.Values);
+					_retiredModels.Add((resident.Model, RetireTicks));
+				}
+
 				resident.Model = null;
 				resident.MeshIds.Clear();
 				resident.MaterialIds.Clear();
 				resident.BatchCache.Clear();
-			}
-
-			foreach (var resident in _models.Values)
-			{
-				resident.MeshIds.Clear();
-				resident.MaterialIds.Clear();
-				resident.BatchCache.Clear();
-
-				if (resident.Model == null)
-				{
-					continue;
-				}
-
-				try
-				{
-					RegisterResident(resident, resident.Model);
-				}
-				catch (Exception ex)
-				{
-					resident.Error = ex.Message;
-					resident.Model = null;
-					EditorConsoleLog.Add(LogLevel.Error,
-						$"Model streaming: failed to re-register '{resident.Path}': {ex.Message}");
-				}
 			}
 
 			RecomputeTextureBytes();
@@ -834,7 +861,7 @@ namespace DecaEngine.Editor.ECS
 			// Незавершённый фоновый декод апгрейда бросаем - его alive-проверка не пройдёт.
 			_textureJob = null;
 
-			var anyGpu = _retiredTextures.Count > 0;
+			var anyGpu = _retiredTextures.Count > 0 || _retiredModels.Count > 0;
 			foreach (var resident in _models.Values)
 			{
 				if (resident.Model != null)
@@ -856,7 +883,11 @@ namespace DecaEngine.Editor.ECS
 			_env.DilApi.ImmediateContext.WaitForIdle();
 			_env.BatchRenderer.ResetRegistrations();
 
+			// Барьер уже был (Flush+WaitForIdle выше) - отложенные очереди партиционного выселения
+			// (_retiredModels, см. ResetResidency) и апгрейда текстур можно слить немедленно, не
+			// дожидаясь их RetireTicks.
 			FlushRetiredTextures();
+			FlushRetiredModels();
 
 			foreach (var resident in _models.Values)
 			{
@@ -884,6 +915,7 @@ namespace DecaEngine.Editor.ECS
 			{
 				_textureJob = null;
 				FlushRetiredTextures(); // барьер уже был - перед освобождением старого окружения
+				FlushRetiredModels();
 
 				foreach (var resident in _models.Values)
 				{

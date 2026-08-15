@@ -12,7 +12,6 @@ public class RenderResourceManager
 	private readonly DiligentBatchRenderer _batchRenderer;
 	private readonly NativeStack<int> _freeSlots;
 	private readonly EntityStore _store;
-	private readonly ArchetypeQuery<BatchRenderInfo> _deadEntitiesQuery;
 	private int[] _batchCounts;
 
 	public int totalInstances;
@@ -71,18 +70,63 @@ public class RenderResourceManager
 			_freeSlots.Push(totalInstances - 1 - i);
 		}
 
-		_deadEntitiesQuery = _store.Query<BatchRenderInfo>();
+		// Подстраховка от утечки GPU-слотов: если сущность с BatchRenderInfo удаляют напрямую
+		// (Entity.DeleteEntity), минуя UnregisterRenderable (например InspectorWindow при удалении
+		// объекта из иерархии), её слот раньше никогда не возвращался в _freeSlots - разрежение
+		// росло безвозвратно, а верхняя граница диспатча (_slotHighWaterMark) не опускалась.
+		// OnEntityDelete стреляет ДО фактического удаления (сущность ещё жива и с компонентами -
+		// см. документацию Friflo), так что можно прочитать GpuSlotIndex и освободить слот тем же
+		// путём, что и UnregisterRenderable. Для сущностей, уже отцепленных через
+		// UnregisterRenderable (обычный протокол вьюпортов/стримера), TryGetComponent тут вернёт
+		// false - двойного освобождения нет.
+		_store.OnEntityDelete += OnEntityDeleting;
 	}
 
+	private void OnEntityDeleting(EntityDelete args)
+	{
+		if (args.Entity.TryGetComponent<BatchRenderInfo>(out var batchInfo))
+		{
+			FreeSlot(batchInfo.GpuSlotIndex, batchInfo.BatchId);
+		}
+	}
+
+	/// <summary>Поджимает верхнюю границу диспатча (<see cref="_slotHighWaterMark"/>) под фактически
+	/// занятые слоты, схлопывая освободившийся хвост. Вызывается сама из <see cref="FreeSlot"/> при
+	/// каждом освобождении слота, так что отдельный вызов обычно не нужен - метод публичный и
+	/// идемпотентный на случай, если слоты когда-нибудь освободятся в обход FreeSlot.</summary>
 	public void RecycleDeadHandles()
 	{
-		/*_deadEntitiesQuery.ForEach((chunk, entities) =>
+		while (_slotHighWaterMark > 0 && _renderSubset.instances[_slotHighWaterMark - 1].batchId.batchId < 0)
 		{
-		    ref RenderHandleComponent handle = ref chunk[0];
-		    entities.
-		    _freeSlots.Push(handle.GpuSlotIndex);
-		    entity.Remove<RenderHandleComponent>();
-		});*/
+			_slotHighWaterMark--;
+		}
+	}
+
+	/// <summary>Общий путь освобождения одного GPU-слота инстанса: возвращает индекс в
+	/// <see cref="_freeSlots"/>, гасит запись в <see cref="_renderSubset"/> (иначе куллинг-шейдер
+	/// продолжил бы читать чужой/устаревший инстанс по этому индексу), откатывает
+	/// префикс-суммы <see cref="_batchCounts"/>/countData и поджимает хвост диспатча. Используется
+	/// и из <see cref="UnregisterRenderable"/> (явное снятие), и из <see cref="OnEntityDeleting"/>
+	/// (сущность удалена напрямую, в обход UnregisterRenderable).</summary>
+	private unsafe void FreeSlot(int slotIndex, BatchId batchId)
+	{
+		_freeSlots.Push(slotIndex);
+		totalFreeSlot = _freeSlots.Count;
+
+		_renderSubset.instances[slotIndex] = new IndirectInstance { batchId = new BatchId(-1), objectId = -1 };
+
+		if (batchId.batchId >= 0 && batchId.batchId < _batchCounts.Length)
+		{
+			_batchCounts[batchId.batchId]--;
+			for (var i = batchId.batchId + 1; i < _batchCounts.Length; i++)
+			{
+				_renderSubset.countData.GetRef(i)--;
+			}
+		}
+
+		RecycleDeadHandles();
+
+		_batchRenderer.MarkInstancesContentDirty();
 	}
 
 	public unsafe bool RegisterRenderable(Entity entity, BatchId batchId)
@@ -211,34 +255,10 @@ public class RenderResourceManager
 	{
 		if (entity.TryGetComponent<BatchRenderInfo>(out var batchInfo))
 		{
-			_freeSlots.Push(batchInfo.GpuSlotIndex);
-			totalFreeSlot = _freeSlots.Count;
-
-			// Опустить границу можно только когда занятых слотов не осталось вовсе - в общем случае
-			// дырка в середине не даёт её уменьшить (см. _slotHighWaterMark). Этого достаточно для
-			// сценариев превью/бейка, где сцена между этапами очищается целиком
-			// (ModelIconBaker.ClearStageEntities, ModelPreviewViewport.ClearInstances): следующий этап
-			// снова начинает набирать слоты с нуля, а не тянет за собой границу от прошлой модели.
-			if (_freeSlots.Count == totalInstances)
-			{
-				_slotHighWaterMark = 0;
-			}
-
-			_renderSubset.instances[batchInfo.GpuSlotIndex] = new IndirectInstance { batchId = new BatchId(-1), objectId = -1 };
-
-			if (batchInfo.BatchId.batchId >= 0 && batchInfo.BatchId.batchId < _batchCounts.Length)
-			{
-				_batchCounts[batchInfo.BatchId.batchId]--;
-				for (var i = batchInfo.BatchId.batchId + 1; i < _batchCounts.Length; i++)
-				{
-					_renderSubset.countData.GetRef(i)--;
-				}
-			}
+			FreeSlot(batchInfo.GpuSlotIndex, batchInfo.BatchId);
 
 			entity.RemoveComponent<BatchRenderInfo>();
 			entity.RemoveComponent<LinkDrawInfo>();
-
-			_batchRenderer.MarkInstancesContentDirty();
 		}
 	}
 }
