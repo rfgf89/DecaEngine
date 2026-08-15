@@ -42,8 +42,22 @@ namespace DecaEngine.Editor
 			Play
 		}
 
+		// Кадр ImGui, на котором ЛЮБАЯ из Game View последний раз была в фокусе (окон может быть
+		// несколько). Пишется при отрисовке, читается системой полётной камеры - см. IsAnyFocused.
+		private static int _lastFocusedImGuiFrame = int.MinValue;
+
+		/// <summary>Активна ли сейчас какая-нибудь Game View. Ввод у полётной камеры читается в обход
+		/// ImGui и ДО его отрисовки (см. EditorManager.OnUpdate: Root.Update идёт раньше RenderWindows),
+		/// поэтому засчитываем и предыдущий кадр - иначе камера дёргалась бы через кадр.</summary>
+		public static bool IsAnyFocused => ImGui.GetFrameCount() - _lastFocusedImGuiFrame <= 1;
+
 		protected override void OnRender(uint dockId)
 		{
+			if (IsFocused)
+			{
+				_lastFocusedImGuiFrame = ImGui.GetFrameCount();
+			}
+
 			DrawHeader();
 
 			var state = _projectSession.State;
