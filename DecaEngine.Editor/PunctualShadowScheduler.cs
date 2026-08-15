@@ -47,6 +47,14 @@ public static unsafe class PunctualShadowScheduler
     // Печатаем только при ИЗМЕНЕНИИ числа, иначе строка сыпалась бы каждый кадр.
     private static int _lastReportedSkipped;
 
+    /// <summary>DECA_PUNCTUAL_CULL=0 выключает фрустум-кулинг кастеров в теневых слайсах punctual-света
+    /// (слайс рисует ВСЮ сцену). Диагностический тумблер: эти плоскости - единственный потребитель
+    /// GPU-фрустум-кулинга во всём движке (у камер и каскадов cullFrustum = 0), поэтому при жалобе
+    /// "тень неполная/лишняя геометрия пропала" сравнение с выключенным кулингом отделяет ошибку
+    /// отсечения от ошибки самой карты за один запуск.</summary>
+    private static readonly bool FrustumCullCasters =
+        Environment.GetEnvironmentVariable("DECA_PUNCTUAL_CULL") != "0";
+
     /// <summary>Заполняет слайсы теней кадра в <paramref name="target"/> (cull/light-данные для
     /// записи shadow map + матрицы для сэмплинга) и раскладку "id сущности света - первый слайс" в
     /// <paramref name="assignments"/> (её читает LightCulling.TryBuildPunctualLight, собирая
@@ -176,7 +184,7 @@ public static unsafe class PunctualShadowScheduler
             drawCount = drawCount,
             // Бит 0 - фрустум-кулинг (кастеры вне конуса света в его карту не попадают), без LOD:
             // тень геометрии обязана совпадать с тем, что нарисовано в основном виде.
-            cullFrustum = 1,
+            cullFrustum = FrustumCullCasters ? 1 : 0,
         };
 
         int slice = target.punctualShadowCullData.Count;
