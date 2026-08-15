@@ -18,11 +18,16 @@ public sealed class ShadowCascadeSchedule
 {
 	public const int AllCascades = ~0;
 
-	/// <summary>Аварийный выключатель стаггеринга: DECA_SHADOW_STAGGER=0 возвращает прежнее
-	/// поведение "все каскады каждый кадр" (и запись команд ShadowPass прямо в буфер графа,
-	/// без суб-буферов и колбэка).</summary>
+	/// <summary>Стаггеринг ВЫКЛЮЧЕН по умолчанию: DECA_SHADOW_STAGGER=1 включает его, всё остальное
+	/// оставляет прежнее поведение "все каскады каждый кадр" (запись команд ShadowPass прямо в буфер
+	/// графа, без суб-буферов и колбэка).
+	///
+	/// Причина: путь с суб-буферами падал с AV в DiligentMaterial.SetPipelineState при переключении
+	/// между вьюпортами превью и сцены - замороженные суб-буферы переживают освобождение материалов
+	/// модели, тогда как буфер графа на том же событии перезаписывается. Пока время жизни не
+	/// починено, дефолт - проверенный путь.</summary>
 	public static readonly bool StaggerEnabled =
-		Environment.GetEnvironmentVariable("DECA_SHADOW_STAGGER") != "0";
+		Environment.GetEnvironmentVariable("DECA_SHADOW_STAGGER") == "1";
 
 	private int _renderMask = AllCascades;
 
