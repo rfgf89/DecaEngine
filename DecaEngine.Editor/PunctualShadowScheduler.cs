@@ -127,12 +127,17 @@ public static unsafe class PunctualShadowScheduler
         var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(fov, 1f, near, far);
         var viewProj = view * proj;
 
-        // Компактный фрустум - той же формулой, что CameraComponent.CreateCullData.
+        // Компактный фрустум - БУКВАЛЬНО тем же выражением, что CameraComponent.CreateCullData:
+        // плоскость собирается из СТРОК транспонированной проекции. Раньше здесь стояли её СТОЛБЦЫ
+        // (M14+M11, M24+M21, ...) - лишняя транспозиция, из-за которой z-компонента левой плоскости
+        // выходила -n*f/(f-n) вместо 1. На спот-конусе это давало условие "кастер виден, только если
+        // его радиус больше смещения от оси света", то есть из карты теней выбрасывало почти всю
+        // геометрию в пятне света, и карта оставалась пустой. Заметить было негде: у всех камер и
+        // каскадов cullFrustum = 0 (см. CreateCullData), так что эти плоскости читает ТОЛЬКО
+        // пунктуальный слот.
         var projT = Matrix4x4.Transpose(proj);
-        var frustumX = new Vector4(projT.M14 + projT.M11, projT.M24 + projT.M21,
-            projT.M34 + projT.M31, projT.M44 + projT.M41);
-        var frustumY = new Vector4(projT.M14 + projT.M12, projT.M24 + projT.M22,
-            projT.M34 + projT.M32, projT.M44 + projT.M42);
+        var frustumX = projT[3] + projT[0];
+        var frustumY = projT[3] + projT[1];
         DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumX);
         DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumY);
 
