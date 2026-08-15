@@ -22,6 +22,11 @@ public readonly struct ModelLoadOptions
 	/// следующей загрузке модели. Текстуры с авторским point-фильтром не трогает.</summary>
 	public bool AnisotropicFiltering { get; init; } = true;
 
+	/// <summary>Смещение выбора мип-уровня для сэмплеров текстур модели - log2 масштаба рендера при
+	/// темпоральном апскейле (см. IGraphicsApi.CreateSampler). Уровня ЗАГРУЗКИ, как и анизотропия:
+	/// сэмплеры immutable, смена масштаба подхватится при следующей загрузке модели.</summary>
+	public float MipLodBias { get; init; } = 0f;
+
 	/// <summary>Компилировать в пиксельные варианты фичи Lighting-превью (кейворды
 	/// FEATURE_NORMAL_MAPS/OCCLUSION/SHADOWS - см. UnlitInstancedPS.hlsl): live-тумблеры настроек
 	/// работают битами ВНУТРИ скомпилированной фичи. false - варианты без кода фич вовсе (для
@@ -35,6 +40,18 @@ public readonly struct ModelLoadOptions
 	/// одна 4096x4096 - это ~89 МБ, с лимитом 2048 - ~22 МБ. 0 = без лимита. Потребителям с
 	/// маленьким выходом (бейкер иконок) имеет смысл ставить сильно меньше.</summary>
 	public int MaxTextureSize { get; init; } = 2048;
+
+	/// <summary>Прогрессивный стриминг качества текстур: первый декод (и первая видимая модель) - на
+	/// <see cref="StreamInitialTextureSize"/>, а сжатые исходники (PNG/JPG) сохраняются в
+	/// <see cref="ModelLoader.StreamedTextures"/> для последующих фоновых ре-декодов на бо́льших
+	/// размерах с горячей заменой в живых материалах (см. DecaEngine.Editor.ECS.ModelStreamer).
+	/// Меши при этом появляются почти сразу: декод крошечных текстур перестаёт быть самой дорогой
+	/// CPU-фазой загрузки.</summary>
+	public bool StreamTextures { get; init; }
+
+	/// <summary>Сторона текстур первого декода при <see cref="StreamTextures"/> (дальше качество
+	/// поднимается ступенями до <see cref="MaxTextureSize"/>).</summary>
+	public int StreamInitialTextureSize { get; init; } = 64;
 
 	public ModelLoadOptions()
 	{

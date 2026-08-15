@@ -171,6 +171,12 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             });
         }
 
+        /// <summary>Нативные врезки поддержаны только в заморожённом буфере на immediate-контексте
+        /// (см. DiligentCommandBuffer.Callback): FSR пишет в командный лист именно immediate, а
+        /// этот буфер пишет в deferred.</summary>
+        public void Callback(Action callback) =>
+            throw new NotSupportedException("Callback commands are only supported by the frozen immediate-context buffer.");
+
         public void CopyTexture(IGpuTexture src, IGpuTexture dst)
         {
             var srcTex = GetNativeTexture(src);

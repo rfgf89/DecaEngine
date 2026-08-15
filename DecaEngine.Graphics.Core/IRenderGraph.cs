@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Core;
@@ -6,6 +6,9 @@ namespace DecaEngine.Core;
 public abstract unsafe class RenderGraphPass<T>() : IRenderGraphPass
 {
 	public abstract string Name { get; }
+
+	/// <summary>См. <see cref="IRenderGraphPass.Enabled"/>. По умолчанию включён.</summary>
+	public bool Enabled { get; set; } = true;
 
 	private T _passData;
 
@@ -32,6 +35,16 @@ public abstract unsafe class RenderGraphPass<T>() : IRenderGraphPass
 public interface IRenderGraphPass
 {
 	public string Name { get; }
+
+	/// <summary>Исполнять ли пасс. Учитывается при КОМПИЛЯЦИИ: выключенный пасс не проходит сетап, не
+	/// участвует в графе зависимостей и не пишет команд - для графа его просто нет. Поэтому переходы
+	/// состояний ресурсов расставляются между оставшимися пассами и выключать можно ЛЮБОЙ пасс,
+	/// включая структурные.
+	///
+	/// Смена значения помечает граф на перекомпиляцию (см. IRenderGraph.SetPassEnabled). Она дешёвая:
+	/// нативные текстуры и буферы переиспользуются из пула графа, пересобираются только командные
+	/// буферы - см. IRenderGraph.TrimResourcePool о том, где VRAM реально возвращается.</summary>
+	public bool Enabled { get; set; }
 
 	public void SetupPassData(IRenderGraphBuilder builder);
 
@@ -69,6 +82,17 @@ public interface IRenderGraphBuilder
 	BufferResource ReadBuffer(BufferResource bufferResource);
 
 	TextureResource PinTexture(TextureInfo info);
+
+	/// <summary>Объявляет графу УЖЕ СУЩЕСТВУЮЩИЙ таргет, созданный вне его (офскрин-таргеты конвейера,
+	/// собственные таргеты пассов - см. <see cref="PipelineRenderTargets"/>, <see cref="SsaoPassResources"/>).
+	/// Граф его не создаёт и не освобождает - он лишь узнаёт, кто его читает и пишет, и потому может
+	/// строить настоящие рёбра зависимостей вместо порядка добавления, а окно отладки - показывать
+	/// времена жизни и вес ресурсов кадра. Дальше с ним работают как с любым другим:
+	/// <see cref="ReadTarget"/>/<see cref="WriteTarget"/>.
+	///
+	/// Повторный импорт того же таргета в другом пассе - норма и обязателен: именно из повторов и
+	/// складывается граф. Вернёт тот же ресурс.</summary>
+	TextureResource ImportTexture(IGpuTexture texture);
 
 	BufferResource PinBuffer(BufferInfo bufferInfo);
 
@@ -121,6 +145,30 @@ public interface IRenderGraph : IReleaseObject
 	/// new one.
 	/// </summary>
 	void Invalidate();
+
+	/// <summary>Включает/выключает пасс ПО ИМЕНИ (<see cref="IRenderGraphPass.Name"/>) на уже
+	/// собранном графе. Изменение значения помечает граф на перекомпиляцию - выключенный пасс
+	/// исключается из графа целиком, вместе со своими переходами состояний, так что тумблер
+	/// безопасен для любого пасса (см. <see cref="IRenderGraphPass.Enabled"/>).
+	/// Возвращает false, если пасса с таким именем в графе нет.</summary>
+	bool SetPassEnabled(string name, bool enabled);
+
+	/// <summary>Сносит СПИСОК ПАССОВ (в отличие от <see cref="IReleaseObject.Release"/> - нативные
+	/// ресурсы при этом уходят в пул и переживут пересборку). Именно этим пользуется конвейер, когда
+	/// пересобирает граф под новую сцену или новый набор фич: пассы создаются заново, а текстуры,
+	/// буферы и вьюхи переиспользуются, пока совпадают их дескрипторы.
+	/// Вызывающий обязан гарантировать, что кадры со старыми командами уже не в полёте.</summary>
+	void ResetPasses();
+
+	/// <summary>Освобождает нативные ресурсы, лежащие в пуле и не востребованные текущей компиляцией,
+	/// - то есть VRAM выключенных фич и таргетов старого размера. Держать их в пуле дёшево по
+	/// времени, но не по памяти: этот метод - точка, где вызывающий решает, что пора отдать.
+	/// Вызывающий обязан дождаться GPU (Flush + WaitForIdle).</summary>
+	void TrimResourcePool();
+
+	/// <summary>Имена пассов текущего собранного графа, в порядке добавления - чтобы UI мог
+	/// показать список, а не хардкодить его.</summary>
+	IReadOnlyList<string> PassNames { get; }
 
 	void Execute();
 

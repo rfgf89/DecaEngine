@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -19,6 +19,10 @@ public class DiligentMaterial : IMaterialObject
 	private IShaderResourceBinding? _srb;
 
 	private readonly Dictionary<ShaderObjectType, IShader> _shaders = new();
+
+	/// <summary>См. <see cref="IMaterialObject.OwnsShaders"/>. По умолчанию true - историческое
+	/// поведение, на которое опираются все пассы движка.</summary>
+	public bool OwnsShaders { get; set; } = true;
 	private readonly Dictionary<string, DiligentBufferHandle> _constantBuffers = new();
 	private readonly Dictionary<string, IDeviceObject> _pendingResources = new();
 	private readonly Dictionary<string, ImmutableSamplerDesc> _immutableSamplers = new();
@@ -84,7 +88,14 @@ public class DiligentMaterial : IMaterialObject
 	{
 		if (bufferHandle is DiligentBufferHandle dilBuffer)
 		{
-			var shaderStages = dilBuffer.GetShaderType() | DiligentGraphicsUtility.AccessToShaderType(access);
+			// БЕЗ Compute-стадии: у графического материала её не бывает, а буфер, созданный с
+			// HandleAccess.Compute в access (UAV для компьют-пассов, см. кластерные буферы
+			// DiligentBatchRenderer), тащил её через GetShaderType в дескриптор переменной.
+			// Переменная с compute-стадией в лейауте ГРАФИЧЕСКОГО PSO ломает привязку на Vulkan -
+			// остальные переменные сета молча оставались без дескрипторов (GPURenderInstances
+			// "has never been updated", весь батч-дроу рисовал пустоту).
+			var shaderStages = (dilBuffer.GetShaderType() | DiligentGraphicsUtility.AccessToShaderType(access))
+				& ~ShaderType.Compute;
 			DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, shaderStages, ref _isDirty);
 
 			if (dilBuffer.Info.type == BufferHandleType.Constant)
@@ -133,6 +144,15 @@ public class DiligentMaterial : IMaterialObject
 			return;
 		}
 
+		// DECA_MAT_DIAG=1 - трассировка привязки сэмплеров (диагностика мёртвых ручек bias/aniso).
+		if (Environment.GetEnvironmentVariable("DECA_MAT_DIAG") == "1")
+		{
+			var attached = name.EndsWith("_sampler") &&
+				_pendingResources.TryGetValue(name.Substring(0, name.Length - 8), out var r) && r is ITextureView;
+			Console.WriteLine($"[matdiag] SetSampler {name}: bias={dilSampler.Desc.MipLODBias:F1} " +
+				$"filter={dilSampler.Desc.MinFilter} viewAttached={attached}");
+		}
+
 		var shaderStages = DiligentGraphicsUtility.AccessToShaderType(access);
 		if (shaderStages == ShaderType.Unknown)
 		{
@@ -169,9 +189,12 @@ public class DiligentMaterial : IMaterialObject
 		var shaderStages = DiligentGraphicsUtility.AccessToShaderType(access);
 		if (shaderStages == ShaderType.Unknown) shaderStages = ShaderType.Pixel;
 
-		if (_immutableSamplers.TryGetValue(name, out var existing))
+		// Сравнение ВМЕСТЕ с Desc: прежний ранний выход по одним лишь стадиям молча глотал НОВЫЙ
+		// дескриптор (смену анизотропии/bias на живом материале) - PSO оставался со старым.
+		if (_immutableSamplers.TryGetValue(name, out var existing) &&
+		    existing.ShaderStages == shaderStages && existing.Desc.Equals(dilSampler.Desc))
 		{
-			if (existing.ShaderStages == shaderStages) return;
+			return;
 		}
 
 		_immutableSamplers[name] = new ImmutableSamplerDesc
@@ -238,7 +261,36 @@ public class DiligentMaterial : IMaterialObject
 			psoCreateInfo.GraphicsPipeline = _basePsoCreateInfo.GraphicsPipeline;
 			
 			var psoDesc = psoCreateInfo.PSODesc;
-			psoDesc.Name = $"{Name} Material PSO";
+
+			// Конфигурация immutable-сэмплеров - ЧАСТЬ ИМЕНИ, потому что имя - ключ дискового
+			// PSO-кэша (D3D12 pipeline library, см. DiligentPsoManager). Сэмплеры живут в
+			// рут-сигнатуре внутри кэшированного блоба, и совпадение имени возвращало блоб со
+			// СТАРЫМИ сэмплерами первого запуска: ручки анизотропии и mip bias были мертвы, что ни
+			// делай (замерено: кадры с ANISO=0/1 и MIPBIAS=+4 бит-в-бит, с DECA_PSO_CACHE=0 bias
+			// сразу ожил). Сигнатура строится детерминированно (HashCode рандомизирован на процесс
+			// и в ключ кэша не годится).
+			var samplerSignature = "";
+			foreach (var s in _immutableSamplers.Values)
+			{
+				samplerSignature += $"|{s.SamplerOrTextureName}:{(int)s.Desc.MinFilter}" +
+					$":{(int)s.Desc.AddressU}:{s.Desc.MipLODBias:F2}:{s.Desc.MaxAnisotropy}:{s.Desc.MaxLOD:G3}";
+			}
+
+			// Сигнатура ЛЕЙАУТА ПЕРЕМЕННЫХ - тоже часть ключа кэша: набор переменных у живого
+			// материала растёт (ресайз довешивает _SceneColor всем материалам модели), и блоб под
+			// старым именем нёс рут-сигнатуру БЕЗ неё - библиотека отвергала создание, Diligent
+			// возвращал null, а бинд null-PSO ронял процесс AV-ом на первом же ресайзе превью.
+			// FNV, а не HashCode: тот рандомизирован на процесс и в дисковый ключ не годится.
+			uint layoutHash = 2166136261;
+			foreach (var name in _variablesDesc.Keys.OrderBy(n => n, StringComparer.Ordinal))
+			{
+				foreach (var c in name)
+				{
+					layoutHash = (layoutHash ^ c) * 16777619;
+				}
+			}
+
+			psoDesc.Name = $"{Name} Material PSO{samplerSignature}|L{layoutHash:X8}";
 
 			foreach (var shader in _shaders)
 			{
@@ -280,6 +332,20 @@ public class DiligentMaterial : IMaterialObject
 
 			_pipelineState?.Dispose();
 			_pipelineState = _api.PsoManager.CreateGraphicsPipelineState(psoCreateInfo);
+
+			// Протухший/несовместимый блоб дискового кэша - не повод ронять процесс: пересоздаём
+			// БЕЗ кэша. null дальше по коду означал бинд null-PSO и AV без единого сообщения.
+			if (_pipelineState is null)
+			{
+				Console.WriteLine($"[material] PSO '{psoDesc.Name}': кэш отверг создание - пересоздаю без кэша");
+				_pipelineState = _api.Device.CreateGraphicsPipelineState(psoCreateInfo);
+			}
+
+			if (_pipelineState is null)
+			{
+				throw new InvalidOperationException($"Failed to create PSO '{psoDesc.Name}'.");
+			}
+
 			_variables.Clear();
 
 			var stagesToTry = new[] { ShaderType.Vertex, ShaderType.Pixel, ShaderType.Compute, ShaderType.Geometry, ShaderType.Domain, ShaderType.Hull };
@@ -337,6 +403,13 @@ public class DiligentMaterial : IMaterialObject
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public void SetPipelineState(IDeviceContext ctx)
 	{
+		// DECA_MAT_DIAG=2 - трассировка биндов PSO (охота на AV в реплее после ресайза).
+		if (Environment.GetEnvironmentVariable("DECA_MAT_DIAG") == "2")
+		{
+			Console.WriteLine($"[matdiag] SetPipelineState '{Name}' dirty={_isDirty}");
+			Console.Out.Flush();
+		}
+
 		RebuildPipelineIfNeeded();
 		ctx.SetPipelineState(_pipelineState);
 	}
@@ -347,11 +420,22 @@ public class DiligentMaterial : IMaterialObject
 		ctx.CommitShaderResources(_srb, transition);
 	}
 
+	/// <summary>Идемпотентен: повторный вызов ничего не делает. Материал законно оказывается в
+	/// нескольких коллекциях сразу (дефолтный материал модели раздаётся всем её null-материалам),
+	/// и без обнуления полей второй Release дважды диспозил бы нативные SRB/PSO - то есть обращался
+	/// к освобождённой памяти.</summary>
 	public void Release()
 	{
 		_srb?.Dispose();
+		_srb = null;
 		_pipelineState?.Dispose();
-		foreach (var shader in _shaders.Values) shader.Release();
+		_pipelineState = null;
+		// Только СВОИ шейдеры: у шареных владелец другой, и лишний Release здесь - это декремент
+		// чужого счётчика ссылок и падение на следующем владельце (см. IMaterialObject.OwnsShaders).
+		if (OwnsShaders)
+		{
+			foreach (var shader in _shaders.Values) shader.Release();
+		}
 		foreach (var buffer in _constantBuffers.Values) buffer.Release();
 		_constantBuffers.Clear();
 		_variables.Clear();

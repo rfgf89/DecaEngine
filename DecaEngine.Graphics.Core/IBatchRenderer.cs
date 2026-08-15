@@ -1,4 +1,5 @@
 using DecaEngine.Graphics.Diligent;
+using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Core;
 
@@ -45,9 +46,51 @@ public interface IBatchRenderer
 	/// SsaoPass): им нужна камера, но Register() тянет за собой лишние ресурсы (инстанс-буферы, тени).</summary>
 	void BindViewConstants(IMaterialObject material);
 
+	/// <summary>Привязывает кбуфер Light (матрицы каскадов, направление и цвет солнца) и сам массив
+	/// shadow map к материалу, который НЕ регистрируется как батч-материал, - фуллскрин-пассу,
+	/// которому нужны тени сцены (см. <see cref="VolumetricLightPass"/>: марш объёмного света
+	/// выбирает shadow map в каждой точке луча). Register() для такого материала избыточен - он
+	/// тянет за собой инстанс-буферы и прочую машинерию рисования геометрии.</summary>
+	void BindShadowResources(IMaterialObject material);
+
+	/// <summary>Переводит массив shadow map в состояние чтения из шейдера. Нужен пассам, которые
+	/// читают тени ВНЕ рисования геометрии (см. <see cref="BindShadowResources"/>): переход, который
+	/// делает <see cref="ExecuteDrawBatching(ICommandBuffer, ICullResult)"/>, полагаться на себя не
+	/// позволяет - пассы включаются и выключаются по имени, а выключенный пасс не делает и своих
+	/// переходов.</summary>
+	void TransitionShadowMapsForRead(ICommandBuffer cmd);
+
 	void SetupViewData(ICommandBuffer cmd, ref ViewData viewData);
 	void SetupCullData(ICommandBuffer cmd, ref CullData cullData);
 	void SetupLightData(ICommandBuffer cmd, ref LightData lightData);
+
+	/// <summary>Загружает пул punctual-светов кадра (PunctualLight, см. ViewSubset.punctualLights) в
+	/// GPU-буфер. Команда замороженная: запоминается сырой указатель и память перечитывается на каждом
+	/// реплее - пул обязан жить в стабильной unmanaged-памяти. Зовётся один раз на кадр перед пер-камерными
+	/// диспатчами <see cref="ExecuteLightClustering"/>; какая камера каким отрезком пула владеет,
+	/// сообщает её LightData.ClusterParams.</summary>
+	unsafe void SetupPunctualLights(ICommandBuffer cmd, UnsafeArray* lights);
+
+	/// <summary>Диспатчит компьют-кластеризацию светов (LightClusterCS.hlsl): раскладывает отрезок
+	/// пула текущей камеры (границы - из последнего <see cref="SetupLightData"/>) по фроксел-кластерам,
+	/// с по-типовым тестом свет-против-кластера (сфера для точечных, конус для спотов). Результат
+	/// (ClusterCounts/ClusterIndices) читают пиксельные шейдеры батч-материалов.</summary>
+	void ExecuteLightClustering(ICommandBuffer cmd);
+
+	/// <summary>Заливает viewProj-матрицы теневых слайсов punctual-светов кадра (сэмплинг теней в
+	/// пиксельном шейдере). Команда замороженная - память обязана быть стабильной
+	/// (см. RenderCamerasData.punctualShadowMatrices).</summary>
+	unsafe void SetupPunctualShadowMatrices(ICommandBuffer cmd, UnsafeArray* matrices);
+
+	/// <summary>Пишет один слайс texture array теней punctual-светов по результату куллинга слайса:
+	/// вызывающий сперва заливает SetupCullData фрустумом света и SetupLightData с CascadeMatrix0 =
+	/// viewProj слайса (см. PunctualShadowScheduler), затем ExecuteComputeCulling - и этот дроу.</summary>
+	void ExecuteDrawPunctualShadow(ICommandBuffer cmd, ICullResult cullResult, int sliceIndex);
+
+	/// <summary>Переводит массив теней punctual-светов в состояние чтения из шейдера - зовётся перед
+	/// камерными дроу ВСЕГДА, даже если слайсы не рисовались (текстура объявлена в PS безусловно,
+	/// лейаут обязан быть валиден).</summary>
+	void TransitionPunctualShadowsForRead(ICommandBuffer cmd);
 
 	/// <summary>Dispatches the GPU culling compute shader for the currently bound view/cull data.</summary>
 	ICullResult ExecuteComputeCulling(ICommandBuffer cmd, int cascadeIndex = -1);
@@ -60,6 +103,18 @@ public interface IBatchRenderer
 
 	/// <summary>Renders only the materials selected by <paramref name="filter"/> - see <see cref="BatchDrawFilter"/>.</summary>
 	void ExecuteDrawBatching(ICommandBuffer cmd, ICullResult cullResult, BatchDrawFilter filter);
+
+	/// <summary>Включает АЛЬФА-ТЕСТ при записи shadow map для материала - для «дырявой» геометрии
+	/// (листва, ажурные решётки). Без этого теневой пасс пишет геометрию квада, а не то, что на нём
+	/// нарисовано: крона отбрасывает монолитную кляксу, и сквозь неё не пробивается ни солнечное
+	/// кружево на полу, ни лучи в объёмном свете (см. VolumetricLightPass).
+	///
+	/// Стоит дроу-колла на материал в каждом каскаде, поэтому звать ТОЛЬКО для реально дырявой
+	/// геометрии: пометки glTF alphaMode=MASK недостаточно - экспортеры сплошь метят ею камень и
+	/// ткань с альфой ~1 (см. критерий по средней альфе в ModelViewportGeometry и тот же самый в
+	/// ProbeGi). Пока материал не помечен, он пишет тень по-старому, сплошным квадом.</summary>
+	void SetMaterialAlphaTestedShadow(int materialId, DecaEngine.Graphics.ModelLoader.BaseColorBinding baseColor,
+		float alphaCutoff);
 
 	/// <summary>Marks a registered material as transparent/transmissive for <see cref="BatchDrawFilter"/>
 	/// purposes (raw material id - <c>MaterialId.materialId</c>). Materials default to opaque.</summary>

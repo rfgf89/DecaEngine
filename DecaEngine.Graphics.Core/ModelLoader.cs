@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
@@ -518,6 +518,16 @@ public struct MaterialPbrFactors
 	public float MetallicFactor;
 	public float RoughnessFactor;
 
+	/// <summary>Среднее ЛИНЕЙНОЕ альбедо материала (среднее по base color текстуре × фактор; без
+	/// текстуры - просто фактор). Цвет отскока для CPU-бейка probe-GI (см. DecaEngine.Editor.ProbeGiBaker):
+	/// трассировщику нужен один цвет на материал, а не сэмплинг текстур.</summary>
+	public Vector3 AverageBaseColor;
+
+	/// <summary>Средняя альфа base color текстуры × фактор (1 без текстуры). Probe-GI бейкер по
+	/// ней отличает «дырявые» материалы (листва: альфа мала - не блокируют лучи) от сплошных,
+	/// даже если экспортер пометил их MASK/BLEND (камень: альфа ~1).</summary>
+	public float AverageAlpha;
+
 	/// <summary>Whether the material has a base-color texture bound as _MainTex - lets a shader
 	/// decide between sampling it and using <see cref="BaseColorFactor"/> alone (an unbound
 	/// _MainTex cannot be detected from HLSL).</summary>
@@ -603,6 +613,107 @@ public class ModelLoader
 {
 	public List<InstanceData> instances = new();
 
+	/// <summary>Разбивка времени загрузки и объём декодированных текстур - диагностика.
+	/// Фазы стоят очень по-разному на разных ассетах, и «очевидный» виновник обычно не тот:
+	/// без этих чисел оптимизация загрузки - гадание.</summary>
+	public readonly record struct LoadTimings(long ParseMs, long DecodeMs, long MaterialsMs, long MeshesMs,
+		long FinalizeMs, int DecodedImages, long DecodedBytes, int ShaderVariants, long ShaderMs,
+		int TextureUploads, long TextureMs, int MeshUploads, long MeshMs, int Samplers, long SamplerMs, int MaterialsBuilt, long MaterialBuildMs, long MatCreateMs, long MatShaderMs);
+
+	public LoadTimings Timings { get; internal set; }
+
+	// Компиляция вариантов пиксельного шейдера внутри финализации - накапливается там же
+	// (см. BuildFromPreparedIncremental.GetPixelShaderVariant).
+	internal long _shaderMs;
+	internal int _shaderVariants;
+	internal long _textureMs;
+	internal int _textureCount;
+	internal long _meshMs;
+	internal int _meshCount;
+	internal long _samplerMs;
+	internal int _samplerCount;
+	internal long _materialMs;
+	internal int _materialCount;
+	internal long _matCreateMs;
+	internal long _matShaderMs;
+
+	/// <summary>Освобождает GPU-ресурсы модели: меши (вершинные/индексные буферы плюс их CPU-копии
+	/// в неуправляемой памяти) и материалы (PSO, SRB, кбуферы, шейдеры, текстуры).
+	///
+	/// Раньше этого не было вовсе - <see cref="ModelLoader"/> не был освобождаемым, и каждая
+	/// открытая модель оставляла на GPU весь свой footprint навсегда.
+	///
+	/// Про шейдеры отдельно, потому что рядом в коде есть предупреждение о двойном освобождении:
+	/// один вершинный шейдер и горстка вариантов пиксельного ШАРЯТСЯ между материалами модели, и
+	/// <see cref="IMaterialObject.Release"/> освобождает их у каждого. Здесь это безопасно по двум
+	/// причинам: DiligentShader.Release нуллит нативный объект и повторный вызов на нём - no-op, а
+	/// кэш вариантов локален для ОДНОЙ загрузки (см. BuildFromPreparedIncremental), так что чужой
+	/// модели эти шейдеры не принадлежат. Опасен был другой сценарий - освобождение шейдера, пока им
+	/// пользуется ЖИВОЙ материал; здесь же умирает весь набор разом.
+	///
+	/// Вызывающий обязан сперва снять все инстансы со сцены и дождаться GPU: на буферы модели
+	/// ссылаются записанные команды рендер-графа (см. ModelPreviewViewport.PopulateFromScene).</summary>
+	/// <summary>Шейдеры, созданные загрузкой этой модели: один вершинный, варианты пиксельного и
+	/// (при не-треугольных топологиях) точечный вершинный. ШАРЯТСЯ между материалами модели, поэтому
+	/// материалы их не освобождают (OwnsShaders=false) - освобождает их отсюда, по одному разу.</summary>
+	internal readonly List<IShaderObject> _ownedShaders = new();
+
+	public void Release()
+	{
+		foreach (var mesh in Meshes)
+		{
+			mesh?.Release();
+		}
+
+		Meshes.Clear();
+		MeshHasUv.Clear();
+
+		// По РАЗЛИЧНЫМ объектам, а не по значениям словаря: дефолтный материал раздаётся ВСЕМ
+		// null-материалам модели, то есть лежит в materialObjects под несколькими ключами. Простой
+		// проход по Values освободил бы его столько же раз, а повторный Dispose нативного SRB/PSO -
+		// это обращение к освобождённой памяти, ровно как с шарёными шейдерами.
+		var releasedMaterials = new HashSet<IMaterialObject>(ReferenceEqualityComparer.Instance
+			as IEqualityComparer<IMaterialObject>);
+		foreach (var material in materialObjects.Values)
+		{
+			if (material != null && releasedMaterials.Add(material))
+			{
+				material.Release();
+			}
+		}
+
+		materialObjects.Clear();
+
+		// Текстуры - ПОСЛЕ материалов: их SRB держали вьюхи текстур; сами материалы текстур не
+		// освобождают (см. DiligentMaterial.Release), владение здесь.
+		foreach (var texture in _ownedTextures)
+		{
+			texture?.Release();
+		}
+
+		_ownedTextures.Clear();
+
+		foreach (var streamed in StreamedTextures)
+		{
+			streamed.Texture?.Release();
+			streamed.Texture = null;
+			streamed.EncodedPixels = null;
+			streamed.Bindings.Clear();
+		}
+
+		StreamedTextures.Clear();
+
+		// ПОСЛЕ материалов: они держат нативные шейдеры, и освобождать шейдер, пока жив
+		// использующий его материал, - та же ошибка, только с другой стороны.
+		foreach (var shader in _ownedShaders)
+		{
+			shader?.Release();
+		}
+
+		_ownedShaders.Clear();
+		instances.Clear();
+	}
+
 	public List<IMeshObject> Meshes = new();
 
 	/// <summary>
@@ -614,6 +725,88 @@ public class ModelLoader
 	public List<bool> MeshHasUv = new();
 
 	public OrderedDictionary<int, IMaterialObject> materialObjects = new();
+
+	/// <summary>Одна стримимая текстура модели (см. <see cref="ModelLoadOptions.StreamTextures"/>):
+	/// текущая GPU-текстура (первая ступень - низкое качество), сжатый исходник для ре-декода и все
+	/// слоты материалов, куда она привязана (один image часто шарится каналами/материалами - ORM).
+	/// Апгрейды делает DecaEngine.Editor.ECS.ModelStreamer: фоновый декод следующей ступени ->
+	/// CreateTexture -> SetTexture по всем привязкам (SRB живого материала обновляется на месте, см.
+	/// DiligentMaterial.SetTexture - тот же приём, что у ProbeGiTextures.Bind) -> отложенный Release
+	/// старой. По достижении целевого/нативного размера <see cref="EncodedPixels"/> обнуляется -
+	/// CPU-данные освобождаются.</summary>
+	public sealed class StreamedTexture
+	{
+		/// <summary>Путь к внешнему файлу картинки (ре-декод читает его с диска в фоне) - null для
+		/// встроенных, у них исходник лежит в <see cref="EncodedPixels"/>.</summary>
+		public string FilePath;
+
+		/// <summary>Сжатый исходник встроенной картинки (.glb / data-URI).</summary>
+		public byte[] EncodedPixels;
+
+		/// <summary>Есть ли ещё откуда декодировать (иначе стриминг этой текстуры окончен).</summary>
+		public bool HasSource => !Completed && (FilePath != null || EncodedPixels != null);
+
+		/// <summary>Читает сжатый исходник. Дисковый I/O - звать только из фонового потока.</summary>
+		public byte[] ReadEncoded() => EncodedPixels ?? (FilePath != null ? File.ReadAllBytes(FilePath) : null);
+
+		/// <summary>Освобождает CPU-данные исходника (стриминг завершён).</summary>
+		public void ReleaseCpuData()
+		{
+			Completed = true;
+			EncodedPixels = null;
+			FilePath = null;
+		}
+
+		/// <summary>Бо́льшая сторона текущего GPU-декода (0 = ещё 1x1-филлер).</summary>
+		public int CurrentSize;
+
+		/// <summary>Целевая сторона (<see cref="ModelLoadOptions.MaxTextureSize"/>; 0 = нативное
+		/// разрешение файла).</summary>
+		public int TargetSize;
+
+		public bool Completed;
+
+		/// <summary>Авторские настройки сэмплера glTF - апгрейд создаёт текстуру, сэмплер уже
+		/// привязан к слоту как immutable и не меняется.</summary>
+		public TextureAddress AddressMode;
+		public TextureFilter FilterMode;
+
+		/// <summary>Текущая GPU-текстура (шарится всеми привязками); null = слот ещё на 1x1-филлере.
+		/// Финальную освобождает <see cref="ModelLoader.Release"/>, промежуточные - стример
+		/// отложенной очередью.</summary>
+		public IGpuTexture Texture;
+
+		public readonly List<(IMaterialObject Material, string Slot)> Bindings = new();
+	}
+
+	/// <summary>Что привязано в слот _MainTex материала - текстура, её (immutable) сэмплер и запись
+	/// стриминга, если текстура приезжает ступенями.
+	///
+	/// Существует ради ТЕНЕВОГО материала с альфа-тестом (см. ShadowRenderer.RegisterAlphaTestedMaterial):
+	/// теневой пасс - отдельный PSO со своим SRB, и чтобы вырезать листву по альфе, ему нужна ровно
+	/// та же текстура и тот же сэмплер, что и экранному материалу. Пересоздавать их для тени
+	/// значило бы удвоить память на каждую крону.</summary>
+	public sealed class BaseColorBinding
+	{
+		public IGpuTexture Texture;
+		public ISamplerObject Sampler;
+
+		/// <summary>Запись стриминга (null - текстура загружена целиком): подписавшись на неё,
+		/// теневой материал получает те же ступени качества, что и экранный.</summary>
+		public StreamedTexture Stream;
+	}
+
+	/// <summary>Привязки _MainTex по ключу материала (тому же, что у <see cref="materialObjects"/> и
+	/// <see cref="MaterialPbr"/>). Материалы без базовой текстуры сюда не попадают.</summary>
+	public readonly Dictionary<int, BaseColorBinding> MaterialBaseColor = new();
+
+	/// <summary>Стримимые текстуры модели; пусто без <see cref="ModelLoadOptions.StreamTextures"/>.</summary>
+	public readonly List<StreamedTexture> StreamedTextures = new();
+
+	/// <summary>Не-стримимые GPU-текстуры загрузки (полноразмерные + 1x1-филлеры): материалы текстур
+	/// не освобождают (см. DiligentMaterial.Release), владение и Release - здесь. Раньше они не
+	/// хранились нигде и утекали навсегда.</summary>
+	internal readonly List<IGpuTexture> _ownedTextures = new();
 
 	// Коды топологии меша (MaterialPbrFactors.Topology / PreparedMesh.Topology): точечные и
 	// линейные glTF-примитивы рисуются клоном материала с PSO соответствующей топологии.
@@ -791,10 +984,13 @@ public class ModelLoader
 	{
 		// Строгая валидация SharpGLTF на больших сценах заметно небесплатна; TryFix заодно чинит
 		// мелкие огрехи экспортёров вместо жёсткого отказа.
-		var model = ModelRoot.Load(modelPath, new ReadSettings { Validation = SharpGLTF.Validation.ValidationMode.TryFix });
+		var swPhase = System.Diagnostics.Stopwatch.StartNew();
+		var model = LoadModelRoot(modelPath, options, out var externalImagePaths);
 		cancellationToken.ThrowIfCancellationRequested();
 
 		var prepared = new PreparedModel();
+		prepared.MsParse = swPhase.ElapsedMilliseconds;
+		swPhase.Restart();
 
 		// Картинки, на которые реально ссылаются декодируемые ниже каналы материалов. Декод (PNG/JPG +
 		// даунскейл) - самая дорогая CPU-фаза загрузки: параллелится по уникальным image, материалы
@@ -827,22 +1023,66 @@ public class ModelLoader
 			}
 		}
 
+		// Стриминг текстур: в фоновой фазе НЕ ДЕКОДИРУЕТСЯ НИ ОДНА картинка. Декод (PNG/JPG +
+		// даунскейл) - самая дорогая CPU-фаза загрузки и главный вкладчик в пиковую память, и именно
+		// он раньше держал сцену пустой всё время загрузки. Материалы строятся сразу с 1x1-филлерами
+		// (кейворды шейдера при этом ТЕ ЖЕ - они ставятся по наличию текстуры в glTF, а не по
+		// наличию пикселей, так что апгрейд не трогает PSO), геометрия появляется почти сразу, а
+		// пиксели приезжают ступенями из ModelStreamer.
+		//
+		// Источник ре-декода - ПУТЬ к файлу картинки, если она внешняя (типовая .gltf-сцена вроде
+		// Sponza: папка с PNG рядом), и только для встроенных (.glb / data-URI) копируются байты.
+		// Иначе сотни 4K-исходников Sponza жили бы в managed-памяти всё время сессии.
+		int decodeMaxSize = options.MaxTextureSize;
+		Dictionary<SharpGLTF.Schema2.Image, TextureStreamSource> streamSources = null;
+		if (options.StreamTextures)
+		{
+			decodeMaxSize = 0; // ничего не декодируем в этой фазе
+			streamSources = new Dictionary<SharpGLTF.Schema2.Image, TextureStreamSource>();
+			foreach (var image in usedImages)
+			{
+				streamSources[image] = CreateStreamSource(image, externalImagePaths);
+			}
+		}
+
 		var decodedImages = new Dictionary<SharpGLTF.Schema2.Image, (byte[] Pixels, int Width, int Height)>();
-		if (usedImages.Count > 0)
+		if (usedImages.Count > 0 && !options.StreamTextures)
 		{
 			var decodedResults = new (byte[] Pixels, int Width, int Height)[usedImages.Count];
 			int imagesDone = 0;
-			Parallel.For(0, usedImages.Count, new ParallelOptions { CancellationToken = cancellationToken }, i =>
+
+			// Параллелизм ОГРАНИЧЕН, и это не про загрузку CPU, а про ПАМЯТЬ. Декод идёт в полном
+			// разрешении файла и только потом ужимается до MaxTextureSize (stb иначе не умеет), то
+			// есть каждый поток держит в пике полноразмерную RGBA-копию: для 4K это 64 МБ. Без
+			// ограничения Parallel.For берёт по потоку на ядро, и на 16-32-поточной машине это
+			// 1-2 ГБ ОДНИХ ТОЛЬКО промежуточных буферов - поверх того, что уже накоплено
+			// декодированным (см. ниже: decodedResults держит ВСЕ картинки до конца фазы).
+			//
+			// Четыре потока сохраняют почти всю выгоду распараллеливания (декод упирается в память,
+			// а не в ALU) и срезают этот пик до сотен мегабайт.
+			var decodeOptions = new ParallelOptions
 			{
-				decodedResults[i] = DecodeImagePixels(usedImages[i], options.MaxTextureSize);
+				CancellationToken = cancellationToken,
+				MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount),
+			};
+
+			Parallel.For(0, usedImages.Count, decodeOptions, i =>
+			{
+				decodedResults[i] = DecodeImagePixels(usedImages[i], decodeMaxSize);
 				progress?.Report(0.05f + 0.30f * (Interlocked.Increment(ref imagesDone) / (float)usedImages.Count));
 			});
 
 			for (int i = 0; i < usedImages.Count; i++)
 			{
 				decodedImages[usedImages[i]] = decodedResults[i];
+				prepared.DecodedBytes += decodedResults[i].Pixels?.LongLength ?? 0;
 			}
+
+			prepared.DecodedImages = usedImages.Count;
 		}
+
+		prepared.MsDecode = swPhase.ElapsedMilliseconds;
+		swPhase.Restart();
 
 		// Weight the big background phases (texture decode above, then materials and meshes) roughly
 		// by count so the progress bar moves at a believable pace instead of jumping straight to 50%.
@@ -870,7 +1110,7 @@ public class ModelLoader
 			var baseColorTexture = logicalMaterial.GetDiffuseTexture();
 			if (baseColorTexture?.PrimaryImage != null)
 			{
-				preparedMaterial.BaseColorTexture = DecodeTexture(baseColorTexture, options.MaxTextureSize, decodedImages);
+				preparedMaterial.BaseColorTexture = DecodeTexture(baseColorTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
 			}
 
 			// PBR metallic-roughness scalars for the editor's Lighting preview (see MaterialPbr).
@@ -923,7 +1163,7 @@ public class ModelLoader
 				var mrTexture = channel.Texture;
 				if (mrTexture?.PrimaryImage != null)
 				{
-					preparedMaterial.MetallicRoughnessTexture = DecodeTexture(mrTexture, options.MaxTextureSize, decodedImages);
+					preparedMaterial.MetallicRoughnessTexture = DecodeTexture(mrTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
 				}
 			}
 
@@ -1026,7 +1266,7 @@ public class ModelLoader
 				var thicknessTexture = thicknessChannel.Value.Texture;
 				if (thicknessTexture?.PrimaryImage != null)
 				{
-					preparedMaterial.ThicknessTexture = DecodeTexture(thicknessTexture, options.MaxTextureSize, decodedImages);
+					preparedMaterial.ThicknessTexture = DecodeTexture(thicknessTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
 				}
 			}
 
@@ -1072,7 +1312,7 @@ public class ModelLoader
 				var occlusionTexture = occlusionChannel.Value.Texture;
 				if (occlusionTexture?.PrimaryImage != null)
 				{
-					preparedMaterial.OcclusionTexture = DecodeTexture(occlusionTexture, options.MaxTextureSize, decodedImages);
+					preparedMaterial.OcclusionTexture = DecodeTexture(occlusionTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
 				}
 			}
 
@@ -1093,7 +1333,7 @@ public class ModelLoader
 				var normalTexture = normalChannel.Value.Texture;
 				if (normalTexture?.PrimaryImage != null)
 				{
-					preparedMaterial.NormalTexture = DecodeTexture(normalTexture, options.MaxTextureSize, decodedImages);
+					preparedMaterial.NormalTexture = DecodeTexture(normalTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
 				}
 			}
 
@@ -1138,6 +1378,9 @@ public class ModelLoader
 			prepared.Materials.Add(preparedMaterial);
 			progress?.Report(0.35f + 0.05f * ((index + 1) / (float)materialCount));
 		}
+
+		prepared.MsMaterials = swPhase.ElapsedMilliseconds;
+		swPhase.Restart();
 
 		var primitiveToMeshIdMap = new Dictionary<MeshPrimitive, int>();
 		var meshWork = new List<MeshWorkItem>();
@@ -1430,6 +1673,7 @@ public class ModelLoader
 		}
 
 		progress?.Report(1f);
+		prepared.MsMeshes = swPhase.ElapsedMilliseconds;
 		return prepared;
 	}
 
@@ -1446,7 +1690,12 @@ public class ModelLoader
 	{
 		var (vsFactoryPath, vsFileName) = options.VertexShader.ToShaderFactoryParts();
 		var (psFactoryPath, psFileName) = options.PixelShader.ToShaderFactoryParts();
-		var modelShaderVs = graphicsApi.CreateShader("Model Vertex Shader", vsFactoryPath, vsFileName, ShaderObjectType.Vertex);
+		// Шейдеры модели берутся из ОБЩЕГО кэша бэкенда: варианты у разных моделей практически
+		// всегда одни и те же, а компиляция идёт синхронно на потоке рендера (см. CreateSharedShader).
+		// Материалы модели помечены OwnsShaders=false, так что шарёный экземпляр никто не убьёт.
+		var modelShaderVs = graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
+			ShaderObjectType.Vertex);
+		result._ownedShaders.Add(modelShaderVs);
 
 		// Пиксельные ВАРИАНТЫ по shader keywords (см. шапку UnlitInstancedPS.hlsl): эффекты,
 		// статически известные по материалу (текстуры, transmission, dispersion, alpha clip),
@@ -1461,10 +1710,15 @@ public class ModelLoader
 
 			if (!pixelShaderVariants.TryGetValue(cacheKey, out var shader))
 			{
-				shader = graphicsApi.CreateShader(
+				var swShader = System.Diagnostics.Stopwatch.StartNew();
+				shader = graphicsApi.CreateSharedShader(
 					cacheKey.Length == 0 ? "Model Pixel Shader" : $"Model Pixel Shader [{cacheKey}]",
 					psFactoryPath, psFileName, ShaderObjectType.Pixel, "Main", keywords.ToArray());
 				pixelShaderVariants[cacheKey] = shader;
+				result._ownedShaders.Add(shader);
+
+				result._shaderMs += swShader.ElapsedMilliseconds;
+				result._shaderVariants++;
 			}
 
 			return shader;
@@ -1516,6 +1770,12 @@ public class ModelLoader
 		}
 
 		var defaultMaterial = graphicsApi.CreateMaterial("Default Material");
+
+		// Шейдеры шареные - см. IMaterialObject.OwnsShaders. Этот материал вдобавок раздаётся
+		// НЕСКОЛЬКИМ логическим индексам (все null-материалы модели ссылаются на один объект),
+		// так что его Release зовётся из ModelLoader.Release столько же раз - ещё одна причина не
+		// давать ему трогать шейдеры.
+		defaultMaterial.OwnsShaders = false;
 		defaultMaterial.SetShader(GetPixelShaderVariant(BuildMaterialKeywords(null)), modelShaderVs);
 
 		// Белый 1x1-филлер для _MainTex/_MetallicRoughnessTex у материалов без соответствующей
@@ -1525,6 +1785,48 @@ public class ModelLoader
 		// безобидный «нулевой» сэмпл. Один общий на модель, создаётся лениво.
 		Core.Texture fallbackTexture = null;
 		ISamplerObject fallbackSampler = null;
+
+		// Отдельный филлер для _NormalTex: белый пиксель распаковался бы в наклонённую нормаль
+		// (1,1,1)->(1,1,1), а "плоский" (128,128,255) -> (0,0,1) оставляет геометрическую.
+		Core.Texture flatNormalTexture = null;
+
+		// Создаёт (лениво) оба 1x1-филлера, не привязывая их ни к какому слоту: стриминг ставит их
+		// сам, со СВОИМ (авторским) сэмплером - см. BindPreparedTexture.
+		void EnsureFallbackTextures()
+		{
+			if (fallbackTexture == null)
+			{
+				fallbackTexture = new Core.Texture("Model Fallback White", new CpuTextureData
+				{
+					Name = "Model Fallback White",
+					DecodedPixels = new byte[] { 255, 255, 255, 255 },
+					DecodedWidth = 1,
+					DecodedHeight = 1,
+				});
+				fallbackTexture.Upload(graphicsApi, true);
+				result._ownedTextures.Add(fallbackTexture.GpuHandle);
+
+				fallbackSampler = graphicsApi.CreateSampler(
+					name: "Model Fallback Sampler",
+					filter: TextureFilter.Point,
+					address: TextureAddress.Wrap,
+					comparisonFunction: CompFunction.Always,
+					border: Vector4.Zero);
+			}
+
+			if (flatNormalTexture == null)
+			{
+				flatNormalTexture = new Core.Texture("Model Fallback Flat Normal", new CpuTextureData
+				{
+					Name = "Model Fallback Flat Normal",
+					DecodedPixels = new byte[] { 128, 128, 255, 255 },
+					DecodedWidth = 1,
+					DecodedHeight = 1,
+				});
+				flatNormalTexture.Upload(graphicsApi, true);
+				result._ownedTextures.Add(flatNormalTexture.GpuHandle);
+			}
+		}
 
 		void BindFallbackTexture(IMaterialObject material, string slot)
 		{
@@ -1538,6 +1840,7 @@ public class ModelLoader
 					DecodedHeight = 1,
 				});
 				fallbackTexture.Upload(graphicsApi, true);
+				result._ownedTextures.Add(fallbackTexture.GpuHandle);
 
 				fallbackSampler = graphicsApi.CreateSampler(
 					name: "Model Fallback Sampler",
@@ -1550,10 +1853,6 @@ public class ModelLoader
 			material.SetTexture(slot, fallbackTexture.GpuHandle);
 			material.SetImmutableSampler(slot, fallbackSampler);
 		}
-
-		// Отдельный филлер для _NormalTex: белый пиксель распаковался бы в наклонённую нормаль
-		// (1,1,1)->(1,1,1), а "плоский" (128,128,255) -> (0,0,1) оставляет геометрическую.
-		Core.Texture flatNormalTexture = null;
 
 		void BindFlatNormalFallback(IMaterialObject material)
 		{
@@ -1573,6 +1872,7 @@ public class ModelLoader
 					DecodedHeight = 1,
 				});
 				flatNormalTexture.Upload(graphicsApi, true);
+				result._ownedTextures.Add(flatNormalTexture.GpuHandle);
 			}
 
 			material.SetTexture("_NormalTex", flatNormalTexture.GpuHandle);
@@ -1615,12 +1915,14 @@ public class ModelLoader
 				return 4096;
 			}
 
+			// В режиме стриминга Pixels у всех каналов null (заливки на этой фазе нет вовсе) - оценка
+			// честно выходит в «почти ноль», и финализация материалов не тратит кадровый бюджет.
 			long bytes = 4096;
-			bytes += pm.BaseColorTexture?.Pixels.Length ?? 0;
-			bytes += pm.MetallicRoughnessTexture?.Pixels.Length ?? 0;
-			bytes += pm.NormalTexture?.Pixels.Length ?? 0;
-			bytes += pm.OcclusionTexture?.Pixels.Length ?? 0;
-			bytes += pm.TransmissionFactor > 0f ? pm.ThicknessTexture?.Pixels.Length ?? 0 : 0;
+			bytes += pm.BaseColorTexture?.Pixels?.Length ?? 0;
+			bytes += pm.MetallicRoughnessTexture?.Pixels?.Length ?? 0;
+			bytes += pm.NormalTexture?.Pixels?.Length ?? 0;
+			bytes += pm.OcclusionTexture?.Pixels?.Length ?? 0;
+			bytes += pm.TransmissionFactor > 0f ? pm.ThicknessTexture?.Pixels?.Length ?? 0 : 0;
 			return bytes;
 		}
 
@@ -1637,25 +1939,107 @@ public class ModelLoader
 			materialScales.TryAdd(instance.materialId, (s.X + s.Y + s.Z) / 3f);
 		}
 
-		void BindPreparedTexture(IMaterialObject materialObj, string slot, PreparedTexture preparedTexture)
+		// Реестр стрим-текстур по исходнику: один image шарится несколькими слотами/материалами
+		// (типовая ORM-текстура), апгрейд декодируется один раз и раскладывается по всем привязкам.
+		var streamEntries = new Dictionary<TextureStreamSource, StreamedTexture>();
+
+		// Возвращает привязку (текстура + сэмплер + запись стриминга) - её переиспользует теневой
+		// материал с альфа-тестом (см. ModelLoader.MaterialBaseColor). null - слот получил филлер.
+		BaseColorBinding BindPreparedTexture(IMaterialObject materialObj, string slot, PreparedTexture preparedTexture)
 		{
 			if (preparedTexture == null)
 			{
 				// Белый филлер (для _ThicknessTex G=1 -> толщина остаётся чистым factor-ом).
 				BindFallbackTexture(materialObj, slot);
-				return;
+				return null;
 			}
 
-			var cpuData = new CpuTextureData
+			// Режим стриминга: пикселей ещё нет вовсе - слот получает общий 1x1-филлер (белый, для
+			// _NormalTex - плоская нормаль), а первая ступень приедет из ModelStreamer. Заливать
+			// здесь нечего, поэтому финализация материалов стоит копейки и геометрия появляется
+			// почти сразу. Кейворды шейдера при этом ТЕ ЖЕ (ставятся по наличию текстуры в glTF),
+			// так что апгрейд не трогает PSO.
+			if (preparedTexture.StreamSource != null)
 			{
-				Name = slot,
-				DecodedPixels = preparedTexture.Pixels,
-				DecodedWidth = preparedTexture.Width,
-				DecodedHeight = preparedTexture.Height,
-			};
+				if (!streamEntries.TryGetValue(preparedTexture.StreamSource, out var streamEntry))
+				{
+					streamEntry = new StreamedTexture
+					{
+						FilePath = preparedTexture.StreamSource.FilePath,
+						EncodedPixels = preparedTexture.StreamSource.EncodedBytes,
+						CurrentSize = 0,
+						TargetSize = options.MaxTextureSize,
+						Texture = null,
+						AddressMode = preparedTexture.AddressMode,
+						FilterMode = preparedTexture.FilterMode,
+					};
 
-			var texture = new Core.Texture(cpuData.Name, cpuData);
-			texture.Upload(graphicsApi, true);
+					streamEntries[preparedTexture.StreamSource] = streamEntry;
+					result.StreamedTextures.Add(streamEntry);
+				}
+
+				// Текстура-филлер - общая 1x1 (белая; для нормалей плоская), а вот СЭМПЛЕР ставится
+				// сразу авторский: он immutable и печётся в layout PSO, то есть подменить его при
+				// апгрейде уже нельзя - фоллбечный Point/Wrap остался бы с текстурой навсегда.
+				EnsureFallbackTextures();
+				materialObj.SetTexture(slot, slot == "_NormalTex"
+					? flatNormalTexture.GpuHandle
+					: fallbackTexture.GpuHandle);
+
+				var streamFilter = preparedTexture.FilterMode == TextureFilter.Linear && options.AnisotropicFiltering
+					? TextureFilter.Anisotropic
+					: preparedTexture.FilterMode;
+
+				var streamSampler = graphicsApi.CreateSampler(
+					name: slot + "_Sampler",
+					filter: streamFilter,
+					address: preparedTexture.AddressMode,
+					comparisonFunction: CompFunction.Always,
+					border: Vector4.Zero,
+					mipLodBias: options.MipLodBias);
+
+				// Динамический сэмплер (на texture view), а не immutable, - как в прямом пути ниже:
+				// immutable для батч-материалов был мёртв из-за PSO-кэша (см. там же), а стримингу
+				// динамический ещё и роднее - при горячей замене текстуры SetTexture сам перевесит
+				// его на новый view (см. DiligentMaterial.SetTexture).
+				materialObj.SetSampler(slot + "_sampler", streamSampler);
+				result._samplerCount++;
+
+				streamEntry.Bindings.Add((materialObj, slot));
+
+				// Текстура здесь - общий 1x1-филлер; теневому материалу важна не она, а ЗАПИСЬ
+				// стриминга: он подпишется на неё и получит те же ступени качества.
+				return new BaseColorBinding
+				{
+					Texture = slot == "_NormalTex" ? flatNormalTexture.GpuHandle : fallbackTexture.GpuHandle,
+					Sampler = streamSampler,
+					Stream = streamEntry,
+				};
+			}
+
+			IGpuTexture gpuTexture;
+			{
+				var cpuData = new CpuTextureData
+				{
+					Name = slot,
+					DecodedPixels = preparedTexture.Pixels,
+					DecodedWidth = preparedTexture.Width,
+					DecodedHeight = preparedTexture.Height,
+				};
+
+				var texture = new Core.Texture(cpuData.Name, cpuData);
+
+				// Замер отдельно от остальной финализации: она оказалась 80% времени загрузки и при этом
+				// почти не зависит от ОБЪЁМА текстур - значит цена не в байтах, а в вызовах, и надо
+				// знать, в каких именно.
+				var swUpload = System.Diagnostics.Stopwatch.StartNew();
+				texture.Upload(graphicsApi, true);
+				result._textureMs += swUpload.ElapsedMilliseconds;
+				result._textureCount++;
+
+				gpuTexture = texture.GpuHandle;
+				result._ownedTextures.Add(gpuTexture);
+			}
 
 			// Линейные текстуры апгрейдятся до анизотропных (тумблер в ModelLoadOptions) - без
 			// этого доска/пол мылятся под острым углом; авторский point-фильтр сохраняется.
@@ -1663,27 +2047,49 @@ public class ModelLoader
 				? TextureFilter.Anisotropic
 				: preparedTexture.FilterMode;
 
+			var swSampler = System.Diagnostics.Stopwatch.StartNew();
 			var samplerObject = graphicsApi.CreateSampler(
 				name: slot + "_Sampler",
 				filter: filterMode,
 				address: preparedTexture.AddressMode,
 				comparisonFunction: CompFunction.Always,
-				border: Vector4.Zero
+				border: Vector4.Zero,
+				mipLodBias: options.MipLodBias
 			);
+			result._samplerMs += swSampler.ElapsedMilliseconds;
+			result._samplerCount++;
 
-			materialObj.SetTexture(slot, texture.GpuHandle);
-			materialObj.SetImmutableSampler(slot, samplerObject);
+			materialObj.SetTexture(slot, gpuTexture);
+
+			// ДИНАМИЧЕСКАЯ привязка (сэмплер вешается на texture view), а не SetImmutableSampler:
+			// immutable-путь для батч-материалов молча не срабатывает - Diligent подставляет дефолтный
+			// сэмплер (linear wrap), и все ручки (анизотропия, mip bias) оказываются мёртвыми.
+			// Замерено пробником: кадры с ANISO=0/1 и MIPBIAS=+4 были БИТ-В-БИТ одинаковыми.
+			materialObj.SetSampler(slot + "_sampler", samplerObject);
+
+			return new BaseColorBinding { Texture = gpuTexture, Sampler = samplerObject, Stream = null };
 		}
 
 		// vs передаётся параметром (а не правится повторным SetShader): DiligentMaterial.SetShader
 		// release-ит ранее установленные шейдеры, а они шарятся между материалами - повторный вызов
 		// на живом наборе роняет процесс двойным освобождением.
-		IMaterialObject BuildMaterialObject(PreparedMaterial pm, string name, IShaderObject vs)
+		IMaterialObject BuildMaterialObject(PreparedMaterial pm, string name, IShaderObject vs,
+			out BaseColorBinding baseColor)
 		{
+			var swCreate = System.Diagnostics.Stopwatch.StartNew();
 			var materialObj = graphicsApi.CreateMaterial(name);
-			materialObj.SetShader(GetPixelShaderVariant(BuildMaterialKeywords(pm)), vs);
 
-			BindPreparedTexture(materialObj, "_MainTex", pm.BaseColorTexture);
+			// Шейдеры ШАРЕНЫЕ между материалами модели (вариантный кэш + один VS): освобождать их
+			// материалу нельзя - это декремент чужого счётчика ссылок и падение на следующем
+			// материале. См. IMaterialObject.OwnsShaders и ModelLoader.Release.
+			materialObj.OwnsShaders = false;
+			result._matCreateMs += swCreate.ElapsedMilliseconds;
+
+			var swSetShader = System.Diagnostics.Stopwatch.StartNew();
+			materialObj.SetShader(GetPixelShaderVariant(BuildMaterialKeywords(pm)), vs);
+			result._matShaderMs += swSetShader.ElapsedMilliseconds;
+
+			baseColor = BindPreparedTexture(materialObj, "_MainTex", pm.BaseColorTexture);
 
 			// Слот объявлен в шейдере только под HAS_MR_TEXTURE (см. UnlitInstancedPS.hlsl) - этот
 			// кейворд ставится только когда у материала реально есть MR-текстура, так что фоллбек
@@ -1717,9 +2123,14 @@ public class ModelLoader
 
 		// scaleKey - ключ, под которым ИНСТАНСЫ ссылаются на материал (для клонов топологий это
 		// синтетический ключ, см. MakeTopologyMaterialKey), т.к. materialScales собран по инстансам.
-		MaterialPbrFactors BuildFactors(PreparedMaterial pm, int scaleKey) => new MaterialPbrFactors
+		MaterialPbrFactors BuildFactors(PreparedMaterial pm, int scaleKey)
 		{
+			var averageBaseColor = ComputeAverageBaseColor(pm);
+			return new MaterialPbrFactors
+			{
 			BaseColorFactor = pm.BaseColorFactor,
+			AverageBaseColor = new Vector3(averageBaseColor.X, averageBaseColor.Y, averageBaseColor.Z),
+			AverageAlpha = averageBaseColor.W,
 			MetallicFactor = pm.MetallicFactor,
 			RoughnessFactor = pm.RoughnessFactor,
 			HasBaseColorTexture = pm.BaseColorTexture != null,
@@ -1739,7 +2150,8 @@ public class ModelLoader
 			VolumeAttenuation = ScaleVolumeAttenuation(pm, materialScales, scaleKey),
 			ThicknessWorld = pm.ThicknessFactor *
 				(materialScales.TryGetValue(scaleKey, out var nodeScale) && nodeScale > 0f ? nodeScale : 1f)
-		};
+			};
+		}
 
 		foreach (var preparedMaterial in prepared.Materials)
 		{
@@ -1750,8 +2162,18 @@ public class ModelLoader
 				continue;
 			}
 
-			result.materialObjects.Add(preparedMaterial.LogicalIndex,
-				BuildMaterialObject(preparedMaterial, preparedMaterial.Name, modelShaderVs));
+			var swMat = System.Diagnostics.Stopwatch.StartNew();
+			var builtMaterial = BuildMaterialObject(preparedMaterial, preparedMaterial.Name, modelShaderVs,
+				out var builtBaseColor);
+			result._materialMs += swMat.ElapsedMilliseconds;
+			result._materialCount++;
+
+			if (builtBaseColor != null)
+			{
+				result.MaterialBaseColor[preparedMaterial.LogicalIndex] = builtBaseColor;
+			}
+
+			result.materialObjects.Add(preparedMaterial.LogicalIndex, builtMaterial);
 			result.MaterialPbr[preparedMaterial.LogicalIndex] =
 				BuildFactors(preparedMaterial, preparedMaterial.LogicalIndex);
 
@@ -1782,8 +2204,10 @@ public class ModelLoader
 			{
 				if (pointShaderVs == null && vsFileName == "UnlitInstancedVS.hlsl")
 				{
-					pointShaderVs = graphicsApi.CreateShader("Model Point Vertex Shader", vsFactoryPath,
+					// Добавляется в _ownedShaders сразу после создания - см. ниже.
+					pointShaderVs = graphicsApi.CreateSharedShader("Model Point Vertex Shader", vsFactoryPath,
 						"UnlitInstancedPointVS.hlsl", ShaderObjectType.Vertex);
+					result._ownedShaders.Add(pointShaderVs);
 				}
 
 				cloneVs = pointShaderVs ?? modelShaderVs;
@@ -1794,6 +2218,10 @@ public class ModelLoader
 			if (source == null)
 			{
 				materialObj = graphicsApi.CreateMaterial($"Default Material (topology {clone.Topology})");
+
+				// Шейдеры здесь ШАРЕНЫЕ (вариантный кэш + один VS на модель) - освобождает их
+				// ModelLoader.Release, по разу на каждый. См. IMaterialObject.OwnsShaders.
+				materialObj.OwnsShaders = false;
 				materialObj.SetShader(GetPixelShaderVariant(BuildMaterialKeywords(null)), cloneVs);
 				BindFallbackTexture(materialObj, "_MainTex");
 				BindFallbackTexture(materialObj, "_OcclusionTex");
@@ -1802,8 +2230,14 @@ public class ModelLoader
 			}
 			else
 			{
-				materialObj = BuildMaterialObject(source, $"{source.Name} (topology {clone.Topology})", cloneVs);
+				materialObj = BuildMaterialObject(source, $"{source.Name} (topology {clone.Topology})", cloneVs,
+					out var cloneBaseColor);
 				factors = BuildFactors(source, synthKey);
+
+				if (cloneBaseColor != null)
+				{
+					result.MaterialBaseColor[synthKey] = cloneBaseColor;
+				}
 			}
 
 			factors.Topology = clone.Topology;
@@ -1815,9 +2249,12 @@ public class ModelLoader
 
 		foreach (var preparedMesh in prepared.Meshes)
 		{
+			var swMesh = System.Diagnostics.Stopwatch.StartNew();
 			var meshObj = graphicsApi.CreateMesh(preparedMesh.Name);
 			meshObj.SetVertices(preparedMesh.Vertices);
 			meshObj.SetIndices(preparedMesh.Indices);
+			result._meshMs += swMesh.ElapsedMilliseconds;
+			result._meshCount++;
 			meshObj.SetBounds(preparedMesh.BoundsCenter, preparedMesh.BoundsRadius);
 
 			if (preparedMesh.LodLevels != null)
@@ -1939,8 +2376,31 @@ public class ModelLoader
 	/// сэмплера. Сэмплер в glTF опционален (нет - значит wrap + linear по спеке): WaterBottle и
 	/// другие Khronos-семплы без явных сэмплеров роняли загрузку NRE.</summary>
 	private static PreparedTexture DecodeTexture(SharpGLTF.Schema2.Texture texture, int maxSize,
-		Dictionary<SharpGLTF.Schema2.Image, (byte[] Pixels, int Width, int Height)> decodedImages)
+		Dictionary<SharpGLTF.Schema2.Image, (byte[] Pixels, int Width, int Height)> decodedImages,
+		Dictionary<SharpGLTF.Schema2.Image, TextureStreamSource> streamSources,
+		Dictionary<int, string> externalImagePaths = null)
 	{
+		var sampler = texture.Sampler;
+		var prepared = new PreparedTexture
+		{
+			AddressMode = sampler != null ? ToAddressMode(sampler.WrapS) : TextureAddress.Wrap,
+			FilterMode = sampler != null ? ToFilter(sampler.MinFilter, sampler.MagFilter) : TextureFilter.Linear,
+		};
+
+		if (streamSources != null)
+		{
+			// Стриминг: пикселей на этой фазе нет вовсе - слот получит 1x1-филлер, а первая ступень
+			// приедет из ModelStreamer. Страховка на канал, не учтённый пре-сбором usedImages.
+			if (!streamSources.TryGetValue(texture.PrimaryImage, out var streamSource))
+			{
+				streamSource = CreateStreamSource(texture.PrimaryImage, externalImagePaths);
+				streamSources[texture.PrimaryImage] = streamSource;
+			}
+
+			prepared.StreamSource = streamSource;
+			return prepared;
+		}
+
 		if (!decodedImages.TryGetValue(texture.PrimaryImage, out var decoded))
 		{
 			// Страховка: канал, не учтённый пре-сбором usedImages, декодируется на месте.
@@ -1948,23 +2408,147 @@ public class ModelLoader
 			decodedImages[texture.PrimaryImage] = decoded;
 		}
 
-		var sampler = texture.Sampler;
-		return new PreparedTexture
+		prepared.Pixels = decoded.Pixels;
+		prepared.Width = decoded.Width;
+		prepared.Height = decoded.Height;
+		return prepared;
+	}
+
+	/// <summary>Источник ре-декодов для стриминга: путь к ВНЕШНЕМУ файлу картинки, если он известен
+	/// (типовая .gltf-сцена - папка с PNG рядом), иначе копия встроенных байт (.glb / data-URI).
+	/// Путь предпочтительнее ровно по памяти: у Sponza сотни 4K-исходников, и держать их все в
+	/// managed-куче всю сессию - гигабайты на ровном месте.</summary>
+	private static TextureStreamSource CreateStreamSource(SharpGLTF.Schema2.Image image,
+		Dictionary<int, string> externalImagePaths)
+	{
+		// Внешний файл, чьё чтение мы подменили заглушкой при парсинге (см. LoadModelRoot): в
+		// памяти его нет вовсе, читаем с диска в момент апгрейда.
+		if (externalImagePaths != null && externalImagePaths.TryGetValue(image.LogicalIndex, out var path))
 		{
-			Pixels = decoded.Pixels,
-			Width = decoded.Width,
-			Height = decoded.Height,
-			AddressMode = sampler != null ? ToAddressMode(sampler.WrapS) : TextureAddress.Wrap,
-			FilterMode = sampler != null ? ToFilter(sampler.MinFilter, sampler.MagFilter) : TextureFilter.Linear,
-		};
+			return new TextureStreamSource { FilePath = path };
+		}
+
+		var sourcePath = image.Content.SourcePath;
+		if (!string.IsNullOrEmpty(sourcePath) && File.Exists(sourcePath))
+		{
+			return new TextureStreamSource { FilePath = sourcePath };
+		}
+
+		// Встроенная картинка (.glb / data-URI / bufferView) - её байты и так уже в памяти модели.
+		return new TextureStreamSource { EncodedBytes = image.Content.Content.ToArray() };
+	}
+
+	/// <summary>Минимальный валидный PNG 1x1 - заглушка вместо реального содержимого внешних
+	/// картинок при стриминге (см. <see cref="LoadModelRoot"/>).</summary>
+	private static readonly byte[] StubPng = Convert.FromBase64String(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
+	/// <summary>
+	/// Парсит glTF. В обычном режиме - как раньше. В режиме стриминга внешние файлы картинок НЕ
+	/// ЧИТАЮТСЯ ВОВСЕ: их содержимое подменяется 1x1-заглушкой, а на выход отдаётся карта
+	/// «логический индекс image -> путь к файлу», по которой стример читает нужную картинку с диска
+	/// в момент, когда она реально понадобилась материалу.
+	///
+	/// Это и была главная причина «сцена пустая, редактор висит две минуты»: SharpGLTF грузит
+	/// содержимое КАЖДОГО image при разборе документа, то есть Sponza затягивала в managed-кучу все
+	/// свои сотни мегабайт (а с Intel-версией - гигабайты) PNG ещё до того, как появлялась хоть
+	/// одна вершина, - и всё это до единого байта тут же становилось мусором, потому что декод
+	/// текстур в этой фазе уже не делается.
+	/// </summary>
+	private static ModelRoot LoadModelRoot(string modelPath, ModelLoadOptions options,
+		out Dictionary<int, string> externalImagePaths)
+	{
+		externalImagePaths = null;
+
+		var settings = new ReadSettings { Validation = SharpGLTF.Validation.ValidationMode.TryFix };
+
+		// Только для текстового .gltf: у .glb картинки лежат внутри самого файла, подменять нечего.
+		if (!options.StreamTextures ||
+			!string.Equals(Path.GetExtension(modelPath), ".gltf", StringComparison.OrdinalIgnoreCase))
+		{
+			return ModelRoot.Load(modelPath, settings);
+		}
+
+		// URI картинок берём из JSON напрямую: порядок элементов "images" совпадает с
+		// ModelRoot.LogicalImages, а разбирать их через SharpGLTF мы как раз и не хотим.
+		var baseDirectory = Path.GetDirectoryName(Path.GetFullPath(modelPath)) ?? Environment.CurrentDirectory;
+		var pathsByIndex = new Dictionary<int, string>();
+		var stubbedUris = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+		try
+		{
+			using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(modelPath));
+			if (json.RootElement.TryGetProperty("images", out var images) &&
+				images.ValueKind == System.Text.Json.JsonValueKind.Array)
+			{
+				int index = 0;
+				foreach (var image in images.EnumerateArray())
+				{
+					if (image.TryGetProperty("uri", out var uriElement) &&
+						uriElement.GetString() is { Length: > 0 } uri &&
+						!uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+					{
+						var relative = Uri.UnescapeDataString(uri).Replace('/', Path.DirectorySeparatorChar);
+						var fullPath = Path.Combine(baseDirectory, relative);
+						if (File.Exists(fullPath))
+						{
+							pathsByIndex[index] = fullPath;
+							stubbedUris.Add(uri);
+							stubbedUris.Add(Uri.UnescapeDataString(uri));
+						}
+					}
+
+					index++;
+				}
+			}
+		}
+		catch (Exception)
+		{
+			// Не разобрали JSON сами - просто грузим обычным путём (медленно, но верно).
+			return ModelRoot.Load(modelPath, settings);
+		}
+
+		if (pathsByIndex.Count == 0)
+		{
+			return ModelRoot.Load(modelPath, settings);
+		}
+
+		var context = ReadContext
+			.Create(uri =>
+			{
+				if (stubbedUris.Contains(uri))
+				{
+					return new ArraySegment<byte>(StubPng);
+				}
+
+				var candidate = Path.Combine(baseDirectory, Uri.UnescapeDataString(uri)
+					.Replace('/', Path.DirectorySeparatorChar));
+				if (!File.Exists(candidate))
+				{
+					candidate = Path.Combine(baseDirectory, uri);
+				}
+
+				return new ArraySegment<byte>(File.ReadAllBytes(candidate));
+			})
+			.WithSettingsFrom(settings);
+
+		externalImagePaths = pathsByIndex;
+		return context.ReadSchema2(Path.GetFileName(modelPath));
 	}
 
 	/// <summary>Декодирование картинки (PNG/JPG) + даунскейл до <paramref name="maxSize"/> (см.
 	/// ModelLoadOptions.MaxTextureSize). Чистый CPU без разделяемого состояния - зовётся из
 	/// Parallel.For в PrepareModel.</summary>
 	private static (byte[] Pixels, int Width, int Height) DecodeImagePixels(SharpGLTF.Schema2.Image image, int maxSize)
+		=> DecodeEncodedImage(image.Content.Content.ToArray(), maxSize);
+
+	/// <summary>Декод сжатой картинки (PNG/JPG) с даунскейлом до <paramref name="maxSize"/> (0 = без
+	/// лимита). Публичный - им же фоновые апгрейды стрим-текстур ре-декодируют сохранённые исходники
+	/// (см. <see cref="StreamedTextures"/>). Чистый CPU без разделяемого состояния - безопасен из
+	/// любого потока; учти, что декод идёт в ПОЛНОМ разрешении файла и только потом ужимается (stb
+	/// иначе не умеет) - пиковая память по одной задаче на 4K-исходнике ~64 МБ.</summary>
+	public static (byte[] Pixels, int Width, int Height) DecodeEncodedImage(byte[] encodedBytes, int maxSize)
 	{
-		var encodedBytes = image.Content.Content.ToArray();
 		var decoded = ImageResult.FromMemory(encodedBytes, ColorComponents.RedGreenBlueAlpha);
 
 		var pixels = decoded.Data;
@@ -2010,6 +2594,61 @@ public class ModelLoader
 		return (result, newWidth, newHeight);
 	}
 
+	/// <summary>Среднее линейное альбедо материала для <see cref="MaterialPbrFactors.AverageBaseColor"/>:
+	/// разреженное среднее по base color текстуре (sRGB → linear), умноженное на линейный фактор.
+	/// Без текстуры - просто фактор. Альфа (линейная, без sRGB) уходит в
+	/// <see cref="MaterialPbrFactors.AverageAlpha"/> - по ней probe-GI бейкер отличает реально
+	/// «дырявые» материалы (листва/трава/решётки, средняя альфа мала) от сплошных, которые
+	/// экспортер зачем-то пометил MASK/BLEND (камень с альфой ~1) - см. ProbeGiBaker.</summary>
+	private static Vector4 ComputeAverageBaseColor(PreparedMaterial pm)
+	{
+		var factor = new Vector3(pm.BaseColorFactor.X, pm.BaseColorFactor.Y, pm.BaseColorFactor.Z);
+		var texture = pm.BaseColorTexture;
+		if (texture?.Pixels == null || texture.Width <= 0 || texture.Height <= 0)
+		{
+			return new Vector4(factor, pm.BaseColorFactor.W);
+		}
+
+		// Каждый ~16-й пиксель: среднему хватает, а гигантские атласы не тормозят загрузку.
+		int pixelCount = texture.Width * texture.Height;
+		int stride = Math.Max(1, pixelCount / 4096);
+		var sum = Vector3.Zero;
+		float alphaSum = 0f;
+		int count = 0;
+		for (int i = 0; i < pixelCount; i += stride)
+		{
+			int idx = i * 4;
+			if (idx + 3 >= texture.Pixels.Length)
+			{
+				break;
+			}
+
+			// sRGB → linear тем же pow(2.2), что и шейдер (см. UnlitInstancedPS.hlsl).
+			sum += new Vector3(
+				MathF.Pow(texture.Pixels[idx] / 255f, 2.2f),
+				MathF.Pow(texture.Pixels[idx + 1] / 255f, 2.2f),
+				MathF.Pow(texture.Pixels[idx + 2] / 255f, 2.2f));
+			alphaSum += texture.Pixels[idx + 3] / 255f;
+			count++;
+		}
+
+		return count > 0
+			? new Vector4(sum / count * factor, alphaSum / count * pm.BaseColorFactor.W)
+			: new Vector4(factor, pm.BaseColorFactor.W);
+	}
+
+	/// <summary>Сжатый исходник одной glTF-картинки для стриминга качества - один на image, шарится
+	/// всеми PreparedTexture его каналов/материалов; в финализации по нему группируются привязки в
+	/// один <see cref="StreamedTexture"/>.</summary>
+	private sealed class TextureStreamSource
+	{
+		/// <summary>Внешний файл картинки (предпочтительно - ничего не держим в памяти).</summary>
+		public string FilePath;
+
+		/// <summary>Встроенные байты (.glb / data-URI), когда файла на диске нет.</summary>
+		public byte[] EncodedBytes;
+	}
+
 	private sealed class PreparedTexture
 	{
 		public byte[] Pixels;
@@ -2017,6 +2656,9 @@ public class ModelLoader
 		public int Height;
 		public TextureAddress AddressMode;
 		public TextureFilter FilterMode;
+
+		/// <summary>null = стриминг выключен (обычный полноразмерный декод).</summary>
+		public TextureStreamSource StreamSource;
 	}
 
 	private sealed class PreparedMaterial
@@ -2098,6 +2740,16 @@ public class ModelLoader
 		/// (исходный glTF-материал, код топологии). Заполняется в PrepareModel, материализуется в
 		/// BuildFromPrepared.</summary>
 		public Dictionary<int, (int SourceMaterial, int Topology)> TopologyMaterialClones = new();
+
+		/// <summary>Тайминги фоновых фаз, мс - для диагностики (см. ModelLoader.Timings). Без них
+		/// оптимизация загрузки превращается в гадание: фазы стоят очень по-разному на разных
+		/// ассетах, и «очевидный» виновник обычно не тот.</summary>
+		public long MsParse, MsDecode, MsMaterials, MsMeshes;
+
+		/// <summary>Сколько уникальных картинок декодировано и сколько мегабайт они заняли
+		/// несжатыми - главный вкладчик в пиковую память загрузки.</summary>
+		public int DecodedImages;
+		public long DecodedBytes;
 	}
 
 	/// <summary>
@@ -2121,6 +2773,7 @@ public class ModelLoader
 		// Состояние пошаговой финализации (см. FinalizeChunk): наполовину построенный ModelLoader и
 		// текущая позиция итератора BuildFromPreparedIncremental. Живёт между кадрами.
 		private ModelLoader _finalizing;
+		private long _finalizeMs;
 		private IEnumerator<long> _finalizeSteps;
 
 		internal ModelLoadRequest(IGraphicsApi graphicsApi, string modelPath, ModelLoadOptions options,
@@ -2157,7 +2810,7 @@ public class ModelLoader
 		/// модель одним вызовом - в интерактивном рендер-лупе предпочитайте покадровый
 		/// <see cref="FinalizeChunk"/>, иначе upload-хип раздувается на весь размер модели.
 		/// </summary>
-		public ModelLoader FinalizeOnMainThread() => FinalizeChunk(long.MaxValue);
+		public ModelLoader FinalizeOnMainThread() => FinalizeChunk(long.MaxValue, long.MaxValue);
 
 		/// <summary>
 		/// Покадровая версия <see cref="FinalizeOnMainThread"/>: создаёт GPU-ресурсы, пока суммарная
@@ -2169,7 +2822,8 @@ public class ModelLoader
 		/// созданными GPU-ресурсами: у ModelLoader нет Release, недостроенный экземпляр никому не
 		/// возвращается.
 		/// </summary>
-		public ModelLoader FinalizeChunk(long budgetBytes = DefaultFinalizeBudgetBytes)
+		public ModelLoader FinalizeChunk(long budgetBytes = DefaultFinalizeBudgetBytes,
+			long budgetMs = FinalizeBudgetMs)
 		{
 			if (!PrepareTask.IsCompletedSuccessfully)
 			{
@@ -2188,24 +2842,58 @@ public class ModelLoader
 				_finalizeSteps = BuildFromPreparedIncremental(_graphicsApi, _options, _prepared, _finalizing);
 			}
 
+			// Финализация размазана по кадрам, поэтому её время копится по кусочкам - иначе цифра
+			// показывала бы длину последнего чанка, а не стоимость фазы.
+			var swFinalize = System.Diagnostics.Stopwatch.StartNew();
+
 			long uploadedBytes = 0;
 			while (uploadedBytes < budgetBytes)
 			{
 				if (!_finalizeSteps.MoveNext())
 				{
 					var ready = _finalizing;
+					_finalizeMs += swFinalize.ElapsedMilliseconds;
+					ready.Timings = new LoadTimings(_prepared.MsParse, _prepared.MsDecode,
+						_prepared.MsMaterials, _prepared.MsMeshes, _finalizeMs,
+						_prepared.DecodedImages, _prepared.DecodedBytes,
+						ready._shaderVariants, ready._shaderMs, ready._textureCount, ready._textureMs,
+						ready._meshCount, ready._meshMs, ready._samplerCount, ready._samplerMs, ready._materialCount, ready._materialMs, ready._matCreateMs, ready._matShaderMs);
+
 					_finalizeSteps.Dispose();
 					_finalizeSteps = null;
 					_finalizing = null;
 					_prepared = null;
+
+					// Кэш PSO - на диск ровно здесь: загрузка только что создала все конвейеры модели,
+					// а следующий запуск иначе скомпилирует их заново (см. IGraphicsApi.SavePipelineCache).
+					_graphicsApi.SavePipelineCache();
 					return ready;
 				}
 
 				uploadedBytes += _finalizeSteps.Current;
+
+				// Бюджет ВРЕМЕНИ, а не только байт. Байтовый бюджет считает ЗАЛИВКУ, а самое дорогое
+				// в финализации байт не заливает вовсе: компиляция вариантов пиксельного шейдера
+				// (секунда на вариант) и создание материалов. В режиме стриминга текстур оценка
+				// материала - жалкие 4 КБ, так что все 50+ материалов Sponza со всеми компиляциями
+				// проходили за ОДИН вызов, то есть за один кадр: окно редактора висело "Not
+				// Responding" на всё время загрузки.
+				if (swFinalize.ElapsedMilliseconds >= budgetMs)
+				{
+					break;
+				}
 			}
+
+			_finalizeMs += swFinalize.ElapsedMilliseconds;
 
 			return null;
 		}
+
+		/// <summary>Сколько миллисекунд одному вызову <see cref="FinalizeChunk"/> позволено занимать
+		/// поток рендера. Один шаг итератора прервать нельзя (компиляция шейдера идёт целиком), так
+		/// что реальный кадр может выйти длиннее - но следующий шаг уже уедет в следующий кадр, и UI
+		/// остаётся живым.</summary>
+		public const long FinalizeBudgetMs = 8;
 
 		private sealed class ProgressTracker
 		{

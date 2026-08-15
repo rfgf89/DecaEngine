@@ -58,6 +58,51 @@ SamplerState _OcclusionTex_sampler;
 Texture2D    _EnvMap;
 SamplerState _EnvMap_sampler;
 
+// Probe-GI (DDGI-лайт, см. DecaEngine.Editor.ProbeGiBaker): атласы SH L1 irradiance-проб,
+// запечённых CPU-трассировкой. Сетка РАЗРЕЖЕННАЯ - пробы существуют только в кирпичах рядом с
+// геометрией, а атлас хранит пул таких кирпичей (кирпич - блок 4 в ширину и 4*4 в высоту,
+// z-слайсы столбиком). Тексель пробы ищется через _ProbeIndirection, см. ProbeTexel/SampleProbeGi.
+// Sh0: rgb = L0, a = sky visibility; Sh1: rgb = L1x, a = валидность пробы (0 = в стене);
+// Sh2/Sh3: rgb = L1y/L1z. Читаются через Load - сэмплер не нужен, трилинейность ручная
+// (SampleProbeGi). Привязаны только в превью с пробами (ProbeGridOrigin.w = 0 иначе - как _EnvMap,
+// объявлены безусловно, но мёртвая ветка их не трогает).
+Texture2D _ProbeSh0;
+Texture2D _ProbeSh1;
+Texture2D _ProbeSh2;
+Texture2D _ProbeSh3;
+// DDGI visibility: окто-атлас 8x8 текселей на пробу (r = средняя дистанция до геометрии по
+// направлению, g = средний квадрат) - тест Чебышёва в SampleProbeGi отбрасывает пробы,
+// заслонённые стеной от точки сэмпла. Та же раскладка пула, умноженная на 8 по обеим осям.
+Texture2D _ProbeVis;
+// Релокация: rgb = смещение пробы от её узла сетки в мировых единицах (см.
+// ProbeGiBakeResult.Offset). Проба, стоявшая внутри стены или колонны, отодвинута наружу, и знать
+// об этом обязаны ОБА потребителя: и трилинейный вес, и тест Чебышёва меряют расстояние до пробы.
+// В запечке атлас нулевой - релокация работает только в реальном времени.
+Texture2D _ProbeOffset;
+// Карта индирекции RGBA8 размером с сетку КИРПИЧЕЙ, тексель (bx, bz*BrickCountY+by): r/g -
+// младший/старший байт индекса кирпича в пуле, b > 0 - кирпич существует. Читается один раз на
+// сэмпл: все восемь углов трилинейной ячейки по построению лежат в одном кирпиче.
+Texture2D _ProbeIndirection;
+
+// КАСКАДЫ (см. SampleProbeGi): те же комплекты атласов для одного-двух дополнительных, более
+// МЕЛКИХ объёмов вокруг точки интереса - _C1 вдвое плотнее базового, _C2 вчетверо. Выборка идёт от
+// мелкого к крупному, базовый объём остаётся гарантией покрытия всей сцены. Активность каскада -
+// ProbeGridOrigin1/2.w (0 = не создан, слоты держат плейсхолдер, мёртвая ветка их не читает).
+Texture2D _ProbeSh0_C1;
+Texture2D _ProbeSh1_C1;
+Texture2D _ProbeSh2_C1;
+Texture2D _ProbeSh3_C1;
+Texture2D _ProbeVis_C1;
+Texture2D _ProbeOffset_C1;
+Texture2D _ProbeIndirection_C1;
+Texture2D _ProbeSh0_C2;
+Texture2D _ProbeSh1_C2;
+Texture2D _ProbeSh2_C2;
+Texture2D _ProbeSh3_C2;
+Texture2D _ProbeVis_C2;
+Texture2D _ProbeOffset_C2;
+Texture2D _ProbeIndirection_C2;
+
 // Contains data about the camera/view (e.g., camera position).
 cbuffer View
 {
@@ -70,6 +115,21 @@ cbuffer Light
 {
     LightData lightData;
 }
+
+// Результаты кластеризации punctual-светов (LightClusterCS.hlsl, привязка -
+// DiligentBatchRenderer.Register). Объявлены безусловно: при ClusterParams.y == 0 (превью,
+// камеры без punctual-светов) кластерная ветка мёртвая и буферы не читаются.
+StructuredBuffer<PunctualLight> PunctualLights;
+StructuredBuffer<uint> ClusterCounts;
+StructuredBuffer<uint> ClusterIndices;
+
+// Тени punctual-светов: texture array слайсов (спот - один, точечный - шесть граней куба) и
+// viewProj-матрицы слайсов (см. PunctualShadowScheduler). Обычный Z (запись Less, clear 1.0),
+// сравнение LessEqual - та же конвенция, что у каскадов солнца. Объявлены безусловно: при
+// ShadowParams.x < 0 ветка мёртвая, а лейаут текстуры держит валидным ForwardPass.
+StructuredBuffer<float4x4> PunctualShadowMatrices;
+Texture2DArray PunctualShadowMaps;
+SamplerComparisonState PunctualShadowMaps_sampler;
 
 #if FEATURE_SHADOWS
 // Shadow map мирового света (каскад 0; привязывается DiligentBatchRenderer.Register ->
@@ -137,6 +197,41 @@ cbuffer PreviewSettings
     // спекуляра). Каждый пуш Lighting-режима обязан слать (1,1,1,1) для материалов без
     // расширения - нулевой w глушит спекуляр в чёрный (см. PreviewSettingsData).
     float4 PbrSpecularColorFactor;
+
+    // Probe-GI сетка (см. ProbeGiTextures): xyz = мировая позиция пробы (0,0,0), w = 1 - пробы
+    // запечены и привязаны (0 - zero-init, фича выключена, атласы могут быть не привязаны).
+    float4 ProbeGridOrigin;
+    // xyz = шаг сетки в мировых единицах, w = normal-бейас точки сэмпла (доля ячейки) - от
+    // утечек света сквозь тонкие стены (аналог DDGI normal bias).
+    float4 ProbeGridCell;
+    // xyz = число проб по осям ВИРТУАЛЬНОЙ сетки (float для простоты cbuffer-паковки) - в ней
+    // ищется ячейка по мировой позиции; реально выделены только пробы живых кирпичей.
+    float4 ProbeGridCounts;
+    // xyz = размер сетки кирпичей, w = сколько кирпичей в ряду пула (см. ProbeGiTextures.GridBricks).
+    float4 ProbeGridBricks;
+    // Ручки probe-GI из окна Graphics (см. GraphicsSettingsWindow / EditorSettings): x = флор
+    // глушения солнечной доли эмбиента тенью ключа (дефолт 0.3), y = флор глушения env-спекуляра
+    // видимостью неба (0.2), z = интенсивность солнца (0 = zero-init, берём дефолт 2.0),
+    // w = множитель probe-irradiance (0 = дефолт 1.0).
+    float4 ProbeGiParams;
+    // x = флор глушения НЕБЕСНОЙ доли эмбиента тенью ключа (1 = небо в тени не гасится - дефолт,
+    // редактор шлёт явно; 0-init вне превью тоже трактуется как 1). yzw - резерв.
+    float4 ProbeGiParams2;
+
+    // Сетки каскадов 1 и 2 (мелких) - та же семантика, что у базовых ProbeGrid*; Origin.w = 1
+    // означает «каскад создан и атласы _C1/_C2 привязаны» (см. SampleProbeGi).
+    float4 ProbeGridOrigin1;
+    float4 ProbeGridCell1;
+    float4 ProbeGridCounts1;
+    float4 ProbeGridBricks1;
+    float4 ProbeGridOrigin2;
+    float4 ProbeGridCell2;
+    float4 ProbeGridCounts2;
+    float4 ProbeGridBricks2;
+
+    // Режим кривой тонмапа (см. Tonemap.hlsl). Действует только в LDR-режиме: в HDR-конвейере
+    // кривую применяет TonemapPS в самом конце, а здесь кадр остаётся линейным.
+    int PbrToneCurve;
 }
 
 // KHR_texture_transform поверх UV0 (см. PbrUvTransform выше).
@@ -153,46 +248,74 @@ static const int FeatureNormalMaps = 1;
 static const int FeatureOcclusion = 2;
 static const int FeatureShadows = 4;
 
+// HDR-конвейер превью (см. GraphicsPipelineSimple с eyeAdaptation): цветовой таргет - RGBA16F,
+// шейдинг пишет в него ЛИНЕЙНЫЙ радианс без тонмапа и sRGB-энкода, а экспозиция + кривая
+// применяются один раз в TonemapPass после замера яркости кадра. Бит, а не кейворд: HDR - опция
+// окружения, а материалы переживают его пересоздание только через перезагрузку модели, и лишний
+// вариант шейдера на каждый материал того не стоит.
+static const int FeatureHdrOutput = 8;
+
 #if FEATURE_SHADOWS
-// PCF 3x3 по каскаду 0 shadow map мирового света; за пределами каскада - освещено.
+// PCF 3x3 по shadow map мирового света с выбором каскада: каскады - концентрические ортобоксы
+// (мелкие вокруг точки интереса камеры, последний накрывает всю сцену, см.
+// SimpleCullingAndRenderSystem.BuildLightData), берётся ПЕРВЫЙ, чей объём содержит точку -
+// он самый детальный. Валидность каскада - ненулевая ширина в CascadeSizes (превью моделей
+// по-прежнему заполняет один каскад, и цикл вырождается в прежний код). За пределами всех
+// каскадов - освещено.
 float SampleWorldLightShadow(float3 worldPos, float3 N)
 {
-    // Normal-offset bias: точка сэмплирования сдвигается вдоль нормали на ~полтора текселя
-    // shadow map В МИРОВЫХ единицах (CascadeSizes.x = ширина орто-каскада, см. BuildLightData).
-    // Депф-bias один не спасает тонкую геометрию (черепица, ткань): её задняя грань лежит в
-    // сантиметрах за передней, и PCF-соседи на рельефе ловят чужие задние грани - крыши
-    // затеняют сами себя. Сдвиг по нормали уводит точку из этой зоны независимо от глубины.
-    float texelWorld = lightData.CascadeSizes.x / 4096.0;
-    worldPos += N * texelWorld * 1.5;
-
-    float4 lightClip = mul(float4(worldPos, 1.0), lightData.CascadeMatrix[0]);
-    float3 lightNdc = lightClip.xyz / max(lightClip.w, 1e-6);
-    float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 0.5 - lightNdc.y * 0.5);
-
-    if (any(shadowUv < 0.0) || any(shadowUv > 1.0) || lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
-    {
-        return 1.0;
-    }
-
-    // Минимальное смещение: shadow map пишется с front-face culling (глубина ЗАДНИХ граней, см.
-    // ShadowRenderer.GetBaseState) - от acne защищает сама конвенция, а крупный bias поверх неё
-    // отклеивал тень от основания фигур (peter-panning).
-    float referenceDepth = lightNdc.z - 0.0004;
-
-    const float texel = 1.0 / 4096.0;
-    float sum = 0.0;
     [unroll]
-    for (int y = -1; y <= 1; y++)
+    for (int c = 0; c < 4; c++)
     {
-        [unroll]
-        for (int x = -1; x <= 1; x++)
+        float cascadeWorld = lightData.CascadeSizes[c];
+        if (cascadeWorld <= 0.0)
         {
-            sum += ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
-                float3(shadowUv + float2(x, y) * texel, 0.0), referenceDepth);
+            continue;
         }
+
+        // Normal-offset bias: точка сэмплирования сдвигается вдоль нормали на ~полтора текселя
+        // shadow map В МИРОВЫХ единицах (CascadeSizes[c] = ширина орто-каскада ЭТОГО уровня).
+        // Депф-bias один не спасает тонкую геометрию (черепица, ткань): её задняя грань лежит в
+        // сантиметрах за передней, и PCF-соседи на рельефе ловят чужие задние грани - крыши
+        // затеняют сами себя. Сдвиг по нормали уводит точку из этой зоны независимо от глубины.
+        float texelWorld = cascadeWorld / 4096.0;
+        float3 samplePos = worldPos + N * texelWorld * 1.5;
+
+        float4 lightClip = mul(float4(samplePos, 1.0), lightData.CascadeMatrix[c]);
+        float3 lightNdc = lightClip.xyz / max(lightClip.w, 1e-6);
+        float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 0.5 - lightNdc.y * 0.5);
+
+        if (any(shadowUv < 0.0) || any(shadowUv > 1.0) || lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
+        {
+            // Точка вне этого каскада - пробуем следующий, крупнее.
+            continue;
+        }
+
+        // Небольшое смещение: shadow map пишется БЕЗ отсечения граней (см. ShadowRenderer.GetBaseState -
+        // прежний front-cull делал одностороннюю геометрию прозрачной для света: планки крыши без
+        // задних граней пропускали солнце полосами). Основную работу против acne делают растеризаторные
+        // байасы записи (DepthBias + SlopeScaledDepthBias) и normal-offset выше; константа здесь -
+        // добивка, крупнее нельзя (peter-panning у основания фигур). Глубинный диапазон у всех
+        // каскадов одинаковый (см. BuildLightData), так что константа работает на любом уровне.
+        float referenceDepth = lightNdc.z - 0.0004;
+
+        const float texel = 1.0 / 4096.0;
+        float sum = 0.0;
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                sum += ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
+                    float3(shadowUv + float2(x, y) * texel, (float)c), referenceDepth);
+            }
+        }
+
+        return sum / 9.0;
     }
 
-    return sum / 9.0;
+    return 1.0;
 }
 #endif
 
@@ -211,32 +334,258 @@ float3 SampleEnvironment(float3 dir, float roughness)
     return _EnvMap.SampleLevel(_EnvMap_sampler, uv, roughness * EnvMipMax).rgb;
 }
 
-// Khronos PBR Neutral tone mapper (https://github.com/KhronosGroup/ToneMapping) - the reference
-// curve of the glTF Sample Viewer's "PBR Neutral" mode. Unlike Reinhard (which halves every
-// midtone and is a big part of why the preview used to read as unlit), it passes values below
-// ~0.76 through unchanged and only compresses the top of the range, preserving color saturation.
-float3 PbrNeutralToneMap(float3 color)
+// Ручной трилинейный сэмпл probe-GI сетки: 8 угловых проб ячейки, вес = трилинейный ×
+// валидность (пробы внутри геометрии не интерполируются - от утечек тьмы/света). SH L1 →
+// диффузная irradiance по нормали (константы Ramamoorthi: A0*Y00 = 0.886, A1*Y1 = 1.023).
+// Возвращает E/PI - готовый ламбертов множитель альбедо; skyVisibility - доля неба, видимая
+// точкой (глушит env-спекуляр в закрытых местах). Отрицательный x = валидных проб рядом нет,
+// вызывающий откатывается на константный ambient.
+// Геометрия кирпича разреженной сетки - обязана совпадать с ProbeGiBaker.BrickProbes/BrickCells.
+#define PROBE_BRICK_PROBES 4
+#define PROBE_BRICK_CELLS  3
+
+// Сторона окто-карты видимости на пробу. Приходит кбуфером (ProbeGiParams2.y - ручка «Visibility
+// res», см. ProbeGiBakeResult.VisRes): раскладка атласа задаётся ей же на CPU, и разойтись им
+// нельзя. 0 (zero-init кбуфера вне превью) трактуется как дефолтные 8.
+int ProbeVisRes()
 {
-    const float startCompression = 0.8 - 0.04;
-    const float desaturation = 0.15;
+    int res = (int)ProbeGiParams2.y;
+    return res > 0 ? res : 8;
+}
 
-    float x = min(color.r, min(color.g, color.b));
-    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
-    color -= offset;
+// Окто-топология при выходе за край тайла: октаэдр развёрнут в квадрат, поэтому сосед за кромкой -
+// это тексель ЭТОГО ЖЕ тайла с противоположной стороны и зеркальной второй координатой (переход
+// через ребро октаэдра). Нужно для билинейной фильтрации карты глубин: без обёртки края тайла
+// пришлось бы либо клампить (ложная "стена" по краю окто-развёртки), либо держать в атласе
+// border-тексели, то есть переразмечать его и переписывать обе записи (CPU и ProbeRoundCS).
+int2 OctWrapTexel(int2 t, int res)
+{
+    if (t.x < 0)         { t.x = 0;         t.y = res - 1 - t.y; }
+    else if (t.x >= res) { t.x = res - 1;   t.y = res - 1 - t.y; }
 
-    float peak = max(color.r, max(color.g, color.b));
-    if (peak < startCompression)
+    if (t.y < 0)         { t.y = 0;         t.x = res - 1 - t.x; }
+    else if (t.y >= res) { t.y = res - 1;   t.x = res - 1 - t.x; }
+
+    return t;
+}
+
+// Окто-кодирование направления в [0,1]² - обязано бит-в-бит совпадать с ProbeGiBaker.OctEncode
+// (CPU пишет атлас видимости в этой же раскладке).
+float2 OctEncode(float3 d)
+{
+    float sum = abs(d.x) + abs(d.y) + abs(d.z);
+    float2 p = d.xy / sum;
+    if (d.z < 0.0)
     {
-        return color;
+        p = (1.0 - abs(p.yx)) * float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
     }
 
-    float d = 1.0 - startCompression;
-    float newPeak = 1.0 - d * d / (peak + d - startCompression);
-    color *= newPeak / peak;
-
-    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
-    return lerp(color, newPeak.xxx, g);
+    return p * 0.5 + 0.5;
 }
+
+// sunFraction - доля солнечного света (баунс + переотскоки) в поле, альфа Sh2: экранная тень
+// ключа глушит только её (см. probeShadow в Main) - небесная часть эмбиента в тени легитимна.
+// Нелинейная реконструкция облучённости из L1 (Geomerics/Enlighten, см. Graham Hazel, "Spherical
+// Harmonics for Lighting"). Линейная форма I(n) = R0 + 2*R1.n имеет врождённый дефект: длина R1
+// доходит до R0, поэтому множитель 2 позволяет второму слагаемому превысить первое, и с обратной
+// стороны от яркого направления облучённость становится ОТРИЦАТЕЛЬНОЙ. Физически этого не бывает,
+// а на картинке даёт чёрные пятна напротив ярких проёмов (или потерю энергии, если просто
+// клампить в ноль).
+//
+// Здесь R0 и R1 - в «нормированном» соглашении Хейзела (R0 = среднее по сфере), на канал: у
+// каждого канала своя направленность.
+//
+// ВАЖНО: это не строгое улучшение, а размен, замеренный численно против точного интегрирования.
+// При сильной направленности (r = |R1|/R0 около 0.85-0.99) линейная форма уходит в минус на всю
+// величину R0, и нелинейная точнее вчетверо. Зато на полусферическом источнике (r = 0.5) линейная
+// ТОЧНА, а нелинейная замыливает и не умеет темнеть с изнанки. Поэтому смешиваем по r, и порог не
+// подобран на глаз: при r <= 0.5 линейная форма неотрицательна по построению (2r <= 1), то есть
+// ломаться ей просто негде.
+float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
+{
+    float len = length(R1v);
+    if (R0 <= 1e-6 || len <= 1e-8)
+    {
+        return max(R0, 0.0);
+    }
+
+    float r = saturate(len / R0);
+    float linearForm = R0 + 2.0 * dot(R1v, n);
+    if (r <= 0.5)
+    {
+        return linearForm;
+    }
+
+    float q = 0.5 * (1.0 + dot(R1v / len, n));
+    float p = 1.0 + 2.0 * r;
+    float a = (1.0 - r) / (1.0 + r);
+    float nonLinear = R0 * (a + (1.0 - a) * (p + 1.0) * pow(q, p));
+
+    return lerp(linearForm, nonLinear, smoothstep(0.5, 0.8, r));
+}
+
+// Выборка одного объёма (каскада) живёт в ProbeGiSampleBody.hlsl и разворачивается по разу на
+// каскад: HLSL до SM 6.6 не передаёт текстуры параметрами, поэтому один код с разными атласами -
+// это инклюд с макросами, а не функция.
+#define PROBE_GI_FN      SampleProbeGiC0
+#define PROBE_GI_SH0     _ProbeSh0
+#define PROBE_GI_SH1     _ProbeSh1
+#define PROBE_GI_SH2     _ProbeSh2
+#define PROBE_GI_SH3     _ProbeSh3
+#define PROBE_GI_VIS     _ProbeVis
+#define PROBE_GI_OFFSET  _ProbeOffset
+#define PROBE_GI_IND     _ProbeIndirection
+#define PROBE_GI_ORIGIN  ProbeGridOrigin
+#define PROBE_GI_CELL    ProbeGridCell
+#define PROBE_GI_COUNTS  ProbeGridCounts
+#define PROBE_GI_BRICKS  ProbeGridBricks
+#include "ProbeGiSampleBody.hlsl"
+#undef PROBE_GI_FN
+#undef PROBE_GI_SH0
+#undef PROBE_GI_SH1
+#undef PROBE_GI_SH2
+#undef PROBE_GI_SH3
+#undef PROBE_GI_VIS
+#undef PROBE_GI_OFFSET
+#undef PROBE_GI_IND
+#undef PROBE_GI_ORIGIN
+#undef PROBE_GI_CELL
+#undef PROBE_GI_COUNTS
+#undef PROBE_GI_BRICKS
+
+#define PROBE_GI_FN      SampleProbeGiC1
+#define PROBE_GI_SH0     _ProbeSh0_C1
+#define PROBE_GI_SH1     _ProbeSh1_C1
+#define PROBE_GI_SH2     _ProbeSh2_C1
+#define PROBE_GI_SH3     _ProbeSh3_C1
+#define PROBE_GI_VIS     _ProbeVis_C1
+#define PROBE_GI_OFFSET  _ProbeOffset_C1
+#define PROBE_GI_IND     _ProbeIndirection_C1
+#define PROBE_GI_ORIGIN  ProbeGridOrigin1
+#define PROBE_GI_CELL    ProbeGridCell1
+#define PROBE_GI_COUNTS  ProbeGridCounts1
+#define PROBE_GI_BRICKS  ProbeGridBricks1
+#include "ProbeGiSampleBody.hlsl"
+#undef PROBE_GI_FN
+#undef PROBE_GI_SH0
+#undef PROBE_GI_SH1
+#undef PROBE_GI_SH2
+#undef PROBE_GI_SH3
+#undef PROBE_GI_VIS
+#undef PROBE_GI_OFFSET
+#undef PROBE_GI_IND
+#undef PROBE_GI_ORIGIN
+#undef PROBE_GI_CELL
+#undef PROBE_GI_COUNTS
+#undef PROBE_GI_BRICKS
+
+#define PROBE_GI_FN      SampleProbeGiC2
+#define PROBE_GI_SH0     _ProbeSh0_C2
+#define PROBE_GI_SH1     _ProbeSh1_C2
+#define PROBE_GI_SH2     _ProbeSh2_C2
+#define PROBE_GI_SH3     _ProbeSh3_C2
+#define PROBE_GI_VIS     _ProbeVis_C2
+#define PROBE_GI_OFFSET  _ProbeOffset_C2
+#define PROBE_GI_IND     _ProbeIndirection_C2
+#define PROBE_GI_ORIGIN  ProbeGridOrigin2
+#define PROBE_GI_CELL    ProbeGridCell2
+#define PROBE_GI_COUNTS  ProbeGridCounts2
+#define PROBE_GI_BRICKS  ProbeGridBricks2
+#include "ProbeGiSampleBody.hlsl"
+#undef PROBE_GI_FN
+#undef PROBE_GI_SH0
+#undef PROBE_GI_SH1
+#undef PROBE_GI_SH2
+#undef PROBE_GI_SH3
+#undef PROBE_GI_VIS
+#undef PROBE_GI_OFFSET
+#undef PROBE_GI_IND
+#undef PROBE_GI_ORIGIN
+#undef PROBE_GI_CELL
+#undef PROBE_GI_COUNTS
+#undef PROBE_GI_BRICKS
+
+// Плавный вес объёма: ноль у грани бокса (и снаружи), единица в двух шагах сетки внутрь. Лечит
+// сразу две видимые беды стыков (см. скриншоты с «переходами»):
+//   1) тело выборки КЛАМПИТ точку к боксу - без веса пиксель ВНЕ мелкого каскада не проваливался
+//      на крупный, а получал растянутые крайние кирпичи мелкого;
+//   2) даже честная граница переключала разрешение поля жёстко, швом.
+// Отступ 0.5 шага держит выборку подальше от кламп-зоны самой грани.
+float ProbeCascadeWeight(float3 worldPos, float4 origin, float4 cell, float4 counts)
+{
+    float3 f = (worldPos - origin.xyz) / cell.xyz;
+    float3 hi = counts.xyz - 1.0;
+    float d = min(min(f.x, hi.x - f.x), min(min(f.y, hi.y - f.y), min(f.z, hi.z - f.z)));
+    return saturate((d - 0.5) / 1.5);
+}
+
+// Каскадная выборка: база - гарантия покрытия, мелкие объёмы подмешиваются ПОВЕРХ с весом своего
+// бокса. Плата за плавный стык - в зоне каскада выборок больше одной (до трёх в самом мелком);
+// это ровно те места, ради которых каскады и заведены, так что цена по адресу.
+float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out float sunFraction,
+                     out float3 probeMarker)
+{
+    float3 result = SampleProbeGiC0(worldPos, N, skyVisibility, sunFraction, probeMarker);
+
+    if (ProbeGridOrigin1.w > 0.5)
+    {
+        float w = ProbeCascadeWeight(worldPos, ProbeGridOrigin1, ProbeGridCell1, ProbeGridCounts1);
+        if (w > 0.0)
+        {
+            float sky1, sun1;
+            float3 marker1;
+            float3 mid = SampleProbeGiC1(worldPos, N, sky1, sun1, marker1);
+            if (mid.x >= 0.0)
+            {
+                // Базе нечем крыть (дыра без кирпича) - мелкий объём целиком, без фейда в мусор.
+                if (result.x < 0.0)
+                {
+                    w = 1.0;
+                }
+
+                result = lerp(max(result, 0.0), mid, w);
+                skyVisibility = lerp(skyVisibility, sky1, w);
+                sunFraction = lerp(sunFraction, sun1, w);
+                if (w > 0.5)
+                {
+                    probeMarker = marker1;
+                }
+            }
+        }
+    }
+
+    if (ProbeGridOrigin2.w > 0.5)
+    {
+        float w = ProbeCascadeWeight(worldPos, ProbeGridOrigin2, ProbeGridCell2, ProbeGridCounts2);
+        if (w > 0.0)
+        {
+            float sky2, sun2;
+            float3 marker2;
+            float3 fine = SampleProbeGiC2(worldPos, N, sky2, sun2, marker2);
+            if (fine.x >= 0.0)
+            {
+                if (result.x < 0.0)
+                {
+                    w = 1.0;
+                }
+
+                result = lerp(max(result, 0.0), fine, w);
+                skyVisibility = lerp(skyVisibility, sky2, w);
+                sunFraction = lerp(sunFraction, sun2, w);
+                if (w > 0.5)
+                {
+                    probeMarker = marker2;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+// Кривая тонмапа переехала в общий Tonemap.hlsl - её же применяет TonemapPS.hlsl в HDR-режиме
+// (см. FeatureHdrOutput ниже).
+#include "Tonemap.hlsl"
 
 // Direct-lighting contribution of one light for the Lighting preview mode: Cook-Torrance GGX
 // specular (D - GGX, G - Smith-Schlick with the direct-lighting k remap, F - Schlick) plus
@@ -380,14 +729,6 @@ PSOutput Main(in PSInput input)
 
     if (PreviewMode == 3)
     {
-        // Diagnostic hook (PreviewProbe's debug_transmission stage): dump the raw PbrTransmission
-        // constant as grayscale to verify the cbuffer value actually reaches the shader.
-        if (PreviewChannel == 9)
-        {
-            output.color = float4(PbrTransmission.xxx, 1.0);
-            return output;
-        }
-
         // PBR (Cook-Torrance GGX metallic-roughness) lighting preview - see ShadePbrLight above.
         // Per the glTF spec COLOR_0 multiplies the base color (it is linear, like PbrBaseColor).
         float4 baseColor = PbrBaseColor * input.vertexColor;
@@ -492,13 +833,21 @@ PSOutput Main(in PSInput input)
 
         if (hasWorldLight)
         {
-            keyDir = -normalize(lightData.LightDirection.xyz);
+            // Конвенция ОСНОВНОГО пайплайна (см. CullingAndRenderSystem): LightData.LightDirection
+            // указывает НА солнце - SimpleCullingAndRenderSystem теперь пишет так же.
+            keyDir = normalize(lightData.LightDirection.xyz);
             keyShadow = SampleWorldLightShadow(input.worldPos, N);
 
             // Мировой ключ слабее камерного (3.5 тюнился под риг без IBL-солнца): источник, из
             // которого он выведен, УЖЕ светит через энвайронмент-отражения - полная двойная
             // интенсивность пересвечивает глянцевые горизонтальные поверхности в белое.
-            keyIntensity = 2.0;
+            // Та же интенсивность обязана уходить в ProbeGiBaker.Bake sunColor - иначе баунс
+            // разойдётся с прямым светом (вьюпорт шлёт одно значение в оба места, см.
+            // ModelPreviewViewport). Поднимать её "для контраста теней" бесполезно: на светлом
+            // альбедо сумма direct+ambient уходит за колено PBR Neutral (~0.76), и тонемап
+            // сжирает контраст обратно (проверено на DragonAttenuation: при 5.0 тень на шахматке
+            // исчезала совсем). 0 = кбуфер вне превью не заполнен, дефолт 2.0.
+            keyIntensity = ProbeGiParams.z > 0.01 ? ProbeGiParams.z : 2.0;
         }
         else
 #endif
@@ -580,6 +929,93 @@ PSOutput Main(in PSInput input)
                + ShadeSheenLight(N, V, fillDir, fillColor, sheenColor, sheenRoughness);
 #endif
 
+        // ----- Clustered punctual-света (point/spot) -------------------------------------------
+        // Пиксель находит свой фроксел-кластер (тайл экрана + экспоненциальный срез по view-z,
+        // обязано зеркалить прямое отображение в LightClusterCS.hlsl) и шейдит только света его
+        // кластера. ClusterParams.y == 0 - punctual-светов у камеры нет, ветка мёртвая.
+        uint punctualCount = (uint)lightData.ClusterParams.y;
+        if (punctualCount > 0)
+        {
+            float clusterViewZ = mul(float4(input.worldPos, 1.0), viewData.view).z;
+            float clusterZNear = lightData.ClusterParams.z;
+            float clusterZFar = lightData.ClusterParams.w;
+
+            float2 clusterUv = input.pos.xy / viewData.viewport.zw;
+            uint tileX = min((uint)(clusterUv.x * CLUSTER_GRID_X), CLUSTER_GRID_X - 1);
+            uint tileY = min((uint)(clusterUv.y * CLUSTER_GRID_Y), CLUSTER_GRID_Y - 1);
+            float clusterSlice = log2(max(clusterViewZ, clusterZNear) / clusterZNear)
+                               / log2(clusterZFar / clusterZNear) * CLUSTER_GRID_Z;
+            uint tileZ = (uint)clamp(clusterSlice, 0.0, CLUSTER_GRID_Z - 1.0);
+
+            uint clusterIdx = ClusterFlatIndex(uint3(tileX, tileY, tileZ));
+            uint clusterLightCount = min(ClusterCounts[clusterIdx], CLUSTER_MAX_LIGHTS);
+
+            for (uint li = 0; li < clusterLightCount; li++)
+            {
+                PunctualLight punctual = PunctualLights[ClusterIndices[clusterIdx * CLUSTER_MAX_LIGHTS + li]];
+                float3 toLight = punctual.PositionRange.xyz - input.worldPos;
+                float punctualDistSq = dot(toLight, toLight);
+                float punctualRange = punctual.PositionRange.w;
+                if (punctualDistSq > punctualRange * punctualRange)
+                    continue;
+
+                float punctualDist = sqrt(max(punctualDistSq, 1e-6));
+                float3 punctualL = toLight / punctualDist;
+
+                // Гладкое окно затухания (Frostbite/glTF punctual): обратный квадрат, приглушенный
+                // к нулю на границе радиуса - без ступеньки на срезе кулинга.
+                float distFactor = saturate(1.0 - pow(punctualDist / punctualRange, 4.0));
+                float punctualAtten = distFactor * distFactor / (punctualDistSq + 1e-2);
+
+                if (punctual.DirectionType.w > 0.5)
+                {
+                    float cd = dot(-punctualL, punctual.DirectionType.xyz);
+                    float spotFactor = saturate((cd - punctual.SpotAngles.x) * punctual.SpotAngles.y);
+                    punctualAtten *= spotFactor * spotFactor;
+                }
+
+                // Тень света: спот сэмплирует свой единственный слайс, точечный выбирает грань куба
+                // по доминирующей оси вектора свет-фрагмент (индексация граней ОБЯЗАНА совпадать с
+                // PunctualShadowScheduler.FaceDirs: +X,-X,+Y,-Y,+Z,-Z).
+                if (punctual.ShadowParams.x >= 0.0 && punctualAtten > 0.0)
+                {
+                    uint shadowSlice = (uint)punctual.ShadowParams.x;
+                    if (punctual.DirectionType.w < 0.5)
+                    {
+                        float3 toFrag = -toLight;
+                        float3 absDir = abs(toFrag);
+                        if (absDir.x >= absDir.y && absDir.x >= absDir.z)
+                            shadowSlice += toFrag.x > 0.0 ? 0 : 1;
+                        else if (absDir.y >= absDir.z)
+                            shadowSlice += toFrag.y > 0.0 ? 2 : 3;
+                        else
+                            shadowSlice += toFrag.z > 0.0 ? 4 : 5;
+                    }
+
+                    float4 shadowClip = mul(float4(input.worldPos, 1.0), PunctualShadowMatrices[shadowSlice]);
+                    if (shadowClip.w > 1e-4)
+                    {
+                        float3 shadowNdc = shadowClip.xyz / shadowClip.w;
+                        float2 shadowUv = shadowNdc.xy * float2(0.5, -0.5) + 0.5;
+                        if (all(shadowUv >= 0.0) && all(shadowUv <= 1.0) && shadowNdc.z < 1.0)
+                        {
+                            // Склоновый bias по углу к свету давит акне перспективной карты; PCF -
+                            // аппаратным сравнением (LessEqual, обычный Z: ближе к свету = меньше).
+                            float shadowBias = max(0.002 * (1.0 - dot(N, punctualL)), 0.0004);
+                            float shadowLit = PunctualShadowMaps.SampleCmpLevelZero(
+                                PunctualShadowMaps_sampler,
+                                float3(shadowUv, shadowSlice), shadowNdc.z - shadowBias);
+                            punctualAtten *= lerp(1.0, shadowLit, saturate(punctual.ShadowParams.y));
+                        }
+                    }
+                }
+
+                direct += ShadePbrLight(N, V, punctualL,
+                    punctual.ColorIntensity.rgb * punctual.ColorIntensity.w * punctualAtten,
+                    albedo, metallic, roughness, transmission, dielectricF0, specularWeight);
+            }
+        }
+
         // NB: the per-channel F0 spread is left at its physical (subtle) level on purpose - an
         // amplified F0 acts at EVERY angle and painted the whole model with a flat blue cast
         // instead of edge fringes; the visible dispersion cue lives in the edge-weighted
@@ -610,11 +1046,48 @@ PSOutput Main(in PSInput input)
         // KHR_materials_specular участвует и в env-отклике - иначе сатиновый цветной блик виден
         // только в прямом свете, а отражение окружения остаётся "бесцветно стеклянным".
         float3 ambientF0 = lerp(dielectricF0, albedo, metallic);
+
+        // Probe-GI: запечённая irradiance (небо × видимость + отскоки) вместо константного
+        // ambient-уровня - пол двора светлее ниш под арками, отскок от освещённого камня тёплый.
+        // Тень ключа НЕ применяется: заслонённость уже запечена в пробах (envShadow был её
+        // экранной аппроксимацией). skyVisibility ниже глушит env-спекуляр.
+        float skyVisibility = 1.0;
+        float probeSunFraction = 0.0;
+        // Отметка ближайшей пробы для канала 10 (расстановка проб); вне его не используется.
+        float3 probeMarker = float3(1e6, 0.0, 0.0);
+        bool probeGi = ProbeGridOrigin.w > 0.5;
+        float3 probeIrradiance = 0.0;
+        if (probeGi)
+        {
+            probeIrradiance = SampleProbeGi(input.worldPos, N, skyVisibility, probeSunFraction,
+                                            probeMarker);
+            probeGi = probeIrradiance.x >= 0.0;
+        }
+
         // 0.15 тюнился под превью-риг, где тени добирал камерный fill. В сцене с мировым светом
         // fill выключен и эмбиент - ЕДИНСТВЕННЫЙ свет в тени; без буста двор Sponza проваливается
         // в черноту (небо/отскок от камня в реальности много ярче студийной панорамы).
         float ambientLevel = hasWorldLight ? 0.55 : 0.15;
-        float3 ambient = SampleEnvironment(N, 1.0) * ambientLevel * albedo * (1.0 - metallic) * occlusion * envShadow;
+
+        // Экранное глушение тенью ключа ТОЛЬКО солнечной доли probe-поля (probeSunFraction,
+        // печётся бейкером в Sh2.a): пробы стоят на ~1/22 габарита и контактную тень разрешить
+        // не могут - точка в тени получает поле соседних ЛИТ-проб, где солнечный баунс
+        // доминирует, и тень заливается (шахматка DragonAttenuation). Небесная же часть в тени
+        // НЕ трогается: затенённый двор освещён небом - это и есть референсный вид GI (Intel
+        // Sponza); равномерное глушение всего эмбиента (прежний lerp(0.1..0.4, 1, keyShadow))
+        // topило двор в черноте. sunFraction=0 (чисто небесное поле) - тень эмбиент не трогает,
+        // sunFraction=1 (чисто солнечное) - глушение как у прежнего envShadow. Флоры и множитель
+        // эмбиента - ручки окна Graphics (ProbeGiParams/ProbeGiParams2, см. кбуфер). Небесная
+        // доля по умолчанию тенью не гасится (skyFloor=1, физически честно - см. Intel Sponza),
+        // но у художника есть отдельная ручка затемнить тень целиком под нужный муд.
+        float skyFloor = ProbeGiParams2.x > 0.001 ? saturate(ProbeGiParams2.x) : 1.0;
+        float sunDamp = lerp(saturate(ProbeGiParams.x), 1.0, keyShadow);
+        float skyDamp = lerp(skyFloor, 1.0, keyShadow);
+        float probeShadow = lerp(skyDamp, sunDamp, probeSunFraction);
+        float probeBoost = ProbeGiParams.w > 0.01 ? ProbeGiParams.w : 1.0;
+        float3 ambient = probeGi
+            ? probeIrradiance * probeBoost * albedo * (1.0 - metallic) * occlusion * probeShadow
+            : SampleEnvironment(N, 1.0) * ambientLevel * albedo * (1.0 - metallic) * occlusion * envShadow;
 
         // KHR_materials_transmission via a real refraction pass (see ForwardPass): _SceneColor
         // holds the opaque scene as drawn this frame, and each channel samples it along its own
@@ -629,8 +1102,18 @@ PSOutput Main(in PSInput input)
         // alpha 0), fall back to the analytic backdrop gradient the UI composites behind the
         // image (constants mirror ModelPreviewViewport.Render).
 #if MATERIAL_TRANSMISSION
-        const float backdropBottom = 0.26;
-        const float backdropTop = 0.55;
+        // Константы подложки заданы в ОТОБРАЖАЕМОМ пространстве (ровно те, что рисует ImGui). В
+        // HDR-конвейере кадр линейный до самого TonemapPS, и подмешивать сюда sRGB-значение
+        // нельзя - стекло на фоне подложки поехало бы по яркости; поэтому под FeatureHdrOutput
+        // градиент разворачивается в линейное пространство той же гаммой 2.2, какой его потом
+        // свернёт обратно тонемап.
+        float backdropBottom = 0.26;
+        float backdropTop = 0.55;
+        if ((PbrFeatureFlags & FeatureHdrOutput) != 0)
+        {
+            backdropBottom = pow(backdropBottom, 2.2);
+            backdropTop = pow(backdropTop, 2.2);
+        }
 
         float2 screenUv = input.pos.xy / viewData.viewport.zw;
         float thicknessSample = _ThicknessTex.Sample(_ThicknessTex_sampler, uv).g;
@@ -699,7 +1182,11 @@ PSOutput Main(in PSInput input)
         float3 R = reflect(-V, N);
         float3 envColor = SampleEnvironment(R, roughness);
         float3 Fr = ambientF0 + (max((1.0 - roughness).xxx, ambientF0) - ambientF0) * pow(1.0 - NdotV, 5.0);
-        float3 envSpecular = envColor * Fr * lerp(specularWeight, 1.0, metallic) * occlusion * envShadow;
+        // С пробами env-отражение глушится запечённой видимостью неба (интерьеру арки нечего
+        // зеркалить из зенита) И экранной тенью ключа (см. probeShadow выше - глянец в тени иначе
+        // затирается ярким зеркальным пятном), без них - прежней аппроксимацией envShadow.
+        float envOcclusion = probeGi ? lerp(saturate(ProbeGiParams.y), 1.0, skyVisibility) * probeShadow : envShadow;
+        float3 envSpecular = envColor * Fr * lerp(specularWeight, 1.0, metallic) * occlusion * envOcclusion;
 
 #if MATERIAL_SHEEN
         // Env-ворс: окружение вдоль отражённого луча, взвешенное направленным альбедо лоба.
@@ -713,6 +1200,38 @@ PSOutput Main(in PSInput input)
 #endif
 
         // Diagnostic hooks (PreviewProbe): raw linear dumps of the individual lighting terms.
+        // Канал 9 - отладочный вид probe-GI (чекбокс Probe debug view в окне Graphics): R = доля
+        // солнечного света в поле (то, что глушит Sun bounce in shadow), G = видимость неба
+        // (то, что глушит Env specular occlusion), B = экранная тень ключа. Позволяет художнику
+        // видеть, на какие места сцены реально влияет каждая ручка.
+        // Канал 10 - РАССТАНОВКА проб: где каждая проба стоит и что с ней сделала релокация.
+        // Рисуется пятном на поверхности, оказавшейся рядом с пробой: зелёная - проба на своём
+        // узле сетки, жёлтая-красная - отодвинута (тем сильнее, чем краснее), синяя - признана
+        // невалидной, то есть замурована и в интерполяцию не идёт. Фон - валидность поля.
+        // Пробы в открытом воздухе, рядом с которыми нет поверхности, не отмечаются: рисовать их
+        // нечем, здесь нет своего прохода геометрии - зато именно застрявшие в стенах видны все.
+        if (PreviewChannel == 10)
+        {
+            float3 col = float3(0.05, 0.05, 0.05) * probeMarker.z;
+            if (probeMarker.x < 0.14)
+            {
+                float reloc = saturate(probeMarker.y / 0.45);
+                col = probeMarker.z < 0.01
+                    ? float3(0.1, 0.2, 1.0)
+                    : lerp(float3(0.1, 1.0, 0.1), float3(1.0, 0.1, 0.05), reloc);
+            }
+
+            output.color = float4(pow(saturate(col), 1.0 / 2.2), 1.0);
+            return output;
+        }
+        if (PreviewChannel == 9)
+        {
+            // sRGB-кодирование вручную, как у основного пути ниже: таргет UNORM, и линейные
+            // 0.1-0.2 (типичная видимость неба в интерьере) без него читаются как чёрный.
+            float3 probeDebug = float3(probeSunFraction, skyVisibility, keyShadow);
+            output.color = float4(pow(saturate(probeDebug), 1.0 / 2.2), 1.0);
+            return output;
+        }
         if (PreviewChannel == 8)
         {
             output.color = float4(ambient, 1.0);
@@ -729,10 +1248,20 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
+        float3 lit = direct + ambient + envSpecular;
+
+        // HDR-конвейер: таргет RGBA16F, и кадр уходит дальше линейным - экспозицию по замеренной
+        // яркости, кривую и sRGB-энкод делает TonemapPass (см. TonemapPS.hlsl). Тонмапить здесь
+        // значило бы мерить яркость уже сжатого кадра - авто-экспозиции нечего было бы ловить.
+        if ((PbrFeatureFlags & FeatureHdrOutput) != 0)
+        {
+            output.color = float4(lit, 1.0);
+            return output;
+        }
+
         // Khronos PBR Neutral tone map: the key light intentionally overshoots [0,1] for a
         // specular punch, and a plain saturate would clip it into flat white blotches.
-        float3 lit = direct + ambient + envSpecular;
-        float3 mapped = PbrNeutralToneMap(lit);
+        float3 mapped = ApplyToneCurve(lit, PbrToneCurve);
 
         // Back to display (sRGB) space by hand - the preview color target is UNORM, not *_SRGB,
         // so nothing downstream encodes for the monitor. Without this the physically-linear result

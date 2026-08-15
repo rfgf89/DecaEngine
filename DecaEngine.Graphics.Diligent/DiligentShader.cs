@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using DecaEngine.Core;
 using Diligent;
 
@@ -52,12 +52,36 @@ public class DiligentShader : IShaderObject
 		return macros;
 	}
 
+	/// <summary>Диагностика: сколько раз Compile ВЫЗВАН и сколько раз он реально компилировал
+	/// (то есть ранний возврат не сработал). Расхождение этих чисел и есть ответ на вопрос,
+	/// переиспользуется ли скомпилированный шейдер между материалами.</summary>
+	public static long DiagCompileMs;
+	public static int DiagCompileCalls;
+	public static int DiagCompileActual;
+
 	public void Compile()
 	{
+		DiagCompileCalls++;
+
 		if (_nativeShader != null)
 		{
 			return;
 		}
+
+		DiagCompileActual++;
+		var swDiag = System.Diagnostics.Stopwatch.StartNew();
+		try
+		{
+			CompileCore();
+		}
+		finally
+		{
+			DiagCompileMs += swDiag.ElapsedMilliseconds;
+		}
+	}
+
+	private void CompileCore()
+	{
 
 		using var shaderSourceFactory = _api.EngineFactory.CreateDefaultShaderSourceStreamFactory(Path.Combine(Environment.CurrentDirectory, FactoryPath));
 
@@ -137,7 +161,25 @@ public class DiligentShader : IShaderObject
 		}
 	}
 
+	/// <summary>Шейдер выдан из кэша <see cref="DiligentGraphicsApi"/> и шарится между МОДЕЛЯМИ -
+	/// его <see cref="Release"/> игнорируется: освобождение одной модели иначе убило бы нативный
+	/// объект, которым пользуются живые материалы другой. Освобождается только вместе с api
+	/// (см. ReleaseShared).</summary>
+	public bool IsShared { get; init; }
+
 	public void Release()
+	{
+		if (IsShared)
+		{
+			return;
+		}
+
+		_nativeShader?.Dispose();
+		_nativeShader = null;
+	}
+
+	/// <summary>Настоящее освобождение шарёного шейдера - только из владельца кэша.</summary>
+	internal void ReleaseShared()
 	{
 		_nativeShader?.Dispose();
 		_nativeShader = null;

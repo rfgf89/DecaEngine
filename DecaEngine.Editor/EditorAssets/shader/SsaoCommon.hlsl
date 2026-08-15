@@ -24,8 +24,10 @@ cbuffer View
 cbuffer AoConstants
 {
     float aoWorldRange;
-    float aoConstantsPad0;
-    float aoConstantsPad1;
+    // Живые ручки окна Graphics (см. SsaoPassResources.SetStrength): множитель интенсивности и
+    // нижний предел видимости. 0 / отрицательное = дефолты ниже (кбуфер вне превью нулевой).
+    float aoPower;
+    float aoFloor;
     float aoConstantsPad2;
 }
 
@@ -124,7 +126,8 @@ PSOutput Main(in VSOutput input)
         occlusion += saturate(dot(N, v / dist) - Bias) * falloff;
     }
 
-    float ao = saturate(1.0 - occlusion / TapCount * Intensity);
+    float ao = saturate(1.0 - occlusion / TapCount * (aoPower > 0.01 ? aoPower * Intensity : Intensity));
+    ao = max(ao, aoFloor >= 0.0 ? aoFloor : 0.0);
     output.color = float4(ao.xxx, 1.0);
     return output;
 }

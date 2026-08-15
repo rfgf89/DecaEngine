@@ -19,7 +19,13 @@ cbuffer View
 cbuffer SkySettings
 {
     float SkyEnvYaw;
-    float SkyPad0, SkyPad1, SkyPad2;
+
+    // >0.5 - HDR-конвейер превью: кадр остаётся ЛИНЕЙНЫМ до TonemapPS.hlsl, и небо обязано писать
+    // линейную яркость - иначе авто-экспозиция мерила бы уже свёрнутый гаммой фон (см.
+    // SkyPassResources.SetHdrOutput).
+    float SkyHdrOutput;
+
+    float SkyPad1, SkyPad2;
 }
 
 static const float PI = 3.14159265359;
@@ -56,7 +62,8 @@ PSOutput Main(in VSOutput input)
     // не спорить с моделью за внимание.
     float3 sky = _EnvMap.SampleLevel(_EnvMap_sampler, uv, 1.5).rgb;
 
-    // Тот же ручной display-энкод, что в Lighting-режиме (таргет не *_SRGB).
-    output.color = float4(pow(sky, 1.0 / 2.2), 1.0);
+    // Тот же ручной display-энкод, что в Lighting-режиме (таргет не *_SRGB); в HDR-режиме энкод
+    // делает TonemapPS в самом конце.
+    output.color = float4(SkyHdrOutput > 0.5 ? sky : pow(sky, 1.0 / 2.2), 1.0);
     return output;
 }

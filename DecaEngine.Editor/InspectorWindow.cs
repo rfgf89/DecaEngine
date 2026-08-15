@@ -1,7 +1,12 @@
+using System.Linq;
 using System.Numerics;
 using DecaEngine.Core.Prefabs;
+using DecaEngine.Editor.ECS;
 using Engine.ImGui.Core;
 using Friflo.Engine.ECS;
+using Friflo.Engine.ECS.Serialize;
+using Friflo.Engine.ECS.Systems;
+using Friflo.Engine.ECS.Utils;
 using Hexa.NET.ImGui;
 
 namespace DecaEngine.Editor
@@ -53,6 +58,15 @@ namespace DecaEngine.Editor
 		private bool _dirty;
 		private bool _debugMode;
 
+		// --- Play Mode ---
+		// Snapshot/restore is purely ECS-side: on Play the current prefab subtree is captured as
+		// DataEntity JSON (same primitives PrefabAsset uses for save/load), and on Stop every
+		// pre-Play entity's components are written back from that snapshot while any entity created
+		// during Play (not present in the snapshot) is deleted - no file I/O involved either way.
+		private SystemRoot? _playSystemRoot;
+		private List<DataEntity>? _playSnapshot;
+		private bool _isPlaying;
+
 		/// <summary>Width/height ratio the model preview viewport is fit to (1 = square).</summary>
 		private float _previewAspectRatio = 1f;
 
@@ -83,6 +97,104 @@ namespace DecaEngine.Editor
 		public void SetSelected(Entity entity)
 		{
 			_selected = entity;
+		}
+
+		/// <summary>True while Play Mode is running (see <see cref="Play"/>/<see cref="Stop"/>).</summary>
+		public bool IsPlaying => _isPlaying;
+
+		/// <summary>
+		/// Starts Play Mode: snapshots the current prefab subtree (ECS-side, in memory - see
+		/// <see cref="_playSnapshot"/>) and starts ticking <see cref="RotateSystem"/> (and any future
+		/// Play-Mode-only systems) against <see cref="_store"/> every frame via <see cref="UpdatePlayMode"/>.
+		/// </summary>
+		public void Play()
+		{
+			if (_isPlaying || _store is null || _prefabPath is null)
+			{
+				return;
+			}
+
+			var jsonEntities = TreeUtils.EntitiesToJsonArray(new[] { _root });
+			var snapshot = new List<DataEntity>();
+			var error = TreeUtils.JsonArrayToDataEntities(jsonEntities.entities, snapshot);
+			if (error != null)
+			{
+				EditorConsoleLog.Add(LogLevel.Error, $"Play Mode: failed to snapshot prefab: {error}");
+				return;
+			}
+
+			_playSnapshot = snapshot;
+			_playSystemRoot = new SystemRoot { new RotateSystem() };
+			_playSystemRoot.AddStore(_store);
+			_isPlaying = true;
+		}
+
+		/// <summary>
+		/// Stops Play Mode and reverts every change it made, entirely on the ECS side: restores each
+		/// pre-Play entity's components from the snapshot taken in <see cref="Play"/>, and deletes any
+		/// entity created while playing (i.e. absent from that snapshot).
+		/// </summary>
+		public void Stop()
+		{
+			if (!_isPlaying || _playSnapshot is null || _store is null)
+			{
+				return;
+			}
+
+			var snapshotPids = new HashSet<long>(_playSnapshot.Select(de => de.pid));
+			DeleteEntitiesNotInSnapshot(_root, snapshotPids);
+
+			foreach (var de in _playSnapshot)
+			{
+				if (!_store.TryGetEntityByPid(de.pid, out var entity))
+				{
+					continue; // Entity itself was deleted during Play - nothing left to restore.
+				}
+				var componentsJson = de.components.IsNull() ? "{}" : de.components.AsString();
+				if (!PrefabAsset.TryApplyComponentsJson(entity, componentsJson, out var applyError))
+				{
+					EditorConsoleLog.Add(LogLevel.Error, $"Play Mode: failed to restore entity {de.pid}: {applyError}");
+				}
+			}
+
+			_playSystemRoot!.RemoveStore(_store);
+			_playSystemRoot = null;
+			_playSnapshot = null;
+			_isPlaying = false;
+		}
+
+		/// <summary>
+		/// Deletes <paramref name="entity"/> and its whole subtree if it isn't in <paramref name="snapshotPids"/>
+		/// (i.e. it was created after <see cref="Play"/> ran); otherwise recurses into its children.
+		/// Deleting cascades to children, so a match is never recursed into after being deleted.
+		/// </summary>
+		private static void DeleteEntitiesNotInSnapshot(Entity entity, HashSet<long> snapshotPids)
+		{
+			if (!snapshotPids.Contains(entity.Pid))
+			{
+				entity.DeleteEntity();
+				return;
+			}
+			foreach (var child in entity.ChildEntities.ToArray())
+			{
+				DeleteEntitiesNotInSnapshot(child, snapshotPids);
+			}
+		}
+
+		/// <summary>Called every frame by EditorManager while <see cref="IsPlaying"/> to tick Play-Mode-only systems.</summary>
+		public void UpdatePlayMode(float deltaTime, float time)
+		{
+			if (!_isPlaying)
+			{
+				return;
+			}
+			_playSystemRoot!.Update(new UpdateTick(deltaTime, time));
+		}
+
+		/// <summary>Снимает выделение (клик по пустоте в Scene View).</summary>
+		public void ClearSelection()
+		{
+			_selected = null;
 		}
 
 		/// <summary>?????????? SceneViewWindow ????? ?????? ?????????? ????? gizmo: ???????? asset ?????????? ? ?????????? ??? euler-????? Transform-??????.</summary>
@@ -124,6 +236,11 @@ namespace DecaEngine.Editor
 			if (_prefabPath is null)
 			{
 				return;
+			}
+
+			if (_isPlaying)
+			{
+				Stop();
 			}
 
 			_store = new EntityStore();
@@ -317,6 +434,7 @@ namespace DecaEngine.Editor
 				ImGui.TextColored(new Vector4(1f, 0.8f, 0.2f, 1f), "*");
 			}
 
+			ImGui.BeginDisabled(_isPlaying);
 			if (ImGui.Button("Save"))
 			{
 				PrefabAsset.SaveJson(_root, _prefabPath!);
@@ -329,6 +447,26 @@ namespace DecaEngine.Editor
 			if (ImGui.Button("Reload"))
 			{
 				Reload();
+			}
+			ImGui.EndDisabled();
+
+			ImGui.SameLine();
+			// Play Mode runs Play-Mode-only systems (RotateSystem etc, see RenderNode's "Add
+			// Component > Gameplay/Rotate") against this prefab's live entities; Stop reverts every
+			// change purely on the ECS side (see Stop()) - edits made while playing don't persist.
+			if (_isPlaying)
+			{
+				if (ImGui.Button("Stop"))
+				{
+					Stop();
+				}
+			}
+			else
+			{
+				if (ImGui.Button("Play"))
+				{
+					Play();
+				}
 			}
 
 			ImGui.SameLine();
@@ -373,6 +511,19 @@ namespace DecaEngine.Editor
 				if (ImGui.IsItemClicked() && !ImGui.IsItemToggledOpen())
 				{
 					_selected = entity;
+				}
+
+				// Lets EntityRef fields (ComponentFieldEditor) accept an entity dropped from this
+				// hierarchy - payload is the entity's persistent id, which is what EntityRef stores.
+				if (ImGui.BeginDragDropSource())
+				{
+					long pid = entity.Pid;
+					unsafe
+					{
+						ImGui.SetDragDropPayload(DecaEngine.Core.Entities.EntityRef.DragDropPayloadType, &pid, (nuint)sizeof(long));
+					}
+					ImGui.TextUnformatted(label);
+					ImGui.EndDragDropSource();
 				}
 			}
 

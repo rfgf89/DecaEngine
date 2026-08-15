@@ -19,17 +19,65 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		_graphicsApi = graphicsApi;
 
 		renderContainer = new RenderGraphNode<ITextureView, TextureViewDesc, TextureDesc, ITexture>(
-			FindTextureDescIndex, GetTextureViewDescName, GetTextureDescName, CreateTarget, CreateView
+			FindTextureDescIndex, GetTextureViewDescName, GetTextureDescName, CreateTarget, CreateView,
+			TextureDescEquals, TextureViewDescEquals
 #if DEBUG
 			, GetTextureDescSizeInBytes
 #endif
 			);
 		bufferContainer = new RenderGraphNode<IBufferView, BufferViewDesc, BufferDesc, IBuffer>(
-			FindBufferDescIndex, GetBufferViewDescName, GetBufferDescName, CreateBuffer, CreateBufferView
+			FindBufferDescIndex, GetBufferViewDescName, GetBufferDescName, CreateBuffer, CreateBufferView,
+			BufferDescEquals, BufferViewDescEquals
 #if DEBUG
 			, GetBufferDescSizeInBytes
 #endif
 			);
+	}
+
+	// Совместимость дескрипторов для пула ресурсов графа (см. RenderGraphNode): сравниваются ровно те
+	// поля, которые заполняет PinTexture/PinBuffer, - остальные остаются дефолтными у обеих сторон.
+	private static bool TextureDescEquals(TextureDesc a, TextureDesc b)
+	{
+		return a.Name == b.Name &&
+		       a.Type == b.Type &&
+		       a.Width == b.Width &&
+		       a.Height == b.Height &&
+		       a.ArraySizeOrDepth == b.ArraySizeOrDepth &&
+		       a.Format == b.Format &&
+		       a.BindFlags == b.BindFlags &&
+		       a.Usage == b.Usage &&
+		       a.CPUAccessFlags == b.CPUAccessFlags &&
+		       a.MipLevels == b.MipLevels &&
+		       a.SampleCount == b.SampleCount;
+	}
+
+	private static bool TextureViewDescEquals(TextureViewDesc a, TextureViewDesc b)
+	{
+		return a.Name == b.Name &&
+		       a.ViewType == b.ViewType &&
+		       a.TextureDim == b.TextureDim &&
+		       a.NumMipLevels == b.NumMipLevels &&
+		       a.MostDetailedMip == b.MostDetailedMip &&
+		       a.AccessFlags == b.AccessFlags;
+	}
+
+	private static bool BufferDescEquals(BufferDesc a, BufferDesc b)
+	{
+		return a.Name == b.Name &&
+		       a.Size == b.Size &&
+		       a.BindFlags == b.BindFlags &&
+		       a.Usage == b.Usage &&
+		       a.CPUAccessFlags == b.CPUAccessFlags &&
+		       a.Mode == b.Mode &&
+		       a.ElementByteStride == b.ElementByteStride;
+	}
+
+	private static bool BufferViewDescEquals(BufferViewDesc a, BufferViewDesc b)
+	{
+		return a.Name == b.Name &&
+		       a.ViewType == b.ViewType &&
+		       a.ByteOffset == b.ByteOffset &&
+		       a.ByteWidth == b.ByteWidth;
 	}
 
 #if DEBUG
@@ -78,12 +126,22 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		return arg.Name;
 	}
 
-	public void Clean()
+	/// <param name="recycle">true - нативные текстуры/буферы уходят в пул и переживают пересборку
+	/// графа (см. <see cref="RenderGraphNode{TView,TViewDesc,TDesc,T}"/>), false - освобождаются
+	/// вместе с пулом.</param>
+	public void Clean(bool recycle = false)
 	{
-		renderContainer.Clean();
-		bufferContainer.Clean();
+		renderContainer.Clean(recycle);
+		bufferContainer.Clean(recycle);
 		_textureInfos.Clear();
 		_bufferInfos.Clear();
+	}
+
+	/// <summary>Освобождает пул - см. <see cref="IRenderGraph.TrimResourcePool"/>.</summary>
+	public void TrimPool()
+	{
+		renderContainer.TrimPool();
+		bufferContainer.TrimPool();
 	}
 
 	public void PostSetup()
@@ -225,6 +283,40 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		info.type = info.arraySize > 1 ? TextureType.Texture2DArray : TextureType.Texture2D;
 		_textureInfos[info.name] = info;
 		return new TextureResource(info.name, -1);
+	}
+
+	/// <summary>См. <see cref="IRenderGraphBuilder.ImportTexture"/>.</summary>
+	public TextureResource ImportTexture(IGpuTexture texture)
+	{
+		var info = texture.Info;
+		var name = string.IsNullOrEmpty(info.name) ? texture.Name : info.name;
+
+		if (renderContainer.RenderTargetsDesc.FindIndex(existing => existing.Name == name) >= 0)
+		{
+			return new TextureResource(name, -1);
+		}
+
+		var native = texture switch
+		{
+			DiligentRenderTarget target => target.Texture,
+			DiligentGpuTexture gpuTexture => gpuTexture.Texture,
+			_ => throw new InvalidOperationException(
+				$"Texture '{name}' has an unexpected implementation ({texture.GetType().Name}) and cannot be imported into the render graph."),
+		};
+
+		// Дескриптор строится из ФАКТИЧЕСКОГО ресурса, а не из TextureInfo: важны только те поля, по
+		// которым дальше принимаются решения (RTV против DSV в WriteTarget и вес в отладке).
+		var desc = native.GetDesc();
+
+		renderContainer.RenderTargetsDesc.Add(desc);
+		renderContainer.RegisterExternal(name, native);
+
+		info.name = name;
+		info.width = desc.Width;
+		info.height = desc.Height;
+		_textureInfos[name] = info;
+
+		return new TextureResource(name, -1);
 	}
 
 	public BufferResource PinBuffer(BufferInfo info)

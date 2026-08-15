@@ -40,7 +40,8 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             UpdateBuffer,
             ClearBackBufferTarget,
             CopyTexture,
-            ResolveTexture
+            ResolveTexture,
+            Callback
         }
 
         private const int MaxVertexBuffers = 4;
@@ -167,6 +168,14 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.TransitionResource);
             cmd.Obj1 = res; cmd.U1 = (uint)nativeState;
+        }
+
+        /// <summary>См. <see cref="ICommandBuffer.Callback"/>.</summary>
+        public void Callback(Action callback)
+        {
+            if (!_isRecording) return;
+            ref var cmd = ref NextCommand(CommandType.Callback);
+            cmd.Obj1 = callback;
         }
 
         public void CopyTexture(IGpuTexture src, IGpuTexture dst)
@@ -492,6 +501,13 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                             DstTexture = (ITexture)cmd.Obj2,
                             DstTextureTransitionMode = ResourceStateTransitionMode.None,
                         });
+                        break;
+                    case CommandType.Callback:
+                        // Нативная врезка (FSR и т.п.) трогает командный лист мимо Diligent - его
+                        // кэш стейтов после неё недостоверен. Сам колбэк обязан позвать
+                        // InvalidateState; наш трекер сбрасываем здесь же.
+                        ((Action)cmd.Obj1).Invoke();
+                        _stateTracker.Clear();
                         break;
                     case CommandType.ResolveTexture:
                         _context.ResolveTextureSubresource((ITexture)cmd.Obj1, (ITexture)cmd.Obj2,

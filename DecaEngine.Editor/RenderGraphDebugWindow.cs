@@ -10,29 +10,63 @@ namespace DecaEngine.Editor;
 /// per-pass CPU timing, draw call / triangle counts, and a resource lifetime matrix (a table with
 /// one row per resource and one column per pass, showing exactly which passes keep it alive).
 /// Never compiled into Release builds.
+///
+/// Конвейер не передаётся снаружи, а ВЫБИРАЕТСЯ в самом окне из <see cref="GraphicsPipelineRegistry"/>:
+/// в редакторе их одновременно живёт несколько (основная сцена на swap chain, превью модели в
+/// инспекторе, вьюпорт префаба, запекание иконок, офскрин-пробы), и каждый регистрируется сам в
+/// своём конструкторе. Список пересобирается, только когда состав реестра изменился, а выбор
+/// запоминается по стабильному Id записи, а не по индексу - иначе пересоздание любого превью
+/// (RecreateEnvironment) молча переключало бы окно на чужой граф.
 /// </summary>
 public class RenderGraphDebugWindow : ImGuiDockingWindow
 {
-	private readonly IGraphicsPipeline _pipeline;
 	private readonly List<RenderGraphDebugSnapshot> _historyBuffer = new(256);
 	private readonly List<float> _frameTimesMs = new(256);
+
+	// Живые конвейеры реестра + версия состава, под которую этот список набран.
+	private readonly List<GraphicsPipelineRegistry.Entry> _pipelines = new(8);
+	private int _registryVersion = -1;
+
+	private int _selectedId;
+	private IGraphicsPipeline? _selectedPipeline;
+	private string _selectedName = "";
+
+	/// <summary>Конвейер, который надо выбрать первым, если он есть в реестре (иначе - первый живой).</summary>
+	private readonly IGraphicsPipeline? _preferredPipeline;
+	private bool _preferenceApplied;
 
 	// The underlying render graph refreshes its debug snapshot every single frame, which makes the
 	// per-pass ms numbers flicker too fast to actually read. Instead we only "adopt" a new snapshot
 	// for display every _refreshIntervalSec seconds, so the numbers hold still long enough to read.
-	private RenderGraphDebugSnapshot _displaySnapshot;
+	private RenderGraphDebugSnapshot? _displaySnapshot;
 	private float _refreshIntervalSec = 0.5f;
 	private float _timeSinceRefresh;
 	private bool _freeze;
 
-	public RenderGraphDebugWindow(string name, IGraphicsPipeline pipeline, ImGuiRender imGuiRender) : base(name, imGuiRender)
+	/// <param name="preferredPipeline">Необязательный конвейер, на котором окно откроется, если он
+	/// зарегистрирован. Null - откроется на первом живом из реестра.</param>
+	public RenderGraphDebugWindow(string name, ImGuiRender imGuiRender, IGraphicsPipeline? preferredPipeline = null)
+		: base(name, imGuiRender)
 	{
-		_pipeline = pipeline;
+		_preferredPipeline = preferredPipeline;
 	}
 
 	protected override void OnRender(uint dockId)
 	{
-		var liveSnap = _pipeline.DebugSnapshot;
+		RefreshPipelineList();
+		DrawPipelineSelector();
+
+		if (_selectedPipeline == null)
+		{
+			ImGui.TextDisabled("Ни одного конвейера не зарегистрировано.");
+			ImGui.TextWrapped("Конвейеры встают в реестр сами, в своём конструкторе (см. GraphicsPipelineRegistry) - " +
+			                  "пустой список означает, что ни один ещё не создан.");
+			return;
+		}
+
+		ImGui.Separator();
+
+		var liveSnap = _selectedPipeline.DebugSnapshot;
 		if (liveSnap == null)
 		{
 			ImGui.TextDisabled("No frame recorded yet.");
@@ -40,7 +74,11 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		}
 
 		_timeSinceRefresh += ImGui.GetIO().DeltaTime;
-		if (!_freeze && (_displaySnapshot == null || _timeSinceRefresh >= _refreshIntervalSec))
+
+		// Первый снимок берётся ДАЖЕ при включённом Freeze: показывать нечего, а переключение
+		// конвейера обнуляет показанный снимок (он принадлежал чужому графу). Дальше Freeze работает
+		// как и раньше - удерживает то, что уже на экране.
+		if (_displaySnapshot == null || (!_freeze && _timeSinceRefresh >= _refreshIntervalSec))
 		{
 			_displaySnapshot = liveSnap;
 			_timeSinceRefresh = 0f;
@@ -75,6 +113,106 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		}
 	}
 
+	/// <summary>Пересобирает список живых конвейеров, только если состав реестра изменился, и следит,
+	/// чтобы выбор остался валидным: выбранный конвейер могли освободить (пересоздание превью-окружения
+	/// освобождает старый и создаёт новый) - тогда падаем на первый живой.</summary>
+	private void RefreshPipelineList()
+	{
+		var version = GraphicsPipelineRegistry.Version;
+		if (version != _registryVersion)
+		{
+			_registryVersion = GraphicsPipelineRegistry.CollectLive(_pipelines);
+		}
+
+		// Предпочтительный конвейер применяем один раз - и только когда он реально доехал до реестра
+		// (окно могли открыть раньше, чем конвейер создан).
+		if (!_preferenceApplied && _preferredPipeline != null)
+		{
+			foreach (var entry in _pipelines)
+			{
+				if (ReferenceEquals(entry.Pipeline, _preferredPipeline))
+				{
+					SelectPipeline(entry);
+					_preferenceApplied = true;
+					break;
+				}
+			}
+		}
+
+		foreach (var entry in _pipelines)
+		{
+			if (entry.Id == _selectedId)
+			{
+				// Имя записи могло измениться (реестр разводит одинаковые имена суффиксом).
+				_selectedPipeline = entry.Pipeline;
+				_selectedName = entry.Name;
+				return;
+			}
+		}
+
+		if (_pipelines.Count > 0)
+		{
+			SelectPipeline(_pipelines[0]);
+		}
+		else
+		{
+			_selectedId = 0;
+			_selectedPipeline = null;
+			_selectedName = "";
+			_displaySnapshot = null;
+		}
+	}
+
+	private void SelectPipeline(GraphicsPipelineRegistry.Entry entry)
+	{
+		if (entry.Id == _selectedId)
+		{
+			return;
+		}
+
+		_selectedId = entry.Id;
+		_selectedPipeline = entry.Pipeline;
+		_selectedName = entry.Name;
+
+		// Снимок и график принадлежат КОНКРЕТНОМУ графу - иначе после переключения кадр чужого
+		// конвейера продолжал бы висеть на экране до следующего обновления.
+		_displaySnapshot = null;
+		_timeSinceRefresh = _refreshIntervalSec;
+		_frameTimesMs.Clear();
+	}
+
+	private void DrawPipelineSelector()
+	{
+		ImGui.SetNextItemWidth(320 * _scale);
+		if (ImGui.BeginCombo("Pipeline", _pipelines.Count > 0 ? _selectedName : "<нет конвейеров>"))
+		{
+			foreach (var entry in _pipelines)
+			{
+				bool selected = entry.Id == _selectedId;
+				if (ImGui.Selectable(entry.Name, selected))
+				{
+					SelectPipeline(entry);
+				}
+
+				if (selected)
+				{
+					ImGui.SetItemDefaultFocus();
+				}
+			}
+
+			ImGui.EndCombo();
+		}
+
+		if (ImGui.IsItemHovered())
+		{
+			ImGui.SetTooltip("Какой конвейер показывать. Список ведёт GraphicsPipelineRegistry:\n" +
+			                 "каждый конвейер регистрируется в нём сам при создании.");
+		}
+
+		ImGui.SameLine();
+		ImGui.TextDisabled($"({_pipelines.Count} live)");
+	}
+
 	/// <summary>
 	/// Top summary block: frame stats, refresh-rate controls and the CPU-time history graph, all
 	/// grouped into a single bordered panel so they read as one "at a glance" unit instead of being
@@ -94,6 +232,25 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		ImGui.SameLine();
 		ImGui.Text($"Graph VRAM (approx): {snap.TotalResourceMemoryBytes / (1024.0 * 1024.0):F2} MB");
 
+		// Ресурсы выключенных фич конвейер держит наготове, чтобы повторное включение было
+		// бесплатным (см. GraphicsPipelineSimple.SetFeatures) - здесь их можно отдать обратно.
+		if (_selectedPipeline is GraphicsPipelineSimple simple)
+		{
+			ImGui.SameLine();
+			ImGui.TextDisabled("|");
+			ImGui.SameLine();
+			if (ImGui.SmallButton("Release disabled features"))
+			{
+				simple.ReleaseDisabledResources();
+			}
+
+			if (ImGui.IsItemHovered())
+			{
+				ImGui.SetTooltip("Освобождает VRAM выключенных пост-эффектов и пул ресурсов графа.\n" +
+				                 "Следующее включение такой фичи снова создаст её ресурсы и шейдеры.");
+			}
+		}
+
 		ImGui.SetNextItemWidth(160 * _scale);
 		ImGui.SliderFloat("Refresh interval (s)", ref _refreshIntervalSec, 0.1f, 2f, "%.2f");
 		ImGui.SameLine();
@@ -108,7 +265,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 
 	private void DrawFrameHistoryGraph()
 	{
-		var history = _pipeline.DebugHistory;
+		var history = _selectedPipeline?.DebugHistory;
 		if (history == null || history.Count == 0)
 		{
 			return;
@@ -275,14 +432,14 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		int passCount = snap.Passes.Length;
 		if (passCount == 0 || snap.Resources.Length == 0)
 		{
-			ImGui.TextColored(new Vector4(0.95f, 0.75f, 0.2f, 1f), "No resources are pinned in this render graph.");
+			ImGui.TextColored(new Vector4(0.95f, 0.75f, 0.2f, 1f), "No resources are declared in this render graph.");
 			ImGui.TextWrapped(
-				"This is expected if every registered pass's Setup() returns without calling " +
-				"builder.PinTexture/PinBuffer + ReadTarget/WriteTarget (e.g. ShadowPass and ForwardPass " +
-				"currently draw straight to the back buffer / shared batch-renderer buffers and never " +
-				"declare resources to the graph). Nothing is being \"leaked\" or left un-deallocated - " +
-				"there is simply no tracked resource to show a lifetime for yet. Wire a pass to call " +
-				"builder.PinTexture(...) and ReadTarget/WriteTarget(...) to see it appear here.");
+				"Expected for the swap-chain pipeline: ShadowPass and ForwardPass draw straight to the " +
+				"back buffer and to shared batch-renderer buffers, which the graph does not own. " +
+				"Nothing is being \"leaked\" or left un-deallocated - there is simply no tracked resource " +
+				"to show a lifetime for. The off-screen pipeline declares its targets via " +
+				"builder.ImportTexture(...) + ReadTarget/WriteTarget(...) (see ForwardPass.Setup), and " +
+				"graph-owned transients would use builder.PinTexture(...) the same way.");
 			return;
 		}
 

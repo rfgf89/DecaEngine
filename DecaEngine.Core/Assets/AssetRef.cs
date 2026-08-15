@@ -40,9 +40,9 @@ namespace DecaEngine.Core.Assets
 		public static implicit operator string(AssetRef assetRef) => assetRef.Path;
 
 		public readonly bool Equals(AssetRef other) => string.Equals(Path, other.Path, StringComparison.Ordinal);
-		public override readonly bool Equals(object? obj) => obj is AssetRef other && Equals(other);
-		public override readonly int GetHashCode() => Path is null ? 0 : Path.GetHashCode(StringComparison.Ordinal);
-		public override readonly string ToString() => Path ?? string.Empty;
+		public readonly override bool Equals(object? obj) => obj is AssetRef other && Equals(other);
+		public readonly override int GetHashCode() => Path is null ? 0 : Path.GetHashCode(StringComparison.Ordinal);
+		public readonly override string ToString() => Path ?? string.Empty;
 	}
 }
 

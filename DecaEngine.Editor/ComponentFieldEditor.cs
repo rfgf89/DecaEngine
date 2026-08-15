@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Reflection;
 using DecaEngine.Core.Assets;
+using DecaEngine.Core.Entities;
 using Friflo.Engine.ECS;
 using Hexa.NET.ImGui;
 
@@ -82,7 +83,7 @@ namespace DecaEngine.Editor
 #pragma warning disable CS0618
 					object boxed = ec.Value;
 #pragma warning restore CS0618
-					if (DrawObjectFields(boxed, clrType))
+					if (DrawObjectFields(boxed, clrType, entity.Store))
 					{
 						EntityUtils.AddEntityComponentValue(entity, ec.Type, boxed);
 						anyChanged = true;
@@ -109,13 +110,13 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>?????? ????????? ???? <paramref name="type"/> ????? ?????? ??? ????????????? boxed-??????????.</summary>
-		private static bool DrawObjectFields(object boxed, Type type)
+		private static bool DrawObjectFields(object boxed, Type type, EntityStore? store)
 		{
 			bool changed = false;
 			foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
 			{
 				object? value = field.GetValue(boxed);
-				if (DrawField(field.Name, field.FieldType, ref value, field.GetCustomAttribute<AssetTypeAttribute>()))
+				if (DrawField(field.Name, field.FieldType, ref value, store, field.GetCustomAttribute<AssetTypeAttribute>()))
 				{
 					field.SetValue(boxed, value);
 					changed = true;
@@ -125,7 +126,7 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>?????? ???? ?????? ??? ???????? ???? <paramref name="type"/>; ?????????? true, ???? ???????? ??????????.</summary>
-		private static bool DrawField(string label, Type type, ref object? value, AssetTypeAttribute? assetType = null)
+		private static bool DrawField(string label, Type type, ref object? value, EntityStore? store, AssetTypeAttribute? assetType = null)
 		{
 			if (type.IsPointer || type == typeof(IntPtr) || type == typeof(UIntPtr))
 			{
@@ -249,6 +250,11 @@ namespace DecaEngine.Editor
 				return DrawAssetRef(label, ref value, assetType);
 			}
 
+			if (type == typeof(EntityRef))
+			{
+				return DrawEntityRef(label, ref value, store);
+			}
+
 			if (type.IsEnum)
 			{
 				return DrawEnum(label, type, ref value);
@@ -261,7 +267,7 @@ namespace DecaEngine.Editor
 					ImGui.TextDisabled($"{label}: null");
 					return false;
 				}
-				return DrawArray(label, type, array, assetType);
+				return DrawArray(label, type, array, store, assetType);
 			}
 
 			// ???????????? ????????? struct (????????, ????????? ???????????? ???? ?????? ?????
@@ -271,7 +277,7 @@ namespace DecaEngine.Editor
 				bool changed = false;
 				if (ImGui.TreeNodeEx(label, ImGuiTreeNodeFlags.DefaultOpen))
 				{
-					changed = DrawObjectFields(value, type);
+					changed = DrawObjectFields(value, type, store);
 					ImGui.TreePop();
 				}
 				return changed;
@@ -398,6 +404,94 @@ namespace DecaEngine.Editor
 			return changed;
 		}
 
+		/// <summary>
+		/// Draws an <see cref="EntityRef"/> field as a button showing the current target entity's name
+		/// (or "(None)"), which also acts as an ImGui drag&amp;drop target: dropping an entity dragged
+		/// from InspectorWindow's hierarchy assigns its persistent id here.
+		/// </summary>
+		private static bool DrawEntityRef(string label, ref object? value, EntityStore? store)
+		{
+			var current = value is EntityRef entityRef ? entityRef : default;
+			bool changed = false;
+			bool hasValue = !current.IsEmpty;
+
+			var frameHeight = ImGui.GetFrameHeight();
+			var clearWidth = hasValue ? frameHeight + ImGui.GetStyle().ItemSpacing.X : 0f;
+			var slotWidth = MathF.Max(80f, ImGui.GetContentRegionAvail().X - clearWidth);
+			var slotSize = new Vector2(slotWidth, frameHeight);
+
+			ImGui.AlignTextToFramePadding();
+			ImGui.TextUnformatted(label);
+			ImGui.SameLine(0f, ImGui.GetStyle().ItemInnerSpacing.X);
+
+			var slotMin = ImGui.GetCursorScreenPos();
+			var slotMax = slotMin + slotSize;
+
+			ImGui.InvisibleButton("##EntityRefSlot", slotSize);
+			bool hovered = ImGui.IsItemHovered();
+
+			var drawList = ImGui.GetWindowDrawList();
+			var rounding = ImGui.GetStyle().FrameRounding;
+			drawList.AddRectFilled(slotMin, slotMax, ImGui.GetColorU32(hovered ? ImGuiCol.FrameBgHovered : ImGuiCol.FrameBg), rounding);
+
+			string displayText;
+			if (hasValue)
+			{
+				var target = store != null ? current.Resolve(store) : default;
+				displayText = !target.IsNull
+					? (target.HasName && !string.IsNullOrEmpty(target.Name.value) ? target.Name.value : $"Entity {current.Pid}")
+					: $"<missing: {current.Pid}>";
+			}
+			else
+			{
+				displayText = "Drop entity here...";
+			}
+			var textColor = ImGui.GetColorU32(hasValue ? ImGuiCol.Text : ImGuiCol.TextDisabled);
+			var textPos = new Vector2(slotMin.X + 4f, slotMin.Y + (frameHeight - ImGui.GetTextLineHeight()) * 0.5f);
+			drawList.PushClipRect(slotMin, slotMax, true);
+			drawList.AddText(textPos, textColor, displayText);
+			drawList.PopClipRect();
+
+			var borderColor = ImGui.GetColorU32(EditorPalette.WithAlpha(EditorPalette.Selection, hovered ? 0.9f : 0.55f));
+			drawList.AddRect(slotMin, slotMax, borderColor, rounding, ImDrawFlags.None, hovered ? 2f : 1.5f);
+
+			if (hovered && hasValue)
+			{
+				ImGui.SetTooltip(displayText);
+			}
+
+			if (ImGui.BeginDragDropTarget())
+			{
+				var payload = ImGui.AcceptDragDropPayload(EntityRef.DragDropPayloadType);
+				if (!payload.IsNull && payload.DataSize == sizeof(long))
+				{
+					unsafe
+					{
+						long droppedPid = *(long*)payload.Data;
+						current = new EntityRef(droppedPid);
+						changed = true;
+					}
+				}
+				ImGui.EndDragDropTarget();
+			}
+
+			if (hasValue)
+			{
+				ImGui.SameLine(0f, ImGui.GetStyle().ItemSpacing.X);
+				if (ImGui.Button("x##EntityRefClear"))
+				{
+					current = default;
+					changed = true;
+				}
+			}
+
+			if (changed)
+			{
+				value = current;
+			}
+			return changed;
+		}
+
 		private static bool DrawEnum(string label, Type type, ref object? value)
 		{
 			var current = value ?? Activator.CreateInstance(type)!;
@@ -450,7 +544,7 @@ namespace DecaEngine.Editor
 			return false;
 		}
 
-		private static bool DrawArray(string label, Type type, Array array, AssetTypeAttribute? assetType = null)
+		private static bool DrawArray(string label, Type type, Array array, EntityStore? store, AssetTypeAttribute? assetType = null)
 		{
 			var elemType = type.GetElementType()!;
 			bool changed = false;
@@ -461,7 +555,7 @@ namespace DecaEngine.Editor
 				{
 					object? elem = array.GetValue(i);
 					ImGui.PushID(i);
-					if (DrawField($"[{i}]", elemType, ref elem, assetType))
+					if (DrawField($"[{i}]", elemType, ref elem, store, assetType))
 					{
 						array.SetValue(elem, i);
 						changed = true;

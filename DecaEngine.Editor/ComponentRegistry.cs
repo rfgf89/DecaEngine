@@ -99,7 +99,9 @@ namespace DecaEngine.Editor
 
 			RegisterComponent<BoundingBoxInfo>("Rendering/Bounding Box");
 			RegisterComponent<ModelRenderer>("Rendering/Model Renderer");
+			RegisterComponent<LightComponent>("Rendering/Light");
 
+			RegisterComponent<RotateComponent>("Gameplay/Rotate");
 		}
 
 		// ------------------------------------------------------------------

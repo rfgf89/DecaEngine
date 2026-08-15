@@ -42,7 +42,17 @@ namespace DecaEngine.Graphics.Core
 		R32G32B32A32Float = 3,
 		D32Float = 4,
 		D24UNormS8UInt = 5,
-		D32FloatS8X24UInt = 6
+		D32FloatS8X24UInt = 6,
+
+		/// <summary>Двухканальный полуплавающий таргет - экранные ВЕКТОРЫ, а не цвет: motion vectors
+		/// (см. <see cref="DecaEngine.Core.MotionVectorPassResources"/>). Знаковый формат обязателен -
+		/// смещение к прошлому кадру бывает любого знака, а UNorm срезал бы половину направлений.</summary>
+		R16G16Float = 7,
+
+		/// <summary>Одноканальный float32 - ТИПИЗИРОВАННАЯ копия глубины для нативных апскейлеров:
+		/// сам депт Diligent создаёт как R32_TYPELESS, и внешний рантайм, строящий SRV по дескриптору
+		/// ресурса, читал бы его нулями (см. FsrUpscalerBackend).</summary>
+		R32Float = 8
 	}
 
 	public class CpuTextureData

@@ -47,6 +47,26 @@ namespace DecaEngine
 		public IWindowHandle WindowHandle { get; set; }
 		public DiligentPsoManager PsoManager { get; private set; }
 
+		/// <summary>См. <see cref="IGraphicsApi.RayTracing"/>. Фича запрашивается опционально (см.
+		/// Initialize), поэтому мало проверить флаги адаптера - надо убедиться, что устройство её
+		/// действительно включило.</summary>
+		public RayTracingSupport RayTracing
+		{
+			get
+			{
+				if (_renderDevice == null ||
+					Device.GetDeviceInfo().Features.RayTracing != DeviceFeatureState.Enabled)
+				{
+					return RayTracingSupport.None;
+				}
+
+				var capFlags = Device.GetAdapterInfo().RayTracing.CapFlags;
+				return capFlags.HasFlag(RayTracingCapFlags.InlineRayTracing)
+					? RayTracingSupport.Inline
+					: RayTracingSupport.Pipeline;
+			}
+		}
+
 		public DiligentGraphicsApi(IWindowHandle windowHandle)
 		{
 			WindowHandle = windowHandle;
@@ -109,6 +129,51 @@ namespace DecaEngine
 		public TextureObjectFormat SwapChainColorFormat => DiligentResourceFormats.ToTextureObjectFormat(SwapChain.GetDesc().ColorBufferFormat);
 		public TextureObjectFormat SwapChainDepthFormat => DiligentResourceFormats.ToTextureObjectFormat(SwapChain.GetDesc().DepthBufferFormat);
 
+		/// <summary>Кэш скомпилированных шейдеров на весь срок жизни api: ключ - файл + точка входа +
+		/// тип + набор кейвордов варианта. Раньше кэш вариантов жил ВНУТРИ одной загрузки модели
+		/// (см. ModelLoader.BuildFromPreparedIncremental), то есть каждая следующая модель - и каждое
+		/// переключение в Asset Browser - компилировала ровно те же варианты UnlitInstancedPS заново,
+		/// синхронно на потоке рендера. Шейдеров десятки, память копеечная, а компиляция большого
+		/// PS-варианта стоит секунды.</summary>
+		private readonly Dictionary<string, DiligentShader> _shaderCache = new();
+
+		/// <summary>
+		/// Шейдер из общего кэша - ТОЛЬКО для потребителей, чьи материалы помечены OwnsShaders=false
+		/// (сейчас это загрузка моделей, см. ModelLoader.BuildFromPreparedIncremental). Обычный
+		/// <see cref="CreateShader(string,string,string,ShaderObjectType)"/> кэш не трогает намеренно:
+		/// материалы пассов движка владеют своими шейдерами и при Release освобождают НАТИВНЫЙ объект
+		/// напрямую - выдай им шарёный экземпляр, и первое же пересоздание окружения убило бы шейдер
+		/// под живыми материалами модели.
+		/// </summary>
+		public IShaderObject CreateSharedShader(string name, string factoryPath, string filePath,
+			ShaderObjectType type, string entryPoint = "Main", IReadOnlyList<string> keywords = null)
+		{
+			return GetOrCreateShader(name, factoryPath, filePath, type, entryPoint, keywords);
+		}
+
+		private IShaderObject GetOrCreateShader(string name, string factoryPath, string filePath,
+			ShaderObjectType type, string entryPoint, IReadOnlyList<string> keywords)
+		{
+			var key = string.Concat(factoryPath, "|", filePath, "|", entryPoint, "|", ((int)type).ToString(), "|",
+				keywords == null ? "" : string.Join(";", keywords));
+
+			if (_shaderCache.TryGetValue(key, out var cached))
+			{
+				return cached;
+			}
+
+			// Шареный между моделями объект: его Release игнорируется (см. DiligentShader.IsShared) -
+			// иначе освобождение одной модели убило бы нативный шейдер, которым пользуются живые
+			// материалы другой.
+			var shader = new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords)
+			{
+				IsShared = true,
+			};
+
+			_shaderCache[key] = shader;
+			return shader;
+		}
+
 		public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type)
 		{
 			return new DiligentShader(this, name, factoryPath, filePath, type);
@@ -122,6 +187,17 @@ namespace DecaEngine
 		public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type, string entryPoint, IReadOnlyList<string> keywords)
 		{
 			return new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords);
+		}
+
+		/// <summary>Освобождает кэш шейдеров (их Release игнорирует IsShared - только отсюда).</summary>
+		private void ReleaseShaderCache()
+		{
+			foreach (var shader in _shaderCache.Values)
+			{
+				shader.ReleaseShared();
+			}
+
+			_shaderCache.Clear();
 		}
 
 		private static TextureAddressMode ToDiligent(TextureAddress mode)
@@ -151,12 +227,19 @@ namespace DecaEngine
 			TextureFilter filter,
 			TextureAddress address,
 			CompFunction comparisonFunction,
-			Vector4 border)
+			Vector4 border,
+			float mipLodBias = 0f)
 		{
 			var desc = new SamplerDesc
 			{
 				BorderColor = border,
 				ComparisonFunc = (ComparisonFunction)comparisonFunction,
+				MipLODBias = mipLodBias,
+				// НЕ дефолт C#-структуры: new SamplerDesc{} зануляет MaxLOD, а MaxLOD == 0 зажимает
+				// выборку в mip 0 - мипы не работают ВООБЩЕ (и любой mip bias сложится и заклампится
+				// в ноль). Нативный Diligent дефолтит MaxLOD в +FLT_MAX - возвращаем его семантику.
+				MinLOD = 0f,
+				MaxLOD = float.MaxValue,
 				MinFilter = ToDiligent(filter),
 				MagFilter = ToDiligent(filter),
 				MipFilter = ToDiligent(filter),
@@ -248,8 +331,17 @@ namespace DecaEngine
 				}
 			}
 
+			// DECA_TEX_DIAG=1 - фактическое число мипов КАЖДОЙ созданной текстуры. Диагностика тракта
+			// mip bias: если у текстур один мип, LOD клампится в [0,0] и любые ручки сэмплера
+			// (bias/анизотропия/MaxLOD) физически не могут ничего изменить.
+			if (Environment.GetEnvironmentVariable("DECA_TEX_DIAG") == "1")
+			{
+				Console.WriteLine($"[texdiag] {data.Name}: {width}x{height} " +
+					$"mips={nativeTexture.GetDesc().MipLevels} generate={generateMips}");
+			}
+
 			// Add a transition to ShaderResource. Diligent's engine doesn't automatically transition
-			// the underlying native resource to ShaderResource correctly if you skip Context update 
+			// the underlying native resource to ShaderResource correctly if you skip Context update
 			// transition barriers in materials or if it's used inside indirect draw setups.
 			ImmediateContext.TransitionResourceStates(
 			[
@@ -346,9 +438,130 @@ namespace DecaEngine
 			return new DiligentGpuTexture(name, textureInfo, nativeTexture);
 		}
 
+		/// <summary>См. <see cref="IGraphicsApi.CreateTexture2DMutable"/>.</summary>
+		public IGpuTexture CreateTexture2DMutable(string name, int width, int height,
+			bool floatFormat = false, bool unorderedAccess = false)
+		{
+			var desc = new TextureDesc
+			{
+				Name = name,
+				Type = ResourceDimension.Tex2d,
+				Width = (uint)width,
+				Height = (uint)height,
+				Format = floatFormat ? TextureFormat.RGBA16_Float : TextureFormat.RGBA8_UNorm,
+				BindFlags = unorderedAccess
+					? BindFlags.ShaderResource | BindFlags.UnorderedAccess
+					: BindFlags.ShaderResource,
+				// Default (не Dynamic): заливаем целиком командой UpdateTexture, а не через Map -
+				// Dynamic-текстуры в D3D12/Vulkan-бэкендах Diligent не поддерживаются.
+				Usage = Usage.Default,
+				MipLevels = 1,
+			};
+
+			var nativeTexture = Device.CreateTexture(desc, new TextureData());
+			if (nativeTexture == null)
+			{
+				// Diligent сообщает об отказе в лог и возвращает null. Без этой проверки null уезжал
+				// бы дальше и падал уже на первом использовании - падение процесса вместо внятной
+				// ошибки, которую вызывающий мог бы обработать откатом.
+				throw new InvalidOperationException(
+					$"Failed to create texture '{name}' ({width}x{height}, " +
+					$"{(floatFormat ? "RGBA16F" : "RGBA8")}{(unorderedAccess ? ", UAV" : string.Empty)}) - " +
+					"see the graphics log above; the device may have been removed");
+			}
+
+			// Тот же явный переход в ShaderResource, что и в CreateTexture выше - см. комментарий там.
+			ImmediateContext.TransitionResourceStates(
+			[
+				new StateTransitionDesc()
+				{
+					Resource = nativeTexture,
+					OldState = ResourceState.Unknown,
+					NewState = ResourceState.ShaderResource,
+					Flags = StateTransitionFlags.UpdateState
+				}
+			]);
+
+			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			{
+				name = name,
+				width = (uint)width,
+				height = (uint)height,
+				format = floatFormat ? TextureObjectFormat.R16G16B16A16Float : TextureObjectFormat.R8G8B8A8UNorm,
+				type = TextureType.Texture2D,
+			};
+
+			return new DiligentGpuTexture(name, textureInfo, nativeTexture);
+		}
+
+		/// <summary>См. <see cref="IGraphicsApi.UpdateTexture2D"/>.</summary>
+		public unsafe void UpdateTexture2D(IGpuTexture texture, byte[] pixels)
+		{
+			if (texture is not DiligentGpuTexture gpuTexture)
+			{
+				throw new ArgumentException($"Expected a Diligent texture, got {texture.GetType().Name}",
+					nameof(texture));
+			}
+
+			var info = gpuTexture.Info;
+			int bytesPerPixel = info.format == TextureObjectFormat.R16G16B16A16Float ? 8 : 4;
+			long expected = (long)info.width * info.height * bytesPerPixel;
+			if (pixels.LongLength < expected)
+			{
+				throw new ArgumentException(
+					$"Texture '{texture.Name}' needs {expected} bytes, got {pixels.LongLength}", nameof(pixels));
+			}
+
+			var box = new Box
+			{
+				MinX = 0, MaxX = info.width,
+				MinY = 0, MaxY = info.height,
+				MinZ = 0, MaxZ = 1,
+			};
+
+			var handle = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+			try
+			{
+				var subResource = new TextureSubResData
+				{
+					Data = handle.AddrOfPinnedObject(),
+					Stride = (uint)(info.width * bytesPerPixel),
+				};
+
+				ImmediateContext.UpdateTexture(gpuTexture.Texture, 0, 0, box, subResource,
+					ResourceStateTransitionMode.Transition, ResourceStateTransitionMode.Transition);
+			}
+			finally
+			{
+				handle.Free();
+			}
+
+			// UpdateTexture оставляет текстуру в CopyDest. SRB материалов уже собраны и ждут её в
+			// ShaderResource, а автоматический переход на месте использования их не спасает -
+			// Vulkan-валидация ловит несовпадение layout-а дескриптора (VUID-vkCmdDraw-None-09600).
+			// Возвращаем состояние явно, здесь же.
+			ImmediateContext.TransitionResourceStates(
+			[
+				new StateTransitionDesc()
+				{
+					Resource = gpuTexture.Texture,
+					OldState = ResourceState.CopyDest,
+					NewState = ResourceState.ShaderResource,
+					Flags = StateTransitionFlags.UpdateState
+				}
+			]);
+		}
+
 		public IRenderTarget CreateRenderTarget(TextureInfo info)
 		{
 			return new DiligentRenderTarget(Device, info);
+		}
+
+		public IBufferHandle CreateBuffer(BufferInfo info)
+		{
+			var buffer = new DiligentBufferHandle(Device);
+			buffer.Alloc(info);
+			return buffer;
 		}
 
 		public ICommandBuffer CreateCommandBuffer()
@@ -505,6 +718,10 @@ namespace DecaEngine
 				createInfo.Features = new DeviceFeatures()
 				{
 					MultiViewport = DeviceFeatureState.Enabled,
+					// Optional, а не Enabled: на железе/драйвере без трассировки Enabled уронил бы
+					// создание устройства, а так фича просто останется выключенной, и вызывающий
+					// уйдёт на compute-обход своего BVH (см. IGraphicsApi.RayTracing).
+					RayTracing = DeviceFeatureState.Optional,
 				};
 
 				engineFactory.CreateDeviceAndContextsD3D12(createInfo, out var renderDevice, out var deviceContexts);
@@ -569,6 +786,10 @@ namespace DecaEngine
 				createInfo.Features = new DeviceFeatures()
 				{
 					MultiViewport = DeviceFeatureState.Enabled,
+					// Optional, а не Enabled: на железе/драйвере без трассировки Enabled уронил бы
+					// создание устройства, а так фича просто останется выключенной, и вызывающий
+					// уйдёт на compute-обход своего BVH (см. IGraphicsApi.RayTracing).
+					RayTracing = DeviceFeatureState.Optional,
 				};
 
 				engineFactory.CreateDeviceAndContextsVk(createInfo, out var renderDevice, out var deviceContexts);
@@ -596,6 +817,13 @@ namespace DecaEngine
 			}
 
 			_frameFence = Device.CreateFence(new FenceDesc { Name = "Frame Fence" });
+		}
+
+		/// <summary>См. <see cref="IGraphicsApi.WaitForGpuIdle"/>.</summary>
+		public void WaitForGpuIdle()
+		{
+			ImmediateContext.Flush();
+			ImmediateContext.WaitForIdle();
 		}
 
 		private void OnWindowHandleResize()
@@ -652,6 +880,13 @@ namespace DecaEngine
 			return suitableAdapter.DeviceId != 0 ? 0 : throw new NullReferenceException("There's no graphics adapter available.");
 		}
 
+		/// <summary>См. <see cref="IGraphicsApi.SavePipelineCache"/>. Ошибки глотаются внутри
+		/// DiligentPsoManager.SaveCache - протухший кэш там же удаляется.</summary>
+		public void SavePipelineCache()
+		{
+			PsoManager?.SaveCache();
+		}
+
 		public void Present()
 		{
 			// SyncInterval 1 (vsync/FIFO), не 0: с MAILBOX на бескапном фреймрейте презентованные
@@ -678,6 +913,9 @@ namespace DecaEngine
 
 		public void Release()
 		{
+			// Шарёные шейдеры живут до конца api - освобождаются только здесь.
+			ReleaseShaderCache();
+
 			_frameFence?.Dispose();
 			PsoManager?.Dispose();
 			_swapChain?.Dispose();

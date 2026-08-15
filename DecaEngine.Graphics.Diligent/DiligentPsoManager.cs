@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using Diligent;
 
@@ -111,18 +111,34 @@ public class DiligentPsoManager : IDisposable
 	/// <summary>
 	/// Создает Graphics Pipeline State с использованием глобального кэша.
 	/// </summary>
+	/// <summary>Диагностика: сколько графических PSO создано и во что это обошлось. Статика -
+	/// сознательно: счётчик глобальный на процесс, его смысл именно в суммарной цене за запуск.</summary>
+	public static long DiagCreateMs;
+	public static int DiagCreateCount;
+
 	public IPipelineState CreateGraphicsPipelineState(GraphicsPipelineStateCreateInfo createInfo)
 	{
 		createInfo.PSOCache = _psoCache;
-		return _device.CreateGraphicsPipelineState(createInfo);
+
+		var sw = System.Diagnostics.Stopwatch.StartNew();
+		var pso = _device.CreateGraphicsPipelineState(createInfo);
+		DiagCreateMs += sw.ElapsedMilliseconds;
+		DiagCreateCount++;
+		return pso;
 	}
 
 	/// <summary>
-	/// Создает Compute Pipeline State с использованием глобального кэша.
+	/// Создает Compute Pipeline State БЕЗ дискового кэша - сознательно. D3D12 pipeline library
+	/// для компьют-PSO, сохранённого другим запуском, возвращает НЕвалидный объект без единой
+	/// ошибки и без null - бинд такого PSO падает AV-ом в реплее замороженных команд
+	/// (воспроизводится двумя запусками full-loop подряд: первый пишет кэш, второй падает на
+	/// "Light Cluster CS"; с DECA_PSO_CACHE=0 оба чистые). Графический путь от того же спасает
+	/// null-фолбэк в DiligentMaterial - компьюту Diligent null не возвращает, ловить нечего.
+	/// Выигрыша кэш тут и не давал: компьют-PSO без растровых состояний создаётся за миллисекунды
+	/// из уже скомпилированного байткода.
 	/// </summary>
 	public IPipelineState CreateComputePipelineState(ComputePipelineStateCreateInfo createInfo)
 	{
-		createInfo.PSOCache = _psoCache;
 		return _device.CreateComputePipelineState(createInfo);
 	}
 

@@ -1,0 +1,234 @@
+// Тело выборки probe-GI одного ОБЪЁМА (каскада) - включается по разу на каскад с переопределёнными
+// макросами (см. UnlitInstancedPS.hlsl). HLSL не умеет передавать текстуры параметрами до SM 6.6,
+// поэтому один и тот же код разворачивается под разные наборы атласов инклюдом, а не функцией.
+//
+// Ожидает макросы:
+//   PROBE_GI_FN       - имя генерируемой функции
+//   PROBE_GI_SH0..SH3, PROBE_GI_VIS, PROBE_GI_OFFSET, PROBE_GI_IND - текстуры атласов объёма
+//   PROBE_GI_ORIGIN / PROBE_GI_CELL / PROBE_GI_COUNTS / PROBE_GI_BRICKS - float4 его сетки
+//
+// Использует OctEncode, NonLinearIrradianceL1, viewData и PROBE_BRICK_* - они объявлены до
+// первого включения. Возвращает (-1,-1,-1), если точка вне кирпичей объёма или весам не из чего
+// собраться - вызывающий падает на следующий, более крупный каскад (см. SampleProbeGiCascaded).
+//
+// sunFraction - доля солнечного света (баунс + переотскоки) в поле, альфа Sh2: экранная тень
+// ключа глушит только её - небесная часть эмбиента в тени легитимна.
+// probeMarker - для отладочного вида расстановки проб: x = расстояние до ближайшей из восьми проб
+// ячейки в долях шага, y = её смещение релокацией (в долях шага), z = её валидность.
+float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float sunFraction,
+                   out float3 probeMarker)
+{
+    skyVisibility = 1.0;
+    sunFraction = 0.0;
+    probeMarker = float3(1e6, 0.0, 0.0);
+
+    float3 counts = PROBE_GI_COUNTS.xyz;
+    float3 brickCounts = PROBE_GI_BRICKS.xyz;
+
+    // Смещение точки сэмпла по нормали И ПО ВЗГЛЯДУ - self-shadow bias, формула (2) Majercik 2021
+    // (§4.1): (n*0.2 + wo*0.8) * (0.75 * минимальный шаг проб) * ручка. Дисперсия оценки видимости
+    // максимальна ровно на поверхности; смещение к камере уводит точку с разрыва в ту сторону,
+    // откуда смотрят. Множитель зашит в PROBE_GI_CELL.w (см. ModelPreviewViewport).
+    // ВАЖНО: смещённая точка используется ТОЛЬКО для теста видимости (toProbe/Чебышёв/wrap) - ровно
+    // как в статье: "a new point which we use for the visibility test". Трилинейные веса и выбор
+    // ячейки считаются от ЧЕСТНОЙ worldPos: смещение идёт вдоль нормали, на рёбрах треугольников
+    // нормаль скачет, и смещённая точка вместе с ней - гнать через неё веса ячейки значит рисовать
+    // грани треугольников прямо в эмбиенте (видно при большом Normal bias). Вес видимости мягкий,
+    // ему скачок безвреден; веса ячейки жёсткие - им нельзя.
+    // Смещение ТОЛЬКО к камере, без нормали - осознанный отход от весов 0.2/0.8 статьи: любая
+    // доля нормали в смещении рисует грани треугольников в эмбиенте (нормаль скачет на рёбрах,
+    // с ней скачут точка видимости и её веса), и жёсткие фасетки на плоских мешах хуже, чем
+    // редкое самозатенение у скользящих углов, от которого нормаль страховала. Направление на
+    // камеру непрерывно по экрану везде - граней не даёт по построению.
+    float3 toCamera = normalize(viewData.CameraWorldPos - worldPos);
+    float3 samplePos = worldPos + toCamera * PROBE_GI_CELL.w;
+    float3 f = (worldPos - PROBE_GI_ORIGIN.xyz) / PROBE_GI_CELL.xyz;
+
+    // Вне объёма - к следующему каскаду. Кламп, как у одиночной сетки, здесь не годится: он
+    // прилепил бы точку к граничной ячейке, и мелкий каскад «растянулся» бы на всю сцену.
+    if (any(f < 0.0) || any(f > counts - 1.0))
+    {
+        return float3(-1.0, -1.0, -1.0);
+    }
+
+    // Кирпич, накрывающий точку - ищется в САМОЙ МЕЛКОЙ сетке кирпичей, куда крупный прописан во
+    // все свои ячейки. Граничные пробы соседних кирпичей дублируются, поэтому все восемь углов
+    // лежат в найденном кирпиче - индирекция читается один раз, а не по разу на угол.
+    int3 brickCoord = min((int3)(f / PROBE_BRICK_CELLS), (int3)brickCounts - 1);
+    int brickCountY = (int)brickCounts.y;
+    float4 indirection = PROBE_GI_IND.Load(int3(
+        brickCoord.x, brickCoord.z * brickCountY + brickCoord.y, 0));
+    if (indirection.b < 0.5)
+    {
+        // Кирпича нет - в этом объёме тут пусто. Вызывающий пробует следующий каскад, а за
+        // последним откатится на константный ambient.
+        return float3(-1.0, -1.0, -1.0);
+    }
+
+    // Индекс кирпича упакован по байтам, в альфе - уровень подразделения (см.
+    // ProbeGiBakeResult.Indirection); разворачиваем его в координаты блока в пуле.
+    int brick = (int)round(indirection.r * 255.0) + (int)round(indirection.g * 255.0) * 256;
+    int level = (int)round(indirection.a * 255.0);
+    int step = 1 << level;
+    int poolColumns = max((int)PROBE_GI_BRICKS.w, 1);
+    int2 brickTexel = int2(brick % poolColumns, brick / poolColumns)
+                    * int2(PROBE_BRICK_PROBES, PROBE_BRICK_PROBES * PROBE_BRICK_PROBES);
+
+    // Угол кирпича: координаты выравниваются вниз по его размеру (крупный кирпич покрывает 2^level
+    // мелких), а локальные координаты считаются в ЕГО шаге проб.
+    float3 brickOrigin = (float3)((brickCoord / step) * step * PROBE_BRICK_CELLS);
+    float3 lf = (f - brickOrigin) / step;
+    int3 localCell = clamp((int3)floor(lf), 0, PROBE_BRICK_CELLS - 1);
+    float3 t = saturate(lf - (float3)localCell);
+    float3 probeStep = PROBE_GI_CELL.xyz * step;
+
+    float4 sum0 = 0.0;
+    float3 sumX = 0.0, sumY = 0.0, sumZ = 0.0;
+    float sunFracSum = 0.0;
+    float weightSum = 0.0;
+
+    [unroll]
+    for (int corner = 0; corner < 8; corner++)
+    {
+        int3 offset = int3(corner & 1, (corner >> 1) & 1, corner >> 2);
+
+        // Тексель угла внутри блока кирпича: локальная проба (0..BrickProbes-1) по каждой оси,
+        // z-слайсы столбиком - зеркало ProbeGiBaker.ProbeTexel.
+        int3 lp = localCell + offset;
+        int3 texel = int3(brickTexel.x + lp.x,
+                          brickTexel.y + lp.z * PROBE_BRICK_PROBES + lp.y, 0);
+
+        // Валидность в альфе Sh1 читается первой - невалидный угол не тянет остальные Load-ы.
+        // ТРИЛИНЕЙНЫЙ вес считается отдельно и умножается ПОСЛЕ подавления малых весов - как в
+        // эталонной реализации DDGI. Порядок принципиален: crush нелинеен, и трилинейка,
+        // пропущенная через него, теряет плавность - веса становятся почти бинарными, и вместо
+        // интерполяции получаются плато с резкими органическими границами (видно в дебаг-виде
+        // поля как «странная интерполяция»).
+        float4 sh1 = PROBE_GI_SH1.Load(texel);
+        float trilinear = (offset.x ? t.x : 1.0 - t.x)
+                        * (offset.y ? t.y : 1.0 - t.y)
+                        * (offset.z ? t.z : 1.0 - t.z);
+        float w = sh1.a;
+
+        // Мягкий backface-вес (DDGI wrap shading): проба ПОЗАДИ поверхности не должна тянуть
+        // своё поле сквозь стену/колонну - иначе в зазорах тонкой геометрии небо/солнце
+        // протекают на теневую сторону даже при нормальном бейасе. Квадрат полукосинуса
+        // оставляет боковым пробам частичный вес (иначе плоская стена теряла бы половину
+        // интерполяции и полосила по ячейкам).
+        float3 probeOffsetWorld = PROBE_GI_OFFSET.Load(texel).rgb;
+        float3 probeWorld = PROBE_GI_ORIGIN.xyz
+                          + brickOrigin * PROBE_GI_CELL.xyz + (float3)lp * probeStep
+                          + probeOffsetWorld;
+        float3 toProbe = probeWorld - samplePos;
+        float toProbeLen = length(toProbe);
+
+        // Отметка ближайшей пробы - до всех отсечек по весу: показывать надо и невалидные пробы,
+        // ради них отладочный вид и заводится.
+        float cellSize = min(probeStep.x, min(probeStep.y, probeStep.z));
+        if (toProbeLen < probeMarker.x * cellSize)
+        {
+            probeMarker = float3(toProbeLen / max(cellSize, 1e-4),
+                                 length(probeOffsetWorld) / max(cellSize, 1e-4),
+                                 sh1.a);
+        }
+        float wrap = (dot(toProbe / max(toProbeLen, 1e-4), N) + 1.0) * 0.5;
+        // 0.2, а не 0.05: эталонная реализация статьи оставляет боковым пробам заметно больший
+        // остаточный вес. Меньший пол выглядит «строже», но на плоской стене отбирает у половины
+        // окружающих проб почти весь вес, и интерполяция начинает полосить по ячейкам.
+        w *= wrap * wrap + 0.2;
+
+        // Тест Чебышёва по окто-карте видимости пробы (DDGI depth): если от пробы до точки
+        // дальше, чем проба в среднем видит в этом направлении - между ними стена, вес гасится
+        // пропорционально дисперсии. Ловит боковые протечки у стыков (основания колонн, кромки
+        // штор), до которых wrap-вес по нормали не дотягивается.
+        float2 oct = OctEncode(-toProbe / max(toProbeLen, 1e-4));
+
+        // БИЛИНЕЙНАЯ выборка карты глубин, а не точечный Load. Карта всего 8x8 на пробу (~25° на
+        // тексель), и точечная выборка делает глубину ступенчатой по направлению: на дальних
+        // каскадах, где ячейка крупная и проба далеко, в один тексель попадают и стена, и проём -
+        // средняя глубина скачет между соседними текселями, тест Чебышёва то срабатывает, то нет,
+        // и свет протекает сквозь тонкую геометрию (шторы, кромки колонн). Отсюда же зависимость
+        // артефакта от расстояния до камеры: вблизи работает мелкий каскад, там ячейка меньше.
+        //
+        // Фильтруем вручную по четырём текселям с окто-обёрткой (см. OctWrapTexel): аппаратный
+        // сэмплер потребовал бы border-текселей в атласе, то есть переразметки и правок в обеих
+        // записях, а на кромках развёртки всё равно был бы приблизителен.
+        int visRes = ProbeVisRes();
+        float2 visUv = oct * (float)visRes - 0.5;
+        int2 visBase = (int2)floor(visUv);
+        float2 visFrac = visUv - (float2)visBase;
+
+        int2 tileOrigin = texel.xy * visRes;
+        float2 v00 = PROBE_GI_VIS.Load(int3(tileOrigin + OctWrapTexel(visBase + int2(0, 0), visRes), 0)).rg;
+        float2 v10 = PROBE_GI_VIS.Load(int3(tileOrigin + OctWrapTexel(visBase + int2(1, 0), visRes), 0)).rg;
+        float2 v01 = PROBE_GI_VIS.Load(int3(tileOrigin + OctWrapTexel(visBase + int2(0, 1), visRes), 0)).rg;
+        float2 v11 = PROBE_GI_VIS.Load(int3(tileOrigin + OctWrapTexel(visBase + int2(1, 1), visRes), 0)).rg;
+
+        float2 visDepth = lerp(lerp(v00, v10, visFrac.x), lerp(v01, v11, visFrac.x), visFrac.y);
+        if (toProbeLen > visDepth.x)
+        {
+            float variance = abs(visDepth.y - visDepth.x * visDepth.x) + 1e-4;
+            float diff = toProbeLen - visDepth.x;
+            float cheb = variance / (variance + diff * diff);
+            // Пол 0.05 - как в эталонной реализации: полностью занулять вес загороженной пробы
+            // нельзя, иначе в углу, где все восемь проб «за стеной», сумма весов схлопывается и
+            // точке не остаётся освещения вовсе.
+            w *= max(cheb * cheb * cheb, 0.05);
+        }
+
+        // Перцептивное подавление МАЛЫХ весов (§5.2 статьи Majercik 2019): глаз замечает протечку
+        // света в тёмное место острее, чем недостачу в светлом, поэтому уже подавленный соседями
+        // вес давится ещё и кубически.
+        const float crushThreshold = 0.2;
+        if (w < crushThreshold)
+        {
+            w *= (w * w) / (crushThreshold * crushThreshold);
+        }
+
+        // Трилинейка - ПОСЛЕ crush (порядок эталона): плавность интерполяции между пробами не
+        // проходит через нелинейность. Пол 0.001 - тоже из эталона: угол ячейки не обнуляется
+        // совсем, иначе на самой грани ячейки сумма весов рвётся.
+        w *= max(trilinear, 0.001);
+
+        if (w <= 1e-5)
+        {
+            continue;
+        }
+
+        float4 sh0 = PROBE_GI_SH0.Load(texel);
+        float4 sh2 = PROBE_GI_SH2.Load(texel);
+        sum0 += sh0 * w;
+        sumX += sh1.rgb * w;
+        sumY += sh2.rgb * w;
+        sumZ += PROBE_GI_SH3.Load(texel).rgb * w;
+        sunFracSum += sh2.a * w;
+        weightSum += w;
+    }
+
+    if (weightSum < 1e-3)
+    {
+        return float3(-1.0, -1.0, -1.0);
+    }
+
+    float inv = 1.0 / weightSum;
+    skyVisibility = saturate(sum0.a * inv);
+    sunFraction = saturate(sunFracSum * inv);
+
+    // Перевод в нормированное соглашение (R0 = среднее по сфере): свёртка облучённости даёт
+    // множители pi*Y00 = 0.8862269 для L0 и (2pi/3)*Y1 = 1.0233267 для L1, а деление на pi в
+    // конце - это ламбертов множитель. Собрав всё вместе: R0 = L0 * 0.282095,
+    // 2*R1 = L1 * 0.325735, то есть R1 = L1 * 0.1628675.
+    float3 R0 = sum0.rgb * (inv * 0.2820948);
+    float3 R1x = sumX * (inv * 0.1628675);
+    float3 R1y = sumY * (inv * 0.1628675);
+    float3 R1z = sumZ * (inv * 0.1628675);
+
+    // По каналу: у красного и синего направленность своя (небо синее сверху, отскок тёплый снизу),
+    // и общей на три канала её делать нельзя - цвет уедет.
+    float3 irradiance = float3(
+        NonLinearIrradianceL1(R0.r, float3(R1x.r, R1y.r, R1z.r), N),
+        NonLinearIrradianceL1(R0.g, float3(R1x.g, R1y.g, R1z.g), N),
+        NonLinearIrradianceL1(R0.b, float3(R1x.b, R1y.b, R1z.b), N));
+
+    return max(irradiance, 0.0);
+}

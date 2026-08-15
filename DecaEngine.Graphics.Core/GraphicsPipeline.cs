@@ -16,8 +16,8 @@ public class GraphicsPipeline : IGraphicsPipeline
 
 	private Ref<Vector2> _viewPortRef;
 
-	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer)
-		: this(api, batchRenderer, null, null, new Vector4(0.1f, 0.1f, 0.1f, 1f))
+	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer, string? debugName = null)
+		: this(api, batchRenderer, null, null, new Vector4(0.1f, 0.1f, 0.1f, 1f), debugName)
 	{
 	}
 
@@ -28,7 +28,9 @@ public class GraphicsPipeline : IGraphicsPipeline
 	/// / <paramref name="depthTarget"/> instead of the swap chain, and doesn't need the swap-chain
 	/// resize hookup or the render-graph-debugger demo passes.
 	/// </summary>
-	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer, IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor)
+	/// <param name="debugName">Имя конвейера в окне отладки рендер-графа (см.
+	/// <see cref="GraphicsPipelineRegistry"/>). Null - имя по умолчанию, по режиму конвейера.</param>
+	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer, IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor, string? debugName = null)
 	{
 		_api = api;
 		_batchRenderer = batchRenderer;
@@ -46,6 +48,20 @@ public class GraphicsPipeline : IGraphicsPipeline
 			_viewPortRef = new Ref<Vector2>(_api.WindowHandle.Size);
 			_api.WindowHandle.OnWindowResize += OnViewportChange;
 		}
+
+		// Конвейер сам встаёт в реестр - окно отладки рендер-графа набирает свой список именно так
+		// (см. GraphicsPipelineRegistry). Реестр держит слабую ссылку и жизнь конвейера не продлевает.
+		GraphicsPipelineRegistry.Register(this,
+			debugName ?? (_colorTarget is null ? "Main Scene (swap chain)" : "Offscreen (GraphicsPipeline)"));
+	}
+
+	/// <summary>Убирает конвейер из <see cref="GraphicsPipelineRegistry"/>, чтобы он пропал из окна
+	/// отладки сразу, как только перестал использоваться. Не обязателен - реестр держит слабую
+	/// ссылку, - но избавляет UI от мёртвой строки до ближайшей сборки мусора.</summary>
+	public void Release()
+	{
+		GraphicsPipelineRegistry.Unregister(this);
+		_renderGraph.Release();
 	}
 
 	public void OnViewportChange()
@@ -104,7 +120,9 @@ public class GraphicsPipeline : IGraphicsPipeline
 
 	public void SignalGraph(DirectionalLightCascadeData renderScene, RenderCamerasData renderViews)
 	{
-		_renderGraph.Release();
+		// ResetPasses, а не Release: пассы пересоздаются, а нативные ресурсы графа переиспользуются
+		// (см. IRenderGraph.ResetPasses).
+		_renderGraph.ResetPasses();
 
 		/*if (_colorTarget is null)
 		{

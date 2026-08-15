@@ -35,7 +35,6 @@ public sealed class ShadowPass : RenderGraphPass<ShadowPass.PassData>
 		var cmd = context.cmd;
 
 		_batchRenderer.CheckAndReallocateBuffers();
-		_batchRenderer.ClearIndirectDrawBuffers(cmd);
 
 		var lights = _directionalLightCascadeData;
 		if (!lights.IsCreated)
@@ -43,11 +42,13 @@ public sealed class ShadowPass : RenderGraphPass<ShadowPass.PassData>
 			return;
 		}
 
-		for (int i = 0; i < lights.viewData.Count; i++)
+		for (int i = 0; i < lights.viewData.Capacity; i++)
 		{
-			_batchRenderer.SetupViewData(cmd, ref lights.viewData.GetRef(i));
-			_batchRenderer.SetupCullData(cmd, ref lights.cullData.GetRef(i));
-			_batchRenderer.SetupLightData(cmd, ref lights.lightData.GetRef(i));
+			_batchRenderer.ClearIndirectDrawBuffers(cmd);
+
+			_batchRenderer.SetupViewData(cmd, ref lights.viewData.GetRef(i, false));
+			_batchRenderer.SetupCullData(cmd, ref lights.cullData.GetRef(i, false));
+			_batchRenderer.SetupLightData(cmd, ref lights.lightData.GetRef(i, false));
 
 			var shadowCullResult = _batchRenderer.ExecuteComputeCulling(cmd, i);
 			_batchRenderer.ExecuteDrawShadows(cmd, shadowCullResult, i);

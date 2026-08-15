@@ -77,10 +77,30 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private readonly uint _sampleCount = 1;
 
+	// Формат цветового таргета геометрии - пекётся во все PSO наравне с _sampleCount. Unknown =
+	// брать формат свопчейна (главная сцена); превью в HDR-режиме передаёт RGBA16F.
+	private readonly TextureObjectFormat _colorFormat = TextureObjectFormat.Unknown;
+
+	private TextureObjectFormat RenderColorFormat =>
+		_colorFormat != TextureObjectFormat.Unknown ? _colorFormat : _api.SwapChainColorFormat;
+
 	private readonly DiligentBufferHandle? _lightConstantsBuffer;
 	private readonly DiligentBufferHandle? _viewConstantsBuffer;
 	private readonly DiligentBufferHandle? _cullConstantsBuffer;
 	private readonly IComputeMaterial _cullingMaterial;
+
+	// Кластеризация punctual-светов (LightClusterCS.hlsl): пул светов кадра + counts/indices
+	// фроксел-сетки. Буферы фиксированного размера (LightClusters), создаются один раз в конструкторе;
+	// доступ Compute|Pixel - компьют пишет через UAV, пиксельные шейдеры батч-материалов читают SRV.
+	private readonly DiligentBufferHandle? _punctualLightsBuffer;
+	private readonly DiligentBufferHandle? _clusterCountsBuffer;
+	private readonly DiligentBufferHandle? _clusterIndicesBuffer;
+	private readonly IComputeMaterial _lightClusterMaterial;
+
+	// viewProj-матрицы теневых слайсов punctual-светов - SRV пиксельному шейдеру (сэмплинг теней в
+	// кластерной петле UnlitInstancedPS); заливается раз в кадр из стабильной памяти
+	// (RenderCamerasData.punctualShadowMatrices, замороженная команда).
+	private readonly DiligentBufferHandle? _punctualShadowMatricesBuffer;
 
 	private readonly int _instanceBufferSectorCapacity = 64;
 	private int _instanceBufferCapacity = 0;
@@ -125,13 +145,22 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	public int ShadowCascadeCount => ShadowRenderer.MaxCascades;
 
+	/// <summary>Рендерер каскадных теней мирового света - наружу только ради отладочного
+	/// ридбека shadow map (см. PreviewProbe, DECA_PROBE_SHADOWDUMP).</summary>
+	public ShadowRenderer WorldShadowRenderer => _shadowRenderer;
+
 	/// <param name="sampleCount">MSAA sample count целевых таргетов - пекётся во все PSO
 	/// (GetBaseState/GetTopologyState/GetWireframeState); 1 = без MSAA (главная сцена).</param>
-	public DiligentBatchRenderer(DiligentGraphicsApi api, uint sampleCount = 1)
+	/// <param name="colorFormat">Формат цветового таргета, в который рисует геометрия - тоже пекётся
+	/// во все PSO. Unknown = формат свопчейна; офскрин-превью в HDR-режиме передаёт сюда RGBA16F
+	/// (см. PipelineRenderTargets.RenderColorFormat).</param>
+	public DiligentBatchRenderer(DiligentGraphicsApi api, uint sampleCount = 1,
+		TextureObjectFormat colorFormat = TextureObjectFormat.Unknown)
 	{
 		_perMeshData = UnsafeList.Allocate<PerMeshData>(32);
 		_api = api;
 		_sampleCount = Math.Max(1u, sampleCount);
+		_colorFormat = colorFormat;
 		_deviceType = _api.Device.GetDeviceInfo().Type;
 		
 		_cullConstantsBuffer = CreateConstantsBuffer<CullData>("Cull Constants");
@@ -142,6 +171,47 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_cullingMaterial = new DiligentComputeMaterial("Batching Instancing CS", _api);
 		_cullingMaterial.SetShader(cullingShader);
 		_cullingMaterial.SetBuffer("Constants", _cullConstantsBuffer);
+
+		_punctualLightsBuffer = (DiligentBufferHandle)_api.CreateBuffer<PunctualLight>(LightClusters.MaxLights,
+			new BufferInfo
+			{
+				name = "Punctual Lights Buffer",
+				type = BufferHandleType.Structured,
+				access = HandleAccess.Compute | HandleAccess.Pixel,
+			});
+		_clusterCountsBuffer = (DiligentBufferHandle)_api.CreateBuffer<uint>(LightClusters.ClusterCount,
+			new BufferInfo
+			{
+				name = "Light Cluster Counts Buffer",
+				type = BufferHandleType.Structured,
+				access = HandleAccess.Compute | HandleAccess.Pixel,
+			});
+		_clusterIndicesBuffer = (DiligentBufferHandle)_api.CreateBuffer<uint>(
+			LightClusters.ClusterCount * LightClusters.MaxLightsPerCluster,
+			new BufferInfo
+			{
+				name = "Light Cluster Indices Buffer",
+				type = BufferHandleType.Structured,
+				access = HandleAccess.Compute | HandleAccess.Pixel,
+			});
+
+		_punctualShadowMatricesBuffer = (DiligentBufferHandle)_api.CreateBuffer<Matrix4x4>(
+			LightClusters.MaxShadowSlices,
+			new BufferInfo
+			{
+				name = "Punctual Shadow Matrices Buffer",
+				type = BufferHandleType.Structured,
+				access = HandleAccess.Pixel,
+			});
+
+		var clusterShader = new DiligentShader(_api, "Light Cluster CS", "EditorAssets/shader", "LightClusterCS.hlsl", ShaderObjectType.Compute, "CSMain");
+		_lightClusterMaterial = new DiligentComputeMaterial("Light Cluster CS", _api);
+		_lightClusterMaterial.SetShader(clusterShader);
+		_lightClusterMaterial.SetBuffer("Constants", _cullConstantsBuffer);
+		_lightClusterMaterial.SetBuffer("Light", _lightConstantsBuffer);
+		_lightClusterMaterial.SetBuffer("PunctualLights", _punctualLightsBuffer);
+		_lightClusterMaterial.SetBuffer("ClusterCounts", _clusterCountsBuffer);
+		_lightClusterMaterial.SetBuffer("ClusterIndices", _clusterIndicesBuffer);
 
 		_shadowRenderer = new ShadowRenderer(api);
 	}
@@ -230,11 +300,23 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		int baseVertex = _megaVertexBufferCPU.Count;
 		uint firstIndex = (uint)_megaIndexBufferCPU.Count;
 
-		for (int i = 0; i < UnsafeArray.GetLength(vertices); i++)
-			_megaVertexBufferCPU.Add(UnsafeArray.Get<Vertex>(vertices, i));
+		// Копирование БЛОКОМ, а не поэлементно: у сцены уровня Sponza это миллионы вершин и десятки
+		// миллионов индексов, то есть десятки миллионов вызовов Add, каждый из которых ещё и мог
+		// вызвать рост ёмкости удвоением с перекопированием всего накопленного.
+		var vertexCount = UnsafeArray.GetLength(vertices);
+		var indexCount = UnsafeArray.GetLength(indices);
 
-		for (int i = 0; i < UnsafeArray.GetLength(indices); i++)
-			_megaIndexBufferCPU.Add(UnsafeArray.Get<uint>(indices, i));
+		if (vertexCount > 0)
+		{
+			UnsafeList.AddRange(_megaVertexBufferCPU.GetNative(),
+				UnsafeArray.GetPtr<Vertex>(vertices, 0), vertexCount);
+		}
+
+		if (indexCount > 0)
+		{
+			UnsafeList.AddRange(_megaIndexBufferCPU.GetNative(),
+				UnsafeArray.GetPtr<uint>(indices, 0), indexCount);
+		}
 
 		_meshInfos[meshId] = new MeshInfo
 		{
@@ -270,6 +352,13 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		material.SetBuffer("GPURenderInstances", _gpuInstancesDataBuffer, HandleAccess.Vertex);
 
+		// Результаты кластеризации светов - пиксельному шейдеру (SRV): пул светов + counts/indices
+		// фроксел-сетки (см. UnlitInstancedPS.hlsl, петля clustered-шейдинга).
+		material.SetBuffer("PunctualLights", _punctualLightsBuffer, HandleAccess.Pixel);
+		material.SetBuffer("ClusterCounts", _clusterCountsBuffer, HandleAccess.Pixel);
+		material.SetBuffer("ClusterIndices", _clusterIndicesBuffer, HandleAccess.Pixel);
+		material.SetBuffer("PunctualShadowMatrices", _punctualShadowMatricesBuffer, HandleAccess.Pixel);
+
 		gMaterialIndex++;
 		_isDrawBatchCmdDirty = true;
 		return new MaterialId(materialId);
@@ -291,6 +380,64 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		SetAllCommandsDirty();
 	}
 
+	/// <summary>Выбрасывает ВСЕ регистрации меша/материала/батча и накопленную геометрию, возвращая
+	/// рендерер в состояние сразу после создания.
+	///
+	/// Нужен потому, что снять регистрацию ПОШТУЧНО нельзя: MeshId/MaterialId/BatchId - плотные
+	/// монотонные индексы, по которым размеряются GPU-буферы (см. комментарий у _meshBatchDataBuffer:
+	/// «batch ids are dense 0..gBatchIndex-1 and never removed»), и удаление одного сдвинуло бы все
+	/// последующие. Потребителю, который показывает ОДНУ модель за раз (превью, бейкер иконок), сброс
+	/// - ровно то, что нужно; сцене с множеством моделей он противопоказан.
+	///
+	/// Без него геометрия каждой открытой модели навсегда оставалась в мега-буферах, а те на любое
+	/// изменение пересоздаются и заливаются ЦЕЛИКОМ (см. UpdateGpuMegaBuffers) - то есть открытие
+	/// N-й модели стоило O(вся геометрия, когда-либо загруженная), и по памяти, и по заливке.
+	///
+	/// Вызывающий ОБЯЗАН сперва дождаться GPU (Flush + WaitForIdle) и пересобрать граф: старые
+	/// MeshId/MaterialId/BatchId становятся недействительными, а замороженные команды на них
+	/// ссылаются.</summary>
+	public void ResetRegistrations()
+	{
+		// Мега-буферы CPU освобождаются, а не очищаются: Clear сохранил бы ёмкость, накопленную под
+		// все прошлые модели, - а это ровно та память, ради которой сброс и делается. Следующий
+		// Register создаст их заново под размер новой модели (см. проверку IsCreated в Register).
+		if (_megaVertexBufferCPU.IsCreated)
+		{
+			_megaVertexBufferCPU.Dispose();
+			_megaVertexBufferCPU = default;
+		}
+
+		if (_megaIndexBufferCPU.IsCreated)
+		{
+			_megaIndexBufferCPU.Dispose();
+			_megaIndexBufferCPU = default;
+		}
+
+		// GPU-буферы отпускаем здесь же: UpdateGpuMegaBuffers пересоздаст их по _isMeshBuffersDirty,
+		// а держать до тех пор буфер с геометрией уже несуществующих мешей незачем.
+		_megaVertexBufferGPU?.Release();
+		_megaVertexBufferGPU = null;
+		_megaIndexBufferGPU?.Release();
+		_megaIndexBufferGPU = null;
+
+		// Сброс обязан быть ПОЛНЫМ: оставь любую из коллекций непустой - и её ключи разойдутся с
+		// заново выданными с нуля индексами.
+		_meshInfos.Clear();
+		_materialObjects.Clear();
+		_indirectBatches.Clear();
+		_materialDrawRanges.Clear();
+		UnsafeList.Clear(_perMeshData);
+
+		gMeshIndex = 0;
+		gMaterialIndex = 0;
+		gBatchIndex = 0;
+
+		_isMeshBuffersDirty = true;
+		_isDrawRangesCacheDirty = true;
+		_isDrawBatchCmdDirty = true;
+		SetAllCommandsDirty();
+	}
+
 	public void PinInstances(BatchSubset subset)
 	{
 		_instancesSubset = subset;
@@ -305,12 +452,47 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		((DiligentMaterial)material).SetBuffer("View", _viewConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 	}
 
+	/// <summary>См. <see cref="IBatchRenderer.BindShadowResources"/>: кбуфер Light + массив shadow
+	/// map фуллскрин-материалу, минуя Register().</summary>
+	public void BindShadowResources(IMaterialObject material)
+	{
+		((DiligentMaterial)material).SetBuffer("Light", _lightConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
+		_shadowRenderer.SetShadowResources(material);
+	}
+
+	/// <summary>См. <see cref="IBatchRenderer.SetMaterialAlphaTestedShadow"/>.</summary>
+	public void SetMaterialAlphaTestedShadow(int materialId, DecaEngine.Graphics.ModelLoader.BaseColorBinding baseColor,
+		float alphaCutoff)
+	{
+		if (baseColor is null)
+		{
+			return;
+		}
+
+		_shadowRenderer.RegisterAlphaTestedMaterial(materialId, baseColor.Texture, baseColor.Sampler,
+			alphaCutoff, baseColor.Stream);
+	}
+
+	/// <summary>См. <see cref="IBatchRenderer.TransitionShadowMapsForRead"/>. DepthRead, а не
+	/// ShaderResource - см. комментарий в ShadowRenderer.ExecuteDrawShadows.</summary>
+	public void TransitionShadowMapsForRead(ICommandBuffer cmd)
+	{
+		cmd.TransitionResource(_shadowRenderer.ShadowMapsTarget, ResourceState.DepthRead);
+	}
+
+	// После каждого UpdateBuffer - явный барьер CopyDest -> ConstantBuffer. Без него между
+	// копией констант и дроу/диспатчами нет зависимости, и D3D12 вправе слить НЕСКОЛЬКО
+	// апдейтов одного кбуфера в пачку до исполнения дроу: теневые каскады (4 апдейта View/Light
+	// за пасс, см. ShadowPass) рендерились с матрицами ЧУЖИХ каскадов - слайсы 1/3 выходили
+	// побитовыми копиями 0/2. На Vulkan драйвер прощал, на D3D12 - нет (видно в RenderDoc).
+
 	public unsafe void SetupViewData(ICommandBuffer? cmd, ref ViewData viewData)
 	{
 		fixed(ViewData* ptr = &viewData)
 		{
 			cmd.UpdateBuffer(_viewConstantsBuffer, 0, ptr);
 		}
+		cmd.TransitionResource(_viewConstantsBuffer, ResourceState.ConstantBuffer);
 	}
 
 	public unsafe void SetupCullData(ICommandBuffer? cmd, ref CullData cullData)
@@ -319,6 +501,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		{
 			cmd.UpdateBuffer(_cullConstantsBuffer, 0, ptr);
 		}
+		cmd.TransitionResource(_cullConstantsBuffer, ResourceState.ConstantBuffer);
 	}
 
 	public unsafe void SetupLightData(ICommandBuffer? cmd, ref LightData lightData)
@@ -327,6 +510,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		{
 			cmd.UpdateBuffer(_lightConstantsBuffer, 0, ptr);
 		}
+		cmd.TransitionResource(_lightConstantsBuffer, ResourceState.ConstantBuffer);
 	}
 
 	public IReadOnlyList<KeyValuePair<int, DiligentMaterial>> GetMaterials() => _materialObjects;
@@ -516,6 +700,61 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return new CullResult(_finallyInstancesBuffer, _indirectArgsBuffers, _gpuInstancesDataBuffer, _materialDrawRanges);
 	}
 
+	/// <summary>См. <see cref="IBatchRenderer.SetupPunctualLights"/>: заливка пула punctual-светов
+	/// кадра. Команда замороженная - указатель на UnsafeArray перечитывается на каждом реплее,
+	/// память обязана быть стабильной (см. ViewSubset.punctualLights).</summary>
+	public void SetupPunctualLights(ICommandBuffer cmd, UnsafeArray* lights)
+	{
+		if (lights == null) return;
+		cmd.UpdateBuffer<PunctualLight>(_punctualLightsBuffer, lights);
+	}
+
+	/// <summary>См. <see cref="IBatchRenderer.SetupPunctualShadowMatrices"/>: заливка viewProj-матриц
+	/// теневых слайсов кадра. Команда замороженная - память обязана быть стабильной
+	/// (см. ViewSubset.punctualShadowMatrices).</summary>
+	public void SetupPunctualShadowMatrices(ICommandBuffer cmd, UnsafeArray* matrices)
+	{
+		if (matrices == null) return;
+		cmd.UpdateBuffer<Matrix4x4>(_punctualShadowMatricesBuffer, matrices);
+	}
+
+	/// <summary>См. <see cref="IBatchRenderer.ExecuteDrawPunctualShadow"/>: запись одного слайса
+	/// теней punctual-света по последним SetupCullData/SetupLightData (CascadeMatrix0 = viewProj
+	/// слайса, см. PunctualShadowScheduler).</summary>
+	public void ExecuteDrawPunctualShadow(ICommandBuffer cmd, CullResult cullResult, int sliceIndex)
+	{
+		if (_instancesSubset.instances.Length == 0 || _totalCommands == 0)
+		{
+			return;
+		}
+
+		UpdateGpuMegaBuffers();
+		UpdateDrawRangesCache();
+		_shadowRenderer.ExecuteDrawPunctualShadow(cmd, _megaVertexBufferGPU, _megaIndexBufferGPU,
+			cullResult, (uint)sliceIndex);
+	}
+
+	/// <summary>См. <see cref="IBatchRenderer.TransitionPunctualShadowsForRead"/>.</summary>
+	public void TransitionPunctualShadowsForRead(ICommandBuffer cmd)
+	{
+		_shadowRenderer.TransitionPunctualShadowsForRead(cmd);
+	}
+
+	/// <summary>См. <see cref="IBatchRenderer.ExecuteLightClustering"/>: раскладка отрезка пула
+	/// текущей камеры (границы - в LightData.ClusterParams последнего SetupLightData) по
+	/// фроксел-кластерам. Пустой отрезок не повод пропускать диспатч: ClusterCounts надо
+	/// занулить, иначе шейдинг прочтёт кластеры прошлой камеры.</summary>
+	public void ExecuteLightClustering(ICommandBuffer cmd)
+	{
+		cmd.TransitionResource(_punctualLightsBuffer, ResourceState.UnorderedAccess);
+		cmd.TransitionResource(_clusterCountsBuffer, ResourceState.UnorderedAccess);
+		cmd.TransitionResource(_clusterIndicesBuffer, ResourceState.UnorderedAccess);
+
+		cmd.SetPipelineState(_lightClusterMaterial);
+		cmd.CommitShaderResources(_lightClusterMaterial);
+		cmd.DispatchCompute((uint)((LightClusters.ClusterCount + 63) / 64));
+	}
+
 	// --- IBatchRenderer explicit implementations (boxed CullResult behind the ICullResult marker) ---
 	ICullResult IBatchRenderer.ExecuteComputeCulling(ICommandBuffer cmd, int cascadeIndex) => ExecuteComputeCulling(cmd, cascadeIndex);
 
@@ -525,6 +764,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	void IBatchRenderer.ExecuteDrawBatching(ICommandBuffer cmd, ICullResult cullResult, BatchDrawFilter filter) =>
 		ExecuteDrawBatching(cmd, (CullResult)cullResult, filter);
+
+	void IBatchRenderer.ExecuteDrawPunctualShadow(ICommandBuffer cmd, ICullResult cullResult, int sliceIndex) =>
+		ExecuteDrawPunctualShadow(cmd, (CullResult)cullResult, sliceIndex);
 
 	/// <summary>См. <see cref="IBatchRenderer.SetMaterialTransparent"/>. Влияет только на выбор
 	/// диапазонов в <see cref="ExecuteDrawBatching(ICommandBuffer, CullResult, BatchDrawFilter)"/> -
@@ -651,6 +893,14 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);
 		cmd.TransitionResource(cullResult.IndirectArgsBuffers, ResourceState.IndirectArgument);
 
+		// Результаты кластеризации светов (UAV после ExecuteLightClustering) - на чтение пиксельным
+		// шейдером. Переход здесь, а не в кластеризации: сюда приходит КАЖДЫЙ рисующий путь,
+		// включая превью без кластеризации (тогда буферы просто остаются нулевыми).
+		cmd.TransitionResource(_punctualLightsBuffer, ResourceState.ShaderResource);
+		cmd.TransitionResource(_clusterCountsBuffer, ResourceState.ShaderResource);
+		cmd.TransitionResource(_clusterIndicesBuffer, ResourceState.ShaderResource);
+		cmd.TransitionResource(_punctualShadowMatricesBuffer, ResourceState.ShaderResource);
+
 		cmd.SetVertexBuffers(0, [_megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 		cmd.SetIndexBuffer(_megaIndexBufferGPU, 0);
 
@@ -682,7 +932,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return _api.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Instancing PSO",
-			RenderTargetFormats = [_api.SwapChainColorFormat],
+			RenderTargetFormats = [RenderColorFormat],
 			DepthStencilFormat = _api.SwapChainDepthFormat,
 			SampleCount = _sampleCount,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
@@ -711,7 +961,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return _api.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = $"Instancing PSO ({topology})",
-			RenderTargetFormats = [_api.SwapChainColorFormat],
+			RenderTargetFormats = [RenderColorFormat],
 			DepthStencilFormat = _api.SwapChainDepthFormat,
 			SampleCount = _sampleCount,
 			PrimitiveTopology = topology,
@@ -744,7 +994,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return _api.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Wireframe Overlay PSO",
-			RenderTargetFormats = [_api.SwapChainColorFormat],
+			RenderTargetFormats = [RenderColorFormat],
 			DepthStencilFormat = _api.SwapChainDepthFormat,
 			SampleCount = _sampleCount,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
@@ -777,8 +1027,13 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_indirectArgsBuffers?.Release();
 		_megaVertexBufferGPU?.Release();
 		_megaIndexBufferGPU?.Release();
+		_punctualLightsBuffer?.Release();
+		_clusterCountsBuffer?.Release();
+		_clusterIndicesBuffer?.Release();
+		_punctualShadowMatricesBuffer?.Release();
 		_shadowRenderer?.Release();
 		_cullingMaterial?.Release();
+		_lightClusterMaterial?.Release();
 		UnsafeArray.Free(_indirectDatas);
 		UnsafeArray.Free(_cpuBatchCounters);
 	}

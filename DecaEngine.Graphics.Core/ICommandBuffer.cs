@@ -48,6 +48,13 @@ public interface ICommandBuffer
 	void UpdateBuffer<T>(IBufferHandle buffer, NativeArray<T> data) where T : unmanaged;
 	unsafe void UpdateBuffer<T>(IBufferHandle buffer, UnsafeArray* data) where T : unmanaged;
 
+	/// <summary>Управляемый колбэк ВНУТРИ реплея заморожённого буфера - точка врезки нативных
+	/// библиотек (FSR/DLSS), которые пишут в командный лист кадра мимо Diligent (см.
+	/// NativeUpscalePass). Исполняется на КАЖДОМ реплее, в позиции записи. Колбэк, трогающий
+	/// командный лист напрямую, обязан после себя вернуть контекст в согласованное состояние
+	/// (InvalidateState) - это забота самого колбэка.</summary>
+	void Callback(Action callback);
+
 	void BeginRecording();
 	void EndRecording();
 	void Execute();

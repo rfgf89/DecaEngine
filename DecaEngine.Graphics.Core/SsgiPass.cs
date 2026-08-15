@@ -16,15 +16,19 @@ public sealed class SsgiPassResources : IReleaseObject
 	internal IMaterialObject GiMaterial { get; }
 	internal IMaterialObject CompositeMaterial { get; }
 
+	/// <param name="colorFormat">Формат цветового таргета (RGBA16F в HDR-режиме превью): его берут и
+	/// PSO композита, и сам GI-таргет - bounce собирается из линейного HDR-кадра, и в RGBA8 яркие
+	/// участки клипались бы в единицу ещё до композита.</param>
 	public SsgiPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, string colorTargetName,
-		uint width, uint height, IGpuTexture depthTarget, IGpuTexture sceneCopyTarget, bool msaaDepth)
+		uint width, uint height, IGpuTexture depthTarget, IGpuTexture sceneCopyTarget, bool msaaDepth,
+		TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
 	{
 		GiTarget = graphicsApi.CreateRenderTarget(new TextureInfo
 		{
 			name = colorTargetName + " SSGI",
 			width = width,
 			height = height,
-			format = TextureObjectFormat.R8G8B8A8UNorm,
+			format = colorFormat,
 		});
 
 		// У КАЖДОГО материала свой экземпляр VS - см. комментарий в SsaoPassResources (двойной
@@ -37,7 +41,7 @@ public sealed class SsgiPassResources : IReleaseObject
 		var postProcessState = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "SSGI PostProcess PSO",
-			RenderTargetFormats = [TextureObjectFormat.R8G8B8A8UNorm],
+			RenderTargetFormats = [colorFormat],
 			DepthStencilFormat = TextureObjectFormat.Unknown,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
@@ -55,7 +59,10 @@ public sealed class SsgiPassResources : IReleaseObject
 		// Источник bounce-света - копия кадра (Load по пикселю, сэмплер не нужен).
 		GiMaterial.SetTexture("_SceneTex", sceneCopyTarget);
 
-		var compositePs = graphicsApi.CreateShader("SSGI Composite PS", "EditorAssets/shader", "SsgiCompositePS.hlsl", ShaderObjectType.Pixel);
+		// Композит билатеральный (размытие bounce по глубине, см. SsgiCompositeCommon.hlsl),
+		// поэтому у него та же пара обёрток под депт, что у самой оценки GI.
+		var compositePs = graphicsApi.CreateShader("SSGI Composite PS", "EditorAssets/shader",
+			msaaDepth ? "SsgiCompositeMsaaPS.hlsl" : "SsgiCompositePS.hlsl", ShaderObjectType.Pixel);
 		CompositeMaterial = graphicsApi.CreateMaterial("SSGI Composite Material");
 		CompositeMaterial.SetShader(compositeVs, compositePs);
 		CompositeMaterial.SetState(postProcessState);
@@ -71,19 +78,53 @@ public sealed class SsgiPassResources : IReleaseObject
 		CompositeMaterial.SetImmutableSampler("_SceneTex", postProcessSampler);
 		CompositeMaterial.SetTexture("_GiTex", GiTarget);
 		CompositeMaterial.SetImmutableSampler("_GiTex", postProcessSampler);
+		CompositeMaterial.SetTexture("_DepthTex", depthTarget);
 
 		// Иначе cbuffer остался бы с мусором до первого пуша (кадрирование случается только
 		// после загрузки модели, а GI-пасс рисует с первого кадра) - см. SsaoPassResources.
 		SetWorldRange(0f);
+		SetCompositeParams(DefaultBlurRadius, false);
 	}
 
-	/// <summary>Layout of the "GiConstants" cbuffer в SsgiCommon.hlsl - ровно 16 байт
+	/// <summary>Дефолты ручек SSGI - ими же инициализируется кбуфер до первого пуша из окна
+	/// Graphics и они же служат стартовыми значениями в <see cref="EditorSettings"/>-аналогах.</summary>
+	public const float DefaultIntensity = 1.0f;
+	public const int DefaultSampleCount = 16;
+	public const float DefaultMaxLuminance = 4f;
+	public const float DefaultSaturation = 0.8f;
+	public const int DefaultBlurRadius = 2;
+
+	/// <summary>Потолки, зашитые в шейдеры (GiMaxTaps в SsgiCommon.hlsl, GiMaxBlurRadius в
+	/// SsgiCompositeCommon.hlsl): границы циклов там статические, и значение выше просто
+	/// клампится - выносим их сюда, чтобы UI не предлагал недостижимое.</summary>
+	public const int MaxSampleCount = 32;
+	public const int MaxBlurRadius = 3;
+
+	/// <summary>Layout of the "GiConstants" cbuffer в SsgiCommon.hlsl - 32 байта
 	/// (SetConstant грузит размер структуры, округлённый вверх до 16).</summary>
 	private struct GiConstantsData
 	{
 		public float WorldRange;
+		public float Intensity;
+		public float SampleCount;
+		public float MaxLuminance;
+		public float Saturation;
 		public float Pad0, Pad1, Pad2;
 	}
+
+	/// <summary>Layout of the "GiComposite" cbuffer в SsgiCompositeCommon.hlsl - ровно 16 байт.</summary>
+	private struct GiCompositeData
+	{
+		public float BlurRadius;
+		public float DebugView;
+		public float Pad0, Pad1;
+	}
+
+	private float _worldRange;
+	private float _intensity = DefaultIntensity;
+	private float _sampleCount = DefaultSampleCount;
+	private float _maxLuminance = DefaultMaxLuminance;
+	private float _saturation = DefaultSaturation;
 
 	/// <summary>Мировой радиус сбора GI. Пушится после кадрирования модели как доля её
 	/// габаритного радиуса (см. ModelPreviewViewport.FrameAll) - шире AO-шного, bounce тянется
@@ -91,7 +132,46 @@ public sealed class SsgiPassResources : IReleaseObject
 	/// глубины точки - см. SsgiCommon.hlsl).</summary>
 	public void SetWorldRange(float worldRange)
 	{
-		var data = new GiConstantsData { WorldRange = worldRange };
+		_worldRange = worldRange;
+		PushGiConstants();
+	}
+
+	/// <summary>Живые ручки оценки GI - окно Graphics (см. GraphicsSettingsWindow).
+	/// Радиус сохраняется прежним.</summary>
+	/// <param name="maxLuminance">Потолок яркости ОДНОГО тапа (firefly clamp): в HDR-кадре
+	/// солнечное пятно рядом с тенью даёт тап в десятки единиц, и один такой из восьми превращал
+	/// пасс в цветной снег. 0 = без ограничения.</param>
+	public void SetParams(float intensity, int sampleCount, float maxLuminance, float saturation)
+	{
+		_intensity = intensity;
+		_sampleCount = Math.Clamp(sampleCount, 4, MaxSampleCount);
+		_maxLuminance = maxLuminance;
+		_saturation = saturation;
+		PushGiConstants();
+	}
+
+	/// <summary>Живые ручки композита: радиус билатерального размытия bounce и отладочный вид
+	/// (вывести один только GI вместо кадра) - см. SsgiCompositeCommon.hlsl.</summary>
+	public void SetCompositeParams(int blurRadius, bool debugView)
+	{
+		var data = new GiCompositeData
+		{
+			BlurRadius = Math.Clamp(blurRadius, 0, MaxBlurRadius),
+			DebugView = debugView ? 1f : 0f,
+		};
+		CompositeMaterial.SetConstant("GiComposite", ref data);
+	}
+
+	private void PushGiConstants()
+	{
+		var data = new GiConstantsData
+		{
+			WorldRange = _worldRange,
+			Intensity = _intensity,
+			SampleCount = _sampleCount,
+			MaxLuminance = _maxLuminance,
+			Saturation = _saturation,
+		};
 		GiMaterial.SetConstant("GiConstants", ref data);
 	}
 
@@ -103,6 +183,7 @@ public sealed class SsgiPassResources : IReleaseObject
 		GiMaterial.SetTexture("_SceneTex", sceneCopyTarget);
 		CompositeMaterial.SetTexture("_SceneTex", sceneCopyTarget);
 		CompositeMaterial.SetTexture("_GiTex", GiTarget);
+		CompositeMaterial.SetTexture("_DepthTex", depthTarget);
 	}
 
 	public void Release()
@@ -145,8 +226,25 @@ public sealed class SsgiPass : RenderGraphPass<SsgiPass.PassData>
 		_viewPortRef = viewPortRef;
 	}
 
+	/// <summary>Объявляет графу таргеты пасса - см. <see cref="ForwardPass.Setup"/>.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
+		// Кадр и читается (источник копии и bounce), и пишется (композит).
+		var color = builder.ImportTexture(_colorTarget);
+		builder.ReadTarget(color);
+		builder.WriteTarget(color);
+
+		// Копия кадра переснимается ЭТИМ пассом - для него она и вход, и выход.
+		var sceneCopy = builder.ImportTexture(_sceneCopy);
+		builder.WriteTarget(sceneCopy);
+		builder.ReadTarget(sceneCopy);
+
+		builder.ReadTarget(builder.ImportTexture(_renderDepth));
+
+		var gi = builder.ImportTexture(_resources.GiTarget);
+		builder.WriteTarget(gi);
+		builder.ReadTarget(gi);
+
 		return default;
 	}
 

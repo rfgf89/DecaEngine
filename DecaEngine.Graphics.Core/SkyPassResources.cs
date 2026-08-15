@@ -13,8 +13,11 @@ public sealed class SkyPassResources : IReleaseObject
 {
 	private readonly IMaterialObject _material;
 
+	/// <param name="colorFormat">Формат цветового таргета, в который небо рисуется инлайн внутри
+	/// <see cref="ForwardPass"/> - в HDR-режиме превью это RGBA16F, и PSO обязан совпадать с
+	/// привязанным таргетом (см. <see cref="PipelineRenderTargets.RenderColorFormat"/>).</param>
 	public SkyPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, IGpuTexture environmentMap,
-		uint msaaSamples)
+		uint msaaSamples, TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
 	{
 		var skyVs = graphicsApi.CreateShader("Sky Background VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var skyPs = graphicsApi.CreateShader("Sky Background PS", "EditorAssets/shader", "SkyBackgroundPS.hlsl", ShaderObjectType.Pixel);
@@ -24,7 +27,7 @@ public sealed class SkyPassResources : IReleaseObject
 		_material.SetState(graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Sky Background PSO",
-			RenderTargetFormats = [TextureObjectFormat.R8G8B8A8UNorm],
+			RenderTargetFormats = [colorFormat],
 			DepthStencilFormat = TextureObjectFormat.D32Float,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
@@ -47,6 +50,7 @@ public sealed class SkyPassResources : IReleaseObject
 		// SkySettings обязан быть привязан до первого Draw: без этого дескриптор пустой
 		// (VUID-vkCmdDraw-None-08114) и шейдер читает мусор, пока пользователь не тронет ползунок
 		// света (единственный другой вызов SetEnvironmentYaw - ApplyLightRotation).
+		_hdrOutput = colorFormat != TextureObjectFormat.R8G8B8A8UNorm;
 		SetEnvironmentYaw(0f);
 	}
 
@@ -55,15 +59,38 @@ public sealed class SkyPassResources : IReleaseObject
 	private struct SkySettingsData
 	{
 		public float EnvYawRadians;
-		public float Pad0, Pad1, Pad2;
+
+		/// <summary>>0.5 - писать линейную яркость вместо display-энкода (HDR-конвейер).</summary>
+		public float HdrOutput;
+
+		public float Pad1, Pad2;
 	}
+
+	private bool _hdrOutput;
+	private float _envYawRadians;
 
 	/// <summary>Пользовательский поворот энвайронмента вокруг Y в радианах (ползунок света в
 	/// превью): сдвигает equirect-U фонового неба тем же значением, что уходит в PbrEnvYaw
 	/// материалов модели (см. UnlitInstancedPS.hlsl), - фон и отражения вращаются синхронно.</summary>
 	public void SetEnvironmentYaw(float radians)
 	{
-		var data = new SkySettingsData { EnvYawRadians = radians };
+		_envYawRadians = radians;
+		PushSettings();
+	}
+
+	/// <summary>Писать ли небу ЛИНЕЙНУЮ яркость. Обычно совпадает с HDR-режимом конвейера, но
+	/// сбрасывается на время passthrough-режимов тонемапа (отладочные каналы/AO debug): там кадр
+	/// копируется в отображаемый таргет как есть, и линейное небо ушло бы туда без энкода - заметно
+	/// темнее, чем то же небо в LDR-конвейере. См. <see cref="TonemapPassResources.SetPassthrough"/>.</summary>
+	public void SetHdrOutput(bool hdrOutput)
+	{
+		_hdrOutput = hdrOutput;
+		PushSettings();
+	}
+
+	private void PushSettings()
+	{
+		var data = new SkySettingsData { EnvYawRadians = _envYawRadians, HdrOutput = _hdrOutput ? 1f : 0f };
 		_material.SetConstant("SkySettings", ref data, HandleAccess.Pixel);
 	}
 

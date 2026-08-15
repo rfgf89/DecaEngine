@@ -1,4 +1,4 @@
-using DecaEngine.Graphics.Core;
+﻿using DecaEngine.Graphics.Core;
 using Diligent;
 
 namespace DecaEngine.Core;
@@ -13,6 +13,21 @@ public struct MaterialDrawRange
 
 public interface IMaterialObject : IStateObject
 {
+	/// <summary>Освобождает ли <see cref="IReleaseObject.Release"/> этого материала свои шейдеры.
+	///
+	/// По умолчанию true, и это верно для подавляющего большинства материалов движка: каждый пасс
+	/// заводит СВОЙ экземпляр шейдера именно затем, чтобы материал мог его освободить (см.
+	/// SsaoPassResources и родственные - там об этом прямо написано).
+	///
+	/// Но у загрузчика моделей всё наоборот: один вершинный шейдер и горстка вариантов пиксельного
+	/// ШАРЯТСЯ между всеми материалами модели - ради этого вариантный кэш и существует, компиляция
+	/// стоит сотни миллисекунд. Освобождение шейдера материалом - это декремент счётчика ссылок
+	/// НАТИВНОГО объекта, и двадцать пять материалов на одну ссылку уводят счётчик в минус: объект
+	/// уничтожается на первых вызовах, а следующие бьют в освобождённую память
+	/// (0xC0000005 в Diligent.ComObject.Release). Такие материалы обязаны выставлять false, а
+	/// владелец шейдеров освобождает их сам, по одному разу (см. ModelLoader.Release).</summary>
+	bool OwnsShaders { get; set; }
+
 	PipelineStateType IStateObject.StateType => PipelineStateType.Graphics;
 
 	public void SetState(IStateObject stateObject);

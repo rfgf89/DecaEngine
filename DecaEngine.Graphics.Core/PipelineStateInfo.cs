@@ -66,6 +66,11 @@ public struct RasterizerStateInfo
 	public CullModeType CullMode;
 	public FillModeType FillMode;
 	public int DepthBias;
+
+	/// <summary>Наклонозависимый депт-байас (D3D SlopeScaledDepthBias): смещение растёт с
+	/// крутизной полигона к камере/свету. Нужен shadow map-у с CullMode None - у поверхностей
+	/// под скользящим углом к свету константного байаса не хватает (акне полосами).</summary>
+	public float SlopeScaledDepthBias;
 }
 
 public struct DepthStencilStateInfo

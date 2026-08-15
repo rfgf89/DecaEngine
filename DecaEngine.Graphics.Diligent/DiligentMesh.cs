@@ -16,6 +16,11 @@ public class DiligentMesh : IMeshObject
 	public int VertexCount { get; private set; }
 	public int IndexCount { get; private set; }
 
+	/// <summary>Размер вершины в байтах. Нужен построению BLAS: аппаратная трассировка читает
+	/// позиции прямо из вершинного буфера и требует шаг явно (позиция лежит первым полем -
+	/// см. ModelLoader.Vertex).</summary>
+	public int VertexStride { get; private set; }
+
 	public Vector3 Center { get; private set; }
 	public float Radius { get; private set; }
 
@@ -32,6 +37,14 @@ public class DiligentMesh : IMeshObject
 		Name = name;
 		_device = device;
 	}
+
+	/// <summary>Флаг RayTracing на геометрические буферы - без него из них нельзя построить BLAS.
+	/// Ставится ТОЛЬКО когда устройство фичу включило: на железе без трассировки этот флаг сделал бы
+	/// создание буфера невалидным, а мешей в сцене тысячи.</summary>
+	private BindFlags RayTracingBindFlag() =>
+		_device.GetDeviceInfo().Features.RayTracing == DeviceFeatureState.Enabled
+			? BindFlags.RayTracing
+			: BindFlags.None;
 
 	public unsafe void SetVertices<T>(T[] vertices) where T : unmanaged
 	{
@@ -71,12 +84,13 @@ public class DiligentMesh : IMeshObject
 	private unsafe void UpdateVertexBuffer<T>() where T : unmanaged
 	{
 		ulong size = (ulong)(VertexCount * sizeof(T));
+		VertexStride = sizeof(T);
 
 		var vbDesc = new BufferDesc
 		{
 			Name = $"{Name} Vertex Buffer",
 			Usage = Usage.Immutable,
-			BindFlags = BindFlags.VertexBuffer,
+			BindFlags = BindFlags.VertexBuffer | RayTracingBindFlag(),
 			Size = size
 		};
 
@@ -135,7 +149,7 @@ public class DiligentMesh : IMeshObject
 		{
 			Name = $"{Name} Index Buffer",
 			Usage = Usage.Immutable,
-			BindFlags = BindFlags.IndexBuffer,
+			BindFlags = BindFlags.IndexBuffer | RayTracingBindFlag(),
 			Size = size
 		};
 
@@ -172,8 +186,29 @@ public class DiligentMesh : IMeshObject
 		VertexCount = 0;
 		IndexCount = 0;
 
-		if (VertexData != null) UnsafeArray.Free(VertexData);
-		if (IndexData != null) UnsafeArray.Free(IndexData);
-		if (_lodLevels != null) UnsafeArray.Free(_lodLevels);
+		// Указатели ОБЯЗАНЫ обнуляться, и по двум независимым причинам:
+		//
+		// 1. Повторный Release иначе освобождает уже освобождённую память - порча кучи.
+		// 2. Наружу VertexData/IndexData отдаются как признак «CPU-копия геометрии есть»: probe GI
+		//    строит по ним BVH и проверяет ровно на null (см. ProbeGiBaker и
+		//    PrefabSceneViewport.CollectSceneGeometry). Висячий ненулевой указатель прошёл бы эту
+		//    проверку и дал чтение освобождённой памяти вместо честного пропуска меша.
+		if (VertexData != null)
+		{
+			UnsafeArray.Free(VertexData);
+			VertexData = null;
+		}
+
+		if (IndexData != null)
+		{
+			UnsafeArray.Free(IndexData);
+			IndexData = null;
+		}
+
+		if (_lodLevels != null)
+		{
+			UnsafeArray.Free(_lodLevels);
+			_lodLevels = null;
+		}
 	}
 }

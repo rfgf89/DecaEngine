@@ -9,6 +9,15 @@ public static class EditorMain
 
 	private static void Main(string[] args)
 	{
+		// До ЛЮБОЙ ветки: нативные либы апскейлеров нужны и редактору, и CLI-пробам, а P/Invoke
+		// грузит их лениво - на этот момент ничего ещё не загружено и копирование безопасно.
+		NativeLibraryDeployer.Deploy();
+
+		// DirectX Agility SDK - СТРОГО до создания D3D12-устройства (Diligent создаёт его при
+		// инициализации графики). Требует режима разработчика Windows; при неудаче остаёмся на
+		// встроенном рантайме - это штатно. DECA_AGILITY=0 - выключить.
+		NativeLibraryDeployer.TryEnableAgilitySdk();
+
 		if (args.Length > 0 && args[0] == "--preview-probe")
 		{
 			DiligentGraphicsApi.DebugMessage += (severity, message, function, file, line) =>

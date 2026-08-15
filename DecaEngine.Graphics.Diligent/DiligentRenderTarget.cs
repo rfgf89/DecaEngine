@@ -52,7 +52,7 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void CreateTexture()
 		{
-			var (dilFormat, bindFlags) = DiligentResourceFormats.ToRenderTargetFormat(_info.format);
+			var (dilFormat, bindFlags) = DiligentResourceFormats.ToRenderTargetFormat(_info.format, _info.access);
 
 			var desc = new TextureDesc
 			{

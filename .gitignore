@@ -402,3 +402,25 @@ FodyWeavers.xsd
 .idea/
 bin/
 obj/
+# DecaEngine: local debug/probe artifacts
+probe_*/
+probe-*/
+_enumprobe/
+_mvprobe/
+_reflect_tmp2/
+_*.py
+*.csx
+gtao_fixed_backup.hlsl
+sample_shot1.png
+hs_err_pid*.log
+replay_pid*.log
+
+# Vendored binaries / SDK archives (restore manually, not versioned)
+external/
+NativeLibrary/
+*.zip
+
+# Native shim build output
+native/**/build/
+preview-probe/
+preview-probe-result/

@@ -18,7 +18,12 @@ namespace DecaEngine.Editor;
 
 public enum WindowType
 {
-	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView, Settings
+	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView, Settings, Graphics,
+#if DEBUG
+	/// <summary>Окно отладки рендер-графа (см. <see cref="RenderGraphDebugWindow"/>) - только в DEBUG,
+	/// потому что снимки графа в Release не собираются вовсе.</summary>
+	RenderGraph,
+#endif
 }
 
 public class EditorManager : TimeLoopCore
@@ -34,9 +39,6 @@ public class EditorManager : TimeLoopCore
 	private IRenderHandle _renderHandle;
 	private DebugWindow _debugWindow;
 	private MenuBarWindow _menuBarWindow;
-#if DEBUG
-	private RenderGraphDebugWindow _renderGraphDebugWindow;
-#endif
 
 	// --- ECS ---
 	private EntityStore _ecsWorld;
@@ -45,6 +47,8 @@ public class EditorManager : TimeLoopCore
 	private ProjectSession _projectSession;
 	private EditorSettings _editorSettings;
 	private ModelPreviewViewport _modelPreviewViewport;
+	private PrefabSceneViewport _prefabSceneViewport;
+	private InspectorWindow _inspectorWindow;
 	private ModelIconCache _modelIconCache;
 	private ModelIconBaker _modelIconBaker;
 	// --- /ECS ---
@@ -84,7 +88,7 @@ public class EditorManager : TimeLoopCore
 		{
 			_windowHandle.Initialize("DecaEngine Editor", 0, new Vector2(1920, 1080));
 			_windowHandle.LoadAndSetIcon(Path.Combine(Environment.CurrentDirectory, "EditorAssets/Icons", "download (6).jpg"));
-			_graphicsApi.Initialize(GraphicsBackend.Vulkan);
+			_graphicsApi.Initialize(GraphicsBackend.D3D12);
 
 			_imGuiManager.Initialize();
 
@@ -129,7 +133,7 @@ public class EditorManager : TimeLoopCore
 			};
 			_root.AddStore(_ecsWorld);
 
-		BeginLoadDefaultScene();
+		CreateSceneSunEntity();
 
 		_projectSession = new ProjectSession(_graphicsApi, _renderHandle, _ecsWorld, _root);
 		_imGuiManager.ImGuiRender.UiScaleMultiplier = _editorSettings.UiScaleMultiplier;
@@ -146,7 +150,12 @@ public class EditorManager : TimeLoopCore
 		_modelIconCache = new ModelIconCache(_graphicsApi, _imGuiManager.ImGuiRender);
 		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache);
 		var inspectorWindow = new InspectorWindow("Inspector", _modelPreviewViewport, _imGuiManager.ImGuiRender);
+		_inspectorWindow = inspectorWindow;
 		inspectorWindow.Show();
+
+		// GPU-вьюпорт окна Scene View (рендер префаба по AssetRef-ам, см. PrefabSceneViewport) -
+		// один на редактор, окна Scene View его разделяют (как Inspector разделяет превью моделей).
+		_prefabSceneViewport = new PrefabSceneViewport(_graphicsApi, _editorSettings, _projectSession);
 
 		// ВРЕМЕННО: DECA_AUTOLOAD_MODEL=<путь> грузит модель в превью сразу при старте - для
 		// автоматизированного репро багов загрузки/AO без ручных кликов по Asset Browser-у.
@@ -155,151 +164,41 @@ public class EditorManager : TimeLoopCore
 		{
 			_modelPreviewViewport.LoadModel(autoLoadModel);
 		}
-		_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.SceneView, () => new SceneViewWindow("Scene View", inspectorWindow, _imGuiManager.ImGuiRender));
-		new SceneViewWindow("Scene View", inspectorWindow, _imGuiManager.ImGuiRender).Show();
+		_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.SceneView, () => new SceneViewWindow("Scene View", inspectorWindow, _prefabSceneViewport, _imGuiManager.ImGuiRender));
+		new SceneViewWindow("Scene View", inspectorWindow, _prefabSceneViewport, _imGuiManager.ImGuiRender).Show();
 		new HierarchyWindow("Hierarchy", _imGuiManager.ImGuiRender).Show();
 			new ConsoleWindow("Console", _imGuiManager.ImGuiRender).Show();
 
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Settings,
 				() => new SettingsWindow("Settings", _editorSettings, _imGuiManager.ImGuiRender));
+			// Окно Graphics (все настройки превью-графики + probe-GI, см. GraphicsSettingsWindow) -
+			// открывается из меню Window; ссылка на вьюпорт нужна для статуса/ребейка проб.
+			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Graphics,
+				() => new GraphicsSettingsWindow("Graphics", _editorSettings, _modelPreviewViewport, _prefabSceneViewport, _imGuiManager.ImGuiRender));
 			new AssetBrowserWindow("Asset Browser", _projectSession, inspectorWindow, _modelIconCache, _modelIconBaker, _imGuiManager.ImGuiRender).Show();
 			projectWindow.Show();
 			//_debugWindow = new DebugWindow("Debug", _ecsWorld, _batchRenderer, _imGuiManager.ImGuiRender);
 			//_debugWindow.ForceShow();
 
 #if DEBUG
-			//_renderGraphDebugWindow = new RenderGraphDebugWindow("Render Graph Debugger", _pipeline, _imGuiManager.ImGuiRender);
-			//_renderGraphDebugWindow.ForceShow();
+			// Окно отладки рендер-графа открывается из меню Window и САМО находит все живые конвейеры
+			// через GraphicsPipelineRegistry - здесь передаётся лишь тот, на котором оно откроется
+			// по умолчанию (основная сцена).
+			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.RenderGraph,
+				() => new RenderGraphDebugWindow("Render Graph Debugger", _imGuiManager.ImGuiRender, _pipeline));
 #endif
 		}
 	}
 
-	private ModelLoader _modelLoader;
-	private ModelLoader.ModelLoadRequest _defaultSceneLoadRequest;
-	private EditorLoadingStatus.Handle _defaultSceneLoadHandle;
-
-	private void BeginLoadDefaultScene()
+	/// <summary>Солнце главной сцены: направленный свет с каскадными тенями.
+	///
+	/// Раньше это было хвостом CreateTestSceneEntities - функции, которая грузила с диска
+	/// EditorAssets/models/result.gltf (6.8 МБ, с оптимизацией мешей и генерацией LOD-ов) и населяла
+	/// ею сцену на КАЖДОМ запуске редактора, независимо от того, открывают проект или нет. Демо-сцена
+	/// удалена целиком; солнце осталось, потому что оно не тестовое - без него у главной сцены нет ни
+	/// направленного света, ни каскадов теней.</summary>
+	private void CreateSceneSunEntity()
 	{
-		_defaultSceneLoadRequest = ModelLoader.BeginLoadAsync(_graphicsApi, ModelLoader.DefaultModelPath, new ModelLoadOptions
-		{
-			VertexShader = _editorSettings.DefaultVertexShader,
-			PixelShader = _editorSettings.DefaultPixelShader,
-			OptimizeMesh = true,
-			GenerateLods = true
-		});
-		_defaultSceneLoadHandle = EditorLoadingStatus.Begin("Loading scene");
-	}
-
-	private void PollDefaultSceneLoad()
-	{
-		if (_defaultSceneLoadRequest == null)
-		{
-			return;
-		}
-
-		_defaultSceneLoadHandle.Progress = _defaultSceneLoadRequest.Progress;
-
-		if (!_defaultSceneLoadRequest.PrepareTask.IsCompleted)
-		{
-			return;
-		}
-
-		if (_defaultSceneLoadRequest.PrepareTask.IsCompletedSuccessfully)
-		{
-			// Покадровая финализация: страницы upload-хипа Diligent возвращает только на Present,
-			// так что заливка всей сцены одним кадром раздувала host-visible память до 2.5+ GB
-			// («upload heap peak frame size»). null = бюджет кадра исчерпан, продолжим на следующем.
-			var loader = _defaultSceneLoadRequest.FinalizeChunk();
-			if (loader == null)
-			{
-				return;
-			}
-
-			_modelLoader = loader;
-			CreateTestSceneEntities();
-		}
-		else
-		{
-			EditorConsoleLog.Add(LogLevel.Error,
-				$"Failed to load default scene: {_defaultSceneLoadRequest.PrepareTask.Exception?.GetBaseException().Message}");
-		}
-
-		EditorLoadingStatus.End(_defaultSceneLoadHandle);
-		_defaultSceneLoadRequest = null;
-	}
-
-	private void CreateTestSceneEntities()
-	{
-		// UnlitInstancedPS статически использует PreviewSettings и _EnvMap, поэтому дескрипторы
-		// обязаны быть привязаны и у материалов главной сцены (иначе Vulkan-валидация:
-		// VUID-vkCmdDrawIndexedIndirect-None-08114 "has never been updated", а на части драйверов -
-		// чтение мусора). Zero-init PreviewSettings = Textured-режим, в нём _EnvMap не читается,
-		// но дескриптор всё равно должен указывать на живую текстуру.
-		var environment = PreviewEnvironmentMap.Create(_graphicsApi);
-		var environmentSampler = _graphicsApi.CreateSampler(
-			name: "_EnvMap_Sampler",
-			filter: TextureFilter.Linear,
-			address: TextureAddress.Wrap,
-			comparisonFunction: CompFunction.Always,
-			border: Vector4.Zero);
-		var previewDefaults = new PreviewSettingsData();
-
-		var baseMaterialState = _batchRenderer.GetBaseState();
-		var materialIdMap = new Dictionary<int, MaterialId>();
-		for (int i = 0; i < _modelLoader.materialObjects.Count; i++)
-		{
-			var kvp = _modelLoader.materialObjects.GetAt(i);
-			var materialObj = kvp.Value;
-			materialObj.SetState(baseMaterialState);
-
-			var matId = _batchRenderer.Register(materialObj);
-			materialIdMap.Add(kvp.Key, matId);
-
-			materialObj.SetConstant("PreviewSettings", ref previewDefaults, HandleAccess.Pixel);
-			materialObj.SetTexture("_EnvMap", environment.Texture);
-			materialObj.SetImmutableSampler("_EnvMap", environmentSampler);
-		}
-
-		var meshIdMap = new Dictionary<int, MeshId>();
-		for (int i = 0; i < _modelLoader.Meshes.Count; i++)
-		{
-			var meshObj = _modelLoader.Meshes[i];
-			var meshId = _batchRenderer.Register(meshObj);
-			meshIdMap.Add(i, meshId);
-		}
-
-		var batchCache = new Dictionary<(int, int), BatchId>();
-
-		for (int i = 0; i < _modelLoader.instances.Count; i++)
-		{
-			var instance = _modelLoader.instances[i];
-
-			if (!meshIdMap.TryGetValue(instance.meshId, out var mId))
-			{
-				continue;
-			}
-
-			if (!materialIdMap.TryGetValue(instance.materialId, out var matId))
-			{
-				matId = materialIdMap[-1];
-			}
-
-			if (!batchCache.TryGetValue((instance.meshId, instance.materialId), out var batchId))
-			{
-				batchId = _batchRenderer.CreateBatch(mId, matId);
-				batchCache.Add((instance.meshId, instance.materialId), batchId);
-			}
-
-			var entity = _ecsWorld.CreateEntity(
-				new Position(instance.transform.position.X, instance.transform.position.Y, instance.transform.position.Z),
-				new Scale3(instance.transform.scale.X, instance.transform.scale.Y, instance.transform.scale.Z),
-				new Rotation(instance.transform.rotation.X, instance.transform.rotation.Y, instance.transform.rotation.Z, instance.transform.rotation.W),
-				Tags.Get<GpuUpdateTag>()
-			);
-
-			_renderResourceManager.RegisterRenderable(entity, batchId);
-		}
-
         _ecsWorld.CreateEntity(
             new Position(0, 50, 0),
             new Rotation { value = Quaternion.CreateFromYawPitchRoll(0, 45, 0) },
@@ -338,8 +237,6 @@ public class EditorManager : TimeLoopCore
 
 		lock (GameHostBridge.GpuSync)
 		{
-			PollDefaultSceneLoad();
-
 			// Must run before the main scene render below: each offscreen Pipeline.Execute() here
 			// rebinds the device's active render target to its own preview/icon-bake color+depth
 			// texture (see ForwardPass.WriteCommands). _pipeline.Execute() unconditionally rebinds
@@ -347,7 +244,10 @@ public class EditorManager : TimeLoopCore
 			// ImGui (and Present) would draw into whatever offscreen target was bound last instead
 			// of the backbuffer, making the whole editor appear to go blank.
 			_modelPreviewViewport.Update(deltaTime, time);
+			_prefabSceneViewport.Update(deltaTime, time, _inspectorWindow.Root, _inspectorWindow.PrefabPath,
+				_inspectorWindow.Selected);
 			_modelIconBaker.Update(deltaTime, time);
+			_inspectorWindow.UpdatePlayMode(deltaTime, time);
 
 			_root.Update(new UpdateTick(deltaTime, time));
 			_pipeline.Execute();
@@ -357,9 +257,6 @@ public class EditorManager : TimeLoopCore
 			EditorLoadingStatus.Render(_imGuiManager.ImGuiRender.UiScaleMultiplier);
 			//_debugWindow.FramePerSecond = framePerSecond;
 			//_debugWindow.Render(0);
-#if DEBUG
-			//_renderGraphDebugWindow.Render(0);
-#endif
 			_imGuiManager.AfterLayout();
 			_graphicsApi.Present();
 		}

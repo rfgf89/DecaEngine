@@ -5,6 +5,7 @@ using DecaEngine.Graphics;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Editor.ECS;
 
@@ -19,6 +20,10 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
     private RenderCamerasData _renderCamerasData;
     private DirectionalLightCascadeData _directionalLightCascadeData;
 
+    // Кадровая раскладка теневых слайсов punctual-светов: id сущности света -> первый слайс
+    // (см. PunctualShadowScheduler). Пересобирается каждый кадр, читается при сборке пула светов.
+    private readonly System.Collections.Generic.Dictionary<int, int> _punctualShadowSlices = new();
+
     public CullingAndRenderSystem(RenderResourceManager resourceManager, IGraphicsApi api, IGraphicsPipeline pipeline)
     {
         _resourceManager = resourceManager;
@@ -29,6 +34,12 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
     {
         var mainCameras = Query.Store.Query<CameraComponent>().WithoutAllComponents(ComponentTypes.Get<CascadedShadowComponent>());
         var lights = Query.Store.Query<LightComponent, SunComponent, CascadedShadowComponent>();
+
+        // Punctual-света (point/spot): всё с LightComponent, кроме солнца - оно идёт своим путём
+        // через каскадные тени выше. Кулятся ПО-ТИПОВО против фрустума каждой камеры (см.
+        // LightCulling), выжившие складываются в общий пул кадра, сегмент камеры - в её
+        // LightData.ClusterParams.
+        var punctualLightsQuery = Query.Store.Query<LightComponent>().WithoutAllComponents(ComponentTypes.Get<SunComponent>());
 
         int cameraCount = mainCameras.Count;
         if (cameraCount == 0)
@@ -60,10 +71,17 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         // Every camera needs its own view/cull data, but the shadow map(s) are shared: the
         // cascades below are fit to the first camera found (typical single-viewer setup).
         CameraComponent referenceCamera = default;
+        bool hasReferenceCamera = false;
+        Vector3 referenceCameraPos = default;
         mainCameras.ForEachEntity((ref CameraComponent camera, Entity entity) =>
         {
             camera.SetPositionAndRotation(entity.Position.value, entity.Rotation.value);
-            referenceCamera = camera;
+            if (!hasReferenceCamera)
+            {
+                hasReferenceCamera = true;
+                referenceCamera = camera;
+                referenceCameraPos = entity.Position.value;
+            }
         });
 
         LightData sharedLightData = default;
@@ -111,15 +129,46 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             });
         }
 
+        // Теневые слайсы punctual-светов - ДО сборки пер-камерных пулов: TryBuildPunctualLight
+        // читает раскладку, собирая ShadowParams. Приоритет бюджета - по дистанции до опорной камеры.
+        PunctualShadowScheduler.BuildShadowSlices(punctualLightsQuery, referenceCameraPos,
+            drawCount, ref _renderCamerasData, _punctualShadowSlices);
+
+        int punctualLightTotal = 0;
         mainCameras.ForEachEntity((ref CameraComponent camera, Entity entity) =>
         {
             var viewData = camera.CreateViewData();
             var cullData = camera.CreateCullData();
             cullData.drawCount = drawCount;
 
+            // Пер-камерный кулинг punctual-светов: сегмент камеры в общем пуле кадра начинается с
+            // текущего конца - пул один на все камеры, границы уходят в ClusterParams.
+            int segmentOffset = punctualLightTotal;
+            var cullDataCopy = cullData;
+            punctualLightsQuery.ForEachEntity((ref LightComponent light, Entity lightEntity) =>
+            {
+                if (punctualLightTotal >= LightClusters.MaxLights)
+                {
+                    return;
+                }
+
+                if (LightCulling.TryBuildPunctualLight(ref light, lightEntity, in cullDataCopy, _punctualShadowSlices, out var punctualLight))
+                {
+                    UnsafeArray.Set(_renderCamerasData.punctualLights, punctualLightTotal, punctualLight);
+                    punctualLightTotal++;
+                }
+            });
+
+            var cameraLightData = sharedLightData;
+            cameraLightData.ClusterParams = new Vector4(
+                segmentOffset,
+                punctualLightTotal - segmentOffset,
+                MathF.Max(cullData.znear, 0.01f),
+                MathF.Max(cullData.zfar, MathF.Max(cullData.znear, 0.01f) * 2f));
+
             _renderCamerasData.viewData.Add(viewData);
             _renderCamerasData.cullData.Add(cullData);
-            _renderCamerasData.lightData.Add(sharedLightData);
+            _renderCamerasData.lightData.Add(cameraLightData);
         });
     }
 
@@ -167,15 +216,21 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             float farY = f * tanHalfFov;
             float farX = farY * camera.data.aspect;
 
+            // Камера LH, forward = +Z (см. MakePerspectiveReversedZ: clip.w = +z_view; тот же
+            // приём в SimpleCullingAndRenderSystem.FitFrustumSlice - pos + forward*dist).
+            // Прежние -n/-f (RH-конвенция) фитили каскады к срезам ПОЗАДИ камеры: внутри сцены
+            // (превью Sponza) геометрия всё равно попадала в сферы и это маскировалось, а в
+            // Scene View с орбитальной камерой снаружи мелкие каскады висели в пустоте за спиной
+            // и вся видимая геометрия доставалась одному крупному.
             Vector3[] cornersViewSpace = new Vector3[8];
-            cornersViewSpace[0] = new Vector3(-nearX, -nearY, -n);
-            cornersViewSpace[1] = new Vector3(nearX, -nearY, -n);
-            cornersViewSpace[2] = new Vector3(nearX, nearY, -n);
-            cornersViewSpace[3] = new Vector3(-nearX, nearY, -n);
-            cornersViewSpace[4] = new Vector3(-farX, -farY, -f);
-            cornersViewSpace[5] = new Vector3(farX, -farY, -f);
-            cornersViewSpace[6] = new Vector3(farX, farY, -f);
-            cornersViewSpace[7] = new Vector3(-farX, farY, -f);
+            cornersViewSpace[0] = new Vector3(-nearX, -nearY, n);
+            cornersViewSpace[1] = new Vector3(nearX, -nearY, n);
+            cornersViewSpace[2] = new Vector3(nearX, nearY, n);
+            cornersViewSpace[3] = new Vector3(-nearX, nearY, n);
+            cornersViewSpace[4] = new Vector3(-farX, -farY, f);
+            cornersViewSpace[5] = new Vector3(farX, -farY, f);
+            cornersViewSpace[6] = new Vector3(farX, farY, f);
+            cornersViewSpace[7] = new Vector3(-farX, farY, f);
 
             Vector3 center = Vector3.Zero;
             for (int j = 0; j < 8; j++)
@@ -199,9 +254,14 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             Matrix4x4.Invert(tempLightView, out Matrix4x4 tempLightViewInv);
             center = Vector3.Transform(lightSpaceCenter, tempLightViewInv);
 
-            Vector3 lightPos = center - lightDirection * radius;
+            // Глаз оттянут от сферы каскада к свету на её диаметр, а far расширен на столько же:
+            // кастеры МЕЖДУ солнцем и объёмом каскада (высокая геометрия над срезом фрустума -
+            // башня за спиной камеры) иначе режутся near-плоскостью и не отбрасывают тень.
+            // Тот же фикс, что в SimpleCullingAndRenderSystem.BuildLightData.
+            float casterExtension = radius * 2.0f;
+            Vector3 lightPos = center - lightDirection * (radius + casterExtension);
             float znear = 0.01f;
-            float zfar = radius * 2.0f;
+            float zfar = radius * 2.0f + casterExtension;
 
             (&cascadeSizes.X)[i] = radius * 2.0f;
             (&cascadeNearPlanes.X)[i] = znear;

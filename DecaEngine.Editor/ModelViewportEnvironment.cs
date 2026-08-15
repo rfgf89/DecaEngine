@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
@@ -21,6 +21,19 @@ namespace DecaEngine.Editor
 		public Vector3 LightDirection = new(0.45f, -0.72f, -0.35f);
 		public Vector3 BoundsCenter;
 		public float BoundsRadius;
+
+		/// <summary>Число каскадов теней (1..<see cref="DecaEngine.Graphics.Diligent.ShadowRenderer.MaxCascades"/>).
+		/// 1 (дефолт) - прежнее поведение превью: один ортокаскад на все баунды. Больше - мелкие
+		/// каскады уточняют окрестность <see cref="FocusPoint"/>, последний всегда накрывает сцену
+		/// целиком (см. SimpleCullingAndRenderSystem.BuildLightData). Опция уровня создания
+		/// окружения: под число каскадов замораживаются команды ShadowPass.</summary>
+		public int CascadeCount = 1;
+
+		/// <summary>Точка интереса камеры - центр мелких каскадов (вьюпорт пушит её каждый кадр,
+		/// см. PrefabSceneViewport.Update). Без неё (HasFocus false) каскады центрируются на
+		/// баундах сцены.</summary>
+		public Vector3 FocusPoint;
+		public bool HasFocus;
 
 		/// <summary>Азимут/высота «солнца» энвайронмента в градусах - положение света ДО
 		/// пользовательских ползунков (см. <see cref="SetAngles"/>). Заполняется при создании
@@ -75,6 +88,12 @@ namespace DecaEngine.Editor
 		/// <summary>Тени мирового ключевого света (ShadowMaps + PCF). Требует включённого
 		/// shadow-пасса окружения; без него бит безвреден (LightDirection нулевой).</summary>
 		Shadows = 1 << 2,
+
+		/// <summary>HDR-конвейер: шейдер модели пишет ЛИНЕЙНУЮ яркость без тонемапа и sRGB-энкода -
+		/// их делает TonemapPass в конце кадра, по экспозиции от авто-адаптации (см.
+		/// EyeAdaptationPass). Бит, а не кейворд: HDR - опция уровня создания окружения, а бит
+		/// пушится в тот же кбуфер, что и остальные тумблеры.</summary>
+		HdrOutput = 1 << 3,
 
 		All = NormalMaps | Occlusion | Shadows,
 	}
@@ -154,6 +173,50 @@ namespace DecaEngine.Editor
 		/// обязан заполнить его ((1,1,1,1) = тождественно) - нулевой w глушит спекуляр в чёрный.
 		/// См. <see cref="MaterialPbrFactors.SpecularColorFactor"/>.</summary>
 		public Vector4 SpecularColorFactor;
+
+		/// <summary>Probe-GI сетка (см. <see cref="ProbeGiTextures"/>): xyz = мировая позиция пробы
+		/// (0,0,0), w = 1 - пробы запечены и атласы привязаны (0 = фича выключена/не готова).</summary>
+		public Vector4 ProbeGridOrigin;
+
+		/// <summary>xyz = шаг сетки проб в мировых единицах, w = normal-бейас точки сэмпла.</summary>
+		public Vector4 ProbeGridCell;
+
+		/// <summary>xyz = число проб по осям ВИРТУАЛЬНОЙ сетки (реально выделены только пробы
+		/// кирпичей рядом с геометрией - см. <see cref="ProbeGiBakeResult"/>).</summary>
+		public Vector4 ProbeGridCounts;
+
+		/// <summary>xyz = размер сетки кирпичей, w = кирпичей в ряду пула атласов.</summary>
+		public Vector4 ProbeGridBricks;
+
+		/// <summary>Ручки probe-GI (см. GraphicsSettingsWindow): x = флор глушения солнечной доли
+		/// эмбиента тенью, y = флор глушения env-спекуляра видимостью неба, z = интенсивность
+		/// солнца, w = множитель probe-irradiance.</summary>
+		public Vector4 ProbeGiParams;
+
+		/// <summary>x = флор глушения небесной доли эмбиента тенью (1 = не гасится); y = сторона
+		/// окто-карты видимости проб (см. ProbeGiBakeResult.VisRes - ручка «Visibility res»; 0 =
+		/// шейдер берёт дефолт 8, чтобы zero-init кбуфера вне превью не ломал выборку); zw - резерв.</summary>
+		public Vector4 ProbeGiParams2;
+
+		/// <summary>Сетки мелких каскадов probe-GI (см. SampleProbeGi в UnlitInstancedPS.hlsl):
+		/// семантика та же, что у базовых ProbeGrid*, Origin.w = 1 - каскад создан и его атласы
+		/// _C1/_C2 привязаны. Нулевые (zero-init) = каскада нет, шейдер падает на базовый объём.</summary>
+		public Vector4 ProbeGridOrigin1;
+		public Vector4 ProbeGridCell1;
+		public Vector4 ProbeGridCounts1;
+		public Vector4 ProbeGridBricks1;
+		public Vector4 ProbeGridOrigin2;
+		public Vector4 ProbeGridCell2;
+		public Vector4 ProbeGridCounts2;
+		public Vector4 ProbeGridBricks2;
+
+		/// <summary>Режим кривой тонмапа (см. Tonemap.hlsl / <see cref="ToneCurveMode"/>). Действует
+		/// ТОЛЬКО в LDR-режиме: в HDR-конвейере кривую применяет TonemapPass в самом конце, а
+		/// материал оставляет кадр линейным.
+		///
+		/// Заполняется в ДВУХ местах - вьюпортом и CLI-пробой (см. PreviewProbe): они пушат этот
+		/// кбуфер независимо, и поле, добавленное только в одном, тихо приезжает нулём в другом.</summary>
+		public int ToneCurve;
 	}
 
 	/// <summary>
@@ -194,6 +257,10 @@ namespace DecaEngine.Editor
 		/// источник отражений/ambient-освещения Lighting-режима (см. <see cref="PreviewEnvironmentMap"/>).</summary>
 		public IGpuTexture EnvironmentMap { get; }
 
+		/// <summary>CPU-выборка радианса окружения по направлению (та же панорама, что в
+		/// <see cref="EnvironmentMap"/>) - источник неба для CPU-бейка проб (см. ProbeGiBaker).</summary>
+		public Func<Vector3, Vector3> EnvironmentRadiance { get; }
+
 		/// <summary>MSAA sample count окружения (1 = выключено).</summary>
 		public uint MsaaSamples { get; }
 
@@ -210,11 +277,48 @@ namespace DecaEngine.Editor
 		/// Resize <see cref="Pipeline"/> - см. <see cref="GraphicsPipelineSimple.SsgiResources"/>.</summary>
 		public IRenderTarget? GiTarget => Pipeline.SsgiResources?.GiTarget;
 
+		/// <summary>Линейный HDR-таргет кадра - тот, в который рисует вся геометрия и пост-обработка.
+		/// Ресайзится вместе с остальными (см. ModelPreviewViewport.ResizeTargets); показывается же
+		/// всегда <see cref="ColorTarget"/>, уже после тонемапа.</summary>
+		public IRenderTarget? HdrColorTarget => Pipeline.Targets?.HdrColorTarget;
+
+		/// <summary>Включён ли HDR-конвейер превью - от него зависит бит
+		/// <see cref="PreviewFeatureFlags.HdrOutput"/> в кбуфере материалов. В офскрин-окружении он
+		/// теперь всегда включён (см. GraphicsPipelineSimple): тонемап живёт отдельным пассом при
+		/// любом наборе фич, а тумблер авто-экспозиции лишь выбирает, мерить яркость или взять
+		/// экспозицию из ручной экспокоррекции.</summary>
+		public bool HdrOutput => Pipeline.Targets?.HdrColorTarget is not null;
+
+		/// <summary>Текущий набор фич конвейера - см. <see cref="SetFeatures"/>.</summary>
+		public PipelineFeatures Features => Pipeline.Features;
+
+		/// <summary>Меняет набор фич БЕЗ пересоздания окружения и без перезагрузки сцены - см.
+		/// <see cref="GraphicsPipelineSimple.SetFeatures"/>. Именно этим окно настроек применяет
+		/// SSAO (и его технику), SSGI, туман, god rays, блум, грейдинг, небо и авто-экспозицию.
+		///
+		/// Тени тумблером фич НЕ переключаются: у превью для них свой, ещё более дешёвый путь -
+		/// <see cref="PreviewShadowSettings.Enabled"/> плюс бит <see cref="PreviewFeatureFlags.Shadows"/>,
+		/// и ShadowPass при выключенных тенях сам вырождается в no-op (см. ApplyGraphicsSettings).
+		/// Поэтому <see cref="PipelineFeatures.Shadows"/> здесь остаётся тем, с чем окружение создано.</summary>
+		public void SetFeatures(PipelineFeatures features)
+		{
+			features.Shadows = Pipeline.Features.Shadows;
+			Pipeline.SetFeatures(features);
+		}
+
 		/// <summary>Состояние мирового света/теней (null = тени выключены). Вьюпорт обновляет баунды
 		/// после загрузки модели (см. ModelPreviewViewport.FrameAll).</summary>
 		public PreviewShadowSettings ShadowSettings { get; }
 
-		private SimpleCullingAndRenderSystem _cullingSystem;
+		private SimpleCullingAndRenderSystem? _cullingSystem;
+		private CullingAndRenderSystem? _mainCullingSystem;
+
+		/// <summary>Солнце-сущность (LightComponent + SunComponent + CascadedShadowComponent) -
+		/// существует только в режиме <c>mainCascades</c>: каскады строит ОСНОВНОЙ
+		/// <see cref="CullingAndRenderSystem"/>, направление света = +Z поворота этой сущности.
+		/// Вьюпорт синхронизирует её с <see cref="ShadowSettings"/> каждый кадр (см.
+		/// PrefabSceneViewport.SyncSunEntity).</summary>
+		public Entity SunEntity { get; private set; }
 
 		/// <summary>Освобождает GPU-ресурсы окружения - для пересоздания превью с новыми
 		/// рестарт-левел опциями на лету (см. ModelPreviewViewport.RecreateEnvironment). Вызывающий
@@ -227,7 +331,8 @@ namespace DecaEngine.Editor
 			// (материалы + AO-таргет) - их создаёт и владеет ими Pipeline (см. GraphicsPipelineSimple),
 			// а не это окружение.
 			Pipeline.Release();
-			_cullingSystem.Dispose();
+			_cullingSystem?.Dispose();
+			_mainCullingSystem?.Dispose();
 			BatchRenderer.Release();
 
 			EnvironmentMap.Release();
@@ -259,11 +364,311 @@ namespace DecaEngine.Editor
 			Pipeline.SsaoResources?.SetWorldRange(worldRange);
 		}
 
+		/// <summary>Сила и нижний предел AO - живые ручки окна Graphics (см.
+		/// SsaoPassResources.SetStrength). No-op когда AO выключен.</summary>
+		public void SetAoStrength(float power, float floor)
+		{
+			Pipeline.SsaoResources?.SetStrength(power, floor);
+		}
+
+		/// <summary>Отладочный вид AO - живая ручка окна Graphics (см.
+		/// SsaoPassResources.SetDebugView). No-op когда AO выключен.</summary>
+		public void SetAoDebugView(bool enabled)
+		{
+			Pipeline.SsaoResources?.SetDebugView(enabled);
+		}
+
+		/// <summary>Отладочный вид векторов движения - живая ручка окна Graphics (см.
+		/// MotionVectorDebugPassResources.SetDebugView). No-op когда векторы выключены, а также при
+		/// MSAA: с ним ресурсы векторов не создаются вовсе (см. GraphicsPipelineSimple.EnsureResources).
+		///
+		/// <paramref name="rangePixels"/> - на скольких пикселях смещения шкала упирается в край.</summary>
+		public void SetMotionVectorDebug(bool enabled, float rangePixels)
+		{
+			Pipeline.MotionVectorDebugResources?.SetDebugView(enabled, rangePixels);
+		}
+
+		/// <summary>Есть ли у конвейера буфер векторов движения на самом деле: галка векторов при MSAA
+		/// молча не срабатывает (векторы и мультисемплинг взаимоисключающи - см.
+		/// PipelineFeatures.MotionVectors), и окну настроек нужно чем-то это показать.</summary>
+		public bool MotionVectorsAvailable => Pipeline.MotionVectorResources is not null;
+
+		/// <summary>Суб-пиксельный джиттер проекции - живая ручка окна Graphics (см.
+		/// GraphicsPipelineSimple.SetTemporalJitter). От векторов движения не зависит и с MSAA не
+		/// конфликтует: это мутация одной матрицы на CPU, а не ресурсы конвейера.</summary>
+		public void SetTemporalJitter(bool enabled)
+		{
+			Pipeline.SetTemporalJitter(enabled);
+		}
+
+		/// <summary>Работает ли нативный бэкенд апскейла прямо сейчас (FSR/DLSS) - окну Graphics,
+		/// чтобы честно показать «выбран нативный, но работает TAAU» (нет шима/DLL, нет буфера
+		/// векторов, не то железо).</summary>
+		public bool NativeUpscalerActive => Pipeline.NativeUpscaler is not null;
+
+		/// <summary>Какой именно нативный бэкенд активен - тем же индексом, что в настройке
+		/// (1 - FSR, 2 - DLSS, 0 - никакой/TAAU).</summary>
+		public int ActiveUpscalerKind { get; private set; }
+
+		/// <summary>Подпись активного нативного бэкенда с версией библиотеки ("FSR 2.3.4",
+		/// "DLSS 310.7.0.0") - окну Graphics. Null, когда работает встроенный TAAU.</summary>
+		public string? ActiveUpscalerName => Pipeline.NativeUpscaler?.DebugName;
+
+		/// <summary>Живые настройки самих апскейлеров: вес кадра TAAU, сила RCAS-шарпена FSR,
+		/// пресет качества DLSS (значение NVSDK_NGX_PerfQuality_Value). Первые две - копеечные
+		/// (кбуфер/параметр диспатча); смена пресета DLSS пересоздаёт NGX-фичу, поэтому перед ней -
+		/// GPU-барьер, как при ресайзе.</summary>
+		public void SetUpscalerTuning(float taauBlendAlpha, float fsrSharpness, int dlssQuality,
+			int fsrProviderMajor = 0)
+		{
+			Pipeline.TemporalUpscaleResources?.SetBlendAlpha(taauBlendAlpha);
+
+			switch (Pipeline.NativeUpscaler)
+			{
+				case FsrUpscalerBackend fsr:
+					fsr.SetSharpness(fsrSharpness);
+
+					// Смена ветки провайдера пересоздаёт нативный контекст И его текстуры (маски,
+					// типизированная копия глубины) - GPU-барьер + ОБЯЗАТЕЛЬНАЯ инвалидация графа:
+					// заморожённый буфер держит нативные указатели этих текстур, записанные при
+					// рекорде, и без переписи реплей копировал бы в уничтоженную (AV в CopyTexture).
+					if (fsr.ProviderMajor != fsrProviderMajor)
+					{
+						DilApi.ImmediateContext.Flush();
+						DilApi.ImmediateContext.WaitForIdle();
+						fsr.SetProvider(fsrProviderMajor);
+						Pipeline.InvalidateGraph();
+						Console.WriteLine($"[upscaler] провайдер FSR: {fsr.DebugName}");
+					}
+
+					break;
+				case DlssUpscalerBackend dlss when dlss.Quality != dlssQuality:
+					// Тот же контракт, что у смены провайдера FSR выше.
+					DilApi.ImmediateContext.Flush();
+					DilApi.ImmediateContext.WaitForIdle();
+					dlss.SetQuality(dlssQuality);
+					Pipeline.InvalidateGraph();
+					break;
+			}
+		}
+
+		/// <summary>Живой выбор бэкенда слота апскейлера: 0 - встроенный TAAU, 1 - FSR, 2 - DLSS
+		/// (индексы = EditorSettings.UpscalerBackend). Смена ждёт GPU: конвейер перепривязывает
+		/// вход тонемапа на живом материале. No-op, когда буфера векторов нет (MSAA или выключенные
+		/// векторы); при отсутствии шима/DLL/железа TryCreate вернёт null - остаётся TAAU.</summary>
+		public void SetUpscalerBackend(int kind)
+		{
+			if (kind == ActiveUpscalerKind && (kind == 0) == (Pipeline.NativeUpscaler is null))
+			{
+				return;
+			}
+
+			DilApi.ImmediateContext.Flush();
+			DilApi.ImmediateContext.WaitForIdle();
+
+			if (kind == 0)
+			{
+				Pipeline.SetNativeUpscaler(null);
+				ActiveUpscalerKind = 0;
+				return;
+			}
+
+			if (Pipeline.MotionVectorResources is null || Pipeline.Targets?.HdrColorTarget is null)
+			{
+				return;
+			}
+
+			// Размеры - ФАКТИЧЕСКИЕ на этот момент: сценовые по депту (масштаб рендера мог уже
+			// примениться), отображаемые по ColorTarget. Дальнейшие ресайзы дёрнут Resize бэкенда
+			// через RebindSsaoTargets.
+			var renderSize = Pipeline.Targets.DepthTarget.Size;
+			var displaySize = Pipeline.Targets.ColorTarget.Size;
+			INativeUpscalerBackend? backend = kind == 2
+				? DlssUpscalerBackend.TryCreate(GraphicsApi, "Preview",
+					Pipeline.Targets.HdrColorTarget, Pipeline.Targets.DepthTarget,
+					Pipeline.MotionVectorResources.MotionTarget,
+					(uint)renderSize.X, (uint)renderSize.Y, (uint)displaySize.X, (uint)displaySize.Y)
+				: FsrUpscalerBackend.TryCreate(GraphicsApi, "Preview",
+					Pipeline.Targets.HdrColorTarget, Pipeline.Targets.DepthTarget,
+					Pipeline.MotionVectorResources.MotionTarget,
+					(uint)renderSize.X, (uint)renderSize.Y, (uint)displaySize.X, (uint)displaySize.Y,
+					cameraNear: 0.05f, fovYRad: CameraFovDegrees * MathF.PI / 180f);
+
+			// Неудача создания НЕ трогает текущее состояние: остаётся прежний бэкенд (или TAAU) -
+			// молча падать на TAAU при живом прежнем бэкенде было бы шагом назад.
+			if (backend is not null)
+			{
+				Pipeline.SetNativeUpscaler(backend);
+				ActiveUpscalerKind = kind;
+				Console.WriteLine($"[upscaler] нативный бэкенд активен: {backend.DebugName}");
+			}
+			else if (Pipeline.NativeUpscaler is null)
+			{
+				ActiveUpscalerKind = 0;
+			}
+		}
+
+		/// <summary>Масштаб рендера сцены (см. GraphicsPipelineSimple.SetRenderScale). Только
+		/// запоминает значение; true = изменился, и вызывающий ОБЯЗАН прогнать ресайз-путь
+		/// (см. ModelPreviewViewport.ResizeTargets) - до него сцена рисуется в старом размере.</summary>
+		public bool SetRenderScale(float scale)
+		{
+			return Pipeline.SetRenderScale(scale);
+		}
+
 		/// <summary>Мировой радиус сбора GI-пасса (см. SsgiPassResources.SetWorldRange): пушится
 		/// вместе с AO-радиусом после кадрирования модели. No-op когда SSGI выключен.</summary>
 		public void SetGiWorldRange(float worldRange)
 		{
 			Pipeline.SsgiResources?.SetWorldRange(worldRange);
+		}
+
+		/// <summary>Живые ручки оценки SSGI - окно Graphics (см. SsgiPassResources.SetParams).
+		/// No-op когда SSGI выключен.</summary>
+		public void SetGiParams(float intensity, int sampleCount, float maxLuminance, float saturation)
+		{
+			Pipeline.SsgiResources?.SetParams(intensity, sampleCount, maxLuminance, saturation);
+		}
+
+		/// <summary>Живые ручки тумана - окно Graphics (см. FogPassResources). No-op когда туман выключен.
+		/// Сама галка живой НЕ является: пассу нужны депт и scene-copy, то есть он создаётся вместе с
+		/// конвейером (см. GraphicsPipelineSimple) и переключается пересозданием окружения.</summary>
+		public void SetFogParams(float density, float heightFalloff, float heightRef, float startDistance,
+			float maxDistance, float maxOpacity)
+		{
+			Pipeline.FogResources?.SetParams(density, heightFalloff, heightRef, startDistance, maxDistance,
+				maxOpacity);
+		}
+
+		/// <summary>Цвета дымки и её солнечной подсветки (линейные). No-op когда туман выключен.</summary>
+		public void SetFogColors(Vector3 color, Vector3 sunColor, float sunStrength, float sunSharpness)
+		{
+			Pipeline.FogResources?.SetColors(color, sunColor, sunStrength, sunSharpness);
+		}
+
+		/// <summary>Направление НА солнце - туману оно нужно для подсветки среды. ShadowSettings.LightDirection
+		/// указывает ОТ солнца, поэтому вызывающий обязан передать его С МИНУСОМ (та же конвенция,
+		/// что у бейкера проб).</summary>
+		public void SetFogSun(Vector3 sunDirection)
+		{
+			Pipeline.FogResources?.SetSun(sunDirection);
+		}
+
+		/// <summary>Живые ручки объёмного света - god rays и объёмный туман (см.
+		/// VolumetricLightPassResources). No-op когда пасс выключен: сама галка, как и у тумана,
+		/// живой НЕ является - пассу нужны депт, scene-copy и shadow map, то есть он создаётся
+		/// вместе с конвейером и переключается пересозданием окружения.</summary>
+		public void SetVolumetricParams(float density, float heightFalloff, float heightRef,
+			float startDistance, float maxDistance, int steps, float maxOpacity, float shadowStrength)
+		{
+			Pipeline.VolumetricResources?.SetParams(density, heightFalloff, heightRef, startDistance,
+				maxDistance, steps, maxOpacity, shadowStrength);
+		}
+
+		/// <summary>Оптика среды объёмного света: рассеяние, экстинкция, анизотропия.</summary>
+		public void SetVolumetricScattering(float scattering, float extinction, float anisotropy)
+		{
+			Pipeline.VolumetricResources?.SetScattering(scattering, extinction, anisotropy);
+		}
+
+		/// <summary>Цвета и силы солнечного (это и есть столбы) и небесного рассеяния - линейные.</summary>
+		public void SetVolumetricColors(Vector3 sunColor, float sunIntensity, Vector3 ambientColor,
+			float ambientIntensity, float ambientShadowFloor)
+		{
+			Pipeline.VolumetricResources?.SetColors(sunColor, sunIntensity, ambientColor, ambientIntensity,
+				ambientShadowFloor);
+		}
+
+		/// <summary>Есть ли в конвейере теневой пасс - без него god rays невозможны, остаётся ровный
+		/// объёмный туман (см. VolumetricLightPassResources.ShadowsAvailable). false и когда сам пасс
+		/// выключен.</summary>
+		public bool VolumetricShadowsAvailable => Pipeline.VolumetricResources?.ShadowsAvailable ?? false;
+
+		/// <summary>Живые ручки цветокоррекции (см. ColorGradePassResources). No-op когда грейдинг
+		/// выключен: сама галка - уровня окружения, пасс создаётся вместе с конвейером.</summary>
+		public void SetColorGrade(float saturation, float contrast, float gamma, float temperature,
+			float tint, Vector3 shadowTint, Vector3 highlightTint)
+		{
+			Pipeline.ColorGradeResources?.SetGrade(saturation, contrast, gamma, temperature, tint);
+			Pipeline.ColorGradeResources?.SetTints(shadowTint, highlightTint);
+		}
+
+		/// <summary>Живые ручки виньетки (см. ColorGradePassResources.SetVignette).</summary>
+		public void SetVignette(float intensity, float radius, float smoothness, float roundness)
+		{
+			Pipeline.ColorGradeResources?.SetVignette(intensity, radius, smoothness, roundness);
+		}
+
+		/// <summary>Кривая тонмапа HDR-конвейера (см. Tonemap.hlsl). No-op в LDR - там кривую
+		/// применяет сам UnlitInstancedPS по полю кбуфера PreviewSettings.</summary>
+		public void SetToneCurve(int curve)
+		{
+			Pipeline.TonemapResources?.SetCurve(curve);
+		}
+
+		/// <summary>Живые ручки блума (см. BloomPassResources). No-op когда блум выключен: сама
+		/// галка - уровня окружения, пасс создаётся вместе с конвейером.</summary>
+		public void SetBloomParams(float threshold, float knee, float radius, float intensity)
+		{
+			Pipeline.BloomResources?.SetParams(threshold, knee, radius, intensity);
+		}
+
+		/// <summary>Живые ручки композита SSGI: радиус билатерального размытия bounce и отладочный
+		/// вид (см. SsgiPassResources.SetCompositeParams). No-op когда SSGI выключен.</summary>
+		public void SetGiCompositeParams(int blurRadius, bool debugView)
+		{
+			Pipeline.SsgiResources?.SetCompositeParams(blurRadius, debugView);
+		}
+
+		/// <summary>Ручки авто-экспозиции - живые (см. EyeAdaptationPassResources.SetParams и
+		/// TonemapPassResources.SetParams: key/экспокоррекцию тонемап и замер обязаны видеть
+		/// одинаковыми). No-op когда авто-экспозиция выключена.</summary>
+		public void SetEyeAdaptationParams(float key, float minLuminance, float maxLuminance,
+			float exposureCompensation)
+		{
+			Pipeline.EyeAdaptationResources?.SetParams(key, minLuminance, maxLuminance, exposureCompensation);
+			Pipeline.TonemapResources?.SetParams(key, exposureCompensation);
+
+			// Тот же key - туману: его цвет задан в отображаемых единицах и пересчитывается в
+			// линейные через adapted/key (см. FogPassResources.SetExposure). Разъедься эти два
+			// значения - дымка разошлась бы с кадром по яркости.
+			Pipeline.FogResources?.SetExposure(Pipeline.AutoExposure, key);
+			Pipeline.BloomResources?.SetExposure(Pipeline.AutoExposure, key);
+			Pipeline.VolumetricResources?.SetExposure(Pipeline.AutoExposure, key);
+		}
+
+		/// <summary>Скорости временной адаптации в 1/сек (к светлому / к тёмному) - живая ручка.
+		/// No-op когда авто-экспозиция выключена.</summary>
+		public void SetEyeAdaptationSpeed(float speedUp, float speedDown)
+		{
+			Pipeline.EyeAdaptationResources?.SetSpeed(speedUp, speedDown);
+		}
+
+		/// <summary>Шаг времени кадра для временной адаптации - пушится каждый кадр (см.
+		/// ModelPreviewViewport.Update). No-op когда авто-экспозиция выключена.</summary>
+		public void SetEyeAdaptationDeltaTime(float deltaTime)
+		{
+			Pipeline.EyeAdaptationResources?.SetDeltaTime(deltaTime);
+
+			// Нативному апскейлеру нужна та же длительность кадра (темпоральная аккумуляция) -
+			// пуш тем же путём, чтобы у вызывающих не было второй ручки, о которой можно забыть.
+			Pipeline.NativeUpscaler?.SetDeltaTime(deltaTime);
+		}
+
+		/// <summary>Пропустить тонемап (копировать кадр как есть) - для отладочных режимов превью,
+		/// которые пишут уже отображаемые значения (см. TonemapPassResources.SetPassthrough).
+		/// No-op когда HDR-конвейер выключен.</summary>
+		public void SetTonemapPassthrough(bool passthrough)
+		{
+			Pipeline.TonemapResources?.SetPassthrough(passthrough);
+
+			// Небо - единственное, что рисуется в кадр НЕ шейдером модели, и про режим превью оно
+			// само не знает: на время passthrough оно обязано писать display-space, иначе фон
+			// отладочных видов уезжает в темноту (линейная яркость без энкода).
+			if (HdrOutput)
+			{
+				Pipeline.SkyResources?.SetHdrOutput(!passthrough);
+			}
 		}
 
 		/// <param name="skyBackground">Рисовать ли энвайронмент фоном кадра (см. SkyBackgroundVS/PS).
@@ -285,19 +690,37 @@ namespace DecaEngine.Editor
 		/// <param name="ssgi">Экранная глобальная иллюминация (SSGI-пасс, см. SsgiCommon.hlsl): один
 		/// отскок света из уже отрисованного кадра (color bleeding). false = пасс не создаётся вовсе,
 		/// кадр идентичен прежнему.</param>
+		/// <param name="eyeAdaptation">Авто-экспозиция («адаптация глаза»): замер средней яркости
+		/// кадра + временное сглаживание, по которым экспонируется финальный тонемап (см.
+		/// EyeAdaptationPass / TonemapPass). Включает HDR-конвейер целиком - кадр становится линейным
+		/// RGBA16F, а тонемап уезжает из UnlitInstancedPS в отдельный пасс; false = ни таргетов, ни
+		/// пассов не создаётся, кадр идентичен прежнему. Опция уровня создания окружения: под формат
+		/// цветового таргета пекутся PSO.</param>
+		/// <param name="mainCascades">Каскады теней строит ОСНОВНОЙ <see cref="CullingAndRenderSystem"/>
+		/// (точный камерный CSM основного пайплайна) вместо <see cref="SimpleCullingAndRenderSystem"/>:
+		/// в сторе заводится солнце-сущность, дистанции каскадов и поворот солнца пушит вьюпорт
+		/// (см. PrefabSceneViewport.SyncSunEntity). Только вместе с <paramref name="shadows"/>.</param>
 		public ModelViewportEnvironment(IGraphicsApi graphicsApi, uint width, uint height,
 			string colorTargetName, string depthTargetName, bool skyBackground = false,
 			string environmentHdrPath = null, uint msaaSamples = 1, bool ssao = false, bool shadows = false,
-			AmbientOcclusionMode aoMode = AmbientOcclusionMode.Ssao, bool ssgi = false)
+			AmbientOcclusionMode aoMode = AmbientOcclusionMode.Ssao, bool ssgi = false, bool eyeAdaptation = false,
+			bool mainCascades = false, bool fog = false, bool bloom = false, bool colorGrade = false,
+			bool volumetric = false, bool motionVectors = false, bool temporalUpscale = false,
+			int upscalerBackend = 0)
 		{
 			GraphicsApi = graphicsApi;
 			DilApi = (DiligentGraphicsApi)graphicsApi;
 			MsaaSamples = Math.Max(1u, msaaSamples);
 
-			BatchRenderer = new DiligentBatchRenderer(DilApi, MsaaSamples);
+			// Формат цветового таргета пекётся во все PSO геометрии. Офскрин-конвейер теперь ВСЕГДА
+			// HDR (см. GraphicsPipelineSimple), поэтому формат один и тот же при любом наборе фич -
+			// именно поэтому тумблеры пост-обработки больше не требуют пересоздания окружения.
+			BatchRenderer = new DiligentBatchRenderer(DilApi, MsaaSamples,
+				TextureObjectFormat.R16G16B16A16Float);
 
 			var environmentResult = PreviewEnvironmentMap.Create(graphicsApi, environmentHdrPath);
 			EnvironmentMap = environmentResult.Texture;
+			EnvironmentRadiance = environmentResult.Radiance;
 
 			if (shadows)
 			{
@@ -331,7 +754,14 @@ namespace DecaEngine.Editor
 			Pipeline = new GraphicsPipelineSimple(graphicsApi, BatchRenderer, colorTargetName, depthTargetName,
 				width, height, new Vector4(0.4f, 0.4f, 0.4f, 0f), MsaaSamples,
 				skyBackground: skyBackground, environmentMap: EnvironmentMap,
-				ssao: ssao, enableShadowPass: shadows, aoMode: aoMode, ssgi: ssgi);
+				ssao: ssao, enableShadowPass: shadows, aoMode: aoMode, ssgi: ssgi, eyeAdaptation: eyeAdaptation,
+				fog: fog, bloom: bloom, colorGrade: colorGrade, volumetric: volumetric,
+				motionVectors: motionVectors, temporalUpscale: temporalUpscale);
+
+			if (upscalerBackend != 0 && temporalUpscale)
+			{
+				SetUpscalerBackend(upscalerBackend);
+			}
 
 			Store = new EntityStore();
 			ResourceManager = new RenderResourceManager(16, 16, Store, BatchRenderer);
@@ -346,12 +776,56 @@ namespace DecaEngine.Editor
 				new Scale3(1, 1, 1),
 				cameraComponent);
 
-			_cullingSystem = new SimpleCullingAndRenderSystem(ResourceManager, Pipeline, ShadowSettings);
-			Root = new SystemRoot()
+			if (shadows && mainCascades)
 			{
-				new GpuInstanceBufferSystem(),
-				_cullingSystem
-			};
+				// Солнце-сущность для основного CSM - тот же набор компонентов, что у солнца
+				// основной сцены (см. EditorManager): направление света = +Z её поворота (вьюпорт
+				// перезапишет из ShadowSettings первым же кадром, стартовое - от солнца
+				// энвайронмента), цвет/интенсивность - константы SimpleCullingAndRenderSystem.
+				// CascadeDistances ОБЯЗАНЫ быть валидными сразу: нулевые дистанции дают вырожденные
+				// срезы (n == f) и NaN в матрицах каскадов ещё до первой синхронизации вьюпорта -
+				// он подменит их на адаптивные к габаритам сцены (см. PrefabSceneViewport.SyncSunEntity).
+				var sunDirection = ShadowSettings != null
+					? Vector3.Normalize(ShadowSettings.LightDirection)
+					: new Vector3(0.45f, -0.72f, -0.35f);
+				var sunUp = MathF.Abs(sunDirection.Y) > 0.95f ? Vector3.UnitX : Vector3.UnitY;
+				var sunView = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, sunDirection, sunUp);
+
+				SunEntity = Store.CreateEntity(
+					new Position(0, 50, 0),
+					new Rotation { value = Quaternion.CreateFromRotationMatrix(Matrix4x4.Transpose(sunView)) },
+					new LightComponent
+					{
+						Type = LightType.Directional,
+						Color = new Vector3(1f, 0.97f, 0.9f),
+						Intensity = 1f,
+						ShadowStrength = 1f,
+					},
+					new SunComponent()
+					{
+
+					},
+					new CascadedShadowComponent
+					{
+						CascadeDistances = [0.01f, 10f, 30f, 100f, 300f]
+					});
+
+				_mainCullingSystem = new CullingAndRenderSystem(ResourceManager, graphicsApi, Pipeline);
+				Root = new SystemRoot()
+				{
+					new GpuInstanceBufferSystem(),
+					_mainCullingSystem
+				};
+			}
+			else
+			{
+				_cullingSystem = new SimpleCullingAndRenderSystem(ResourceManager, Pipeline, ShadowSettings);
+				Root = new SystemRoot()
+				{
+					new GpuInstanceBufferSystem(),
+					_cullingSystem
+				};
+			}
 			Root.AddStore(Store);
 		}
 
@@ -362,6 +836,44 @@ namespace DecaEngine.Editor
 
 			CameraEntity.Position = new Position(eye.X, eye.Y, eye.Z);
 			CameraEntity.Rotation = new Rotation { value = rotation };
+
+			// Мировой базис камеры - туману, чтобы он восстановил мировой луч пикселя. Считается
+			// ИМЕННО ЗДЕСЬ, из eye/target, а не разбором viewMatrix: это ровно те три вектора, из
+			// которых CreateLookAtLeftHanded и строит матрицу, так что перепутать строки со
+			// столбцами (и получить туман, «приклеенный» к экрану) здесь просто негде.
+			var fog = Pipeline.FogResources;
+			var volumetric = Pipeline.VolumetricResources;
+			if (fog is not null || volumetric is not null)
+			{
+				var forward = target - eye;
+				forward = forward.LengthSquared() > 1e-8f ? Vector3.Normalize(forward) : Vector3.UnitZ;
+
+				// Тот же порядок, что у левосторонней LookAt: x = up X z, y = z X x.
+				var right = Vector3.Cross(Vector3.UnitY, forward);
+				right = right.LengthSquared() > 1e-8f
+					? Vector3.Normalize(right)
+					// Взгляд строго вертикально вниз/вверх - up вырождается, берём любой
+					// перпендикуляр, иначе базис схлопывается в ноль и туман выдаёт NaN.
+					: Vector3.UnitX;
+
+				var up = Vector3.Cross(forward, right);
+				fog?.SetCamera(right, up, forward);
+
+				// Объёмный свет восстанавливает мировой луч пикселя ровно так же и потому получает
+				// тот же базис - считать его дважды по-разному значило бы завести два источника
+				// правды об одном и том же.
+				volumetric?.SetCamera(right, up, forward);
+
+				// Солнце пушится ЗДЕСЬ ЖЕ, а не из ApplyGraphicsSettings: в Scene View его вращают
+				// гизмо сущности, а то не поднимает событие настроек - подсветка дымки и столбы
+				// отставали бы от света до следующего движения ползунка. LightDirection указывает
+				// ОТ солнца.
+				if (ShadowSettings is not null)
+				{
+					fog?.SetSun(-ShadowSettings.LightDirection);
+					volumetric?.SetSun(-ShadowSettings.LightDirection);
+				}
+			}
 		}
 	}
 
@@ -427,6 +939,32 @@ namespace DecaEngine.Editor
 				{
 					kvp.Value.SetTexture("_EnvMap", environmentMap);
 					kvp.Value.SetImmutableSampler("_EnvMap", environmentSampler);
+
+					// Placeholder для атласов probe-GI: слоты объявлены в шейдере безусловно, и без
+					// привязки дескрипторы невалидны (Vulkan validation VUID-08114), даже когда
+					// probe-GI выключен и шейдер их не читает (ProbeGridOrigin.w=0). Настоящие атласы
+					// перепривяжет ProbeGiTextures.Bind после бейка. Сэмплер не нужен - Load-only.
+					kvp.Value.SetTexture("_ProbeSh0", environmentMap);
+					kvp.Value.SetTexture("_ProbeSh1", environmentMap);
+					kvp.Value.SetTexture("_ProbeSh2", environmentMap);
+					kvp.Value.SetTexture("_ProbeSh3", environmentMap);
+					kvp.Value.SetTexture("_ProbeVis", environmentMap);
+					kvp.Value.SetTexture("_ProbeOffset", environmentMap);
+					kvp.Value.SetTexture("_ProbeIndirection", environmentMap);
+
+					// Каскады: слоты объявлены безусловно, как и базовые - без плейсхолдера
+					// дескрипторы невалидны (VUID-08114), даже когда каскадов нет и мёртвая ветка
+					// шейдера их не читает. Настоящие атласы перепривяжет ProbeGiTextures.Bind.
+					foreach (var suffix in new[] { "_C1", "_C2" })
+					{
+						kvp.Value.SetTexture($"_ProbeSh0{suffix}", environmentMap);
+						kvp.Value.SetTexture($"_ProbeSh1{suffix}", environmentMap);
+						kvp.Value.SetTexture($"_ProbeSh2{suffix}", environmentMap);
+						kvp.Value.SetTexture($"_ProbeSh3{suffix}", environmentMap);
+						kvp.Value.SetTexture($"_ProbeVis{suffix}", environmentMap);
+						kvp.Value.SetTexture($"_ProbeOffset{suffix}", environmentMap);
+						kvp.Value.SetTexture($"_ProbeIndirection{suffix}", environmentMap);
+					}
 				}
 
 				// Слот объявлен в шейдере только под MATERIAL_TRANSMISSION (см. UnlitInstancedPS.hlsl) -
@@ -440,6 +978,22 @@ namespace DecaEngine.Editor
 					kvp.Value.SetImmutableSampler("_SceneColor", sceneCopySampler);
 
 					batchRenderer.SetMaterialTransparent(materialIdMap[kvp.Key], true);
+				}
+
+				// Альфа-тест при записи тени - только для РЕАЛЬНО дырявой геометрии (листва). Критерий
+				// дословно тот же, что у probe-GI при отборе треугольников в BVH (см. ProbeGi.cs), и
+				// по той же причине: смотреть на glTF alphaMode нельзя - экспортеры сплошь метят
+				// MASK/BLEND камень и ткань с альфой ~1, и по режиму под альфа-тест уехала бы вся
+				// сцена. Средняя альфа отделяет крону (много прозрачного) от них.
+				//
+				// Цена ошибки здесь не косметическая: каждый такой материал добавляет дроу-колл в
+				// КАЖДЫЙ теневой каскад (см. ShadowRenderer.ExecuteDrawShadows).
+				if (modelLoader.MaterialPbr.TryGetValue(kvp.Key, out var maskPbr) &&
+					maskPbr.AlphaCutoff > 0f && maskPbr.HasBaseColorTexture && maskPbr.AverageAlpha < 0.6f &&
+					modelLoader.MaterialBaseColor.TryGetValue(kvp.Key, out var maskBaseColor))
+				{
+					batchRenderer.SetMaterialAlphaTestedShadow(materialIdMap[kvp.Key].materialId, maskBaseColor,
+						maskPbr.AlphaCutoff);
 				}
 			}
 

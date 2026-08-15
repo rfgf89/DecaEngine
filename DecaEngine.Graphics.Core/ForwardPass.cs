@@ -1,6 +1,7 @@
 using System.Numerics;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
+using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Core;
 
@@ -24,6 +25,15 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	private readonly IGpuTexture? _msaaDepthTarget;
 	private readonly Vector4 _clearColor;
 
+	/// <summary>Инлайн-оверлей поверх геометрии (дебаг-вид проб и т.п.): рисуется в конце каждого
+	/// вида, в УЖЕ привязанный render target, до резолва MSAA - оверлей мультисэмплится вместе со
+	/// сценой и честно тестируется её депт-буфером.
+	///
+	/// Геттер, а не значение: команды графа заморожены, но перезаписываются по InvalidateGraph -
+	/// геттер даёт вызывающему включать/выключать оверлей без пересоздания пасса (см.
+	/// GraphicsPipelineSimple.InlineOverlay). null-результат = оверлея нет.</summary>
+	private readonly Func<Action<ICommandBuffer>?>? _overlay;
+
 	public struct PassData
 	{
 	}
@@ -43,9 +53,10 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	public ForwardPass(IBatchRenderer batchRenderer, RenderCamerasData renderScene, Ref<Vector2> viewPortRef,
 		IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor, IGpuTexture? sceneCopy = null,
 		SkyPassResources? sky = null, IGpuTexture? msaaColorTarget = null, IGpuTexture? msaaDepthTarget = null,
-		SsaoPassResources? ssao = null)
+		SsaoPassResources? ssao = null, Func<Action<ICommandBuffer>?>? overlay = null)
 	{
 		_sky = sky;
+		_overlay = overlay;
 
 		// AO рисуется инлайн МЕЖДУ opaque- и transmissive-дроу (см. SsaoPassResources.
 		// WriteInlineCommands): стекло преломляет уже затенённый фон, но само экранным AO не
@@ -74,17 +85,78 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		_sceneCopy = colorTarget is not null ? sceneCopy : null;
 	}
 
+	/// <summary>Объявляет графу таргеты, которых пасс касается (см.
+	/// <see cref="IRenderGraphBuilder.ImportTexture"/>): создаёт и владеет ими конвейер, но зная, кто
+	/// что читает и пишет, граф строит настоящие рёбра зависимостей вместо порядка добавления, а окно
+	/// отладки показывает времена жизни и вес ресурсов кадра.
+	///
+	/// Собственные таргеты AO/GTAO сюда не попадают намеренно: они целиком внутри ЭТОГО пасса
+	/// (композит рисуется инлайн, см. SsaoPassResources.WriteInlineCommands), и графу от их
+	/// объявления ни зависимостей, ни времён жизни не прибавится.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
+		if (_msaaColorTarget is not null)
+		{
+			builder.WriteTarget(builder.ImportTexture(_msaaColorTarget));
+		}
+
+		if (_msaaDepthTarget is not null)
+		{
+			builder.WriteTarget(builder.ImportTexture(_msaaDepthTarget));
+		}
+
+		if (_colorTarget is not null)
+		{
+			// Пишется в любом случае: без MSAA - самой геометрией, с MSAA - резолвом в конце.
+			builder.WriteTarget(builder.ImportTexture(_colorTarget));
+		}
+
+		if (_depthTarget is not null)
+		{
+			builder.WriteTarget(builder.ImportTexture(_depthTarget));
+		}
+
+		if (_sceneCopy is not null)
+		{
+			// И пишется (снимок opaque-сцены), и читается - transmissive-материалы сэмплируют его
+			// как "_SceneColor".
+			var sceneCopy = builder.ImportTexture(_sceneCopy);
+			builder.WriteTarget(sceneCopy);
+			builder.ReadTarget(sceneCopy);
+		}
+
 		return default;
 	}
 
-	public override void WriteCommands(in PassData value, in IRenderGraphContext context)
+	public override unsafe void WriteCommands(in PassData value, in IRenderGraphContext context)
 	{
 		var cmd = context.cmd;
 
 		_batchRenderer.CheckAndReallocateBuffers();
-		_batchRenderer.ClearIndirectDrawBuffers(cmd);
+
+		var punctualViews = _renderScene;
+
+		// Тени punctual-светов - ДО привязки цветового таргета: каждый слайс биндит свой depth-слайс
+		// массива теней. Петля фиксированная по ВСЕМ слайсам (команды замороженные): мёртвый слайс
+		// несёт drawCount = 0 и рисует пусто (см. PunctualShadowScheduler).
+		if (punctualViews.IsCreated)
+		{
+			_batchRenderer.SetupPunctualShadowMatrices(cmd, punctualViews.punctualShadowMatrices);
+
+			for (int s = 0; s < punctualViews.punctualShadowCullData.Capacity; s++)
+			{
+				_batchRenderer.ClearIndirectDrawBuffers(cmd);
+				_batchRenderer.SetupCullData(cmd, ref punctualViews.punctualShadowCullData.GetRef(s, false));
+				_batchRenderer.SetupLightData(cmd, ref punctualViews.punctualShadowLightData.GetRef(s, false));
+
+				var sliceCull = _batchRenderer.ExecuteComputeCulling(cmd);
+				_batchRenderer.ExecuteDrawPunctualShadow(cmd, sliceCull, s);
+			}
+
+			// Всегда, даже без единого нарисованного слайса: текстура объявлена в PS безусловно,
+			// лейаут обязан быть валиден.
+			_batchRenderer.TransitionPunctualShadowsForRead(cmd);
+		}
 
 		// При включённом MSAA вся геометрия рисуется в мультисемпловую пару, а _colorTarget
 		// становится resolve-приёмником в конце кадра.
@@ -111,11 +183,24 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		var views = _renderScene;
 		if (views.IsCreated)
 		{
+			// Пул punctual-светов кадра - один на все камеры пасса (каждая берёт свой сегмент по
+			// LightData.ClusterParams), заливается до пер-камерных диспатчей кластеризации.
+			_batchRenderer.SetupPunctualLights(cmd, views.punctualLights);
+
 			for (int i = 0; i < views.viewData.Capacity; i++)
 			{
+				// Свежие indirect-команды/счётчики батчей КАЖДОЙ камере: каллинг аллоцирует слоты
+				// инстансов атомарным инкрементом и без сброса копил бы их между камерами - та же
+				// аккумуляция, что мигала каскадами в ShadowPass (см. комментарий там).
+				_batchRenderer.ClearIndirectDrawBuffers(cmd);
+
 				_batchRenderer.SetupViewData(cmd, ref views.viewData.GetRef(i, false));
 				_batchRenderer.SetupCullData(cmd, ref views.cullData.GetRef(i, false));
 				_batchRenderer.SetupLightData(cmd, ref views.lightData.GetRef(i, false));
+
+				// Раскладка сегмента светов ЭТОЙ камеры по фроксел-кластерам - читает свежезалитый
+				// Light-кбуфер (ClusterParams), поэтому строго после SetupLightData.
+				_batchRenderer.ExecuteLightClustering(cmd);
 
 				// Фон-энвайронмент (см. SkyPassResources.Draw): в уже забинженный этим циклом render
 				// target, ДО геометрии.
@@ -126,6 +211,7 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				if (_sceneCopy is null)
 				{
 					_batchRenderer.ExecuteDrawBatching(cmd, cullResult);
+					_overlay?.Invoke()?.Invoke(cmd);
 					continue;
 				}
 
@@ -154,28 +240,30 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
 
 				// Экранное AO - здесь, а не пост-пассом поверх готового кадра: оценка по opaque-депту,
-				// композит в render-таргет (читает свежий снапшот выше как _SceneTex), затем ПЕРЕ-съём
-				// снапшота - transmissive-материалы преломляют уже затенённую сцену, но их собственные
-				// вогнутости экранным AO не глушатся (см. SsaoPassResources.WriteInlineCommands).
+				// композит в render-таргет (читает снапшот выше как _SceneTex). Сам снапшот при этом
+				// НЕ ПЕРЕСНИМАЕТСЯ, то есть transmissive-материалы преломляют кадр ДО композита AO.
+				//
+				// Раньше он переснимался - ради того, чтобы стекло преломляло уже затенённую сцену.
+				// Замерено, что это давало: на прозрачных шторах Sponza (KHR_materials_transmission,
+				// см. UnlitInstancedPS.hlsl, transmitted = lerp(backdrop, scene, scene.a)) сквозь
+				// ткань проступало AO-поле стены и арки за ней - тёмные пятна формой по арке, тем
+				// заметнее, чем контрастнее техника AO: с выключенным AO узор шторы ровный, с SSAO
+				// лёгкая грязь, с GTAO уже сплошные пятна.
+				//
+				// Пятна тут - не «слишком сильный AO», а двойной учёт: экранное AO аппроксимирует
+				// заслонённость рассеянного амбиента У ПОВЕРХНОСТИ, и переносить её на свет,
+				// прошедший сквозь материал насквозь, оснований нет. Стекло теперь преломляет
+				// незатенённый фон - это осознанный размен: контактная тень за стеклом сквозь него
+				// не видна.
 				if (_ssao is not null)
 				{
 					_ssao.WriteInlineCommands(cmd, renderColor!, renderDepth!, _viewPortRef);
-
-					cmd.SetRenderTarget(null, null);
-					if (_msaaColorTarget is not null)
-					{
-						cmd.ResolveTexture(_msaaColorTarget, _sceneCopy);
-					}
-					else
-					{
-						cmd.CopyTexture(_colorTarget, _sceneCopy);
-					}
-					cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
 				}
 
 				cmd.SetRenderTarget(renderColor, renderDepth);
 				cmd.SetViewport(_viewPortRef);
 				_batchRenderer.ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.TransparentOnly);
+				_overlay?.Invoke()?.Invoke(cmd);
 			}
 		}
 

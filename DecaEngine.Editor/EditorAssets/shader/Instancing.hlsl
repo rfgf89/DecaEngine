@@ -73,6 +73,39 @@ struct LightData
     float4 CascadeSplits;
     float4 CascadeSizes;
     float4 CascadeNearPlanes;
+
+    // Кластеризованные punctual-света этой камеры: x - офсет сегмента камеры в пуле PunctualLights,
+    // y - число светов сегмента, z/w - zNear/zFar экспоненциальных срезов кластерной сетки.
+    // y == 0 - punctual-светов нет (превью, теневые каскады), кластерная ветка мёртвая.
+    float4 ClusterParams;
 };
+
+// ----- Clustered punctual lights (point/spot) ----------------------------------------------------
+// Фроксел-сетка вьюпорта: CLUSTER_GRID_X * CLUSTER_GRID_Y тайлов экрана, CLUSTER_GRID_Z
+// экспоненциальных срезов глубины. Зеркалит LightClusters (LightData.cs) - менять только парой.
+#define CLUSTER_GRID_X 16
+#define CLUSTER_GRID_Y 8
+#define CLUSTER_GRID_Z 24
+#define CLUSTER_COUNT (CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z)
+#define CLUSTER_MAX_LIGHTS 32
+#define PUNCTUAL_SHADOW_SLICES 16
+
+// Зеркало PunctualLight (LightData.cs): позиция/направление МИРОВЫЕ, кластеризация переводит их во
+// view сама (LightClusterCS.hlsl), шейдинг работает в мировом пространстве (UnlitInstancedPS.hlsl).
+struct PunctualLight
+{
+    float4 PositionRange;  // xyz - мировая позиция, w - радиус действия
+    float4 ColorIntensity; // rgb - линейный цвет, w - интенсивность
+    float4 DirectionType;  // xyz - мировое направление конуса (спот), w - тип: 0 point, 1 spot
+    float4 SpotAngles;     // x - cos внешнего полуугла, y - 1/(cosInner-cosOuter), z - sin внешнего
+    float4 ShadowParams;   // x - первый слайс тени (-1 = нет; точечный: 6 граней подряд), y - сила
+};
+
+// Плоский индекс кластера: тайлы экрана идут строками, срезы глубины - самым старшим измерением.
+// ОБЩАЯ для записи (LightClusterCS) и чтения (UnlitInstancedPS) - раскладка обязана совпадать.
+uint ClusterFlatIndex(uint3 c)
+{
+    return (c.z * CLUSTER_GRID_Y + c.y) * CLUSTER_GRID_X + c.x;
+}
 
 RWStructuredBuffer<uint> BatchCounters;

@@ -53,6 +53,46 @@ public static class FullLoopProbe
 			new Scale3(1, 1, 1),
 			cameraComponent);
 
+		// DECA_LOOP_LIGHTS=N - засеять главную сцену N точечными светами по кольцу и одним спотом:
+		// структурная проверка всего кластерного пути (сбор и по-типовый кулинг в
+		// CullingAndRenderSystem, компьют-кластеризация LightClusterCS, чтение кластеров в PS) под
+		// живой валидацией бэкенда. Картинку не проверяет - геометрии в главной сцене нет.
+		if (int.TryParse(Environment.GetEnvironmentVariable("DECA_LOOP_LIGHTS"), out var lightCount) && lightCount > 0)
+		{
+			for (int li = 0; li < lightCount; li++)
+			{
+				float angle = li * MathF.Tau / lightCount;
+				store.CreateEntity(
+					new Position(MathF.Cos(angle) * 3f, 1f, MathF.Sin(angle) * 3f),
+					new LightComponent
+					{
+						Type = LightType.Point,
+						Color = new Vector3(1f, 0.8f, 0.6f),
+						Intensity = 5f,
+						Range = 4f,
+						// Часть светов - с тенями: прогоняет раздачу слайсов (бюджет меньше, чем
+						// просят) и запись/сэмплинг shadow map punctual-светов.
+						ShadowStrength = li % 3 == 0 ? 1f : 0f,
+					});
+			}
+
+			var spotDown = Quaternion.CreateFromAxisAngle(Vector3.UnitX, MathF.PI / 2f);
+			store.CreateEntity(
+				new Position(0, 3f, 0),
+				new Rotation(spotDown.X, spotDown.Y, spotDown.Z, spotDown.W),
+				new LightComponent
+				{
+					Type = LightType.Spot,
+					Color = new Vector3(0.5f, 0.7f, 1f),
+					Intensity = 8f,
+					Range = 10f,
+					SpotAngle = 45f,
+					ShadowStrength = 1f,
+				});
+
+			Console.WriteLine($"[full] seeded {lightCount} point lights + 1 spot");
+		}
+
 		var root = new SystemRoot { new CullingAndRenderSystem(resourceManager, api, pipeline) };
 		root.AddStore(store);
 

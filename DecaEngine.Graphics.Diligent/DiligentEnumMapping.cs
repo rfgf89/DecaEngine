@@ -43,6 +43,7 @@ internal static class DiligentEnumMapping
 		CoreResourceState.CopyDest => NativeResourceState.CopyDest,
 		CoreResourceState.ResolveSource => NativeResourceState.ResolveSource,
 		CoreResourceState.ResolveDest => NativeResourceState.ResolveDest,
+		CoreResourceState.ConstantBuffer => NativeResourceState.ConstantBuffer,
 		_ => throw new ArgumentOutOfRangeException(nameof(state), state, null),
 	};
 

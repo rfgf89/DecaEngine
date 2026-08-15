@@ -622,6 +622,11 @@ public class SettingsWindow : ImGuiModalWindow
 		PreviewGraphicsApplied?.Invoke();
 	}
 
+	/// <summary>Поднимает <see cref="PreviewGraphicsApplied"/> извне модалки - live-путь окна
+	/// Graphics (см. <see cref="GraphicsSettingsWindow"/>): оно пишет в EditorSettings напрямую и
+	/// дёргает тот же событийный канал, что и "OK" здесь.</summary>
+	public static void RaisePreviewGraphicsApplied() => PreviewGraphicsApplied?.Invoke();
+
 	// ВРЕМЕННЫЙ хук для PreviewLoopProbe (диагностика NRE в DiligentCommandBuffer) - вызывает тот
 	// же событийный путь, что и "OK" в окне настроек, без реального ImGui-окна. Удалить вместе с
 	// PreviewLoopProbe.cs после диагностики.

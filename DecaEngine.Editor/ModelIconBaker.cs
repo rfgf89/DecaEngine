@@ -274,10 +274,10 @@ namespace DecaEngine.Editor
 			}
 
 			var request = _loadRequest;
-			_loadRequest = null;
 
 			if (!request.PrepareTask.IsCompletedSuccessfully)
 			{
+				_loadRequest = null;
 				var message = request.PrepareTask.Exception?.GetBaseException().Message ?? "Unknown error";
 				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {message}");
 				FinishCurrentJob();
@@ -286,7 +286,19 @@ namespace DecaEngine.Editor
 
 			try
 			{
-				var resident = new ResidentModel { Model = request.FinalizeOnMainThread() };
+				// ПОРЦИЯМИ, а не одним куском: FinalizeOnMainThread создавал все GPU-ресурсы модели за
+				// один вызов, то есть за один кадр - на сцене уровня Sponza редактор просто вставал
+				// (окно "Not Responding") ровно в тот момент, когда Asset Browser показывал папку с
+				// такой моделью и начинал печь её иконку. FinalizeChunk возвращает null, пока не
+				// закончил, - продолжим на следующем кадре.
+				var model = request.FinalizeChunk();
+				if (model == null)
+				{
+					return;
+				}
+
+				_loadRequest = null;
+				var resident = new ResidentModel { Model = model };
 				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, resident.Model, resident.MeshIdMap, resident.MaterialIdMap,
 					_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap);
 				// Помечаем модель резидентной только ПОСЛЕ успешной регистрации ресурсов - если
@@ -297,6 +309,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
+				_loadRequest = null;
 				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {ex.Message}");
 				_currentResident = null;
 				FinishCurrentJob();

@@ -15,8 +15,12 @@ namespace DecaEngine.Editor;
 /// обеспечивают аналитические key/fill источники, а не энвайронмент.
 /// </summary>
 /// <summary>Результат создания энвайронмента превью: текстура + направление НА доминантный
-/// источник света в ней (солнце/софтбокс) - из него строится мировой ключевой свет и тени.</summary>
-public readonly record struct EnvironmentMapResult(IGpuTexture Texture, Vector3 SunDirection);
+/// источник света в ней (солнце/софтбокс) - из него строится мировой ключевой свет и тени.
+/// Radiance - CPU-двойник шейдерного SampleEnvironment (линейный радианс неба по мировому
+/// направлению, БЕЗ пользовательского поворота) - им пользуется CPU-бейк probe-GI
+/// (см. <see cref="ProbeGiBaker"/>); потокобезопасен.</summary>
+public readonly record struct EnvironmentMapResult(IGpuTexture Texture, Vector3 SunDirection,
+	Func<Vector3, Vector3> Radiance);
 
 public static class PreviewEnvironmentMap
 {
@@ -67,7 +71,8 @@ public static class PreviewEnvironmentMap
 
 		return new EnvironmentMapResult(
 			api.CreateTexture2DWithMips("Preview Environment", mips, BaseWidth, BaseHeight),
-			SunDirection);
+			SunDirection,
+			dir => Shade(dir, 0f));
 	}
 
 	/// <summary>Загрузка equirect Radiance .hdr: даунсемпл до BaseWidth x BaseHeight, автоэкспозиция
@@ -180,10 +185,35 @@ public static class PreviewEnvironmentMap
 			mips.Add(ToHalfPixels(level, levelWidth, levelHeight));
 		}
 
+		// CPU-радианс для probe-GI: билинейный lookup базового уровня (уже с экспозицией/клампом).
+		var radiancePixels = basePixels;
+		Vector3 SampleHdr(Vector3 dir)
+		{
+			dir = Vector3.Normalize(dir);
+			float u = MathF.Atan2(dir.Z, dir.X) / (2f * MathF.PI) + 0.5f;
+			float v = MathF.Acos(Math.Clamp(dir.Y, -1f, 1f)) / MathF.PI;
+
+			float fx = u * BaseWidth - 0.5f;
+			float fy = v * BaseHeight - 0.5f;
+			int x0 = (int)MathF.Floor(fx);
+			int y0 = Math.Clamp((int)MathF.Floor(fy), 0, BaseHeight - 1);
+			int y1 = Math.Clamp(y0 + 1, 0, BaseHeight - 1);
+			float tx = fx - MathF.Floor(fx);
+			float ty = fy - y0;
+
+			int xa = ((x0 % BaseWidth) + BaseWidth) % BaseWidth;
+			int xb = (xa + 1) % BaseWidth;
+
+			var top = Vector3.Lerp(radiancePixels[y0 * BaseWidth + xa], radiancePixels[y0 * BaseWidth + xb], tx);
+			var bottom = Vector3.Lerp(radiancePixels[y1 * BaseWidth + xa], radiancePixels[y1 * BaseWidth + xb], tx);
+			return Vector3.Lerp(top, bottom, ty);
+		}
+
 		return new EnvironmentMapResult(
 			api.CreateTexture2DWithMips($"Preview Environment ({Path.GetFileName(hdrPath)})",
 				mips, BaseWidth, BaseHeight, floatFormat: true),
-			sunDirection);
+			sunDirection,
+			SampleHdr);
 	}
 
 	private static (Vector3[] Pixels, int Width, int Height) Downsample2x(Vector3[] src, int width, int height)

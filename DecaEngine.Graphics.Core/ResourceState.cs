@@ -17,6 +17,7 @@ public enum ResourceState
 	CopyDest,
 	ResolveSource,
 	ResolveDest,
+	ConstantBuffer,
 }
 
 [Flags]

@@ -6,23 +6,26 @@ using Hexa.NET.ImGuizmo;
 namespace DecaEngine.Editor
 {
 	/// <summary>
-	/// ????????? ???-???? "Scene View" ? 3D-?????????????? ???????? ?????????????? ?
-	/// <see cref="InspectorWindow"/> ???????: ?????? ??? ?? ??????? TRS-??????? ?????? ????????
-	/// ????? ?????????? ????????? ImGuizmo, ??????????? ?????? ????? ? gizmo
-	/// ???????????/????????/??????????????? ????????? ????????, ????????? ???????? ????????????
-	/// ??????? ? ?????????? ???????? ????? <see cref="InspectorWindow"/>.
+	/// Докируемое окно "Scene View": GPU-рендер сцены редактируемого в <see cref="InspectorWindow"/>
+	/// префаба через <see cref="PrefabSceneViewport"/> (объекты грузятся по AssetRef из компонентов
+	/// ModelRenderer), с гизмо перемещения/поворота/масштаба выделенной сущности, переключателями
+	/// шейдинга и вращением направленного света - те же ручки, что у превью модели.
 	/// </summary>
 	public class SceneViewWindow : ImGuiDockingWindow
 	{
+		private static readonly string[] ShadingLabels = { "Lighting", "Textured", "Normal", "UV", "Tangent" };
+
 		private readonly InspectorWindow _inspectorWindow;
-		private readonly PrefabSceneViewport _sceneViewport = new();
+		private readonly PrefabSceneViewport _sceneViewport;
 		private string? _lastFramedPrefabPath;
 
 		protected override ImGuiWindowFlags AdditionalWindowFlags => ImGuiWindowFlags.MenuBar;
 
-		public SceneViewWindow(string name, InspectorWindow inspectorWindow, ImGuiRender imGuiRender) : base(name, imGuiRender)
+		public SceneViewWindow(string name, InspectorWindow inspectorWindow, PrefabSceneViewport sceneViewport,
+			ImGuiRender imGuiRender) : base(name, imGuiRender)
 		{
 			_inspectorWindow = inspectorWindow;
+			_sceneViewport = sceneViewport;
 		}
 
 		protected override void OnRender(uint dockId)
@@ -45,7 +48,7 @@ namespace DecaEngine.Editor
 
 			if (_inspectorWindow.PrefabPath != _lastFramedPrefabPath)
 			{
-				_sceneViewport.FrameAll(root.Value);
+				_sceneViewport.FrameAll();
 				_lastFramedPrefabPath = _inspectorWindow.PrefabPath;
 			}
 
@@ -57,9 +60,23 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			if (_sceneViewport.Render(root.Value, _inspectorWindow.Selected, canvasSize))
+			if (_sceneViewport.Render(_imGuiRender, root.Value, _inspectorWindow.Selected, canvasSize, out var pick))
 			{
 				_inspectorWindow.NotifyTransformChangedExternally();
+			}
+
+			// Клик по вьюпорту: объект - выделяем его в Inspector-е (и гизмо переезжает на него),
+			// пустота - снимаем выделение, как в обычных редакторах.
+			if (pick.Clicked)
+			{
+				if (pick.Entity.HasValue)
+				{
+					_inspectorWindow.SetSelected(pick.Entity.Value);
+				}
+				else
+				{
+					_inspectorWindow.ClearSelection();
+				}
 			}
 		}
 
@@ -86,15 +103,51 @@ namespace DecaEngine.Editor
 			{
 				_sceneViewport.Operation = ImGuizmoOperation.Scale;
 			}
+
 			ImGui.SameLine();
 			if (ImGui.SmallButton("Frame All"))
 			{
-				var root = _inspectorWindow.Root;
-				if (root.HasValue)
-				{
-					_sceneViewport.FrameAll(root.Value);
-				}
+				_sceneViewport.FrameAll();
 			}
+
+			// Режим шейдинга - тот же набор, что у превью модели (Lighting/Textured/каналы отладки).
+			ImGui.SameLine();
+			int shadingIndex = (int)_sceneViewport.Shading;
+			ImGui.SetNextItemWidth(110f * _scale);
+			if (ImGui.Combo("##SceneShading", ref shadingIndex, ShadingLabels, ShadingLabels.Length))
+			{
+				_sceneViewport.SetShading((PrefabSceneViewport.ShadingMode)shadingIndex);
+			}
+
+			// HDR+GI: одна галочка включает и авто-экспозицию (HDR-конвейер), и probe-GI сцены.
+			// Применяется пересозданием окружения без перезагрузки моделей (см.
+			// PrefabSceneViewport.SetHdrEnabled).
+			ImGui.SameLine();
+			bool hdr = _sceneViewport.HdrEnabled;
+			if (ImGui.Checkbox("HDR+GI", ref hdr))
+			{
+				_sceneViewport.SetHdrEnabled(hdr);
+			}
+
+			// Поворот мирового направленного света - live, вместе с небом/IBL (см.
+			// PrefabSceneViewport.SetLightRotation; та же семантика, что в превью модели).
+			float lightYaw = _sceneViewport.LightYawDegrees;
+			float lightElevation = _sceneViewport.LightElevationDegrees;
+			bool lightChanged = false;
+
+			ImGui.SameLine();
+			ImGui.SetNextItemWidth(120f * _scale);
+			lightChanged |= ImGui.SliderFloat("Sun Yaw", ref lightYaw, -180f, 180f, "%.0f deg");
+
+			ImGui.SameLine();
+			ImGui.SetNextItemWidth(120f * _scale);
+			lightChanged |= ImGui.SliderFloat("Height", ref lightElevation, -60f, 60f, "%.0f deg");
+
+			if (lightChanged)
+			{
+				_sceneViewport.SetLightRotation(lightYaw, lightElevation);
+			}
+
 			ImGui.SameLine();
 			ImGui.TextDisabled("RMB orbit / MMB pan / wheel zoom");
 
@@ -102,4 +155,3 @@ namespace DecaEngine.Editor
 		}
 	}
 }
-

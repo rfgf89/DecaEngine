@@ -24,6 +24,8 @@ public static class DiligentResourceFormats
 			TextureObjectFormat.R8G8B8A8UNorm => TextureFormat.RGBA8_UNorm,
 			TextureObjectFormat.R16G16B16A16Float => TextureFormat.RGBA16_Float,
 			TextureObjectFormat.R32G32B32A32Float => TextureFormat.RGBA32_Float,
+			TextureObjectFormat.R16G16Float => TextureFormat.RG16_Float,
+			TextureObjectFormat.R32Float => TextureFormat.R32_Float,
 			TextureObjectFormat.D32Float => TextureFormat.D32_Float,
 			TextureObjectFormat.D24UNormS8UInt => TextureFormat.D24_UNorm_S8_UInt,
 			TextureObjectFormat.D32FloatS8X24UInt => TextureFormat.D32_Float_S8X24_UInt,
@@ -42,6 +44,8 @@ public static class DiligentResourceFormats
 			TextureFormat.RGBA8_UNorm => TextureObjectFormat.R8G8B8A8UNorm,
 			TextureFormat.RGBA16_Float => TextureObjectFormat.R16G16B16A16Float,
 			TextureFormat.RGBA32_Float => TextureObjectFormat.R32G32B32A32Float,
+			TextureFormat.RG16_Float => TextureObjectFormat.R16G16Float,
+			TextureFormat.R32_Float => TextureObjectFormat.R32Float,
 			TextureFormat.D32_Float => TextureObjectFormat.D32Float,
 			TextureFormat.D24_UNorm_S8_UInt => TextureObjectFormat.D24UNormS8UInt,
 			TextureFormat.D32_Float_S8X24_UInt => TextureObjectFormat.D32FloatS8X24UInt,
@@ -74,6 +78,21 @@ public static class DiligentResourceFormats
 			: BindFlags.RenderTarget | BindFlags.ShaderResource;
 
 		return (ToNativeFormat(format), bindFlags);
+	}
+
+	/// <summary>Как <see cref="ToRenderTargetFormat"/>, но с UAV-бинд-флагом по
+	/// <see cref="HandleAccess.Compute"/> в <see cref="TextureInfo.access"/>: выход нативного
+	/// апскейлера (FSR) пишется compute-шейдером через UAV (см. DiligentRenderTarget).</summary>
+	public static (TextureFormat Format, BindFlags BindFlags) ToRenderTargetFormat(TextureObjectFormat format,
+		HandleAccess access)
+	{
+		var (dilFormat, bindFlags) = ToRenderTargetFormat(format);
+		if ((access & HandleAccess.Compute) != 0 && (bindFlags & BindFlags.DepthStencil) == 0)
+		{
+			bindFlags |= BindFlags.UnorderedAccess;
+		}
+
+		return (dilFormat, bindFlags);
 	}
 
 	/// <summary>
@@ -126,7 +145,7 @@ public static class DiligentResourceFormats
 				or TextureFormat.RGBA8_SInt or TextureFormat.RGBA8_SNorm
 				or TextureFormat.D32_Float or TextureFormat.D24_UNorm_S8_UInt
 				or TextureFormat.RGB10A2_UNorm or TextureFormat.RGB10A2_UInt
-				or TextureFormat.R11G11B10_Float => 4,
+				or TextureFormat.R11G11B10_Float or TextureFormat.RG16_Float => 4,
 			TextureFormat.RG8_UNorm or TextureFormat.RG8_UInt or TextureFormat.RG8_SInt or TextureFormat.RG8_SNorm
 				or TextureFormat.R16_Float or TextureFormat.R16_UNorm or TextureFormat.R16_UInt
 				or TextureFormat.R16_SInt or TextureFormat.R16_SNorm or TextureFormat.D16_UNorm => 2,
