@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using DecaEngine.Core.Entities;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 
@@ -109,7 +110,7 @@ public static class LightCulling
             return false;
         }
 
-        Vector3 worldPos = lightEntity.Position.value;
+        GetWorldPositionRotation(lightEntity, out Vector3 worldPos, out Quaternion worldRot);
         Vector3 viewPos = Vector3.Transform(worldPos, cullData.view);
 
         var shadowParams = shadowSlices.TryGetValue(lightEntity.Id, out var firstSlice)
@@ -139,8 +140,7 @@ public static class LightCulling
             case LightType.Spot:
             {
                 // Конвенция направления - как у солнца: локальный +Z энтити (камера LH, forward = +Z).
-                var rotation = lightEntity.HasComponent<Rotation>() ? lightEntity.Rotation.value : Quaternion.Identity;
-                Vector3 dirWorld = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, rotation));
+                Vector3 dirWorld = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, worldRot));
                 Vector3 dirView = Vector3.Normalize(Vector3.TransformNormal(dirWorld, cullData.view));
 
                 // SpotAngle - ПОЛНЫЙ внешний угол в градусах; тесты и спад работают с полууглом.
@@ -170,6 +170,25 @@ public static class LightCulling
 
             default:
                 return false;
+        }
+    }
+
+    /// <summary>Мировые позиция/поворот сущности света: если TransformSystem сложил иерархию в
+    /// <see cref="WorldMatrix"/> (у сущности есть родитель), декомпозируем ЕЁ, а не читаем сырой
+    /// локальный Position/Rotation - иначе свет под вложенным родителем (Super > MegaEntity > ...)
+    /// светит и кастует тень из точки локальной системы координат родителя, а не из своего реального
+    /// места в мире (см. GpuInstanceBufferSystem в RenderingSystems.cs - та же декомпозиция для
+    /// геометрии). У корневых сущностей (нет WorldMatrix) своя локальная TRS и есть мировая.</summary>
+    public static void GetWorldPositionRotation(Entity entity, out Vector3 position, out Quaternion rotation)
+    {
+        position = entity.HasComponent<Position>() ? entity.Position.value : Vector3.Zero;
+        rotation = entity.HasComponent<Rotation>() ? entity.Rotation.value : Quaternion.Identity;
+
+        if (entity.TryGetComponent<WorldMatrix>(out var worldMatrix) &&
+            Matrix4x4.Decompose(worldMatrix.value, out _, out var worldRot, out var worldPos))
+        {
+            position = worldPos;
+            rotation = worldRot;
         }
     }
 

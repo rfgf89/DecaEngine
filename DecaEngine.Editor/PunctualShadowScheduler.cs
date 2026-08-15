@@ -74,7 +74,11 @@ public static unsafe class PunctualShadowScheduler
                 return;
             }
 
-            float distSq = Vector3.DistanceSquared(entity.Position.value, cameraPos);
+            // Мировая позиция, не сырой локальный Position: у света под родителем (вложенная
+            // иерархия) локальный Position - это смещение относительно родителя, а не место в мире
+            // (см. LightCulling.GetWorldPositionRotation).
+            LightCulling.GetWorldPositionRotation(entity, out var worldPos, out _);
+            float distSq = Vector3.DistanceSquared(worldPos, cameraPos);
             Candidates.Add((entity, light, distSq));
         });
 
@@ -92,7 +96,12 @@ public static unsafe class PunctualShadowScheduler
                 continue;
             }
 
-            var position = entity.Position.value;
+            // Мировые позиция/поворот (не сырой локальный TRS) - см. комментарий у распределения
+            // кандидатов выше и LightCulling.GetWorldPositionRotation: слайс должен рендериться из
+            // точки/ориентации света В МИРЕ, иначе тень вложенного света рвётся с его же освещением
+            // (то читает мировую позицию, это - локальную) и выглядит "сдвинутой/перекошенной"
+            // относительно каcтующей геометрии.
+            LightCulling.GetWorldPositionRotation(entity, out var position, out var rotation);
             float range = light.Range;
             // near обязан остаться СТРОГО меньше far (= range): CreatePerspectiveFieldOfViewLeftHanded
             // кидает ArgumentOutOfRangeException при near >= far. Для Range <= 0.05 (за пределами
@@ -104,7 +113,6 @@ public static unsafe class PunctualShadowScheduler
 
             if (light.Type == LightType.Spot)
             {
-                var rotation = entity.HasComponent<Rotation>() ? entity.Rotation.value : Quaternion.Identity;
                 var dir = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, rotation));
                 var up = MathF.Abs(dir.Y) > 0.95f ? Vector3.UnitX : Vector3.UnitY;
 
