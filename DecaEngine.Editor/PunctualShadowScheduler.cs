@@ -42,6 +42,11 @@ public static unsafe class PunctualShadowScheduler
     // Скретчи кадра - рендер-системы работают на главном потоке, статики безопасны.
     private static readonly List<(Entity Entity, LightComponent Light, float DistSq)> Candidates = new();
 
+    // Сколько светов не влезло в бюджет на прошлом отчёте: исчерпание бюджета иначе НЕМОЕ - свет
+    // просто светит сквозь стены (ShadowParams.x = -1), и снаружи это неотличимо от сломанных теней.
+    // Печатаем только при ИЗМЕНЕНИИ числа, иначе строка сыпалась бы каждый кадр.
+    private static int _lastReportedSkipped;
+
     /// <summary>Заполняет слайсы теней кадра в <paramref name="target"/> (cull/light-данные для
     /// записи shadow map + матрицы для сэмплинга) и раскладку "id сущности света - первый слайс" в
     /// <paramref name="assignments"/> (её читает LightCulling.TryBuildPunctualLight, собирая
@@ -68,12 +73,14 @@ public static unsafe class PunctualShadowScheduler
         Candidates.Sort(static (a, b) => a.DistSq.CompareTo(b.DistSq));
 
         int nextSlice = 0;
+        int skipped = 0;
         foreach (var (entity, light, _) in Candidates)
         {
             int sliceCount = light.Type == LightType.Point ? 6 : 1;
             if (nextSlice + sliceCount > LightClusters.MaxShadowSlices)
             {
                 // Точечный не влез - следующий спот ещё может (один слайс), продолжаем перебор.
+                skipped++;
                 continue;
             }
 
@@ -112,6 +119,17 @@ public static unsafe class PunctualShadowScheduler
 
             assignments[entity.Id] = nextSlice;
             nextSlice += sliceCount;
+        }
+
+        if (skipped != _lastReportedSkipped)
+        {
+            _lastReportedSkipped = skipped;
+            if (skipped > 0)
+            {
+                Console.WriteLine($"[shadows] {skipped} punctual light(s) with ShadowStrength > 0 got no shadow " +
+                    $"slice: the budget of {LightClusters.MaxShadowSlices} slices is taken (a point light costs 6 " +
+                    "slices, a spot 1; the nearest lights to the camera win). Those lights shine through geometry.");
+            }
         }
 
         // Добить до полной ёмкости мёртвыми слайсами: drawCount = 0 - кулинг никого не пропускает.
