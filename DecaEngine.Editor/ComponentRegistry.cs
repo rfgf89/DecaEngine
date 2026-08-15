@@ -57,6 +57,14 @@ namespace DecaEngine.Editor
 	{
 		private static readonly List<ComponentRegistryEntry> _entries = new();
 
+		// Lazily built caches: the "Add Component" menu tree (rebuilt only after a new registration,
+		// see InvalidateCaches) and per-schema CLR-type -> Friflo-type lookup dictionaries (rebuilt
+		// only when a different EntitySchema instance is passed in).
+		private static MenuNode? _cachedTree;
+		private static EntitySchema? _resolveSchema;
+		private static readonly Dictionary<Type, ComponentType> _componentTypeByClr = new();
+		private static readonly Dictionary<Type, ScriptType> _scriptTypeByClr = new();
+
 		public static IReadOnlyList<ComponentRegistryEntry> Entries => _entries;
 
 		static ComponentRegistry()
@@ -83,6 +91,22 @@ namespace DecaEngine.Editor
 				return; // ??? ??????????????? - ???? ?????????? ????????? ???????????
 			}
 			_entries.Add(new ComponentRegistryEntry(menuPath, type, kind));
+			InvalidateCaches();
+		}
+
+		/// <summary>
+		/// Drops the cached menu tree and the resolve dictionaries, and clears
+		/// <see cref="ComponentFieldEditor"/>'s reflection metadata cache. Called after every
+		/// registration so types registered at runtime (e.g. from a loaded user assembly) show up
+		/// immediately and stale reflection data from an unloaded assembly is never reused.
+		/// </summary>
+		public static void InvalidateCaches()
+		{
+			_cachedTree = null;
+			_resolveSchema = null;
+			_componentTypeByClr.Clear();
+			_scriptTypeByClr.Clear();
+			ComponentFieldEditor.InvalidateCaches();
 		}
 
 		/// <summary>
@@ -120,6 +144,11 @@ namespace DecaEngine.Editor
 		/// <summary>?????? ?????? ?????/??????? ?? ???????? ?????? <see cref="Entries"/> ??? ???????? ?????.</summary>
 		public static MenuNode BuildTree()
 		{
+			return _cachedTree ??= BuildTreeUncached();
+		}
+
+		private static MenuNode BuildTreeUncached()
+		{
 			var root = new MenuNode();
 			foreach (var entry in _entries)
 			{
@@ -147,27 +176,46 @@ namespace DecaEngine.Editor
 		/// <summary>??????? ? <see cref="EntitySchema"/> Friflo-?????????, ??????????????? ??????????????????? CLR-????.</summary>
 		public static ComponentType? ResolveComponentType(EntitySchema schema, Type clrType)
 		{
-			foreach (var ct in schema.Components)
-			{
-				if (ct != null && ct.Type == clrType)
-				{
-					return ct;
-				}
-			}
-			return null;
+			EnsureResolveCaches(schema);
+			return _componentTypeByClr.TryGetValue(clrType, out var ct) ? ct : null;
 		}
 
 		/// <summary>??????? ? <see cref="EntitySchema"/> Friflo-????????? ???????, ??????????????? ??????????????????? CLR-????.</summary>
 		public static ScriptType? ResolveScriptType(EntitySchema schema, Type clrType)
 		{
-			foreach (var st in schema.Scripts)
+			EnsureResolveCaches(schema);
+			return _scriptTypeByClr.TryGetValue(clrType, out var st) ? st : null;
+		}
+
+		/// <summary>
+		/// Populates the CLR-type lookup dictionaries for <paramref name="schema"/>. Rebuilt only
+		/// when a different schema instance is passed in; TryAdd keeps first-match semantics of the
+		/// previous linear scans.
+		/// </summary>
+		private static void EnsureResolveCaches(EntitySchema schema)
+		{
+			if (ReferenceEquals(_resolveSchema, schema))
 			{
-				if (st != null && st.Type == clrType)
+				return;
+			}
+
+			_componentTypeByClr.Clear();
+			_scriptTypeByClr.Clear();
+			foreach (var ct in schema.Components)
+			{
+				if (ct != null && ct.Type != null)
 				{
-					return st;
+					_componentTypeByClr.TryAdd(ct.Type, ct);
 				}
 			}
-			return null;
+			foreach (var st in schema.Scripts)
+			{
+				if (st != null && st.Type != null)
+				{
+					_scriptTypeByClr.TryAdd(st.Type, st);
+				}
+			}
+			_resolveSchema = schema;
 		}
 	}
 }

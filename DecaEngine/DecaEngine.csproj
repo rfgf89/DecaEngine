@@ -6,7 +6,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-        <Configurations>Debug;</Configurations>
+        <Configurations>Debug;Release</Configurations>
         <Platforms>x64;x86</Platforms>
         <AssemblyName>DecaEngine</AssemblyName>
         <RootNamespace>DecaEngine</RootNamespace>

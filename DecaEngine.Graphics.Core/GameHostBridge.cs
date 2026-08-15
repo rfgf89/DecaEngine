@@ -65,11 +65,20 @@ public abstract class GameBehaviour
 
 	public void InternalUpdate(float deltaTime) => OnUpdate(deltaTime);
 
+	public void InternalFixedUpdate(float fixedDeltaTime) => OnFixedUpdate(fixedDeltaTime);
+
 	public void InternalShutdown() => OnShutdown();
 
 	protected abstract void OnInitialize();
 
 	protected abstract void OnUpdate(float deltaTime);
+
+	/// <summary>Called 0..N times per frame with a constant step (see TimeLoopCore.FixedTimeStep)
+	/// before the variable-rate <see cref="OnUpdate"/>. Override for fixed-rate simulation
+	/// (physics, deterministic gameplay). Default implementation does nothing.</summary>
+	protected virtual void OnFixedUpdate(float fixedDeltaTime)
+	{
+	}
 
 	protected abstract void OnShutdown();
 }

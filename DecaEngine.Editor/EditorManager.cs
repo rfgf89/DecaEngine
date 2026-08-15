@@ -111,6 +111,15 @@ public class EditorManager : TimeLoopCore
 			_ecsWorld = new EntityStore();
 
 			_editorSettings = EditorSettings.Load();
+
+			// VSync из настроек применяется сразу на старте: окно Graphics Settings синхронизирует
+			// его только на первом своём кадре, а до открытия окна редактор шёл бы с дефолтом api.
+			// Переменная окружения DECA_VSYNC приоритетнее сохранённой настройки.
+			if (Environment.GetEnvironmentVariable("DECA_VSYNC") is null)
+			{
+				_graphicsApi.PresentInterval = _editorSettings.VSync ? 1 : 0;
+			}
+
 			EditorAssetDatabase.Rescan();
 
 			_renderResourceManager = new RenderResourceManager(2, 2, _ecsWorld, _batchRenderer);
@@ -127,6 +136,9 @@ public class EditorManager : TimeLoopCore
 
 			_root = new SystemRoot()
 			{
+				// Before GpuInstanceBufferSystem: it produces WorldMatrix/WorldTransformDirtyTag
+				// that the instance-buffer upload consumes the same frame.
+				new DecaEngine.Core.Entities.TransformSystem(),
 				new GpuInstanceBufferSystem(),
 				new CullingAndRenderSystem(_renderResourceManager, _graphicsApi, _pipeline),
 				new FlyCameraSystem([ent], _devicePull)

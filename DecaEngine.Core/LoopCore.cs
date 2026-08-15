@@ -18,8 +18,11 @@ public class LoopCore : IEngineRun
 	private const long PausedState = 2L;
 	private const long QuitState = 3L;
 
-	private long statePos;
-	private readonly long[] _processQueue = new long[3];
+	// Single pending command written by Play/Pause/Quit (from any thread) and consumed
+	// (read-and-cleared) once per loop iteration. The latest command wins; unlike the previous
+	// rotating 3-slot queue a command can never be silently dropped because the slot cursor moved
+	// independently of the writers.
+	private long _pendingCommand;
 
 	private long _currentState;
 
@@ -32,17 +35,11 @@ public class LoopCore : IEngineRun
 
 		while (_currentState != QuitState)
 		{
-			var lockReadState = Interlocked.Read(ref statePos);
-			var state = Interlocked.Read(ref _processQueue[lockReadState]);
-
-			if (state != NoneState)
+			var command = Interlocked.Exchange(ref _pendingCommand, NoneState);
+			if (command != NoneState)
 			{
-				_currentState = state;
-				Interlocked.Exchange(ref _processQueue[lockReadState], NoneState);
+				_currentState = command;
 			}
-
-			long statePlus = (lockReadState + 1) % 3;
-			Interlocked.Exchange(ref statePos, statePlus);
 
 			if (_currentState == PausedState)
 			{
@@ -59,20 +56,17 @@ public class LoopCore : IEngineRun
 
 	public void Play()
 	{
-		long stPos = Interlocked.Read(ref statePos);
-		Interlocked.Exchange(ref _processQueue[stPos], PlayingState);
+		Interlocked.Exchange(ref _pendingCommand, PlayingState);
 	}
 
 	public void Pause()
 	{
-		long stPos = Interlocked.Read(ref statePos);
-		Interlocked.Exchange(ref _processQueue[stPos], PausedState);
+		Interlocked.Exchange(ref _pendingCommand, PausedState);
 	}
 
 	public void Quit()
 	{
-		long stPos = Interlocked.Read(ref statePos);
-		Interlocked.Exchange(ref _processQueue[stPos], QuitState);
+		Interlocked.Exchange(ref _pendingCommand, QuitState);
 	}
 
 	public IEngineRun GetRun()

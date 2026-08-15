@@ -47,6 +47,46 @@ namespace DecaEngine
 		public IWindowHandle WindowHandle { get; set; }
 		public DiligentPsoManager PsoManager { get; private set; }
 
+		/// <summary>См. <see cref="IGraphicsApi.PresentInterval"/>. Дефолт 1 (vsync) - осознанный, см.
+		/// комментарий в <see cref="Present"/>; переменная окружения DECA_VSYNC перекрывает его при
+		/// старте (0 - без ожидания, 1..4 - интервалы синхронизации).</summary>
+		public int PresentInterval { get; set; } = ResolvePresentInterval();
+
+		/// <summary>Сколько кадров CPU вправе убежать вперёд GPU (см. фенс в <see cref="Present"/>).
+		/// Меньше - ниже задержка, больше - ровнее загрузка; 2 - прежнее поведение.</summary>
+		public int FramesInFlight { get; set; } = 2;
+
+		private static int ResolvePresentInterval()
+		{
+			var env = Environment.GetEnvironmentVariable("DECA_VSYNC");
+			return env != null && int.TryParse(env, out var interval)
+				? Math.Clamp(interval, 0, 4)
+				: 1;
+		}
+
+		/// <summary>Слои валидации GPU: по умолчанию только в Debug-сборке, DECA_GPU_VALIDATION
+		/// ("1"/"0") перекрывает дефолт в обе стороны. В Release валидация стоит заметного CPU-времени
+		/// на каждый вызов API и не нужна.</summary>
+		private static bool ResolveValidationEnabled()
+		{
+			var env = Environment.GetEnvironmentVariable("DECA_GPU_VALIDATION");
+			if (env == "1")
+			{
+				return true;
+			}
+
+			if (env == "0")
+			{
+				return false;
+			}
+
+#if DEBUG
+			return true;
+#else
+			return false;
+#endif
+		}
+
 		/// <summary>См. <see cref="IGraphicsApi.RayTracing"/>. Фича запрашивается опционально (см.
 		/// Initialize), поэтому мало проверить флаги адаптера - надо убедиться, что устройство её
 		/// действительно включило.</summary>
@@ -640,7 +680,7 @@ namespace DecaEngine
 				var adapter = FindBestAdapter(engineFactory);
 				var createInfo = new EngineD3D11CreateInfo
 				{
-					EnableValidation = true,
+					EnableValidation = ResolveValidationEnabled(),
 					GraphicsAPIVersion = new Version(11, 0),
 					AdapterId = (uint)adapter
 				};
@@ -696,7 +736,7 @@ namespace DecaEngine
 
 				var createInfo = new EngineD3D12CreateInfo
 				{
-					EnableValidation = true,
+					EnableValidation = ResolveValidationEnabled(),
 					AdapterId = (uint)adapter,
 				};
 
@@ -761,7 +801,7 @@ namespace DecaEngine
 				var adapter = FindBestAdapter(engineFactory);
 				var createInfo = new EngineVkCreateInfo
 				{
-					EnableValidation = true,
+					EnableValidation = ResolveValidationEnabled(),
 					AdapterId = (uint)adapter
 				};
 
@@ -889,14 +929,15 @@ namespace DecaEngine
 
 		public void Present()
 		{
-			// SyncInterval 1 (vsync/FIFO), не 0: с MAILBOX на бескапном фреймрейте презентованные
-			// кадры не успевают реаквайриться, и свопчейн Diligent переиспользует их семафоры
-			// (валидация: VUID-vkQueueSubmit-pSignalSemaphores-00067, затем каскад по фенсам и
-			// командным буферам). Редактору бескапный фреймрейт и не нужен.
-			SwapChain.Present(1);
+			// SyncInterval 1 (vsync/FIFO) по умолчанию, не 0: с MAILBOX на бескапном фреймрейте
+			// презентованные кадры не успевают реаквайриться, и свопчейн Diligent переиспользует их
+			// семафоры (валидация: VUID-vkQueueSubmit-pSignalSemaphores-00067, затем каскад по фенсам
+			// и командным буферам). Ставящий PresentInterval = 0 берёт этот риск на себя - лимит
+			// кадров в полёте ниже держит очередь короткой.
+			SwapChain.Present((uint)Math.Max(PresentInterval, 0));
 
-			// Ограничение в 2 кадра в полёте. Без него (vsync = 0) CPU сабмитит кадры без
-			// ограничений и убегает от GPU на десятки кадров: кольцевой DynamicHeap Diligent
+			// Ограничение кадров в полёте (FramesInFlight). Без него (vsync = 0) CPU сабмитит кадры
+			// без ограничений и убегает от GPU на десятки кадров: кольцевой DynamicHeap Diligent
 			// обязан держать данные ВСЕХ кадров в полёте и исчерпывается ("Space in dynamic
 			// heap is almost exhausted. Allocation forced idling the GPU"), пул командных
 			// буферов переиспользует ещё исполняющиеся буферы (валидация Vulkan:
@@ -905,9 +946,10 @@ namespace DecaEngine
 			var fenceValue = _nextFrameValue++;
 			ImmediateContext.EnqueueSignal(_frameFence, fenceValue);
 
-			if (fenceValue > 2)
+			var framesInFlight = (ulong)Math.Max(FramesInFlight, 1);
+			if (fenceValue > framesInFlight)
 			{
-				_frameFence!.Wait(fenceValue - 2);
+				_frameFence!.Wait(fenceValue - framesInFlight);
 			}
 		}
 

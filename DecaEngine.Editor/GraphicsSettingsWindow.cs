@@ -32,6 +32,9 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	private bool _changed;
 	private bool _savePending;
 
+	// Однократная синхронизация VSync при первом кадре секции Display (см. DrawDisplaySection).
+	private bool _vsyncSynced;
+
 	// --- Буфер отложенных настроек (см. DrawApplyBar) --------------------------------------------
 	//
 	// Всё остальное окно применяется живьём, и это правильно: художник крутит ползунок и видит кадр.
@@ -79,6 +82,11 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		// на несколько экранов, и без сворачивания до нужной приходится крутить колесо мимо всех
 		// остальных. Состояние раскрытия держит сам ImGui (по ID заголовка, в своём ini) - хранить
 		// его в EditorSettings незачем.
+		if (ImGui.CollapsingHeader("Display", ImGuiTreeNodeFlags.DefaultOpen))
+		{
+			DrawDisplaySection();
+		}
+
 		if (ImGui.CollapsingHeader("Sun & Shadows", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawLightSection();
@@ -175,6 +183,48 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	}
 
 	// --- Секции --------------------------------------------------------------------------------
+
+	/// <summary>Презентация кадра САМОГО ОКНА редактора, а не превью-конвейера: ручка живёт на
+	/// главном <see cref="IGraphicsApi"/> (том, что зовёт Present) - окно достаёт его через
+	/// окружение вьюпорта, это тот же экземпляр (см. EditorManager). Пока окружение не поднято,
+	/// применять не к чему - секция ждёт. Переменная окружения DECA_VSYNC при старте старше
+	/// сохранённой настройки: галка тогда синхронизируется с фактом, а не наоборот.</summary>
+	private void DrawDisplaySection()
+	{
+		ImGui.Spacing();
+
+		var api = _viewport?.Environment?.GraphicsApi ?? _sceneViewport?.Environment?.GraphicsApi;
+		if (api == null)
+		{
+			ImGui.TextDisabled("Окружение ещё не создано.");
+			return;
+		}
+
+		if (!_vsyncSynced)
+		{
+			_vsyncSynced = true;
+			if (System.Environment.GetEnvironmentVariable("DECA_VSYNC") != null)
+			{
+				_settings.VSync = api.PresentInterval > 0;
+			}
+			else
+			{
+				api.PresentInterval = _settings.VSync ? 1 : 0;
+			}
+		}
+
+		var vsync = _settings.VSync;
+		if (ImGui.Checkbox("VSync", ref vsync))
+		{
+			_settings.VSync = vsync;
+			api.PresentInterval = vsync ? 1 : 0;
+			_changed = true;
+		}
+		Tooltip("Вертикальная синхронизация презента (IGraphicsApi.PresentInterval).\n" +
+			"Выключение снимает кап фреймрейта - для замеров производительности;\n" +
+			"кадры в полёте при этом по-прежнему ограничены фенсом (см. Present).\n" +
+			"Применяется живьём; при старте перекрывается переменной DECA_VSYNC (1/0).");
+	}
 
 	private void DrawLightSection()
 	{

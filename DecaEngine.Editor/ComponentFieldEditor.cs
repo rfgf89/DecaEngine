@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using DecaEngine.Core.Assets;
 using DecaEngine.Core.Entities;
 using Friflo.Engine.ECS;
@@ -31,6 +32,109 @@ namespace DecaEngine.Editor
 	public static class ComponentFieldEditor
 	{
 		/// <summary>
+		/// Per-type reflection metadata resolved once and reused every frame: public instance fields
+		/// in declaration order plus the per-field <see cref="AssetTypeAttribute"/> (the only field
+		/// attribute this editor queries).
+		/// </summary>
+		private sealed class CachedTypeInfo
+		{
+			public readonly FieldInfo[] Fields;
+			public readonly AssetTypeAttribute?[] AssetTypes;
+
+			public CachedTypeInfo(Type type)
+			{
+				Fields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
+				AssetTypes = new AssetTypeAttribute?[Fields.Length];
+				for (int i = 0; i < Fields.Length; i++)
+				{
+					AssetTypes[i] = Fields[i].GetCustomAttribute<AssetTypeAttribute>();
+				}
+			}
+		}
+
+		/// <summary>
+		/// Per-enum-type metadata resolved once: names, parsed boxed values, their numeric bits
+		/// (for [Flags] checkboxes), the prebuilt '\0'-separated combo string and a boxed zero value
+		/// (what Activator.CreateInstance would return for a null field value).
+		/// </summary>
+		private sealed class CachedEnumInfo
+		{
+			public readonly string[] Names;
+			public readonly object[] Values;
+			public readonly long[] Bits;
+			public readonly object ZeroValue;
+			public readonly string ComboItems;
+			public readonly bool IsFlags;
+
+			public CachedEnumInfo(Type type)
+			{
+				Names = Enum.GetNames(type);
+				Values = new object[Names.Length];
+				Bits = new long[Names.Length];
+				for (int i = 0; i < Names.Length; i++)
+				{
+					Values[i] = Enum.Parse(type, Names[i]);
+					Bits[i] = Convert.ToInt64(Values[i]);
+				}
+				ZeroValue = Enum.ToObject(type, 0L);
+				ComboItems = string.Join('\0', Names) + '\0';
+				IsFlags = type.GetCustomAttribute<FlagsAttribute>() != null;
+			}
+		}
+
+		// ConditionalWeakTable (not a plain Dictionary keyed by Type) so metadata for types coming
+		// from a collectible AssemblyLoadContext (user project assemblies, see ProjectSession /
+		// AssemblyApp) does not pin the unloaded context forever - entries die with their Type key.
+		private static readonly ConditionalWeakTable<Type, CachedTypeInfo> _typeInfoCache = new();
+		private static readonly ConditionalWeakTable<Type, CachedEnumInfo> _enumInfoCache = new();
+
+		// Reusable per-frame buffers (editor UI is single-threaded, DrawComponents is not reentrant).
+		private static readonly List<EntityComponent> _componentsScratch = new();
+		private static readonly List<string> _indexLabels = new();
+		private static readonly Dictionary<string, (int Length, string Header)> _arrayHeaders = new(StringComparer.Ordinal);
+
+		/// <summary>
+		/// Drops all cached reflection metadata. Called by <see cref="ComponentRegistry"/> when a new
+		/// component/script type is registered at runtime (e.g. from a freshly loaded user assembly)
+		/// so stale FieldInfo from a previous load is never reused.
+		/// </summary>
+		public static void InvalidateCaches()
+		{
+			_typeInfoCache.Clear();
+			_enumInfoCache.Clear();
+			_arrayHeaders.Clear();
+		}
+
+		private static CachedTypeInfo GetTypeInfo(Type type)
+		{
+			if (!_typeInfoCache.TryGetValue(type, out var info))
+			{
+				info = new CachedTypeInfo(type);
+				_typeInfoCache.AddOrUpdate(type, info);
+			}
+			return info;
+		}
+
+		private static CachedEnumInfo GetEnumInfo(Type type)
+		{
+			if (!_enumInfoCache.TryGetValue(type, out var info))
+			{
+				info = new CachedEnumInfo(type);
+				_enumInfoCache.AddOrUpdate(type, info);
+			}
+			return info;
+		}
+
+		private static string GetIndexLabel(int index)
+		{
+			while (_indexLabels.Count <= index)
+			{
+				_indexLabels.Add($"[{_indexLabels.Count}]");
+			}
+			return _indexLabels[index];
+		}
+
+		/// <summary>
 		/// ?????? ??? ?????????? ???????? (????? ????????????? ? <paramref name="exclude"/> - ??????
 		/// ??? ??, ??? ??? ?????????? ????????? ?????????????????? UI, ??. Transform-????? ?
 		/// <see cref="InspectorWindow"/>), ?????? - ??? ?????????
@@ -43,9 +147,13 @@ namespace DecaEngine.Editor
 
 			// ????????????? ? ??????: ?? ????? ???????? ????? ???? ????????? ???????? ??????????,
 			// ? EntityComponents - ????? span/enumerator ?????? ???????? ????????? ????????.
-			var components = new List<EntityComponent>(entity.Components);
+			_componentsScratch.Clear();
+			foreach (var c in entity.Components)
+			{
+				_componentsScratch.Add(c);
+			}
 
-			foreach (var ec in components)
+			foreach (var ec in _componentsScratch)
 			{
 				var clrType = ec.Type.Type;
 				if (clrType != null && exclude != null && exclude.Contains(clrType))
@@ -113,10 +221,13 @@ namespace DecaEngine.Editor
 		private static bool DrawObjectFields(object boxed, Type type, EntityStore? store)
 		{
 			bool changed = false;
-			foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
+			var info = GetTypeInfo(type);
+			var fields = info.Fields;
+			for (int i = 0; i < fields.Length; i++)
 			{
+				var field = fields[i];
 				object? value = field.GetValue(boxed);
-				if (DrawField(field.Name, field.FieldType, ref value, store, field.GetCustomAttribute<AssetTypeAttribute>()))
+				if (DrawField(field.Name, field.FieldType, ref value, store, info.AssetTypes[i]))
 				{
 					field.SetValue(boxed, value);
 					changed = true;
@@ -494,25 +605,26 @@ namespace DecaEngine.Editor
 
 		private static bool DrawEnum(string label, Type type, ref object? value)
 		{
-			var current = value ?? Activator.CreateInstance(type)!;
+			var cache = GetEnumInfo(type);
+			var current = value ?? cache.ZeroValue;
 
-			if (type.GetCustomAttribute<FlagsAttribute>() != null)
+			if (cache.IsFlags)
 			{
 				bool changed = false;
 				long currentBits = Convert.ToInt64(current);
 
 				if (ImGui.TreeNodeEx(label, ImGuiTreeNodeFlags.DefaultOpen))
 				{
-					foreach (var name in Enum.GetNames(type))
+					for (int i = 0; i < cache.Names.Length; i++)
 					{
-						long bits = Convert.ToInt64(Enum.Parse(type, name));
+						long bits = cache.Bits[i];
 						if (bits == 0)
 						{
 							continue; // "None"/??????? ???????? - ?????? ???????????
 						}
 
 						bool set = (currentBits & bits) == bits;
-						if (ImGui.Checkbox(name, ref set))
+						if (ImGui.Checkbox(cache.Names[i], ref set))
 						{
 							currentBits = set ? currentBits | bits : currentBits & ~bits;
 							changed = true;
@@ -528,17 +640,15 @@ namespace DecaEngine.Editor
 				return changed;
 			}
 
-			var names = Enum.GetNames(type);
-			int index = Array.IndexOf(names, current.ToString());
+			int index = Array.IndexOf(cache.Names, current.ToString());
 			if (index < 0)
 			{
 				index = 0;
 			}
-			string itemsSeparated = string.Join('\0', names) + '\0';
 
-			if (ImGui.Combo(label, ref index, itemsSeparated))
+			if (ImGui.Combo(label, ref index, cache.ComboItems))
 			{
-				value = Enum.Parse(type, names[index]);
+				value = cache.Values[index];
 				return true;
 			}
 			return false;
@@ -549,13 +659,20 @@ namespace DecaEngine.Editor
 			var elemType = type.GetElementType()!;
 			bool changed = false;
 
-			if (ImGui.TreeNodeEx($"{label} [{array.Length}]", ImGuiTreeNodeFlags.DefaultOpen))
+			// Header string is rebuilt only when the array length for this label changes.
+			if (!_arrayHeaders.TryGetValue(label, out var header) || header.Length != array.Length)
+			{
+				header = (array.Length, $"{label} [{array.Length}]");
+				_arrayHeaders[label] = header;
+			}
+
+			if (ImGui.TreeNodeEx(header.Header, ImGuiTreeNodeFlags.DefaultOpen))
 			{
 				for (int i = 0; i < array.Length; i++)
 				{
 					object? elem = array.GetValue(i);
 					ImGui.PushID(i);
-					if (DrawField($"[{i}]", elemType, ref elem, store, assetType))
+					if (DrawField(GetIndexLabel(i), elemType, ref elem, store, assetType))
 					{
 						array.SetValue(elem, i);
 						changed = true;

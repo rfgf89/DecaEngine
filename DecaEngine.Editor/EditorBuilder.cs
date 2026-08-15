@@ -277,6 +277,11 @@ public class EditorBuilder
 		                		}
 		                	}
 
+		                	protected override void OnFixedUpdate(float fixedDeltaTime)
+		                	{
+		                		_game.InternalFixedUpdate(fixedDeltaTime);
+		                	}
+
 		                	protected override void OnQuit()
 		                	{
 		                		_game.InternalShutdown();

@@ -198,6 +198,10 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	// переприкладываются после сборки. Иначе тумблер сбрасывался бы сам собой при любом изменении сцены.
 	private readonly Dictionary<string, bool> _passEnabled = new();
 
+	// Живёт дольше графа по той же причине, что _passEnabled: ShadowPass пересоздаётся каждой
+	// пересборкой, а расписание каскадов делится с системой сборки видов (см. ShadowCascadeSchedule).
+	private readonly ShadowCascadeSchedule _cascadeSchedule = new();
+
 	/// <summary>Non-null only in off-screen mode (<paramref name="colorTargetName"/> given to the
 	/// constructor) - the pipeline owns and creates these itself, the same way a swap chain would own
 	/// the back buffer, so off-screen consumers (see <see cref="DecaEngine.Editor.ModelViewportEnvironment"/>)
@@ -206,6 +210,11 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 	/// <summary>Текущий набор фич - см. <see cref="SetFeatures"/>.</summary>
 	public PipelineFeatures Features => _features;
+
+	/// <summary>Расписание перерисовки теневых каскадов этого конвейера - его маску кадра пишет
+	/// CullingAndRenderSystem, а читает колбэк <see cref="ShadowPass"/> при реплее. Пока маску
+	/// никто не пишет (превью через SimpleCullingAndRenderSystem), каскады рисуются каждый кадр.</summary>
+	public ShadowCascadeSchedule CascadeSchedule => _cascadeSchedule;
 
 	/// <summary>HDR-конвейер (линейный кадр + отдельный тонемап) - всегда в офскрин-режиме и никогда
 	/// на swap chain.</summary>
@@ -830,7 +839,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 		if (_features.Shadows)
 		{
-			_renderGraph.AddPass(new ShadowPass(_batchRenderer, _lastCascadeData));
+			_renderGraph.AddPass(new ShadowPass(_batchRenderer, _lastCascadeData, _cascadeSchedule));
 		}
 
 		// AO рисуется инлайн внутри ForwardPass - между opaque- и transmissive-дроу, чтобы стекло

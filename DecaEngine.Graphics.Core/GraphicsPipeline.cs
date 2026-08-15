@@ -16,6 +16,14 @@ public class GraphicsPipeline : IGraphicsPipeline
 
 	private Ref<Vector2> _viewPortRef;
 
+	// Живёт дольше графа: ShadowPass пересоздаётся каждым SignalGraph, а расписание каскадов
+	// делится с системой сборки видов (см. ShadowCascadeSchedule).
+	private readonly ShadowCascadeSchedule _cascadeSchedule = new();
+
+	/// <summary>Расписание перерисовки теневых каскадов этого конвейера - его маску кадра пишет
+	/// CullingAndRenderSystem, а читает колбэк <see cref="ShadowPass"/> при реплее.</summary>
+	public ShadowCascadeSchedule CascadeSchedule => _cascadeSchedule;
+
 	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer, string? debugName = null)
 		: this(api, batchRenderer, null, null, new Vector4(0.1f, 0.1f, 0.1f, 1f), debugName)
 	{
@@ -141,7 +149,7 @@ public class GraphicsPipeline : IGraphicsPipeline
 			_renderGraph.AddPass(new ReadRenderTargetPass("ReadClearRenderTarget_0", "ClearRenderTarget_0"));
 		}*/
 
-		_renderGraph.AddPass(new ShadowPass(_batchRenderer, renderScene));
+		_renderGraph.AddPass(new ShadowPass(_batchRenderer, renderScene, _cascadeSchedule));
 		_renderGraph.AddPass(new ForwardPass(_batchRenderer, renderViews, _viewPortRef, _colorTarget, _depthTarget, _clearColor));
 	}
 

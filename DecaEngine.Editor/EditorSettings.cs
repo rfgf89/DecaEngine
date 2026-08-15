@@ -50,6 +50,11 @@ public class EditorSettings
 
 	// --- Graphics Pipeline ---
 
+	/// <summary>Вертикальная синхронизация окна редактора (см. IGraphicsApi.PresentInterval:
+	/// true = 1, false = 0). Применяется живьём из окна Graphics; переменная окружения DECA_VSYNC
+	/// при старте старше сохранённого значения (см. GraphicsSettingsWindow.DrawDisplaySection).</summary>
+	public bool VSync { get; set; } = true;
+
 	/// <summary>Vertex shader used by ModelLoader to render loaded glTF models, relative to "EditorAssets/".</summary>
 	public EditorRef DefaultVertexShader { get; set; } = new("shader/UnlitInstancedVS.hlsl");
 
