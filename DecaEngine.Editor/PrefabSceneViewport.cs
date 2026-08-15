@@ -74,6 +74,7 @@ namespace DecaEngine.Editor
 		private readonly EditorSettings _editorSettings;
 		private readonly ProjectSession _projectSession;
 		private readonly ModelStore _modelStore;
+		private readonly SharedViewportResources _sharedResources;
 		private ModelViewportEnvironment _env;
 
 		/// <summary>Есть ли у объёмного света каскадные тени - см. одноимённое свойство
@@ -331,12 +332,13 @@ namespace DecaEngine.Editor
 		}
 
 		public PrefabSceneViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings, ProjectSession projectSession,
-			ModelStore modelStore)
+			ModelStore modelStore, SharedViewportResources sharedResources)
 		{
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
 			_projectSession = projectSession;
 			_modelStore = modelStore;
+			_sharedResources = sharedResources;
 
 			_camera = new SceneCamera(_editorSettings.SceneCameraSpeed);
 
@@ -381,7 +383,7 @@ namespace DecaEngine.Editor
 			// CSM, что в GameView) через солнце-сущность в сторе окружения - Update синхронизирует
 			// её с ShadowSettings и пушит дистанции каскадов (см. SyncSunEntity).
 			return new ModelViewportEnvironment(_graphicsApi, InitialWidth, InitialHeight,
-				"Prefab Scene Color", "Prefab Scene Depth",
+				"Prefab Scene Color", "Prefab Scene Depth", _sharedResources,
 				skyBackground: _appliedSky,
 				environmentHdrPath: _appliedHdrPath.Length > 0 ? _appliedHdrPath : null,
 				msaaSamples: _appliedMsaa,

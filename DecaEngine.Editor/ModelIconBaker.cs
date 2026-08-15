@@ -105,15 +105,18 @@ namespace DecaEngine.Editor
 		}
 
 		public ModelIconBaker(IGraphicsApi graphicsApi, EditorSettings editorSettings, ModelIconCache cache,
-			ModelStore modelStore)
+			ModelStore modelStore, SharedViewportResources sharedResources)
 		{
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
 			_cache = cache;
 			_store = modelStore;
 
+			// Бейкер не рисует небо/тени/HDRI (см. ctor defaults ниже) - shared-контейнер ему нужен
+			// только затем, чтобы получить ТУ ЖЕ процедурную энвайронмент-текстуру и сэмплеры, что и у
+			// остальных вьюпортов, вместо своей копии (см. class-doc SharedViewportResources).
 			_env = new ModelViewportEnvironment(graphicsApi, IconSize, IconSize,
-				"Model Icon Bake Color", "Model Icon Bake Depth");
+				"Model Icon Bake Color", "Model Icon Bake Depth", sharedResources);
 		}
 
 		/// <summary>
@@ -296,7 +299,8 @@ namespace DecaEngine.Editor
 				var resident = new ResidentModel { Handle = handle, Model = model };
 				var materials = _store.AcquireMaterialSet(handle);
 				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, resident.Model, resident.MeshIdMap, resident.MaterialIdMap,
-					_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap, materials);
+					_env.SharedResources.EnvMapSampler, _env.SceneCopyTarget, _env.EnvironmentMap, materials,
+					_env.SharedResources.SceneColorSampler);
 				// Помечаем модель резидентной только ПОСЛЕ успешной регистрации ресурсов - если
 				// RegisterModelResources упадёт на середине, MeshIdMap/MaterialIdMap останутся не
 				// полностью заполненными, и в кеш эта модель попадать не должна (см. StartNextJob).

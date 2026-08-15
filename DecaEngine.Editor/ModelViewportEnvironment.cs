@@ -254,8 +254,15 @@ namespace DecaEngine.Editor
 		public IRenderTarget SceneCopyTarget => Pipeline.Targets!.SceneCopyTarget;
 
 		/// <summary>Процедурный equirect-энвайронмент с префильтрованными по roughness мипами -
-		/// источник отражений/ambient-освещения Lighting-режима (см. <see cref="PreviewEnvironmentMap"/>).</summary>
+		/// источник отражений/ambient-освещения Lighting-режима (см. <see cref="PreviewEnvironmentMap"/>).
+		/// ЧУЖОЙ ресурс: владеет им <see cref="SharedResources"/> (ключ - HDRI путь), это окружение
+		/// его только читает и не освобождает (см. <see cref="Release"/>).</summary>
 		public IGpuTexture EnvironmentMap { get; }
+
+		/// <summary>Общий на процесс контейнер энвайронментов/сэмплеров (см.
+		/// <see cref="SharedViewportResources"/>) - передаётся вызывающим (EditorManager и CLI-гарнессы),
+		/// а не создаётся здесь.</summary>
+		public SharedViewportResources SharedResources { get; }
 
 		/// <summary>CPU-выборка радианса окружения по направлению (та же панорама, что в
 		/// <see cref="EnvironmentMap"/>) - источник неба для CPU-бейка проб (см. ProbeGiBaker).</summary>
@@ -335,7 +342,8 @@ namespace DecaEngine.Editor
 			_mainCullingSystem?.Dispose();
 			BatchRenderer.Release();
 
-			EnvironmentMap.Release();
+			// EnvironmentMap НЕ освобождаем - им владеет SharedResources (несколько окружений могут
+			// делить одну и ту же HDRI-текстуру), см. class-doc EnvironmentMap.
 		}
 
 		/// <summary>Перепривязывает ресайзабельные таргеты к SSAO-материалам ПОСЛЕ Resize - Resize
@@ -701,7 +709,8 @@ namespace DecaEngine.Editor
 		/// в сторе заводится солнце-сущность, дистанции каскадов и поворот солнца пушит вьюпорт
 		/// (см. PrefabSceneViewport.SyncSunEntity). Только вместе с <paramref name="shadows"/>.</param>
 		public ModelViewportEnvironment(IGraphicsApi graphicsApi, uint width, uint height,
-			string colorTargetName, string depthTargetName, bool skyBackground = false,
+			string colorTargetName, string depthTargetName, SharedViewportResources sharedResources,
+			bool skyBackground = false,
 			string environmentHdrPath = null, uint msaaSamples = 1, bool ssao = false, bool shadows = false,
 			AmbientOcclusionMode aoMode = AmbientOcclusionMode.Ssao, bool ssgi = false, bool eyeAdaptation = false,
 			bool mainCascades = false, bool fog = false, bool bloom = false, bool colorGrade = false,
@@ -711,6 +720,7 @@ namespace DecaEngine.Editor
 			GraphicsApi = graphicsApi;
 			DilApi = (DiligentGraphicsApi)graphicsApi;
 			MsaaSamples = Math.Max(1u, msaaSamples);
+			SharedResources = sharedResources;
 
 			// Формат цветового таргета пекётся во все PSO геометрии. Офскрин-конвейер теперь ВСЕГДА
 			// HDR (см. GraphicsPipelineSimple), поэтому формат один и тот же при любом наборе фич -
@@ -718,7 +728,9 @@ namespace DecaEngine.Editor
 			BatchRenderer = new DiligentBatchRenderer(DilApi, MsaaSamples,
 				TextureObjectFormat.R16G16B16A16Float);
 
-			var environmentResult = PreviewEnvironmentMap.Create(graphicsApi, environmentHdrPath);
+			// Резолвится из общего контейнера - НЕ создаётся заново: несколько окружений с одним и тем
+			// же HDRI-путём (или все процедурные) делят одну GPU-текстуру, см. SharedViewportResources.
+			var environmentResult = sharedResources.GetEnvironment(environmentHdrPath);
 			EnvironmentMap = environmentResult.Texture;
 			EnvironmentRadiance = environmentResult.Radiance;
 
@@ -892,39 +904,23 @@ namespace DecaEngine.Editor
 		/// <see cref="ModelLoader.BuildAdditionalMaterialSet"/> - регистрация мутирует материалы (см.
 		/// class-doc DiligentBatchRenderer.Register), так что делить один и тот же набор между двумя
 		/// батч-рендерерами нельзя.</param>
+		/// <param name="envMapSampler">Общий "_EnvMap_Sampler" (см. <see cref="SharedViewportResources"/>) -
+		/// привязывается вместе с <paramref name="environmentMap"/>, null пропускает энвайронмент-биндинг
+		/// целиком (сохраняет прежнее поведение "нет графического API/окружения").</param>
+		/// <param name="sceneCopySampler">Общий "_SceneColor_Sampler" (см. <see cref="SharedViewportResources"/>) -
+		/// привязывается вместе с <paramref name="sceneCopy"/> только к transmissive-материалам.</param>
 		public static void RegisterModelResources(DiligentBatchRenderer batchRenderer, ModelLoader modelLoader,
 			Dictionary<int, MeshId> meshIdMap, Dictionary<int, MaterialId> materialIdMap,
-			IGraphicsApi? graphicsApi = null, IGpuTexture? sceneCopy = null, IGpuTexture? environmentMap = null,
-			OrderedDictionary<int, IMaterialObject>? materials = null)
+			ISamplerObject? envMapSampler = null, IGpuTexture? sceneCopy = null, IGpuTexture? environmentMap = null,
+			OrderedDictionary<int, IMaterialObject>? materials = null, ISamplerObject? sceneCopySampler = null)
 		{
 			var materialSet = materials ?? modelLoader.materialObjects;
 
-			// Энвайронмент-мип-сэмплер: трилинейный + Wrap, чтобы equirect-шов по горизонтали
-			// заворачивался бесшовно, а SampleLevel по roughness блендил соседние мипы.
-			ISamplerObject? environmentSampler = null;
-			if (graphicsApi != null && environmentMap != null)
-			{
-				environmentSampler = graphicsApi.CreateSampler(
-					name: "_EnvMap_Sampler",
-					filter: TextureFilter.Linear,
-					address: TextureAddress.Wrap,
-					comparisonFunction: CompFunction.Always,
-					border: Vector4.Zero);
-			}
-
-			// Сэмплер снимка сцены (см. ForwardPass/UnlitInstancedPS: _SceneColor) - линейный clamp,
-			// чтобы рефракционный UV-сдвиг за краем экрана растягивал крайние пиксели, а не заворачивал
-			// картинку с противоположной стороны.
-			ISamplerObject? sceneCopySampler = null;
-			if (graphicsApi != null && sceneCopy != null)
-			{
-				sceneCopySampler = graphicsApi.CreateSampler(
-					name: "_SceneColor_Sampler",
-					filter: TextureFilter.Linear,
-					address: TextureAddress.Clamp,
-					comparisonFunction: CompFunction.Always,
-					border: Vector4.Zero);
-			}
+			// Энвайронмент-мип-сэмплер и сэмплер снимка сцены (_SceneColor, см. ForwardPass/
+			// UnlitInstancedPS) - оба переданы вызывающим из общего SharedViewportResources, а не
+			// создаются здесь: раньше каждый вызов регистрации плодил новую пару сэмплеров (пер модель
+			// ПЕР окружение) для одного и того же неизменного sampler state.
+			var environmentSampler = environmentMap != null ? envMapSampler : null;
 
 			var baseMaterialState = batchRenderer.GetBaseState();
 			IStateObject? lineListState = null, lineStripState = null, pointState = null;
@@ -981,7 +977,7 @@ namespace DecaEngine.Editor
 				// у остальных материалов этот кейворд выключен, и ресурса просто нет в PSO; привязка
 				// к ним оставляла бы immutable sampler без соответствующего шейдерного ресурса
 				// (Diligent-варнинг "not assigned to any texture or sampler").
-				if (sceneCopySampler != null &&
+				if (sceneCopySampler != null && sceneCopy != null &&
 					modelLoader.MaterialPbr.TryGetValue(kvp.Key, out var pbr) && pbr.TransmissionFactor > 0f)
 				{
 					kvp.Value.SetTexture("_SceneColor", sceneCopy);

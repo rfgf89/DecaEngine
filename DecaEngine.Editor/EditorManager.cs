@@ -58,6 +58,12 @@ public class EditorManager : TimeLoopCore
 	/// One instance, ticked once per frame from OnUpdate (below) under the GPU lock - do NOT let any
 	/// consumer tick it a second time.</summary>
 	private ModelStore _modelStore;
+
+	/// <summary>Device-level container of environment maps + samplers shared by every offscreen
+	/// viewport (Model Preview, Scene View, Icon Baker) - see class-doc SharedViewportResources.
+	/// Same one-instance-for-the-process discipline as <see cref="_modelStore"/> above: created once
+	/// here, handed into each consumer's constructor, released once in <see cref="OnQuit"/>.</summary>
+	private SharedViewportResources _sharedViewportResources;
 	// --- /ECS ---
 
 	public void Initialize()
@@ -171,16 +177,22 @@ public class EditorManager : TimeLoopCore
 		// ниже строит только СВОИ материалы/инстансы поверх общих геометрии/текстур.
 		_modelStore = new ModelStore(_graphicsApi);
 
-		_modelPreviewViewport = new ModelPreviewViewport(_graphicsApi, _editorSettings, _modelStore);
+		// Один контейнер энвайронментов/сэмплеров на весь редактор - Model Preview, Scene View и
+		// бейкер иконок делят его точно так же, как делят загрузку моделей через _modelStore (см.
+		// class-doc SharedViewportResources).
+		_sharedViewportResources = new SharedViewportResources(_graphicsApi);
+
+		_modelPreviewViewport = new ModelPreviewViewport(_graphicsApi, _editorSettings, _modelStore, _sharedViewportResources);
 		_modelIconCache = new ModelIconCache(_graphicsApi, _imGuiManager.ImGuiRender);
-		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache, _modelStore);
+		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache, _modelStore, _sharedViewportResources);
 		var inspectorWindow = new InspectorWindow("Inspector", _modelPreviewViewport, _imGuiManager.ImGuiRender);
 		_inspectorWindow = inspectorWindow;
 		inspectorWindow.Show();
 
 		// GPU-вьюпорт окна Scene View (рендер префаба по AssetRef-ам, см. PrefabSceneViewport) -
 		// один на редактор, окна Scene View его разделяют (как Inspector разделяет превью моделей).
-		_prefabSceneViewport = new PrefabSceneViewport(_graphicsApi, _editorSettings, _projectSession, _modelStore);
+		_prefabSceneViewport = new PrefabSceneViewport(_graphicsApi, _editorSettings, _projectSession, _modelStore,
+			_sharedViewportResources);
 
 		// ВРЕМЕННО: DECA_AUTOLOAD_MODEL=<путь> грузит модель в превью сразу при старте - для
 		// автоматизированного репро багов загрузки/AO без ручных кликов по Asset Browser-у.

@@ -89,7 +89,12 @@ public static class PreviewProbe
 			Console.WriteLine("[probe] shadow cascades: main pipeline (CullingAndRenderSystem)");
 		}
 
-		var env = new ModelViewportEnvironment(api, 512, 512, "Probe Color", "Probe Depth", skyBackground: true,
+		// Гарнесс изолирован (свой процесс, один запуск) - собственный контейнер, а не общий с
+		// редактором (см. class-doc SharedViewportResources: "или per CLI-harness").
+		var sharedResources = new SharedViewportResources(api);
+
+		var env = new ModelViewportEnvironment(api, 512, 512, "Probe Color", "Probe Depth", sharedResources,
+			skyBackground: true,
 			environmentHdrPath: Environment.GetEnvironmentVariable("DECA_PROBE_HDR"),
 			msaaSamples: msaa, ssao: ssao, shadows: shadows, aoMode: aoMode, ssgi: ssgi,
 			eyeAdaptation: eyeAdaptation, mainCascades: mainCascades,
@@ -421,7 +426,8 @@ public static class PreviewProbe
 		var materialIdMap = new Dictionary<int, MaterialId>();
 		var batchCache = new Dictionary<(int, int), BatchId>();
 		ModelViewportGeometry.RegisterModelResources(env.BatchRenderer, model, meshIdMap, materialIdMap,
-			api, env.SceneCopyTarget, env.EnvironmentMap);
+			sharedResources.EnvMapSampler, env.SceneCopyTarget, env.EnvironmentMap,
+			sceneCopySampler: sharedResources.SceneColorSampler);
 
 		// Сколько материалов пишут тень с альфа-тестом (листва). Ноль на сцене с деревом означает,
 		// что критерий отбора её не признал, - и тогда никакие god rays сквозь крону не пойдут по

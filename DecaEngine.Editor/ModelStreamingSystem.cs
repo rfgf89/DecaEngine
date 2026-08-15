@@ -316,7 +316,8 @@ namespace DecaEngine.Editor.ECS
 		{
 			var materials = _store.AcquireMaterialSet(resident.StoreHandle!);
 			ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, model, resident.MeshIds, resident.MaterialIds,
-				_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap, materials);
+				_env.SharedResources.EnvMapSampler, _env.SceneCopyTarget, _env.EnvironmentMap, materials,
+				_env.SharedResources.SceneColorSampler);
 		}
 
 		/// <summary>Записи без ссылок, которые так и не дожили до готовности (заявка снята Release-ом
