@@ -800,6 +800,28 @@ public class ModelLoader
 	/// <see cref="MaterialPbr"/>). Материалы без базовой текстуры сюда не попадают.</summary>
 	public readonly Dictionary<int, BaseColorBinding> MaterialBaseColor = new();
 
+	/// <summary>Обобщение <see cref="MaterialBaseColor"/> на ВСЕ слоты (не только _MainTex): по ключу
+	/// материала (как у <see cref="materialObjects"/>/<see cref="MaterialPbr"/>) - словарь "имя слота
+	/// -&gt; привязка" для каждого слота, куда был привязан РЕАЛЬНЫЙ (не филлер) ресурс. Слоты, ушедшие
+	/// на филлер (нет текстуры в glTF), сюда не попадают - их состояние детерминированно выводится из
+	/// <see cref="MaterialPbr"/> (Has*Texture/TransmissionFactor).
+	///
+	/// Существует ради <see cref="BuildAdditionalMaterialSet"/>: второй (третий, ...) набор материалов
+	/// для ДРУГОГО окружения строится из уже загруженных GPU-текстур этой модели без повторной
+	/// декодировки/заливки - см. класс-комментарий у <see cref="DecaEngine.Editor.ECS.ModelStore"/> о
+	/// том, почему материалы (в отличие от текстур/мешей) НЕ шарятся между окружениями напрямую.</summary>
+	public readonly Dictionary<int, Dictionary<string, BaseColorBinding>> MaterialTextureBindings = new();
+
+	/// <summary>Общие 1x1-филлеры модели (белый и плоская нормаль) плюс их сэмплер - см. локальные
+	/// EnsureFallbackTextures/BindFallbackTexture/BindFlatNormalFallback в
+	/// <see cref="BuildFromPreparedIncremental"/>, которые их лениво создают и заполняют эти поля.
+	/// Освобождаются как обычные <see cref="_ownedTextures"/> в <see cref="Release"/>; хранятся здесь
+	/// отдельно только чтобы <see cref="BuildAdditionalMaterialSet"/> могло переиспользовать те же
+	/// объекты вместо создания собственных копий на каждое окружение.</summary>
+	internal IGpuTexture FallbackWhiteTexture;
+	internal ISamplerObject FallbackSampler;
+	internal IGpuTexture FallbackFlatNormalTexture;
+
 	/// <summary>Стримимые текстуры модели; пусто без <see cref="ModelLoadOptions.StreamTextures"/>.</summary>
 	public readonly List<StreamedTexture> StreamedTextures = new();
 
@@ -1883,6 +1905,13 @@ public class ModelLoader
 		BindFallbackTexture(defaultMaterial, "_OcclusionTex");
 		BindFlatNormalFallback(defaultMaterial);
 
+		// Все три филлера гарантированно созданы к этой точке (вызовы выше) - публикуем их на модели
+		// для BuildAdditionalMaterialSet (см. поле-комментарии у FallbackWhiteTexture/FallbackSampler/
+		// FallbackFlatNormalTexture).
+		result.FallbackWhiteTexture = fallbackTexture.GpuHandle;
+		result.FallbackSampler = fallbackSampler;
+		result.FallbackFlatNormalTexture = flatNormalTexture.GpuHandle;
+
 		result.materialObjects.Add(-1, defaultMaterial);
 
 		// The built-in default material is not a glTF material, so the spec's metallic=1 default
@@ -2070,10 +2099,33 @@ public class ModelLoader
 			return new BaseColorBinding { Texture = gpuTexture, Sampler = samplerObject, Stream = null };
 		}
 
+		// Записывает РЕАЛЬНУЮ (не филлер) привязку слота в result.MaterialTextureBindings под ключом
+		// материала - см. поле-комментарий. Единственный писатель этого словаря.
+		void TrackBinding(int materialKey, string slot, BaseColorBinding binding)
+		{
+			if (binding == null)
+			{
+				return;
+			}
+
+			if (!result.MaterialTextureBindings.TryGetValue(materialKey, out var slots))
+			{
+				slots = new Dictionary<string, BaseColorBinding>();
+				result.MaterialTextureBindings[materialKey] = slots;
+			}
+
+			slots[slot] = binding;
+		}
+
 		// vs передаётся параметром (а не правится повторным SetShader): DiligentMaterial.SetShader
 		// release-ит ранее установленные шейдеры, а они шарятся между материалами - повторный вызов
 		// на живом наборе роняет процесс двойным освобождением.
-		IMaterialObject BuildMaterialObject(PreparedMaterial pm, string name, IShaderObject vs,
+		//
+		// materialKey - ключ, под которым будет зарегистрирован ИТОГОВЫЙ материал в
+		// result.materialObjects (обычный логический индекс или синтетический ключ клона топологии,
+		// см. MakeTopologyMaterialKey) - нужен только чтобы разложить реальные привязки текстур в
+		// result.MaterialTextureBindings (см. TrackBinding) для BuildAdditionalMaterialSet.
+		IMaterialObject BuildMaterialObject(PreparedMaterial pm, string name, IShaderObject vs, int materialKey,
 			out BaseColorBinding baseColor)
 		{
 			var swCreate = System.Diagnostics.Stopwatch.StartNew();
@@ -2090,25 +2142,29 @@ public class ModelLoader
 			result._matShaderMs += swSetShader.ElapsedMilliseconds;
 
 			baseColor = BindPreparedTexture(materialObj, "_MainTex", pm.BaseColorTexture);
+			TrackBinding(materialKey, "_MainTex", baseColor);
 
 			// Слот объявлен в шейдере только под HAS_MR_TEXTURE (см. UnlitInstancedPS.hlsl) - этот
 			// кейворд ставится только когда у материала реально есть MR-текстура, так что фоллбек
 			// тут не нужен и не должен биндиться (иначе immutable sampler без ресурса в шейдере).
 			if (pm.MetallicRoughnessTexture != null)
 			{
-				BindPreparedTexture(materialObj, "_MetallicRoughnessTex", pm.MetallicRoughnessTexture);
+				TrackBinding(materialKey, "_MetallicRoughnessTex",
+					BindPreparedTexture(materialObj, "_MetallicRoughnessTex", pm.MetallicRoughnessTexture));
 			}
 
 			// Слот объявлен в шейдере только под MATERIAL_TRANSMISSION (см. UnlitInstancedPS.hlsl) -
 			// у остальных материалов кейворд выключен, и биндить нечего.
 			if (pm.TransmissionFactor > 0f)
 			{
-				BindPreparedTexture(materialObj, "_ThicknessTex", pm.ThicknessTexture);
+				TrackBinding(materialKey, "_ThicknessTex",
+					BindPreparedTexture(materialObj, "_ThicknessTex", pm.ThicknessTexture));
 			}
 
 			if (pm.NormalTexture != null)
 			{
-				BindPreparedTexture(materialObj, "_NormalTex", pm.NormalTexture);
+				TrackBinding(materialKey, "_NormalTex",
+					BindPreparedTexture(materialObj, "_NormalTex", pm.NormalTexture));
 			}
 			else
 			{
@@ -2116,7 +2172,8 @@ public class ModelLoader
 			}
 
 			// Белый филлер (R=1) = "ничего не заслонено" - has-флаг не нужен.
-			BindPreparedTexture(materialObj, "_OcclusionTex", pm.OcclusionTexture);
+			TrackBinding(materialKey, "_OcclusionTex",
+				BindPreparedTexture(materialObj, "_OcclusionTex", pm.OcclusionTexture));
 
 			return materialObj;
 		}
@@ -2164,7 +2221,7 @@ public class ModelLoader
 
 			var swMat = System.Diagnostics.Stopwatch.StartNew();
 			var builtMaterial = BuildMaterialObject(preparedMaterial, preparedMaterial.Name, modelShaderVs,
-				out var builtBaseColor);
+				preparedMaterial.LogicalIndex, out var builtBaseColor);
 			result._materialMs += swMat.ElapsedMilliseconds;
 			result._materialCount++;
 
@@ -2231,7 +2288,7 @@ public class ModelLoader
 			else
 			{
 				materialObj = BuildMaterialObject(source, $"{source.Name} (topology {clone.Topology})", cloneVs,
-					out var cloneBaseColor);
+					synthKey, out var cloneBaseColor);
 				factors = BuildFactors(source, synthKey);
 
 				if (cloneBaseColor != null)
@@ -2269,6 +2326,184 @@ public class ModelLoader
 		}
 
 		result.instances.AddRange(prepared.Instances);
+	}
+
+	/// <summary>Те же shader-кейворды, что строит локальный BuildMaterialKeywords внутри
+	/// <see cref="BuildFromPreparedIncremental"/>, но выведенные из уже посчитанных
+	/// <see cref="MaterialPbrFactors"/> вместо сырого <see cref="PreparedMaterial"/> (которого больше
+	/// нет - PrepareModel-данные живут только до конца ПЕРВОЙ финализации, см. ModelLoadRequest.FinalizeChunk).
+	/// pbr == null - встроенный дефолтный материал (материал-клон без источника), как и pm == null там.</summary>
+	private static List<string> BuildKeywordsFromFactors(ModelLoadOptions options, MaterialPbrFactors? pbr)
+	{
+		var keywords = new List<string>();
+
+		if (options.PreviewLightingFeatures)
+		{
+			keywords.Add("FEATURE_NORMAL_MAPS");
+			keywords.Add("FEATURE_OCCLUSION");
+			keywords.Add("FEATURE_SHADOWS");
+		}
+
+		if (pbr == null)
+		{
+			return keywords;
+		}
+
+		var f = pbr.Value;
+		if (f.HasBaseColorTexture)
+		{
+			keywords.Add("HAS_BASECOLOR_TEXTURE");
+		}
+		if (f.HasMetallicRoughnessTexture)
+		{
+			keywords.Add("HAS_MR_TEXTURE");
+		}
+		if (f.AlphaCutoff > 0f)
+		{
+			keywords.Add("MATERIAL_ALPHA_CLIP");
+		}
+		if (f.TransmissionFactor > 0f)
+		{
+			keywords.Add("MATERIAL_TRANSMISSION");
+			if (f.Dispersion > 0f)
+			{
+				keywords.Add("MATERIAL_DISPERSION");
+			}
+		}
+		if (new Vector3(f.SheenColorRoughness.X, f.SheenColorRoughness.Y, f.SheenColorRoughness.Z) != Vector3.Zero)
+		{
+			keywords.Add("MATERIAL_SHEEN");
+		}
+
+		return keywords;
+	}
+
+	/// <summary>
+	/// Builds an ADDITIONAL, independent set of <see cref="IMaterialObject"/>s for an already-loaded
+	/// <paramref name="model"/> - for a second (or Nth) viewport/environment that needs its OWN
+	/// materials to register into its OWN batch renderer (see <see cref="DiligentBatchRenderer.Register"/>:
+	/// registering one material object into a second batch renderer silently steals it from the first -
+	/// and PSOs additionally bake per-environment SampleCount/RenderTargetFormats at registration time,
+	/// see DiligentBatchRenderer ~930-954).
+	///
+	/// Does NOT touch the GPU beyond creating small material/PSO objects: shaders come from the
+	/// device-wide shared cache (<see cref="IGraphicsApi.CreateSharedShader"/> - calling it again with
+	/// the same keys is a cache hit, no recompilation), and textures/samplers are the SAME already-
+	/// uploaded GPU objects <paramref name="model"/> owns (see <see cref="MaterialTextureBindings"/>,
+	/// <see cref="FallbackWhiteTexture"/> et al.) - nothing is re-decoded or re-uploaded.
+	///
+	/// A material bound to a texture that is still mid-<see cref="ModelLoadOptions.StreamTextures"/>
+	/// picks up whatever quality is CURRENT on the shared <see cref="StreamedTexture"/> entry (not the
+	/// stale filler captured when the first set was built - see <see cref="StreamedTexture.Texture"/>),
+	/// and registers itself into that entry's <see cref="StreamedTexture.Bindings"/> so future quality
+	/// upgrades hot-swap THIS set's SRBs too, exactly like the first one (see
+	/// DecaEngine.Editor.ECS.ModelStreamer.PumpTextureUpgrades / ModelStore's equivalent pump).
+	///
+	/// <paramref name="options"/> MUST have the same <see cref="ModelLoadOptions.Signature"/> the model
+	/// was originally loaded with - anisotropy/mip bias/keyword toggles are read here again rather than
+	/// re-derived from <paramref name="model"/>, and a mismatch would silently desync the second set
+	/// from what its textures/samplers actually are.
+	/// </summary>
+	public static OrderedDictionary<int, IMaterialObject> BuildAdditionalMaterialSet(IGraphicsApi graphicsApi,
+		ModelLoadOptions options, ModelLoader model)
+	{
+		var (vsFactoryPath, vsFileName) = options.VertexShader.ToShaderFactoryParts();
+		var (psFactoryPath, psFileName) = options.PixelShader.ToShaderFactoryParts();
+
+		var modelShaderVs = graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
+			ShaderObjectType.Vertex);
+
+		var pixelShaderVariants = new Dictionary<string, IShaderObject>();
+		IShaderObject GetPixelShaderVariant(List<string> keywords)
+		{
+			keywords.Sort(StringComparer.Ordinal);
+			var cacheKey = string.Join(";", keywords);
+			if (!pixelShaderVariants.TryGetValue(cacheKey, out var shader))
+			{
+				shader = graphicsApi.CreateSharedShader(
+					cacheKey.Length == 0 ? "Model Pixel Shader" : $"Model Pixel Shader [{cacheKey}]",
+					psFactoryPath, psFileName, ShaderObjectType.Pixel, "Main", keywords.ToArray());
+				pixelShaderVariants[cacheKey] = shader;
+			}
+
+			return shader;
+		}
+
+		IShaderObject pointShaderVs = null;
+
+		// Биндит один слот из уже загруженных ресурсов модели: реальная привязка (см.
+		// MaterialTextureBindings) - тем же СЭМПЛЕРОМ (сэмплеры шарятся между окружениями, см. class-doc
+		// у ModelStore) и АКТУАЛЬНОЙ текстурой стрим-записи, если она есть; иначе - тот же общий филлер,
+		// каким пользуется первый набор (fallbackTexture параметр).
+		void BindShared(IMaterialObject materialObj, string slot, Dictionary<string, BaseColorBinding> slots,
+			IGpuTexture fallbackTexture)
+		{
+			if (slots != null && slots.TryGetValue(slot, out var binding))
+			{
+				var currentTexture = binding.Stream?.Texture ?? binding.Texture;
+				materialObj.SetTexture(slot, currentTexture);
+				materialObj.SetSampler(slot + "_sampler", binding.Sampler);
+				binding.Stream?.Bindings.Add((materialObj, slot));
+				return;
+			}
+
+			if (fallbackTexture == null)
+			{
+				return;
+			}
+
+			materialObj.SetTexture(slot, fallbackTexture);
+			materialObj.SetImmutableSampler(slot, model.FallbackSampler);
+		}
+
+		var result = new OrderedDictionary<int, IMaterialObject>();
+
+		for (int i = 0; i < model.materialObjects.Count; i++)
+		{
+			var kvp = model.materialObjects.GetAt(i);
+			var key = kvp.Key;
+			model.MaterialPbr.TryGetValue(key, out var pbr);
+
+			var vs = modelShaderVs;
+			if (pbr.Topology == MeshTopologyPoints)
+			{
+				// PSO с POINT_LIST обязан писать builtin PointSize из VS (см. тот же выбор в
+				// BuildFromPreparedIncremental) - тот же именной вариант вершинного шейдера.
+				if (pointShaderVs == null && vsFileName == "UnlitInstancedVS.hlsl")
+				{
+					pointShaderVs = graphicsApi.CreateSharedShader("Model Point Vertex Shader", vsFactoryPath,
+						"UnlitInstancedPointVS.hlsl", ShaderObjectType.Vertex);
+				}
+
+				vs = pointShaderVs ?? modelShaderVs;
+			}
+
+			var materialObj = graphicsApi.CreateMaterial($"Model Material {key} (env clone)");
+
+			// Как и у первого набора: шейдеры - шарёные device-кэшем объекты, Release на них - no-op
+			// (см. DiligentShader.IsShared), поэтому этому набору не нужен собственный список owned-
+			// шейдеров - освобождать здесь нечего.
+			materialObj.OwnsShaders = false;
+			materialObj.SetShader(GetPixelShaderVariant(BuildKeywordsFromFactors(options, pbr)), vs);
+
+			model.MaterialTextureBindings.TryGetValue(key, out var slots);
+
+			BindShared(materialObj, "_MainTex", slots, model.FallbackWhiteTexture);
+			if (pbr.HasMetallicRoughnessTexture)
+			{
+				BindShared(materialObj, "_MetallicRoughnessTex", slots, null);
+			}
+			if (pbr.TransmissionFactor > 0f)
+			{
+				BindShared(materialObj, "_ThicknessTex", slots, model.FallbackWhiteTexture);
+			}
+			BindShared(materialObj, "_NormalTex", slots, model.FallbackFlatNormalTexture);
+			BindShared(materialObj, "_OcclusionTex", slots, model.FallbackWhiteTexture);
+
+			result.Add(key, materialObj);
+		}
+
+		return result;
 	}
 
 	private static readonly int VertexSizeBytes = System.Runtime.CompilerServices.Unsafe.SizeOf<Vertex>();

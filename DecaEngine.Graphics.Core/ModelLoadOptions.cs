@@ -56,4 +56,28 @@ public readonly struct ModelLoadOptions
 	public ModelLoadOptions()
 	{
 	}
+
+	/// <summary>
+	/// Stable key capturing every field that changes the SHARED (device-level) load output - the
+	/// geometry/textures/material CPU-data a <see cref="DecaEngine.Editor.ECS.ModelStore"/> entry
+	/// produces for a given file path. Two loads of the same path with equal <see cref="Signature"/>
+	/// are safe to share as ONE ModelLoader; anisotropy/MipLodBias/MaxTextureSize/etc. are baked into
+	/// immutable samplers and the texture decoder (see the field docs above), so a mismatch on any of
+	/// them means the models are NOT interchangeable and must load (and stay) separate.
+	/// </summary>
+	public string Signature()
+	{
+		var ratios = LodRatios ?? DefaultLodRatios;
+		var ratioParts = new string[ratios.Length];
+		for (int i = 0; i < ratios.Length; i++)
+		{
+			ratioParts[i] = ratios[i].ToString("R");
+		}
+
+		return string.Join('|',
+			VertexShader.Path, PixelShader.Path,
+			OptimizeMesh.ToString(), GenerateLods.ToString(), AnisotropicFiltering.ToString(),
+			MipLodBias.ToString("R"), PreviewLightingFeatures.ToString(), string.Join(',', ratioParts),
+			MaxTextureSize.ToString(), StreamTextures.ToString(), StreamInitialTextureSize.ToString());
+	}
 }

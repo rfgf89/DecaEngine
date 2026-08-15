@@ -885,10 +885,20 @@ namespace DecaEngine.Editor
 	/// </summary>
 	public static class ModelViewportGeometry
 	{
+		/// <param name="materials">Какой набор материалов регистрировать - по умолчанию (null) это
+		/// ПЕРВЫЙ, встроенный в <paramref name="modelLoader"/> набор (<see cref="ModelLoader.materialObjects"/>).
+		/// Второе (третье, ...) окружение того же РАЗДЕЛЯЕМОГО <paramref name="modelLoader"/> (см.
+		/// DecaEngine.Editor.ECS.ModelStore) обязано передать сюда СВОЙ набор из
+		/// <see cref="ModelLoader.BuildAdditionalMaterialSet"/> - регистрация мутирует материалы (см.
+		/// class-doc DiligentBatchRenderer.Register), так что делить один и тот же набор между двумя
+		/// батч-рендерерами нельзя.</param>
 		public static void RegisterModelResources(DiligentBatchRenderer batchRenderer, ModelLoader modelLoader,
 			Dictionary<int, MeshId> meshIdMap, Dictionary<int, MaterialId> materialIdMap,
-			IGraphicsApi? graphicsApi = null, IGpuTexture? sceneCopy = null, IGpuTexture? environmentMap = null)
+			IGraphicsApi? graphicsApi = null, IGpuTexture? sceneCopy = null, IGpuTexture? environmentMap = null,
+			OrderedDictionary<int, IMaterialObject>? materials = null)
 		{
+			var materialSet = materials ?? modelLoader.materialObjects;
+
 			// Энвайронмент-мип-сэмплер: трилинейный + Wrap, чтобы equirect-шов по горизонтали
 			// заворачивался бесшовно, а SampleLevel по roughness блендил соседние мипы.
 			ISamplerObject? environmentSampler = null;
@@ -919,9 +929,9 @@ namespace DecaEngine.Editor
 			var baseMaterialState = batchRenderer.GetBaseState();
 			IStateObject? lineListState = null, lineStripState = null, pointState = null;
 
-			for (int i = 0; i < modelLoader.materialObjects.Count; i++)
+			for (int i = 0; i < materialSet.Count; i++)
 			{
-				var kvp = modelLoader.materialObjects.GetAt(i);
+				var kvp = materialSet.GetAt(i);
 
 				// Не-треугольные материалы-клоны (см. ModelLoader.MakeTopologyMaterialKey) получают
 				// PSO с соответствующей примитивной топологией; стейты шарятся между материалами.
