@@ -688,7 +688,8 @@ namespace DecaEngine.Editor
 			// смены бэкенда апскейлера (GPU-барьер + init-команды NGX), см. ModelPreviewViewport.
 			ApplyPendingUpscalerSettings();
 
-			if (root is null || root.Value.IsNull)
+			bool hasRoot = root.HasValue && !root.Value.IsNull;
+			if (!hasRoot)
 			{
 				// Префаб закрыт: снимаем сцену И резидентные модели с загрузками - стримеру без
 				// Root.Update некому шагать, брошенные фоновые задачи иначе повисли бы навсегда.
@@ -697,25 +698,31 @@ namespace DecaEngine.Editor
 					ClearScene();
 				}
 				_lastStore = null;
-				return;
-			}
 
-			// Reload/смена префаба пересоздаёт EntityStore - все закешированные entity id мертвы.
-			var store = root.Value.Store;
-			if (!ReferenceEquals(store, _lastStore))
+				// Кадр НЕ прерывается здесь (в отличие от прежней версии): вьюпорт обязан показывать
+				// лит-небо окружения ДО того, как открыт хоть один префаб (см. задачу про мгновенный
+				// пустой вьюпорт) - см. общий Execute ниже, тот же приём, что и с открытым, но пустым
+				// префабом.
+			}
+			else
 			{
-				ClearScene();
-				_lastStore = store;
-				_framePending = true;
-			}
+				// Reload/смена префаба пересоздаёт EntityStore - все закешированные entity id мертвы.
+				var store = root.Value.Store;
+				if (!ReferenceEquals(store, _lastStore))
+				{
+					ClearScene();
+					_lastStore = store;
+					_framePending = true;
+				}
 
-			// Загрузки опрашивает ModelStreamingSystem внутри _env.Root.Update ниже (приоритет по
-			// камере, финализация порциями); догрузившаяся модель инстанцируется СЛЕДУЮЩИМ SyncScene.
-			SyncScene(root.Value);
-			SyncSelectionHighlight(selected);
-			PollProbeBake(deltaTime);
-			PollSceneCascadeRecenter(deltaTime);
-			PollSceneProbeDebugOverlay();
+				// Загрузки опрашивает ModelStreamingSystem внутри _env.Root.Update ниже (приоритет по
+				// камере, финализация порциями); догрузившаяся модель инстанцируется СЛЕДУЮЩИМ SyncScene.
+				SyncScene(root.Value);
+				SyncSelectionHighlight(selected);
+				PollProbeBake(deltaTime);
+				PollSceneCascadeRecenter(deltaTime);
+				PollSceneProbeDebugOverlay();
+			}
 
 			try
 			{
@@ -745,9 +752,10 @@ namespace DecaEngine.Editor
 					_env.BatchRenderer.CheckAndReallocateBuffers();
 				}
 
-				// Кадр исполняется ВСЕГДА, пока открыт префаб, - пустая сцена показывает небо
-				// окружения (батч-рендерер безопасен при нуле инстансов: ExecuteComputeCulling/
-				// ExecuteDrawBatching выходят сразу), и назначенная сетка просто появляется в ней.
+				// Кадр исполняется ВСЕГДА, даже без открытого префаба (см. hasRoot выше), - пустая
+				// сцена показывает небо окружения (батч-рендерер безопасен при нуле инстансов:
+				// ExecuteComputeCulling/ExecuteDrawBatching выходят сразу), и назначенная сетка просто
+				// появляется в ней, как только пользователь открывает префаб.
 				_env.Pipeline.Execute();
 			}
 			catch (Exception ex)

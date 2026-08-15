@@ -34,19 +34,8 @@ namespace DecaEngine.Editor
 			if (root is null)
 			{
 				_lastFramedPrefabPath = null;
-				var avail = ImGui.GetContentRegionAvail();
-				if (avail.X > 0 && avail.Y > 0)
-				{
-					var center = ImGui.GetCursorScreenPos() + avail * 0.5f;
-					var text = "No prefab loaded";
-					var textSize = ImGui.CalcTextSize(text);
-					ImGui.SetCursorScreenPos(center - textSize * 0.5f);
-					ImGui.TextDisabled(text);
-				}
-				return;
 			}
-
-			if (_inspectorWindow.PrefabPath != _lastFramedPrefabPath)
+			else if (_inspectorWindow.PrefabPath != _lastFramedPrefabPath)
 			{
 				_sceneViewport.FrameAll();
 				_lastFramedPrefabPath = _inspectorWindow.PrefabPath;
@@ -60,9 +49,23 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			if (_sceneViewport.Render(_imGuiRender, root.Value, _inspectorWindow.Selected, canvasSize, out var pick))
+			// Вьюпорт рендерит лит-небо окружения ДАЖЕ без открытого префаба (см.
+			// PrefabSceneViewport.Update: hasRoot) - кадр показываем всегда, а "No prefab loaded"
+			// кладём поверх подсказкой, а не вместо картинки. root телом Render не используется
+			// (см. его сигнатуру) - default передаётся, когда префаб не открыт.
+			var cursor = ImGui.GetCursorScreenPos();
+			if (_sceneViewport.Render(_imGuiRender, root ?? default, _inspectorWindow.Selected, canvasSize, out var pick))
 			{
 				_inspectorWindow.NotifyTransformChangedExternally();
+			}
+
+			if (root is null)
+			{
+				var center = cursor + canvasSize * 0.5f;
+				var text = "No prefab loaded";
+				var textSize = ImGui.CalcTextSize(text);
+				ImGui.GetWindowDrawList().AddText(center - textSize * 0.5f,
+					ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.6f)), text);
 			}
 
 			// Клик по вьюпорту: объект - выделяем его в Inspector-е (и гизмо переезжает на него),

@@ -2615,22 +2615,6 @@ namespace DecaEngine.Editor
 				ApplyPreviewSettingsToMaterials();
 			}
 
-			if (!HasModel)
-			{
-				// Root.Update ниже без модели не выполняется, а загрузку ведёт ModelStreamingSystem
-				// ВНУТРИ Root - без этого шага стриминг первой модели никогда бы не стартовал
-				// (курица и яйцо: модель появится только после тика системы). Пока сцены нет, шагаем
-				// стример напрямую тем же камерным якорем; кадр при этом не пишется. Двойного тика в
-				// одном кадре не бывает: как только модель населена, эта ветка не выполняется.
-				if (_streamingModel != null || _streamer.HasPendingLoads)
-				{
-					var idleEye = ModelViewportGeometry.ComputeOrbitEye(_orbitTarget, _distance, _yaw, _pitch);
-					_streamer.Tick(deltaTime, idleEye);
-				}
-
-				return;
-			}
-
 			// Шаг времени временной адаптации - каждый кадр, до записи: заморожённый командный буфер
 			// графа берёт его из кбуфера (см. EyeAdaptationPassResources.SetDeltaTime). Кламп сверху -
 			// защита от «прыжка» экспозиции после долгих пауз редактора (загрузка модели, бейк проб).
@@ -2641,6 +2625,14 @@ namespace DecaEngine.Editor
 				var eye = ModelViewportGeometry.ComputeOrbitEye(_orbitTarget, _distance, _yaw, _pitch);
 				_env.SetCameraTransform(eye, _orbitTarget);
 
+				// Кадр исполняется ВСЕГДА, даже без единой модели - пустая сцена показывает небо
+				// окружения (батч-рендерер безопасен при нуле инстансов), а загрузку первой модели
+				// ведёт ModelStreamingSystem ВНУТРИ Root.Update (курица и яйцо иначе не разрешается:
+				// стример шагает по позиции камерной сущности стора, которую SetCameraTransform выше
+				// только что обновил). Раньше эта ветка при отсутствии модели вызывала
+				// _streamer.Tick(...) напрямую и выходила без записи кадра - теперь это делает сама
+				// система внутри Root, а кадр (пустое небо) пишется как обычно (см. PrefabSceneViewport.Update
+				// - тот же приём).
 				_env.Root.Update(new UpdateTick(deltaTime, time));
 				_env.Pipeline.Execute();
 			}
@@ -2675,7 +2667,12 @@ namespace DecaEngine.Editor
 
 			if (!_textureBound)
 			{
+				// Bind immediately, not just allocate the ImGui texture id - otherwise the very first
+				// ~ResizeSettleSeconds of the viewport's life (see TrackAndApplyResize) show an unbound
+				// image (nothing drawn) instead of the empty-scene sky, because BindRenderTarget below
+				// used to run ONLY on a settled resize. Same fix as PrefabSceneViewport.Render.
 				_textureRef = imGuiRender.GetNewTexture();
+				imGuiRender.BindRenderTarget(_textureRef.GetTexID(), _env.ColorTarget);
 				_textureBound = true;
 			}
 
