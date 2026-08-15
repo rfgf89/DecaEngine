@@ -20,17 +20,22 @@ float3 PbrNeutralToneMap(float3 color)
     color -= offset;
 
     float peak = max(color.r, max(color.g, color.b));
-    if (peak < startCompression)
+
+    // Единственная точка выхода вместо раннего return внутри ветки: на нём FXC выдаёт
+    // X4000 "use of potentially uninitialized variable (PbrNeutralToneMap)", хотя значение
+    // возвращают обе ветки. Кривая та же, деления на ноль нет - в ветке peak >= 0.76.
+    float3 result = color;
+    if (peak >= startCompression)
     {
-        return color;
+        float d = 1.0 - startCompression;
+        float newPeak = 1.0 - d * d / (peak + d - startCompression);
+        result = color * (newPeak / peak);
+
+        float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+        result = lerp(result, newPeak.xxx, g);
     }
 
-    float d = 1.0 - startCompression;
-    float newPeak = 1.0 - d * d / (peak + d - startCompression);
-    color *= newPeak / peak;
-
-    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
-    return lerp(color, newPeak.xxx, g);
+    return result;
 }
 
 // ACES, аппроксимация Narkowicz (2015) одной рациональной дробью. Классическая «киношная» кривая:
