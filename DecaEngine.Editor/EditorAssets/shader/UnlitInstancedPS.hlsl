@@ -934,6 +934,14 @@ PSOutput Main(in PSInput input)
         // w = shadowLit (1 = сэмплер не увидел окклюдер, 0 = увидел). -1 в w значит "ветка сэмплинга
         // не выполнилась вовсе" (shadowClip.w <= 1e-4 или shadowUv/shadowNdc.z вне диапазона).
         float4 dbgPunctual = float4(0, 0, 0, -1);
+        // Тот же временный хук - какой именно ИНДЕКС слайса (0..LightClusters.MaxShadowSlices-1)
+        // шейдер в итоге выбрал для сэмплинга (база из ShadowParams.x + смещение грани куба у
+        // точечного света). -1 = ветка не дошла до вычисления слайса. Отдельно от dbgPunctual.w
+        // (результат сравнения глубины): белый/лит пиксель сам по себе не отличает "слайс без
+        // окклюдера в кадре" от "слайс вообще пустой/чужой" - индекс тут решает спор (см. канал 12).
+        float dbgShadowSlice = -1;
+        float dbgShadowBase = -1; // ВРЕМЕННЫЙ: punctual.ShadowParams.x ДО добавления смещения грани куба.
+        float dbgClusterRawCount = -1; // ВРЕМЕННЫЙ: ClusterCounts[clusterIdx] сырьём, до клампа CLUSTER_MAX_LIGHTS.
 
         // ----- Clustered punctual-света (point/spot) -------------------------------------------
         // Пиксель находит свой фроксел-кластер (тайл экрана + экспоненциальный срез по view-z,
@@ -955,6 +963,9 @@ PSOutput Main(in PSInput input)
 
             uint clusterIdx = ClusterFlatIndex(uint3(tileX, tileY, tileZ));
             uint clusterLightCount = min(ClusterCounts[clusterIdx], CLUSTER_MAX_LIGHTS);
+            // ВРЕМЕННЫЙ: сколько записей реально в ClusterCounts у этого пикселя ДО клампа - если
+            // >1 при единственном свете в сцене, кластеризация дублирует/мусорит индексы.
+            dbgClusterRawCount = (float)ClusterCounts[clusterIdx];
 
             for (uint li = 0; li < clusterLightCount; li++)
             {
@@ -986,6 +997,7 @@ PSOutput Main(in PSInput input)
                 if (punctual.ShadowParams.x >= 0.0 && punctualAtten > 0.0)
                 {
                     uint shadowSlice = (uint)punctual.ShadowParams.x;
+                    dbgShadowBase = punctual.ShadowParams.x;
                     if (punctual.DirectionType.w < 0.5)
                     {
                         float3 toFrag = -toLight;
@@ -997,6 +1009,7 @@ PSOutput Main(in PSInput input)
                         else
                             shadowSlice += toFrag.z > 0.0 ? 4 : 5;
                     }
+                    dbgShadowSlice = (float)shadowSlice;
 
                     // Normal-offset bias (аналог SampleWorldLightShadow выше): сдвиг точки сэмплирования
                     // вдоль нормали на ~1.5 текселя перспективного слайса В МИРОВЫХ единицах. В отличие
@@ -1301,6 +1314,45 @@ PSOutput Main(in PSInput input)
                 : dbgPunctual.w < -2.5 ? float3(0, 1, 1)   // -3: UV вне [0,1] (точка вне квадрата слайса)
                 : dbgPunctual.w < -1.5 ? float3(1, 0, 1)   // -1: ветка не выполнилась вовсе
                 : dbgPunctual.www;                          // сэмплировано: 0 (тень) .. 1 (свет)
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+        // ВРЕМЕННЫЙ отладочный канал 12 - какой ИНДЕКС слайса шейдер выбрал для сэмплинга этого
+        // пикселя (dbgShadowSlice, см. выше), закодирован как 8-бит серый = slice * 16 (0 слайс -
+        // почти чёрный, 15 слайс - почти белый; шаг между соседями хорошо различим на глаз/в ридбеке).
+        // Магента (1,0,1) - ветка не выполнилась вовсе (нет назначенного слайса/вне радиуса), та же
+        // семантика, что магента в канале 11. Отвечает на вопрос "слайс N дал geometry в SHADOWDUMP,
+        // а слайс, который РЕАЛЬНО сэмплит этот пиксель, - тот же N или другой?" - белый/"лит" пиксель
+        // из канала 11 сам по себе не отличает "в кадре этого слайса нет окклюдера" от "слайс вообще
+        // не тот" (расхождение записи/сэмплинга индекса выглядело бы ИДЕНТИЧНО - см. заметку задачи
+        // про Depth-only Pass #5 vs PunctualShadowMaps почти белым на forward-дроу).
+        if (PreviewChannel == 12)
+        {
+            float3 dbgColor = dbgShadowSlice < -0.5
+                ? float3(1, 0, 1)
+                : saturate(dbgShadowSlice * 16.0 / 255.0).xxx;
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+        // ВРЕМЕННЫЙ отладочный канал 13 - punctual.ShadowParams.x (БАЗОВЫЙ слайс света ДО смещения
+        // грани куба), та же кодировка *16/255, что канал 12 - изолирует, врёт ли БАЗА (назначение
+        // слайса в LightCulling.TryBuildPunctualLight) или смещение грани (UnlitInstancedPS выбор
+        // доминирующей оси).
+        if (PreviewChannel == 13)
+        {
+            float3 dbgColor = dbgShadowBase < -0.5
+                ? float3(1, 0, 1)
+                : saturate(dbgShadowBase * 16.0 / 255.0).xxx;
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+        // ВРЕМЕННЫЙ отладочный канал 14 - сырое ClusterCounts[clusterIdx] (до клампа) этого пикселя,
+        // та же кодировка *16/255. Магента = punctualCount == 0 (ветка кластеров вообще не вошла).
+        if (PreviewChannel == 14)
+        {
+            float3 dbgColor = dbgClusterRawCount < -0.5
+                ? float3(1, 0, 1)
+                : saturate(dbgClusterRawCount * 16.0 / 255.0).xxx;
             output.color = float4(dbgColor, 1.0);
             return output;
         }

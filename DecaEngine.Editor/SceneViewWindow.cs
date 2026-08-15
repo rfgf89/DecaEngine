@@ -13,7 +13,8 @@ namespace DecaEngine.Editor
 	/// </summary>
 	public class SceneViewWindow : ImGuiDockingWindow
 	{
-		private static readonly string[] ShadingLabels = { "Lighting", "Textured", "Normal", "UV", "Tangent" };
+		private static readonly string[] ShadingLabels =
+			{ "Lighting", "Textured", "Normal", "UV", "Tangent", "Punctual Shadow Debug" };
 
 		private readonly InspectorWindow _inspectorWindow;
 		private readonly PrefabSceneViewport _sceneViewport;
@@ -120,6 +121,19 @@ namespace DecaEngine.Editor
 			if (ImGui.Combo("##SceneShading", ref shadingIndex, ShadingLabels, ShadingLabels.Length))
 			{
 				_sceneViewport.SetShading((PrefabSceneViewport.ShadingMode)shadingIndex);
+			}
+			if (ImGui.IsItemHovered())
+			{
+				// "Punctual Shadow Debug" - см. PrefabSceneViewport.ShadingMode.PunctualShadowDebug и
+				// UnlitInstancedPS.hlsl PreviewChannel == 11: цветовая легенда сэмплинга теней
+				// point/spot светов, тот же канал, что диагностирует DECA_PROBE_PUNCTUALDEBUG.
+				ImGui.SetTooltip(
+					"Punctual Shadow Debug legend:\n" +
+					"magenta - shadow sampling branch didn't run (light has no assigned shadow slice,\n" +
+					"          or the point is outside the light's radius)\n" +
+					"orange  - receiver point is beyond the shadow slice's far plane\n" +
+					"cyan    - receiver point is outside the shadow slice's UV square\n" +
+					"grey    - actual sampled shadow result (black = shadowed, white = lit)");
 			}
 
 			// HDR+GI: одна галочка включает и авто-экспозицию (HDR-конвейер), и probe-GI сцены.

@@ -69,6 +69,11 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         var punctualLightsQuery = Query.Store.Query<LightComponent>().WithoutAllComponents(ComponentTypes.Get<SunComponent>());
 
         int cameraCount = mainCameras.Count;
+        if (Environment.GetEnvironmentVariable("DECA_DEBUG_CAMERACOUNT") == "1")
+        {
+            int lightCount = punctualLightsQuery.Count;
+            Console.WriteLine($"[debug] CullingAndRenderSystem.OnUpdate: cameras={cameraCount} punctualLights={lightCount}");
+        }
         if (cameraCount == 0)
         {
             return;
@@ -199,6 +204,10 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 punctualLightTotal - segmentOffset,
                 MathF.Max(cullData.znear, 0.01f),
                 MathF.Max(cullData.zfar, MathF.Max(cullData.znear, 0.01f) * 2f));
+            if (Environment.GetEnvironmentVariable("DECA_DEBUG_CAMERACOUNT") == "1")
+            {
+                Console.WriteLine($"[debug]   camera entity={entity.Id} segmentOffset={segmentOffset} segCount={punctualLightTotal - segmentOffset}");
+            }
 
             _renderCamerasData.viewData.Add(viewData);
             _renderCamerasData.cullData.Add(cullData);

@@ -38,6 +38,13 @@ namespace DecaEngine.Editor
 			Normal,
 			Uv,
 			Tangent,
+			// Mode 3 (Lighting) + Channel 11 - визуализация сэмплинга теней punctual-светов
+			// (см. UnlitInstancedPS.hlsl PreviewChannel == 11 и DECA_PROBE_PUNCTUALDEBUG в
+			// PreviewProbe.cs): магента - ветка сэмплинга не выполнилась (нет назначенного слайса
+			// или точка вне радиуса света), оранжевый - точка приёмника за дальней плоскостью слайса,
+			// голубой - точка приёмника вне квадрата UV слайса, градация серого - реальный
+			// shadowLit сэмплера (чёрный = в тени/окклюдер найден, белый = свет/не найден).
+			PunctualShadowDebug,
 		}
 
 		private const uint InitialWidth = 256;
@@ -2740,6 +2747,9 @@ namespace DecaEngine.Editor
 			{
 				ShadingMode.Uv => 1,
 				ShadingMode.Tangent => 2,
+				// PunctualShadowDebug требует Mode == 3 (см. mode switch выше: попадает в default => 3)
+				// и Channel == 11 - тот же канал, что читает DECA_PROBE_PUNCTUALDEBUG в PreviewProbe.cs.
+				ShadingMode.PunctualShadowDebug => 11,
 				_ => 0,
 			};
 

@@ -569,6 +569,43 @@ public static class PreviewProbe
 			}
 		}
 
+		// DECA_PROBE_POINT=1 - завести один punctual POINT-свет (6 теневых слайсов, куб. грани -
+		// см. PunctualShadowScheduler.FaceDirs/UnlitInstancedPS.hlsl:983-998) вместо спота: спот
+		// покрывает только ОДИН слайс/одну проекцию, а баг-репорт пользователя - именно точечный
+		// свет, чей путь выбора грани по доминирующей оси до сих пор ничем не проверялся.
+		//   DECA_PROBE_POINT_POS="x,y,z"      - позиция света (default eye + up*1.5)
+		//   DECA_PROBE_POINT_RANGE=<float>    - Range (default 6.4, как у пользователя)
+		//   DECA_PROBE_POINT_INTENSITY=<float>- Intensity (default 8)
+		//   DECA_POINT_COLOR / DECA_PROBE_POINT_COLOR="r,g,b" - Color (default 3.45,3.6,4.05)
+		//   DECA_PROBE_POINT_SHADOW=<float>   - ShadowStrength ДО клампа (default 5.85, как у
+		//                                        пользователя; TryBuildPunctualLight клампит к [0,1])
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_POINT") == "1")
+		{
+			var pointPos = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_POINT_POS"))
+				?? eye + Vector3.UnitY * 1.5f;
+			var pointColor = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_POINT_COLOR"))
+				?? new Vector3(3.45f, 3.6f, 4.05f);
+
+			float pointRange = EnvFloat("DECA_PROBE_POINT_RANGE", 6.4f);
+			float pointIntensity = EnvFloat("DECA_PROBE_POINT_INTENSITY", 8f);
+			float pointShadow = EnvFloat("DECA_PROBE_POINT_SHADOW", 5.85f);
+
+			env.Store.CreateEntity(
+				new Position(pointPos.X, pointPos.Y, pointPos.Z),
+				new Rotation(),
+				new LightComponent
+				{
+					Type = LightType.Point,
+					Color = pointColor,
+					Intensity = pointIntensity,
+					Range = pointRange,
+					ShadowStrength = pointShadow,
+				});
+
+			Console.WriteLine($"[probe] point light: pos={pointPos} range={pointRange} " +
+				$"intensity={pointIntensity} shadow={pointShadow} (clamped to 1 downstream)");
+		}
+
 		// DECA_PROBE_RENDERSCALE=<0.25..1> - масштаб рендера сцены (см.
 		// GraphicsPipelineSimple.SetRenderScale): сценовые таргеты уменьшаются, ColorTarget остаётся
 		// display, кадр поднимает тонемап. Зеркало ресайз-пути вьюпорта, как DECA_PROBE_RESIZE.
@@ -1381,6 +1418,113 @@ public static class PreviewProbe
 				out var rw, out var rh);
 			ReportStats("debug_direct_recheck", recheckPixels, rw, rh);
 			PngWriter.Write(Path.Combine(outDir, "probe_debug_direct_recheck.png"), recheckPixels, rw, rh);
+
+			// Канал 12 (см. UnlitInstancedPS.hlsl) - какой ИНДЕКС слайса шейдер РЕАЛЬНО выбрал за
+			// пиксель, закодирован как r=g=b=slice*16 (магента = ветка не выполнилась). Отвечает на
+			// вопрос, который канал 11 сам по себе не решает: белый/"лит" пиксель канала 11 может
+			// значить и "слайс верный, окклюдера в кадре нет", и "слайс вообще не тот - сэмплится
+			// пустая/чужая карта". Сверяется с DECA_PROBE_SHADOWDUMP=3 (какие слайсы РЕАЛЬНО содержат
+			// геометрию) - расхождение "слайс без геометрии в дампе, но часто встречается тут" прямо
+			// указывает на несовпадение записи/сэмплинга индекса.
+			PushPreviewSettings(model, 3, 12, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var slicePixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var sw, out var sh);
+
+			var sliceHistogram = new long[16];
+			long sliceNoBranch = 0;
+			for (int i = 0; i < slicePixels.Length; i += 4)
+			{
+				byte r = slicePixels[i], g = slicePixels[i + 1], b = slicePixels[i + 2];
+				if (r > 200 && g < 50 && b > 200) { sliceNoBranch++; continue; }
+				int slice = (int)Math.Round(r / 16.0);
+				if (slice is >= 0 and < 16) sliceHistogram[slice]++;
+			}
+			long sliceTotalPx = sw * (long)sh;
+			var histStr = string.Join(", ", sliceHistogram.Select((count, idx) => $"{idx}:{100.0 * count / sliceTotalPx:F1}%")
+				.Where((_, idx) => sliceHistogram[idx] > 0));
+			Console.WriteLine($"[probe] punctual shadow slice index (channel 12): no-branch={100.0 * sliceNoBranch / sliceTotalPx:F1}% " +
+				$"per-slice pixel share: {(histStr.Length > 0 ? histStr : "(none sampled)")}");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualslice.png"), slicePixels, sw, sh);
+
+			// Канал 13 - punctual.ShadowParams.x (БАЗОВЫЙ слайс, назначенный LightCulling, ДО
+			// смещения грани куба) - та же кодировка/декод, что канал 12. Изолирует источник
+			// расхождения: если БАЗА уже неверна - баг в LightCulling/assignments, если база верна
+			// (0), а итоговый слайс (канал 12) - нет, баг в выборе грани точечного света в PS.
+			PushPreviewSettings(model, 3, 13, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var basePixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var bw, out var bh);
+
+			var baseHistogram = new long[16];
+			long baseNoBranch = 0;
+			for (int i = 0; i < basePixels.Length; i += 4)
+			{
+				byte r = basePixels[i], g = basePixels[i + 1], b = basePixels[i + 2];
+				if (r > 200 && g < 50 && b > 200) { baseNoBranch++; continue; }
+				int slice = (int)Math.Round(r / 16.0);
+				if (slice is >= 0 and < 16) baseHistogram[slice]++;
+			}
+			long baseTotalPx = bw * (long)bh;
+			var baseHistStr = string.Join(", ", baseHistogram.Select((count, idx) => $"{idx}:{100.0 * count / baseTotalPx:F1}%")
+				.Where((_, idx) => baseHistogram[idx] > 0));
+			Console.WriteLine($"[probe] punctual shadow BASE slice, pre-face-offset (channel 13): no-branch={100.0 * baseNoBranch / baseTotalPx:F1}% " +
+				$"per-slice pixel share: {(baseHistStr.Length > 0 ? baseHistStr : "(none sampled)")}");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualbase.png"), basePixels, bw, bh);
+
+			// Канал 14 - сырое ClusterCounts[clusterIdx] (до клампа CLUSTER_MAX_LIGHTS), та же
+			// кодировка. При единственном свете в сцене ОБЯЗАН быть 0 (ветка не вошла, кластер без
+			// punctual-светов) либо 1 (наш единственный свет) ПОВСЮДУ, где punctualCount > 0.
+			PushPreviewSettings(model, 3, 14, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var countPixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var cw, out var ch);
+
+			var countHistogram = new long[16];
+			long countNoBranch = 0;
+			for (int i = 0; i < countPixels.Length; i += 4)
+			{
+				byte r = countPixels[i], g = countPixels[i + 1], b = countPixels[i + 2];
+				if (r > 200 && g < 50 && b > 200) { countNoBranch++; continue; }
+				int cnt = (int)Math.Round(r / 16.0);
+				if (cnt is >= 0 and < 16) countHistogram[cnt]++;
+			}
+			long countTotalPx = cw * (long)ch;
+			var countHistStr = string.Join(", ", countHistogram.Select((count, idx) => $"{idx}:{100.0 * count / countTotalPx:F1}%")
+				.Where((_, idx) => countHistogram[idx] > 0));
+			Console.WriteLine($"[probe] punctual cluster raw light count (channel 14): no-branch(punctualCount==0)={100.0 * countNoBranch / countTotalPx:F1}% " +
+				$"per-count pixel share: {(countHistStr.Length > 0 ? countHistStr : "(none)")}");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualcount.png"), countPixels, cw, ch);
 
 			env.SetTonemapPassthrough(false);
 		}

@@ -50,6 +50,15 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             .WithoutAllComponents(ComponentTypes.Get<SunComponent>());
 
         int cameraCount = cameras.Count;
+        // ВРЕМЕННЫЙ отладочный принт (расследование "punctual shadow слайс не совпадает") -
+        // сколько камер реально видит этот QuerySystem: подозрение, что оффскрин-баунсы
+        // (probe-GI/иконки) оставляют лишние CameraComponent-сущности в общем сторе.
+        if (Environment.GetEnvironmentVariable("DECA_DEBUG_CAMERACOUNT") == "1")
+        {
+            int lightCount = Query.Store.Query<LightComponent>()
+                .WithoutAllComponents(ComponentTypes.Get<SunComponent>()).Count;
+            Console.WriteLine($"[debug] SimpleCullingAndRenderSystem.OnUpdate: cameras={cameraCount} punctualLights={lightCount}");
+        }
         if (cameraCount == 0)
         {
             return;
