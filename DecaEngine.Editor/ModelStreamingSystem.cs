@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using System.Threading;
-using System.Threading.Tasks;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
@@ -13,27 +11,40 @@ using Friflo.Engine.ECS.Systems;
 namespace DecaEngine.Editor.ECS
 {
 	/// <summary>
-	/// Стриминг моделей (<see cref="ModelLoader"/>) для одного офскрин-окружения
-	/// (<see cref="ModelViewportEnvironment"/>): резидентный кеш по пути файла со счётчиком ссылок,
-	/// очередь фоновых загрузок с приоритетом ПО РАССТОЯНИЮ ДО КАМЕРЫ и покадровая бюджетная
-	/// финализация GPU-ресурсов (см. ModelLoader.FinalizeChunk - дисциплина upload-хипа).
+	/// Per-environment (<see cref="ModelViewportEnvironment"/>) instantiation layer over the
+	/// process-wide <see cref="ModelStore"/>: loading, decoding, GPU-texture streaming and the actual
+	/// residency lifetime of a <see cref="ModelLoader"/> all live in the store now (one copy per
+	/// (path, options) for the WHOLE editor, see its class-doc). This class only tracks, PER
+	/// ENVIRONMENT, which models it currently wants resident (radius-based streaming, same as before),
+	/// the <see cref="ModelStore.Handle"/> that represents this environment's claim on each one, and
+	/// this environment's OWN registrations in ITS OWN <see cref="DiligentBatchRenderer"/> - a material
+	/// set (<see cref="ModelStore.AcquireMaterialSet"/>) plus the resulting MeshId/MaterialId/BatchId
+	/// maps.
 	///
-	/// Владеет жизненным циклом ModelLoader-ов целиком: регистрирует готовую модель в батч-рендерере
-	/// окружения, а при выселении/очистке освобождает её по обязательному протоколу этого движка -
-	/// дождаться GPU -> сбросить регистрации -> Release -> пересобрать граф (см. комментарии в
-	/// ModelPreviewViewport.PopulateFromScene: мега-буферы батч-рендерера пересоздаются целиком, а
-	/// замороженные команды графа держат ссылки на старые буферы).
+	/// A <see cref="Resident"/>'s store <see cref="Resident.StoreHandle"/> is held for as long as the
+	/// LOCAL reference count is non-zero, AND kept a while longer even at zero (the store's own
+	/// <see cref="ModelStore.UnloadAfterSeconds"/> hysteresis - not duplicated here) - so a
+	/// <see cref="Release"/> immediately followed by a fresh <see cref="Acquire"/> of the same path (the
+	/// camera oscillating at the edge of <see cref="StreamRadius"/>) is nearly free: the model is still
+	/// resident in the store, and this environment's Mesh/Material/Batch registrations were never torn
+	/// down, so nothing needs re-registering. Registrations are torn down ONLY in reaction to
+	/// <see cref="ModelStore.BeforeModelEvicted"/> - i.e. only when the model ACTUALLY leaves the GPU
+	/// (see <see cref="OnStoreModelEvicted"/>), which for a normal idle-out only happens once every
+	/// handle across every environment has let go.
 	///
 	/// Кадровый привод - <see cref="ModelStreamingSystem"/> в SystemRoot окружения: она каждый кадр
-	/// читает позицию камеры из ECS-стора и зовёт <see cref="Tick"/>. Потребители (превью, префабы)
-	/// берут модель через <see cref="Acquire"/>/<see cref="Release"/> и следят за
-	/// <see cref="Resident.Ready"/>.
+	/// читает позицию камеры из ECS-стора и зовёт <see cref="Tick"/> (priority bookkeeping only now -
+	/// см. class-doc <see cref="ModelStore.Tick"/> про то, кто на самом деле шагает загрузку/стриминг
+	/// текстур один раз за кадр). Потребители (превью, префабы) берут модель через
+	/// <see cref="Acquire"/>/<see cref="Release"/> и следят за <see cref="Resident.Ready"/>.
 	/// </summary>
 	public sealed class ModelStreamer
 	{
-		/// <summary>Резидентная (или грузящаяся) модель одного файла. Те же поля-словари, что были у
-		/// локальных кешей вьюпортов (MeshIds/MaterialIds/BatchCache), - регистрации в батч-рендерере
-		/// ТЕКУЩЕГО окружения; при любом сбросе регистраций пересоздаются стримером.</summary>
+		/// <summary>Локальное (для ЭТОГО окружения) состояние одного файла модели: регистрации в ЕГО
+		/// батч-рендерере (MeshIds/MaterialIds/BatchCache) плюс ссылка на разделяемый
+		/// <see cref="ModelLoader"/>, которым владеет <see cref="ModelStore"/>. Переживает
+		/// Release/Acquire без переrегистрации, пока <see cref="ModelStore"/> не выселит саму модель -
+		/// см. class-doc.</summary>
 		public sealed class Resident
 		{
 			public readonly string Path;
@@ -48,14 +59,11 @@ namespace DecaEngine.Editor.ECS
 			public Vector3 Anchor;
 
 			internal int RefCount;
-			internal float IdleSeconds;
-			internal ModelLoader.ModelLoadRequest? Request;
-			internal CancellationTokenSource? Cts;
 
-			/// <summary>FinalizeChunk уже создал часть GPU-ресурсов - отмена на этом этапе бросает их
-			/// недостроенными (у ModelLoadRequest нет отката), поэтому начатую финализацию доводим до
-			/// конца даже для уже никому не нужной модели, а выселяем её обычным путём.</summary>
-			internal bool Finalizing;
+			/// <summary>Заявка ЭТОГО окружения на модель в столе - живёт, пока RefCount &gt; 0 (см.
+			/// <see cref="EnsureStoreHandle"/>/<see cref="Release"/>); null, если сейчас нет активной
+			/// заявки (либо ещё не потребовалась, либо путь оказался с ошибкой - см. Error).</summary>
+			internal ModelStore.Handle? StoreHandle;
 
 			public bool Ready => Model != null;
 			public bool Failed => Error != null;
@@ -67,117 +75,69 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		private readonly Dictionary<string, Resident> _models = new(StringComparer.OrdinalIgnoreCase);
+		private readonly ModelStore _store;
 		private readonly IGraphicsApi _graphicsApi;
 		private readonly Func<ModelLoadOptions> _optionsFactory;
 		private ModelViewportEnvironment _env;
 		private Vector3 _cameraPos;
 
-		// Скретчи Tick-а - без аллокаций на кадр.
-		private readonly List<Resident> _startScratch = new();
+		// Скретч выселения абандонированных/ошибочных записей - без аллокаций на кадр.
 		private readonly List<Resident> _evictScratch = new();
-
-		/// <summary>Фоновый ре-декод одной ступени качества текстуры (см. ModelLoader.StreamedTextures).
-		/// Одна задача за раз: декод идёт в полном разрешении файла (пик ~64 МБ на 4K), а заливка -
-		/// одна текстура за Tick, чтобы не раздувать upload-хип.</summary>
-		private sealed class TextureUpgradeJob
-		{
-			public required Resident Resident;
-			public required ModelLoader Model;
-			public required ModelLoader.StreamedTexture Entry;
-			public required int RequestedSize;
-			public required Task<(byte[] Pixels, int Width, int Height)> DecodeTask;
-		}
-
-		private TextureUpgradeJob? _textureJob;
-
-		/// <summary>Заменённые апгрейдами GPU-текстуры, ждущие отложенного Release: у движка нет
-		/// fence кадров в полёте, а WaitForIdle на каждую замену стопорил бы рендер - вместо этого
-		/// текстура низкой ступени живёт ещё несколько тиков после того, как все SRB перестали на
-		/// неё ссылаться.</summary>
-		private readonly List<(IGpuTexture Texture, int TicksLeft)> _retiredTextures = new();
-		private const int RetireTicks = 8;
-
-		/// <summary>Модели, выселенные партиционным <see cref="ResetResidency"/> (см. его комментарий) и
-		/// ждущие отложенного ModelLoader.Release - тем же приёмом, что и <see cref="_retiredTextures"/>:
-		/// партиционное выселение больше не делает Flush/WaitForIdle, поэтому GPU может ещё доигрывать
-		/// кадры, читающие текстуры/буферы модели.</summary>
-		private readonly List<(ModelLoader Model, int TicksLeft)> _retiredModels = new();
-
-		/// <summary>Множитель ступени качества текстур: 64 -> 256 -> 1024 -> целевой размер.</summary>
-		public int TextureStepFactor { get; set; } = 4;
-
-		/// <summary>Первая (и минимальная) ступень качества.</summary>
-		public int InitialTextureSize { get; set; } = 64;
-
-		/// <summary>Дистанция, ближе которой объекту достаётся полное качество текстур; дальше
-		/// потолок падает вдвое на каждое удвоение расстояния (см. TargetSizeForDistance).</summary>
-		public float FullQualityDistance { get; set; } = 12f;
-
-		/// <summary>Потолок памяти под стримленные текстуры. Достигнут - апгрейды останавливаются:
-		/// сцена уровня Sponza (сотни текстур) на полном качестве весит десятки гигабайт RGBA с
-		/// мипами, и без потолка редактор просто уходил в своп.</summary>
-		public long TextureMemoryBudgetBytes { get; set; } = 1024L << 20;
-
-		private long _textureBytes;
-		private bool _budgetReported;
-
-		/// <summary>Сколько фоновых Prepare-задач держать в полёте одновременно. Каждая - это
-		/// параллельный декод текстур с пиковыми полноразмерными RGBA-копиями (см.
-		/// ModelLoader.PrepareModel), так что больше двух заметно раздувает пиковую память.</summary>
-		public int MaxConcurrentLoads { get; set; } = 2;
-
-		/// <summary>Сколько секунд модель с нулём ссылок остаётся резидентной, прежде чем быть
-		/// выселенной с GPU. Буфер против дребезга: камера у границы радиуса стриминга то отпускает,
-		/// то тут же снова берёт одну и ту же модель.</summary>
-		public float UnloadAfterSeconds { get; set; } = 4f;
-
-		/// <summary>Радиус стриминга от камеры (мировые единицы): дальше него потребители через
-		/// <see cref="ShouldBeResident"/> отпускают модель, ближе - берут. Бесконечность = грузить
-		/// всё независимо от камеры (камера тогда влияет только на ПОРЯДОК загрузки).</summary>
-		public float StreamRadius { get; set; } = float.PositiveInfinity;
 
 		/// <summary>Гистерезис выгрузки: уже резидентная модель отпускается только за
 		/// <see cref="StreamRadius"/> * этот множитель - иначе на самой границе радиуса она бы
 		/// грузилась и выгружалась каждый шаг камеры.</summary>
 		public const float StreamOutHysteresis = 1.15f;
 
-		/// <summary>Модель догрузилась и зарегистрирована в батч-рендерере - можно инстанцировать.</summary>
+		/// <summary>Радиус стриминга от камеры (мировые единицы): дальше него потребители через
+		/// <see cref="ShouldBeResident"/> отпускают модель, ближе - берут. Бесконечность = грузить
+		/// всё независимо от камеры (камера тогда влияет только на ПОРЯДОК загрузки, через приоритет
+		/// в столе).</summary>
+		public float StreamRadius { get; set; } = float.PositiveInfinity;
+
+		/// <summary>Модель этого окружения догрузилась и зарегистрирована в его батч-рендерере -
+		/// можно инстанцировать.</summary>
 		public event Action<Resident>? ModelReady;
 
-		/// <summary>Сейчас будут сняты регистрации батч-рендерера какой-то части резидентов (выселение
-		/// простаивающих моделей, ResetResidency) или вообще всех (полная очистка, ClearAll):
-		/// подписчик обязан снять свои инстанс-сущности (UnregisterRenderable + DeleteEntity), пока
-		/// BatchId-ы ещё валидны. Событие не сообщает, КАКИЕ именно модели выселяются - выселение
-		/// одной простаивающей модели больше НЕ трогает MeshId/MaterialId/BatchId выживших (см.
-		/// ResetResidency), но подписчик всё равно узнаёт об этом заранее и волен снять только то,
-		/// что реально ссылается на выселяемых резидентов.</summary>
-		public event Action? ResidencyResetting;
+		/// <summary>Стол СЕЙЧАС снимет регистрации батч-рендерера этого окружения для ОДНОЙ конкретной
+		/// модели (см. <see cref="ModelStore.BeforeModelEvicted"/>): подписчик обязан снять свои
+		/// инстанс-сущности, ссылающиеся ИМЕННО на этот <see cref="Resident"/> (сравнение по ссылке -
+		/// см. <see cref="Resident"/>), пока его BatchId-ы ещё валидны. Другие резиденты этим событием
+		/// не затронуты - в отличие от прежней версии (полный сброс на любое частичное выселение), см.
+		/// задачу про сужение ResidencyResetting.</summary>
+		public event Action<Resident>? ResidencyResetting;
 
-		/// <summary>Сброс завершён - подписчик может инстанцировать заново. Для партиционного
-		/// выселения (ResetResidency) словари Id выживших моделей НЕ перезаполняются - они и не
-		/// менялись; для полной очистки (ClearAll) это по-прежнему полный ResetRegistrations.</summary>
-		public event Action? ResidencyReset;
+		/// <summary>Сброс завершён для этой модели - подписчик может инстанцировать её заново (или
+		/// признать её окончательно ушедшей).</summary>
+		public event Action<Resident>? ResidencyReset;
 
-		public ModelStreamer(ModelViewportEnvironment env, IGraphicsApi graphicsApi,
+		public ModelStreamer(ModelViewportEnvironment env, ModelStore store, IGraphicsApi graphicsApi,
 			Func<ModelLoadOptions> optionsFactory)
 		{
 			_env = env;
+			_store = store;
 			_graphicsApi = graphicsApi;
 			_optionsFactory = optionsFactory;
+
+			// Живут всю сессию редактора вместе с этим ModelStreamer-ом (он не пересоздаётся при
+			// RecreateEnvironment - меняется только _env) - отписка не требуется.
+			_store.ModelReady += OnStoreModelReady;
+			_store.BeforeModelEvicted += OnStoreModelEvicted;
 		}
 
 		/// <summary>Резидентный кеш на чтение - вьюпортам для обхода загруженных моделей
 		/// (материалы, probe-GI и т.п.). Не мутировать.</summary>
 		public IReadOnlyDictionary<string, Resident> Models => _models;
 
-		/// <summary>Есть ли незавершённая работа (фоновые Prepare или недофинализированные модели).</summary>
+		/// <summary>Есть ли незавершённая работа (модель запрошена, но стол её ещё не выдал ни
+		/// готовой, ни ошибкой).</summary>
 		public bool HasPendingLoads
 		{
 			get
 			{
 				foreach (var resident in _models.Values)
 				{
-					if (resident.Request != null)
+					if (resident.Model == null && resident.Error == null)
 					{
 						return true;
 					}
@@ -203,623 +163,219 @@ namespace DecaEngine.Editor.ECS
 			return distance <= (currentlyResident ? StreamRadius * StreamOutHysteresis : StreamRadius);
 		}
 
-		/// <summary>Берёт ссылку на модель файла (загрузка стартует из Tick по приоритету камеры).
-		/// Каждому Acquire обязан соответствовать <see cref="Release"/>.</summary>
+		/// <summary>Берёт ссылку на модель файла (загрузка/финализация/стриминг текстур - целиком в
+		/// <see cref="ModelStore"/>, по приоритету камеры). Каждому Acquire обязан соответствовать
+		/// <see cref="Release"/>.</summary>
 		public Resident Acquire(string path, Vector3 anchor)
 		{
 			if (!_models.TryGetValue(path, out var resident))
 			{
 				resident = new Resident(path) { Anchor = anchor };
 				_models[path] = resident;
-
-				var extension = System.IO.Path.GetExtension(path);
-				if (!string.Equals(extension, ".gltf", StringComparison.OrdinalIgnoreCase) &&
-					!string.Equals(extension, ".glb", StringComparison.OrdinalIgnoreCase))
-				{
-					resident.Error = $"Unsupported model format: {extension}";
-					EditorConsoleLog.Add(LogLevel.Warning, $"Model streaming: {resident.Error} ('{path}')");
-				}
 			}
 
 			resident.RefCount++;
-			resident.IdleSeconds = 0f;
 			resident.Anchor = anchor;
+			EnsureStoreHandle(resident);
+
 			return resident;
 		}
 
-		/// <summary>Отпускает ссылку. Модель НЕ выгружается немедленно - остаётся резидентной ещё
-		/// <see cref="UnloadAfterSeconds"/> (кеш против дребезга), незапущенная загрузка снимается с
-		/// очереди, а запущенная отменяется следующим Tick-ом.</summary>
+		/// <summary>Отпускает ссылку. НЕ трогает регистрации/модель немедленно - см. class-doc: модель
+		/// (и это окружение регистрация) остаётся валидной, пока стол сам не решит её выселить
+		/// (<see cref="OnStoreModelEvicted"/>), что обычно происходит намного позже (гистерезис стола,
+		/// либо модель ещё нужна другому окружению).</summary>
 		public void Release(Resident resident)
 		{
 			resident.RefCount = Math.Max(0, resident.RefCount - 1);
+
+			if (resident.RefCount == 0 && resident.StoreHandle != null)
+			{
+				_store.Release(resident.StoreHandle);
+				resident.StoreHandle = null;
+			}
 		}
 
 		/// <summary>
-		/// Кадровый шаг (главный поток, под GPU-локом): запуск очередных загрузок ближайших к камере
-		/// моделей, опрос фоновых задач, финализация ОДНОЙ модели за кадр (ближайшей из готовых) и
-		/// выселение простаивающих. Зовётся <see cref="ModelStreamingSystem"/> из SystemRoot окружения.
+		/// Кадровый шаг (главный поток, под GPU-локом): обновляет приоритет загрузки/апгрейда текстур
+		/// этого окружения для стола (расстояние до камеры) и забывает локально абандонированные/
+		/// ошибочные записи. Саму загрузку/финализацию/стриминг текстур шагает
+		/// <see cref="ModelStore.Tick"/> - ОДИН раз за кадр на весь процесс (см. EditorManager), а не
+		/// отсюда, иначе бюджет "одна финализация за кадр" считался бы отдельно на каждое окружение.
 		/// </summary>
 		public void Tick(float deltaTime, Vector3 cameraPos)
 		{
 			_cameraPos = cameraPos;
 
-			StartQueuedLoads();
-			PollLoads();
-			PumpTextureUpgrades();
-			AgeRetiredTextures();
-			AgeRetiredModels();
-			EvictIdle(deltaTime);
+			foreach (var resident in _models.Values)
+			{
+				if (resident.StoreHandle != null)
+				{
+					_store.SetPriority(resident.StoreHandle, DistanceToCamera(resident));
+				}
+			}
+
+			EvictAbandoned();
 		}
 
 		private float DistanceToCamera(Resident resident) => Vector3.Distance(resident.Anchor, _cameraPos);
 
-		private void StartQueuedLoads()
+		/// <summary>Заводит заявку этого окружения на модель в столе, если её ещё нет и путь не помечен
+		/// окончательно ошибочным (см. Resident.Error - тот же приём, что был в столе/старом стримере:
+		/// однажды распознанный неподдерживаемый формат больше не переспрашивается).</summary>
+		private void EnsureStoreHandle(Resident resident)
 		{
-			var inFlight = 0;
-			_startScratch.Clear();
-			foreach (var resident in _models.Values)
-			{
-				if (resident.Request != null)
-				{
-					inFlight++;
-				}
-				else if (resident.Model == null && resident.Error == null && resident.RefCount > 0)
-				{
-					_startScratch.Add(resident);
-				}
-			}
-
-			if (_startScratch.Count == 0 || inFlight >= MaxConcurrentLoads)
+			if (resident.StoreHandle != null || resident.Error != null)
 			{
 				return;
 			}
 
-			// Ближайшие к камере - первыми: это и есть "стриминг от камеры", а не FIFO по порядку
-			// обхода префаба.
-			_startScratch.Sort((a, b) => DistanceToCamera(a).CompareTo(DistanceToCamera(b)));
-
-			foreach (var resident in _startScratch)
+			var handle = _store.Acquire(resident.Path, _optionsFactory(), DistanceToCamera(resident));
+			if (handle.Failed)
 			{
-				if (inFlight >= MaxConcurrentLoads)
+				resident.Error = handle.Error;
+				_store.Release(handle); // путь безнадёжен - незачем держать заявку на мёртвую запись
+				return;
+			}
+
+			resident.StoreHandle = handle;
+		}
+
+		/// <summary>Модель СТОЛА догрузилась (в общем-то любая, для любого окружения процесса) -
+		/// проверяем, не наша ли это заявка, и если да - регистрируем в СВОЁМ батч-рендерере.</summary>
+		private void OnStoreModelReady(ModelLoader model)
+		{
+			foreach (var resident in _models.Values)
+			{
+				if (resident.Model != null || resident.StoreHandle == null)
 				{
-					break;
+					continue;
+				}
+
+				if (!_store.TryGetReady(resident.StoreHandle, out var readyModel) ||
+					!ReferenceEquals(readyModel, model))
+				{
+					continue;
 				}
 
 				try
 				{
-					resident.Cts = new CancellationTokenSource();
-					resident.Request = ModelLoader.BeginLoadAsync(_graphicsApi, resident.Path, _optionsFactory(),
-						cancellationToken: resident.Cts.Token);
-					inFlight++;
+					RegisterResident(resident, readyModel);
+					resident.Model = readyModel;
+					ModelReady?.Invoke(resident);
 				}
 				catch (Exception ex)
 				{
 					resident.Error = ex.Message;
-					FinishRequest(resident);
 					EditorConsoleLog.Add(LogLevel.Error,
-						$"Model streaming: failed to load '{resident.Path}': {ex.Message}");
+						$"Model streaming: failed to register '{resident.Path}': {ex.Message}");
 				}
+
+				return; // пути уникальные ключи - максимум один резидент может ссылаться на эту модель
 			}
 		}
 
-		private void PollLoads()
+		/// <summary>Стол СЕЙЧАС выселит эту модель (см. <see cref="ModelStore.BeforeModelEvicted"/>) -
+		/// если это НАША заявка (сравнение по ссылке), снимаем регистрации ИМЕННО этого резидента в
+		/// своём батч-рендерере. Другие резиденты не трогаются - партиционное выселение, а не сброс
+		/// всего окружения (см. class-doc про сужение прежнего ResidencyResetting).</summary>
+		private void OnStoreModelEvicted(ModelLoader model)
 		{
-			// Кандидат на финализацию этого кадра - ближайшая к камере модель с готовым Prepare.
-			// Финализируем ОДНУ за кадр: FinalizeChunk и так порционный, но несколько моделей разом
-			// суммировали бы свои бюджеты в один upload-хип.
-			Resident? best = null;
-			var bestDistance = float.MaxValue;
-			List<Resident>? abandoned = null;
-
+			Resident? found = null;
 			foreach (var resident in _models.Values)
 			{
-				if (resident.Request == null)
+				if (ReferenceEquals(resident.Model, model))
 				{
-					continue;
-				}
-
-				// Модель разлюбили, пока она грузилась (камера ушла / префаб сменился до ClearAll) -
-				// глушим фоновый декод. Начатую финализацию не бросаем (см. Resident.Finalizing).
-				// Удаление из словаря - после цикла: словарь нельзя мутировать во время обхода.
-				if (resident.RefCount <= 0 && !resident.Finalizing)
-				{
-					resident.Cts?.Cancel();
-					FinishRequest(resident);
-					(abandoned ??= new List<Resident>()).Add(resident);
-					continue;
-				}
-
-				if (!resident.Request.PrepareTask.IsCompleted)
-				{
-					continue;
-				}
-
-				if (!resident.Request.PrepareTask.IsCompletedSuccessfully)
-				{
-					resident.Error = resident.Request.PrepareTask.Exception?.GetBaseException().Message
-						?? "Unknown error";
-					FinishRequest(resident);
-					EditorConsoleLog.Add(LogLevel.Error,
-						$"Model streaming: failed to load '{resident.Path}': {resident.Error}");
-					continue;
-				}
-
-				var distance = DistanceToCamera(resident);
-				// Начатая финализация всегда важнее новых: пока она не закончена, её недостроенные
-				// GPU-ресурсы висят без владельца.
-				if (resident.Finalizing)
-				{
-					distance = -1f;
-				}
-
-				if (distance < bestDistance)
-				{
-					bestDistance = distance;
-					best = resident;
+					found = resident;
+					break;
 				}
 			}
 
-			if (abandoned != null)
+			if (found == null)
 			{
-				foreach (var resident in abandoned)
-				{
-					_models.Remove(resident.Path);
-				}
-			}
-
-			if (best == null)
-			{
+				// Либо это окружение никогда не регистрировало эту модель, либо уже само сняло
+				// регистрацию раньше (Release уронил RefCount до нуля и отпустил handle стола ДО того,
+				// как стол реально дошёл до выселения - см. Release/EnsureStoreHandle).
 				return;
 			}
 
-			ModelLoader? model;
-			try
-			{
-				best.Finalizing = true;
-				model = best.Request!.FinalizeChunk();
-			}
-			catch (Exception ex)
-			{
-				best.Error = ex.Message;
-				FinishRequest(best);
-				EditorConsoleLog.Add(LogLevel.Error,
-					$"Model streaming: failed to finalize '{best.Path}': {ex.Message}");
-				return;
-			}
+			ResidencyResetting?.Invoke(found);
 
-			if (model == null)
-			{
-				return; // порция кадра исчерпана - продолжение следующим кадром
-			}
+			_env.BatchRenderer.UnregisterModel(found.BatchCache.Values, found.MaterialIds.Values, found.MeshIds.Values);
+			found.Model = null;
+			found.MeshIds.Clear();
+			found.MaterialIds.Clear();
+			found.BatchCache.Clear();
+			found.StoreHandle = null;
 
-			FinishRequest(best);
-
-			try
-			{
-				RegisterResident(best, model);
-				best.Model = model;
-				best.IdleSeconds = 0f;
-
-				// Разбивка фаз - без неё «долго грузится» не диагностируется: стоимость фаз на
-				// разных ассетах расходится на порядки, и виновник обычно не тот, на кого думаешь.
-				var t = model.Timings;
-				EditorConsoleLog.Add(LogLevel.Info,
-					$"Model load '{System.IO.Path.GetFileName(best.Path)}': " +
-					$"parse {t.ParseMs} ms, materials {t.MaterialsMs} ms, meshes {t.MeshesMs} ms, " +
-					$"finalize {t.FinalizeMs} ms (shaders {t.ShaderMs} ms / {t.ShaderVariants} variants, " +
-					$"PSO+material {t.MaterialBuildMs} ms / {t.MaterialsBuilt}, " +
-					$"mesh upload {t.MeshMs} ms / {t.MeshUploads}, samplers {t.SamplerMs} ms / {t.Samplers}); " +
-					$"shader compiler total {DecaEngine.Graphics.Diligent.DiligentShader.DiagCompileMs} ms " +
-					$"({DecaEngine.Graphics.Diligent.DiligentShader.DiagCompileActual} real / " +
-					$"{DecaEngine.Graphics.Diligent.DiligentShader.DiagCompileCalls} calls)");
-
-				ModelReady?.Invoke(best);
-			}
-			catch (Exception ex)
-			{
-				best.Error = ex.Message;
-				EditorConsoleLog.Add(LogLevel.Error,
-					$"Model streaming: failed to register '{best.Path}': {ex.Message}");
-			}
+			_env.Pipeline.InvalidateGraph();
+			ResidencyReset?.Invoke(found);
 		}
 
-		/// <summary>
-		/// Прогрессивный стриминг качества текстур: ступени 64 -> 256 -> 1024 -> целевой размер (см.
-		/// ModelLoader.StreamedTextures). Декод следующей ступени - асинхронно на пуле потоков;
-		/// заливка и горячая замена (SetTexture обновляет SRB живого материала на месте) - здесь, на
-		/// GPU-потоке, максимум одна текстура за Tick. Порядок - по расстоянию модели до камеры,
-		/// внутри модели - от самой низкокачественной. Заменённая текстура уходит в отложенную
-		/// очередь Release (_retiredTextures), CPU-пиксели декода живут только до заливки, а по
-		/// достижении целевого/нативного размера освобождается и сжатый исходник.
-		/// </summary>
-		private void PumpTextureUpgrades()
+		private void RegisterResident(Resident resident, ModelLoader model)
 		{
-			if (_textureJob != null)
-			{
-				var job = _textureJob;
-				if (!job.DecodeTask.IsCompleted)
-				{
-					return;
-				}
-
-				_textureJob = null;
-
-				// Модель могла быть выгружена/заменена, пока шёл декод, - результат просто
-				// выбрасывается (GPU не трогали, буферы заберёт GC).
-				var alive = _models.TryGetValue(job.Resident.Path, out var current) &&
-					ReferenceEquals(current, job.Resident) &&
-					ReferenceEquals(job.Resident.Model, job.Model);
-
-				if (!job.DecodeTask.IsCompletedSuccessfully)
-				{
-					if (alive)
-					{
-						job.Entry.ReleaseCpuData();
-						EditorConsoleLog.Add(LogLevel.Warning,
-							$"Model streaming: texture upgrade decode failed for '{job.Resident.Path}': " +
-							$"{job.DecodeTask.Exception?.GetBaseException().Message}");
-					}
-
-					return;
-				}
-
-				if (!alive)
-				{
-					return;
-				}
-
-				var (pixels, width, height) = job.DecodeTask.Result;
-				var entry = job.Entry;
-
-				if (pixels == null || Math.Max(width, height) <= entry.CurrentSize)
-				{
-					// Декод не стал крупнее текущего - нативное разрешение достигнуто.
-					entry.ReleaseCpuData();
-					return;
-				}
-
-				try
-				{
-					var gpuTexture = _graphicsApi.CreateTexture(new CpuTextureData
-					{
-						Name = $"Stream {width}x{height}",
-						DecodedPixels = pixels,
-						DecodedWidth = width,
-						DecodedHeight = height,
-					});
-
-					// Горячая замена: SetTexture обновляет SRB живого материала на месте (см.
-					// DiligentMaterial.SetTexture) - ни PSO, ни граф не трогаются.
-					foreach (var (material, slot) in entry.Bindings)
-					{
-						material.SetTexture(slot, gpuTexture);
-					}
-
-					if (entry.Texture != null)
-					{
-						_retiredTextures.Add((entry.Texture, RetireTicks));
-						_textureBytes -= EstimateTextureBytes(entry.CurrentSize);
-					}
-
-					entry.Texture = gpuTexture;
-					entry.CurrentSize = Math.Max(width, height);
-					_textureBytes += EstimateTextureBytes(entry.CurrentSize);
-
-					// Целевая ступень или нативное разрешение (декод меньше запрошенного) - конец
-					// стриминга этой текстуры, CPU-данные (путь/сжатый исходник) освобождаются.
-					if ((entry.TargetSize > 0 && entry.CurrentSize >= entry.TargetSize) ||
-						(width < job.RequestedSize && height < job.RequestedSize))
-					{
-						entry.ReleaseCpuData();
-					}
-				}
-				catch (Exception ex)
-				{
-					entry.ReleaseCpuData();
-					EditorConsoleLog.Add(LogLevel.Warning,
-						$"Model streaming: texture upgrade upload failed for '{job.Resident.Path}': {ex.Message}");
-				}
-
-				return; // одна заливка за Tick
-			}
-
-			// Следующий апгрейд: ближайшая к камере модель, в ней - текстура самой низкой ступени.
-			Resident? bestResident = null;
-			ModelLoader.StreamedTexture? bestEntry = null;
-			var bestTarget = 0;
-			var bestDistance = float.MaxValue;
-			var bestSize = int.MaxValue;
-
-			foreach (var resident in _models.Values)
-			{
-				if (resident.Model == null || resident.RefCount <= 0)
-				{
-					continue;
-				}
-
-				var distance = DistanceToCamera(resident);
-
-				foreach (var entry in resident.Model.StreamedTextures)
-				{
-					if (!entry.HasSource)
-					{
-						continue;
-					}
-
-					// Потолок качества ПО РАССТОЯНИЮ: дальнему объекту полноразмерная текстура
-					// физически не видна, а стоит она столько же. Без этого Sponza тянула все свои
-					// сотни текстур до 2048 - те самые ~15+ ГБ RGBA с мипами, на которых редактор и
-					// вставал.
-					var target = TargetSizeForDistance(entry.TargetSize, distance);
-					if (entry.CurrentSize >= target)
-					{
-						continue;
-					}
-
-					if (distance < bestDistance || (distance == bestDistance && entry.CurrentSize < bestSize))
-					{
-						bestResident = resident;
-						bestEntry = entry;
-						bestTarget = target;
-						bestDistance = distance;
-						bestSize = entry.CurrentSize;
-					}
-				}
-			}
-
-			if (bestEntry == null)
-			{
-				return;
-			}
-
-			var nextSize = bestEntry.CurrentSize <= 0
-				? Math.Max(16, InitialTextureSize)
-				: bestEntry.CurrentSize * Math.Max(2, TextureStepFactor);
-			nextSize = Math.Min(nextSize, bestTarget);
-
-			if (nextSize <= bestEntry.CurrentSize)
-			{
-				return;
-			}
-
-			// Бюджет ПАМЯТИ текстур: следующая ступень заменит текущую, поэтому считаем дельту.
-			// Исчерпан - апгрейды просто останавливаются (картинка остаётся на достигнутом
-			// качестве), вместо того чтобы утащить процесс в своп.
-			var delta = EstimateTextureBytes(nextSize) - EstimateTextureBytes(bestEntry.CurrentSize);
-			if (_textureBytes + delta > TextureMemoryBudgetBytes)
-			{
-				if (!_budgetReported)
-				{
-					_budgetReported = true;
-					EditorConsoleLog.Add(LogLevel.Info,
-						$"Model streaming: texture memory budget reached " +
-						$"({_textureBytes >> 20} MB) - quality upgrades paused.");
-				}
-
-				return;
-			}
-
-			var source = bestEntry;
-			var requestedSize = nextSize;
-			_textureJob = new TextureUpgradeJob
-			{
-				Resident = bestResident!,
-				Model = bestResident!.Model!,
-				Entry = bestEntry,
-				RequestedSize = requestedSize,
-				// Чтение файла с диска и декод - ЦЕЛИКОМ в фоне; главный поток только заливает
-				// готовые пиксели. Одна задача за раз: декод идёт в полном разрешении файла (пик
-				// ~64 МБ на 4K-исходнике), и параллельные задачи складывали бы эти пики.
-				DecodeTask = Task.Run(() =>
-				{
-					var encoded = source.ReadEncoded();
-					return encoded == null
-						? ((byte[])null, 0, 0)
-						: ModelLoader.DecodeEncodedImage(encoded, requestedSize);
-				}),
-			};
+			var materials = _store.AcquireMaterialSet(resident.StoreHandle!);
+			ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, model, resident.MeshIds, resident.MaterialIds,
+				_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap, materials);
 		}
 
-		/// <summary>Потолок качества текстуры для объекта на данном расстоянии: вплотную - целевой
-		/// размер, дальше - вдвое меньше на каждое удвоение дистанции сверх <see cref="FullQualityDistance"/>.
-		/// Нижняя граница - первая ступень.</summary>
-		private int TargetSizeForDistance(int targetSize, float distance)
-		{
-			var maxSize = targetSize > 0 ? targetSize : 4096;
-			if (distance <= FullQualityDistance)
-			{
-				return maxSize;
-			}
-
-			var size = maxSize;
-			var reference = FullQualityDistance;
-			while (size > InitialTextureSize && distance > reference * 2f)
-			{
-				size /= 2;
-				reference *= 2f;
-			}
-
-			return Math.Max(InitialTextureSize, size);
-		}
-
-		/// <summary>Байты GPU-текстуры стороны <paramref name="size"/>: RGBA8 + полная мип-цепочка
-		/// (~4/3 от нулевого мипа).</summary>
-		private static long EstimateTextureBytes(int size)
-		{
-			if (size <= 0)
-			{
-				return 0;
-			}
-
-			return (long)size * size * 4L * 4L / 3L;
-		}
-
-		/// <summary>Пересчитывает учёт текстурной памяти по живым моделям - зовётся после любого
-		/// выселения/очистки, где стримленные текстуры освобождены вместе с моделью.</summary>
-		private void RecomputeTextureBytes()
-		{
-			_textureBytes = 0;
-			foreach (var resident in _models.Values)
-			{
-				if (resident.Model == null)
-				{
-					continue;
-				}
-
-				foreach (var entry in resident.Model.StreamedTextures)
-				{
-					_textureBytes += EstimateTextureBytes(entry.CurrentSize);
-				}
-			}
-
-			_budgetReported = false;
-		}
-
-		private void AgeRetiredTextures()
-		{
-			for (int i = _retiredTextures.Count - 1; i >= 0; i--)
-			{
-				var (texture, ticksLeft) = _retiredTextures[i];
-				if (ticksLeft <= 1)
-				{
-					texture.Release();
-					_retiredTextures.RemoveAt(i);
-				}
-				else
-				{
-					_retiredTextures[i] = (texture, ticksLeft - 1);
-				}
-			}
-		}
-
-		private void AgeRetiredModels()
-		{
-			for (int i = _retiredModels.Count - 1; i >= 0; i--)
-			{
-				var (model, ticksLeft) = _retiredModels[i];
-				if (ticksLeft <= 1)
-				{
-					model.Release();
-					_retiredModels.RemoveAt(i);
-				}
-				else
-				{
-					_retiredModels[i] = (model, ticksLeft - 1);
-				}
-			}
-		}
-
-		/// <summary>Немедленный Release всей отложенной очереди выселенных моделей - только из точек,
-		/// где GPU уже дождались (см. FlushRetiredTextures).</summary>
-		private void FlushRetiredModels()
-		{
-			foreach (var (model, _) in _retiredModels)
-			{
-				model.Release();
-			}
-
-			_retiredModels.Clear();
-		}
-
-		/// <summary>Немедленный Release всей отложенной очереди - только из точек, где GPU уже
-		/// дождались (ClearAll/MigrateEnvironment; ResetResidency больше не барьерится - см. его
-		/// комментарий - и в отложенную очередь только кладёт, не сливает).</summary>
-		private void FlushRetiredTextures()
-		{
-			foreach (var (texture, _) in _retiredTextures)
-			{
-				texture.Release();
-			}
-
-			_retiredTextures.Clear();
-			_budgetReported = false;
-		}
-
-		private void EvictIdle(float deltaTime)
+		/// <summary>Записи без ссылок, которые так и не дожили до готовности (заявка снята Release-ом
+		/// ДО того, как стол успел её выдать) или окончательно ошибочные (Resident.Error) - забываем,
+		/// иначе словарь копит мусор по путям, мимо которых камера просто проехала (тот же приём, что
+		/// раньше делал стол/стример при отмене фоновой загрузки).</summary>
+		private void EvictAbandoned()
 		{
 			_evictScratch.Clear();
 			foreach (var resident in _models.Values)
 			{
-				if (resident.RefCount > 0 || !resident.Ready)
-				{
-					if (resident.RefCount > 0)
-					{
-						resident.IdleSeconds = 0f;
-					}
-					continue;
-				}
-
-				resident.IdleSeconds += deltaTime;
-				if (resident.IdleSeconds >= UnloadAfterSeconds)
+				if (resident.RefCount <= 0 && resident.StoreHandle == null && resident.Model == null)
 				{
 					_evictScratch.Add(resident);
 				}
 			}
 
-			// Ошибочные записи без ссылок тоже забываем - иначе словарь копит мусор по битым путям.
-			// (Без GPU-стороны им сброс регистраций не нужен.)
-			foreach (var resident in _models.Values)
-			{
-				if (resident.RefCount <= 0 && resident.Failed && resident.Model == null && resident.Request == null)
-				{
-					_evictScratch.Add(resident);
-				}
-			}
-
-			if (_evictScratch.Count == 0)
-			{
-				return;
-			}
-
-			var needsGpuReset = false;
 			foreach (var resident in _evictScratch)
 			{
-				if (resident.Model != null)
-				{
-					needsGpuReset = true;
-				}
+				_models.Remove(resident.Path);
 			}
-
-			if (!needsGpuReset)
-			{
-				foreach (var resident in _evictScratch)
-				{
-					_models.Remove(resident.Path);
-				}
-				return;
-			}
-
-			ResetResidency(_evictScratch);
 		}
 
-		/// <summary>Выселение с GPU одной или нескольких простаивающих моделей: снять инстансы
-		/// (событие) -> партиционно снять ИХ батчи/материалы/меши в батч-рендерере (см.
-		/// <see cref="DiligentBatchRenderer.UnregisterModel"/>) -> пересобрать граф -> событие на
-		/// переинстанцирование. Выжившие резиденты не трогаются вовсе: их MeshId/MaterialId/BatchId
-		/// плотные и никогда не переиспользуются, так что снятие чужого id их не сдвигает - в
-		/// отличие от старого протокола (полный ResetRegistrations + Flush/WaitForIdle + перерегистрация
-		/// КАЖДОЙ выжившей модели), выселение больше не стоит O(всех резидентных моделей).
-		///
-		/// GPU не ждём: ResidencyResetting выше уже гарантирует, что подписчики сняли ВСЕ ссылающиеся
-		/// на выселяемые батчи инстанс-сущности (UnregisterRenderable, пока BatchId ещё валиден) -
-		/// удалять сами batchId после этого безопасно. Сами модели (текстуры и GPU-ресурсы
-		/// ModelLoader) освобождаются не сразу, а отложенно через <see cref="_retiredModels"/> - тем
-		/// же приёмом, что и retired-текстуры апгрейда: без барьера GPU может ещё доигрывать кадры,
-		/// отправленные до выселения и читающие эти ресурсы.</summary>
-		private void ResetResidency(List<Resident> evicted)
+		/// <summary>
+		/// Полная очистка ЭТОГО окружения: сбрасывает батч-рендерер целиком (дешевле, чем гонять
+		/// UnregisterModel по каждой когда-либо зарегистрированной записи - см. тот же приём в
+		/// DiligentBatchRenderer.ResetRegistrations) и отпускает заявки стола на все резиденты. Модели
+		/// сами по себе НЕ освобождаются здесь - это теперь дело стола (Release просто снимает заявку
+		/// этого окружения; резидентность в других окружениях/гистерезис стола решают, когда модель
+		/// реально уйдёт с GPU). Вызывающий обязан снять СВОИ инстанс-сущности (и записи, ссылающиеся
+		/// на резидентов) ДО этого вызова - см. PrefabSceneViewport.ClearScene/ModelPreviewViewport.LoadModel.
+		/// </summary>
+		public void ClearAll()
 		{
-			ResidencyResetting?.Invoke();
-
-			foreach (var resident in evicted)
+			var anyRegistered = false;
+			foreach (var resident in _models.Values)
 			{
-				_models.Remove(resident.Path);
-
 				if (resident.Model != null)
 				{
-					_env.BatchRenderer.UnregisterModel(resident.BatchCache.Values, resident.MaterialIds.Values,
-						resident.MeshIds.Values);
-					_retiredModels.Add((resident.Model, RetireTicks));
+					anyRegistered = true;
+					break;
+				}
+			}
+
+			if (anyRegistered)
+			{
+				// Кадры с ресурсами старых регистраций могут быть в полёте - без ожидания GPU сброс
+				// батч-рендерера роняет драйвер (та же дисциплина, что была в прежнем ClearAll).
+				_env.DilApi.ImmediateContext.Flush();
+				_env.DilApi.ImmediateContext.WaitForIdle();
+				_env.BatchRenderer.ResetRegistrations();
+			}
+
+			foreach (var resident in _models.Values)
+			{
+				if (resident.StoreHandle != null)
+				{
+					_store.Release(resident.StoreHandle);
+					resident.StoreHandle = null;
 				}
 
 				resident.Model = null;
@@ -828,106 +384,38 @@ namespace DecaEngine.Editor.ECS
 				resident.BatchCache.Clear();
 			}
 
-			RecomputeTextureBytes();
-			_env.Pipeline.InvalidateGraph();
-			ResidencyReset?.Invoke();
-		}
-
-		/// <summary>
-		/// Полная очистка: отменяет все загрузки и освобождает ВСЕ резидентные модели (барьер GPU +
-		/// сброс регистраций + Release + пересборка графа). Это тот самый порядок "сначала очистить
-		/// предыдущее, потом грузить новое": вызывается при смене модели превью и при открытии другого
-		/// префаба, ДО Acquire новой сцены.
-		/// </summary>
-		public void ClearAll()
-		{
-			foreach (var resident in _models.Values)
-			{
-				if (resident.Request != null)
-				{
-					if (resident.Finalizing)
-					{
-						// Недостроенные GPU-ресурсы прерванной финализации откатить нечем - принимаем
-						// редкую ограниченную утечку (см. комментарий в ModelPreviewViewport.PollPendingLoad).
-						EditorConsoleLog.Add(LogLevel.Warning,
-							$"Model streaming: load of '{resident.Path}' cancelled mid-finalize - partial GPU resources leaked.");
-					}
-
-					resident.Cts?.Cancel();
-					FinishRequest(resident);
-				}
-			}
-
-			// Незавершённый фоновый декод апгрейда бросаем - его alive-проверка не пройдёт.
-			_textureJob = null;
-
-			var anyGpu = _retiredTextures.Count > 0 || _retiredModels.Count > 0;
-			foreach (var resident in _models.Values)
-			{
-				if (resident.Model != null)
-				{
-					anyGpu = true;
-					break;
-				}
-			}
-
-			if (!anyGpu)
-			{
-				_models.Clear();
-				return;
-			}
-
-			ResidencyResetting?.Invoke();
-
-			_env.DilApi.ImmediateContext.Flush();
-			_env.DilApi.ImmediateContext.WaitForIdle();
-			_env.BatchRenderer.ResetRegistrations();
-
-			// Барьер уже был (Flush+WaitForIdle выше) - отложенные очереди партиционного выселения
-			// (_retiredModels, см. ResetResidency) и апгрейда текстур можно слить немедленно, не
-			// дожидаясь их RetireTicks.
-			FlushRetiredTextures();
-			FlushRetiredModels();
-
-			foreach (var resident in _models.Values)
-			{
-				resident.Model?.Release();
-				resident.Model = null;
-			}
-
 			_models.Clear();
-			_textureBytes = 0;
-			_budgetReported = false;
-			_env.Pipeline.InvalidateGraph();
-			ResidencyReset?.Invoke();
+
+			if (anyRegistered)
+			{
+				_env.Pipeline.InvalidateGraph();
+			}
 		}
 
 		/// <summary>Переезд в пересозданное окружение. Вызывающий уже дождался GPU и освободил старое
 		/// окружение целиком (его батч-рендерер умер вместе с регистрациями - сбрасывать нечего).
-		/// <paramref name="dropModels"/> - выбросить и сами модели (например, анизотропия печётся в
-		/// сэмплеры при загрузке - кеш непригоден); иначе резидентные модели перерегистрируются в
-		/// новый батч-рендерер без перечитывания с диска, а незавершённые загрузки продолжаются.</summary>
+		/// <paramref name="dropModels"/> - выбросить и сами заявки стола (например, анизотропия
+		/// печётся в сэмплеры при загрузке - кеш непригоден, опции загрузки другие, значит и запись в
+		/// столе другая); иначе резидентные модели просто перерегистрируются в новый батч-рендерер по
+		/// уже готовым данным (без перечитывания с диска - ModelLoader тот же самый, только
+		/// материалы этого окружения строятся заново, см. <see cref="ModelStore.AcquireMaterialSet"/>),
+		/// а незавершённые загрузки продолжаются в столе как ни в чём не бывало.</summary>
 		public void MigrateEnvironment(ModelViewportEnvironment newEnv, bool dropModels)
 		{
 			_env = newEnv;
 
 			if (dropModels)
 			{
-				_textureJob = null;
-				FlushRetiredTextures(); // барьер уже был - перед освобождением старого окружения
-				FlushRetiredModels();
-
 				foreach (var resident in _models.Values)
 				{
-					resident.Cts?.Cancel();
-					FinishRequest(resident);
-					// Барьер уже был (перед освобождением старого окружения) - Release безопасен.
-					resident.Model?.Release();
-					resident.Model = null;
+					if (resident.StoreHandle != null)
+					{
+						_store.Release(resident.StoreHandle);
+						resident.StoreHandle = null;
+					}
 				}
 
 				_models.Clear();
-				_textureBytes = 0;
 				return;
 			}
 
@@ -936,7 +424,6 @@ namespace DecaEngine.Editor.ECS
 				// Записи о сущностях старого стора забыты вызывающим - ссылки начнутся заново с
 				// первого Acquire по новому окружению.
 				resident.RefCount = 0;
-				resident.IdleSeconds = 0f;
 				resident.MeshIds.Clear();
 				resident.MaterialIds.Clear();
 				resident.BatchCache.Clear();
@@ -948,6 +435,10 @@ namespace DecaEngine.Editor.ECS
 
 				try
 				{
+					// Материалы старого окружения умерли вместе с его батч-рендерером - этот резидент
+					// уже когда-то брал набор у стола (см. ModelStore.AcquireMaterialSet), поэтому
+					// повторный запрос гарантированно вернёт СВЕЖИЙ дополнительный набор, а не украдёт
+					// первичный у кого-то другого.
 					RegisterResident(resident, resident.Model);
 				}
 				catch (Exception ex)
@@ -959,30 +450,13 @@ namespace DecaEngine.Editor.ECS
 				}
 			}
 		}
-
-		private void RegisterResident(Resident resident, ModelLoader model)
-		{
-			ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, model,
-				resident.MeshIds, resident.MaterialIds, _graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap);
-		}
-
-		private static void FinishRequest(Resident resident)
-		{
-			if (resident.Cts != null)
-			{
-				resident.Cts.Dispose();
-				resident.Cts = null;
-			}
-
-			resident.Request = null;
-			resident.Finalizing = false;
-		}
 	}
 
 	/// <summary>
 	/// ECS-привод стриминга: каждый кадр берёт позицию камеры окружения из стора (первая сущность с
-	/// <see cref="CameraComponent"/>) и шагает <see cref="ModelStreamer.Tick"/>. Добавляется в
-	/// SystemRoot окружения ПОСЛЕДНЕЙ (после GpuInstanceBufferSystem/культинга): готовая модель
+	/// <see cref="CameraComponent"/>) и шагает <see cref="ModelStreamer.Tick"/> (приоритеты для стола -
+	/// см. его class-doc, сама загрузка теперь шагается централизованно из EditorManager). Добавляется
+	/// в SystemRoot окружения ПОСЛЕДНЕЙ (после GpuInstanceBufferSystem/культинга): готовая модель
 	/// инстанцируется следующим кадром, зато финализация/регистрация не вклинивается между записью
 	/// инстанс-буферов и раскладкой батчей текущего кадра.
 	/// </summary>

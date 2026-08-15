@@ -1,5 +1,6 @@
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 
@@ -42,7 +43,8 @@ public static class PreviewLoopProbe
 				: AmbientOcclusionMode.Ssao,
 		};
 
-		var viewport = new ModelPreviewViewport(api, settings);
+		var modelStore = new ModelStore(api);
+		var viewport = new ModelPreviewViewport(api, settings, modelStore);
 		viewport.LoadModel(modelPath);
 
 		float time = 0f;
@@ -51,8 +53,11 @@ public static class PreviewLoopProbe
 		{
 			// LoadModel грузит в фоновом Task.Run - реальные кадры редактора идут с реальным
 			// интервалом (в отличие от тайтового цикла), так что тут нужна настоящая задержка,
-			// иначе PollPendingLoad ни разу не увидит PrepareTask завершённым.
+			// иначе PollPendingLoad ни разу не увидит PrepareTask завершённым. Загрузка/финализация
+			// теперь в ModelStore (см. EditorManager.OnUpdate) - без ручного Tick здесь модель никогда
+			// бы не догрузилась, viewport.Update больше сам её не шагает.
 			Thread.Sleep(16);
+			modelStore.Tick(dt);
 			viewport.Update(dt, time);
 			time += dt;
 

@@ -51,6 +51,13 @@ public class EditorManager : TimeLoopCore
 	private InspectorWindow _inspectorWindow;
 	private ModelIconCache _modelIconCache;
 	private ModelIconBaker _modelIconBaker;
+
+	/// <summary>Device-level, refcounted store of loaded models shared by every consumer below - a
+	/// model is loaded and GPU-resident ONCE for the whole editor process, each viewport just builds
+	/// its own material set + instances on top of it (see DecaEngine.Editor.ECS.ModelStore class-doc).
+	/// One instance, ticked once per frame from OnUpdate (below) under the GPU lock - do NOT let any
+	/// consumer tick it a second time.</summary>
+	private ModelStore _modelStore;
 	// --- /ECS ---
 
 	public void Initialize()
@@ -158,16 +165,22 @@ public class EditorManager : TimeLoopCore
 
 		var projectWindow = new ProjectWindow("Project", _projectSession, _imGuiManager.ImGuiRender);
 		new GameViewWindow("Game View", _renderHandle, _projectSession, _imGuiManager.ImGuiRender).Show();
-		_modelPreviewViewport = new ModelPreviewViewport(_graphicsApi, _editorSettings);
+
+		// Один стол на весь редактор - Model Preview, Scene View и иконки браузера ассетов делят
+		// загрузку/GPU-резидентность моделей через него (см. class-doc ModelStore); каждый потребитель
+		// ниже строит только СВОИ материалы/инстансы поверх общих геометрии/текстур.
+		_modelStore = new ModelStore(_graphicsApi);
+
+		_modelPreviewViewport = new ModelPreviewViewport(_graphicsApi, _editorSettings, _modelStore);
 		_modelIconCache = new ModelIconCache(_graphicsApi, _imGuiManager.ImGuiRender);
-		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache);
+		_modelIconBaker = new ModelIconBaker(_graphicsApi, _editorSettings, _modelIconCache, _modelStore);
 		var inspectorWindow = new InspectorWindow("Inspector", _modelPreviewViewport, _imGuiManager.ImGuiRender);
 		_inspectorWindow = inspectorWindow;
 		inspectorWindow.Show();
 
 		// GPU-вьюпорт окна Scene View (рендер префаба по AssetRef-ам, см. PrefabSceneViewport) -
 		// один на редактор, окна Scene View его разделяют (как Inspector разделяет превью моделей).
-		_prefabSceneViewport = new PrefabSceneViewport(_graphicsApi, _editorSettings, _projectSession);
+		_prefabSceneViewport = new PrefabSceneViewport(_graphicsApi, _editorSettings, _projectSession, _modelStore);
 
 		// ВРЕМЕННО: DECA_AUTOLOAD_MODEL=<путь> грузит модель в превью сразу при старте - для
 		// автоматизированного репро багов загрузки/AO без ручных кликов по Asset Browser-у.
@@ -255,6 +268,13 @@ public class EditorManager : TimeLoopCore
 			// the swap-chain backbuffer, so it must be the LAST Execute() this frame - otherwise
 			// ImGui (and Present) would draw into whatever offscreen target was bound last instead
 			// of the backbuffer, making the whole editor appear to go blank.
+			// ОДИН раз за кадр на весь процесс - финализация (один ModelLoader за кадр), прогрессивный
+			// стриминг текстур и выселение простаивающих моделей живут в столе теперь (см. class-doc
+			// ModelStore), а не в каждом потребителе по отдельности. Ticked ДО потребителей ниже, чтобы
+			// догрузившаяся в этом кадре модель успела зарегистрироваться (ModelStore.ModelReady - см.
+			// ModelStreamer/ModelIconBaker) до их Update.
+			_modelStore.Tick(deltaTime);
+
 			_modelPreviewViewport.Update(deltaTime, time);
 			_prefabSceneViewport.Update(deltaTime, time, _inspectorWindow.Root, _inspectorWindow.PrefabPath,
 				_inspectorWindow.Selected);

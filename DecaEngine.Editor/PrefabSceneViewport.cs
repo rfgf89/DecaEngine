@@ -73,6 +73,7 @@ namespace DecaEngine.Editor
 		private readonly IGraphicsApi _graphicsApi;
 		private readonly EditorSettings _editorSettings;
 		private readonly ProjectSession _projectSession;
+		private readonly ModelStore _modelStore;
 		private ModelViewportEnvironment _env;
 
 		/// <summary>Есть ли у объёмного света каскадные тени - см. одноимённое свойство
@@ -329,17 +330,19 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		public PrefabSceneViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings, ProjectSession projectSession)
+		public PrefabSceneViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings, ProjectSession projectSession,
+			ModelStore modelStore)
 		{
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
 			_projectSession = projectSession;
+			_modelStore = modelStore;
 
 			_camera = new SceneCamera(_editorSettings.SceneCameraSpeed);
 
 			_env = CreateEnvironment();
 
-			_streamer = new ModelStreamer(_env, _graphicsApi, BuildLoadOptions);
+			_streamer = new ModelStreamer(_env, _modelStore, _graphicsApi, BuildLoadOptions);
 			_streamer.ModelReady += OnStreamedModelReady;
 			_streamer.ResidencyResetting += OnStreamerResidencyResetting;
 			_streamer.ResidencyReset += OnStreamerResidencyReset;
@@ -1193,32 +1196,33 @@ namespace DecaEngine.Editor
 			_probeTextures?.Bind(resident.Model!);
 		}
 
-		/// <summary>Стример сейчас сбросит ВСЕ регистрации батч-рендерера (выселение простаивающей
-		/// модели): снимаем инстанс-сущности всех записей, пока их BatchId-ы валидны. Ссылки записей
-		/// на резидентов не трогаем - выжившие модели перерегистрируются и переинстанцируются
-		/// следующим SyncScene (Instantiated=false).</summary>
-		private void OnStreamerResidencyResetting()
+		/// <summary>Стример сейчас снимет регистрации батч-рендерера ОДНОЙ конкретной модели
+		/// (партиционное выселение - см. ModelStreamer.ResidencyResetting): снимаем инстанс-сущности
+		/// только тех записей, что ссылаются на ИМЕННО этого резидента, пока его BatchId-ы ещё валидны.
+		/// Записи других моделей не трогаются - в отличие от прежней версии (полный сброс всей сцены
+		/// на любое частичное выселение), см. задачу про сужение этого события.</summary>
+		private void OnStreamerResidencyResetting(ModelStreamer.Resident resident)
 		{
-			// Стример сейчас освободит модели - фоновая сборка BVH обязана перестать читать их
-			// геометрию ДО этого.
+			// Стример сейчас освободит эту модель - фоновая сборка BVH (читает геометрию ВСЕЙ сцены)
+			// обязана перестать её читать ДО этого.
 			WaitProbeBakerTask();
 
 			foreach (var record in _rendered.Values)
 			{
-				if (record.Instantiated)
+				if (record.Instantiated && ReferenceEquals(record.Resident, resident))
 				{
 					RemoveRecord(record, releaseResident: false);
 				}
 			}
 
-			// Контур выделения ссылался на снятые сущности; пробы - на материалы/BVH выселяемых
-			// моделей. Сброс проб безопасен: барьер GPU стример делает сразу после этого события.
+			// Контур выделения ссылался на снятые сущности; пробы - на материалы/BVH выселяемой
+			// модели. Сброс проб безопасен: барьер GPU стример делает сразу после этого события.
 			_highlightedId = -1;
 			_env.Pipeline.PostOverlay = null;
 			_structuralDirtySelection = true;
 		}
 
-		private void OnStreamerResidencyReset()
+		private void OnStreamerResidencyReset(ModelStreamer.Resident resident)
 		{
 			ResetProbeGi();
 			_framePending |= _rendered.Count == 0;

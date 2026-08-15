@@ -104,7 +104,8 @@ public static class FullLoopProbe
 				: AmbientOcclusionMode.Ssao,
 		};
 
-		var viewport = new ModelPreviewViewport(api, settings);
+		var modelStore = new ModelStore(api);
+		var viewport = new ModelPreviewViewport(api, settings, modelStore);
 		viewport.LoadModel(modelPath);
 
 		float time = 0f;
@@ -115,9 +116,11 @@ public static class FullLoopProbe
 			// интервалом, иначе PollPendingLoad ни разу не увидит PrepareTask завершённым.
 			Thread.Sleep(16);
 
-			// Тот же порядок, что EditorManager.OnUpdate: preview ПЕРЕД главным пайплайном (см.
-			// комментарий там про rebind swap-chain backbuffer), затем ECS root, затем
-			// pipeline.Execute() (обязан быть ПОСЛЕДНИМ Execute() кадра), затем Present().
+			// Тот же порядок, что EditorManager.OnUpdate: столу ОДИН тик на весь процесс (загрузка/
+			// финализация/стриминг текстур теперь там - см. ModelStore class-doc), затем preview ПЕРЕД
+			// главным пайплайном (см. комментарий там про rebind swap-chain backbuffer), затем ECS
+			// root, затем pipeline.Execute() (обязан быть ПОСЛЕДНИМ Execute() кадра), затем Present().
+			modelStore.Tick(dt);
 			viewport.Update(dt, time);
 			root.Update(new UpdateTick(dt, time));
 			pipeline.Execute();

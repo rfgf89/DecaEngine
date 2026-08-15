@@ -59,6 +59,7 @@ namespace DecaEngine.Editor
 
 		private readonly IGraphicsApi _graphicsApi;
 		private readonly EditorSettings _editorSettings;
+		private readonly ModelStore _modelStore;
 		private ModelViewportEnvironment _env;
 
 		/// <summary>Есть ли у объёмного света каскадные тени - без них god rays невозможны
@@ -470,14 +471,15 @@ namespace DecaEngine.Editor
 			_loadedSubMesh >= 0 && _residentModel != null &&
 			_loadedSubMesh < _residentModel.MeshHasUv.Count && _residentModel.MeshHasUv[_loadedSubMesh];
 
-		public ModelPreviewViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings)
+		public ModelPreviewViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings, ModelStore modelStore)
 		{
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
+			_modelStore = modelStore;
 
 			_env = CreateEnvironment();
 
-			_streamer = new ModelStreamer(_env, _graphicsApi, BuildLoadOptions);
+			_streamer = new ModelStreamer(_env, _modelStore, _graphicsApi, BuildLoadOptions);
 			_env.Root.Add(new ModelStreamingSystem(_streamer));
 
 			ApplyGraphicsSettings();

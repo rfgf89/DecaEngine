@@ -37,6 +37,7 @@ namespace DecaEngine.Editor
 		private readonly IGraphicsApi _graphicsApi;
 		private readonly EditorSettings _editorSettings;
 		private readonly ModelIconCache _cache;
+		private readonly ModelStore _store;
 
 		private readonly ModelViewportEnvironment _env;
 
@@ -55,7 +56,11 @@ namespace DecaEngine.Editor
 		private string? _currentPath;
 		private string? _currentProjectDirectory;
 		private int _currentStage;
-		private ModelLoader.ModelLoadRequest? _loadRequest;
+
+		/// <summary>Заявка на модель в <see cref="ModelStore"/>, пока она ещё не готова - см.
+		/// <see cref="PollPendingLoad"/>. Загрузка/декод/финализация теперь целиком в столе (общие на
+		/// весь редактор), бейкер только ждёт готовности и регистрирует СВОИ материалы/меши.</summary>
+		private ModelStore.Handle? _pendingHandle;
 		private EditorLoadingStatus.Handle? _statusHandle;
 
 		// Резидентные модели: сабмеши - это логические части уже распарсенного файла, так что
@@ -63,12 +68,14 @@ namespace DecaEngine.Editor
 		// развёрнутого узла) не должны каждый раз заново грузить .gltf/.glb с диска. Держим LRU
 		// на несколько последних моделей (не одну) - при бейке нескольких моделей вперемешку
 		// (например разворачивают то один, то другой узел в браузере) это избавляет от повторной
-		// загрузки уже виденных файлов. GPU-регистрации (мешы/материалы/батчи в _batchRenderer)
-		// на вытеснении из кеша всё равно утекают - у него нет API удаления (бейк редкий, тот же
-		// компромисс, что и в ModelPreviewViewport) - поэтому лимит кеша стоит держать разумным
-		// (см. ResidentCacheCapacity), а не просто "побольше".
+		// загрузки уже виденных файлов. Вытеснение из кеша теперь корректно освобождает GPU-
+		// регистрации этого бейкера (см. ReleaseResident) - раньше (до переезда на ModelStore) они
+		// молча утекали, потому что у батч-рендерера не было API частичного удаления; теперь есть
+		// (DiligentBatchRenderer.UnregisterModel), а сама модель отпускается через _store.Release,
+		// а не разваливается вместе с бейкером.
 		private sealed class ResidentModel
 		{
+			public ModelStore.Handle Handle = null!;
 			public ModelLoader Model = null!;
 			public readonly Dictionary<int, MeshId> MeshIdMap = new();
 			public readonly Dictionary<int, MaterialId> MaterialIdMap = new();
@@ -97,11 +104,13 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		public ModelIconBaker(IGraphicsApi graphicsApi, EditorSettings editorSettings, ModelIconCache cache)
+		public ModelIconBaker(IGraphicsApi graphicsApi, EditorSettings editorSettings, ModelIconCache cache,
+			ModelStore modelStore)
 		{
 			_graphicsApi = graphicsApi;
 			_editorSettings = editorSettings;
 			_cache = cache;
+			_store = modelStore;
 
 			_env = new ModelViewportEnvironment(graphicsApi, IconSize, IconSize,
 				"Model Icon Bake Color", "Model Icon Bake Depth");
@@ -188,7 +197,7 @@ namespace DecaEngine.Editor
 			// в отличие от _residentModels, которые остаются в LRU-кеше между задачами (см. поле выше).
 			if (_currentPath != null)
 			{
-				if (_loadRequest != null)
+				if (_pendingHandle != null)
 				{
 					PollPendingLoad();
 					return;
@@ -240,67 +249,54 @@ namespace DecaEngine.Editor
 				$"(resident cache has {_residentModels.Count} model(s): [{string.Join(", ", _residentLru)}]) - " +
 				"not found in resident cache, re-parsing from disk.");
 
-			try
-			{
-				_loadRequest = ModelLoader.BeginLoadAsync(_graphicsApi, modelPath, new ModelLoadOptions
-				{
-					VertexShader = _editorSettings.DefaultVertexShader,
-					PixelShader = _editorSettings.DefaultPixelShader,
-					OptimizeMesh = false,
-					GenerateLods = false,
-					// Иконка - крохотный офскрин-кадр; полноразмерные текстуры (Intel Sponza: сотни
-					// 4K) кладут VRAM ещё на стадии бейка, до открытия самого превью.
-					MaxTextureSize = 512
-				});
-				_statusHandle = EditorLoadingStatus.Begin($"Baking icon: {Path.GetFileName(modelPath)}");
-			}
-			catch (Exception ex)
-			{
-				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{modelPath}': {ex.Message}");
-				_queued.Remove(MakeQueueKey(modelPath, stage));
-				_currentPath = null;
-				_currentProjectDirectory = null;
-			}
+			// Опции бейка ОТЛИЧАЮТСЯ от опций вьюпортов (MaxTextureSize=512, без стриминга текстур -
+			// иконка не нуждается в полном качестве) - это намеренно даёт ДРУГОЙ ключ в столе
+			// (см. ModelLoadOptions.Signature), т.е. свою, отдельную от вьюпортов запись/ModelLoader,
+			// даже для того же самого файла.
+			_pendingHandle = _store.Acquire(modelPath, BuildBakeOptions());
+			_statusHandle = EditorLoadingStatus.Begin($"Baking icon: {Path.GetFileName(modelPath)}");
 		}
+
+		private ModelLoadOptions BuildBakeOptions() => new()
+		{
+			VertexShader = _editorSettings.DefaultVertexShader,
+			PixelShader = _editorSettings.DefaultPixelShader,
+			OptimizeMesh = false,
+			GenerateLods = false,
+			// Иконка - крохотный офскрин-кадр; полноразмерные текстуры (Intel Sponza: сотни
+			// 4K) кладут VRAM ещё на стадии бейка, до открытия самого превью.
+			MaxTextureSize = 512
+		};
 
 		private void PollPendingLoad()
 		{
-			// Половина прогресса - загрузка модели, вторая половина - сам бейк (см. BakeNextStage).
-			_statusHandle!.Progress = _loadRequest!.Progress * 0.5f;
+			var handle = _pendingHandle!;
 
-			if (!_loadRequest.PrepareTask.IsCompleted)
+			if (_store.TryGetError(handle, out var error))
 			{
-				return;
-			}
-
-			var request = _loadRequest;
-
-			if (!request.PrepareTask.IsCompletedSuccessfully)
-			{
-				_loadRequest = null;
-				var message = request.PrepareTask.Exception?.GetBaseException().Message ?? "Unknown error";
-				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {message}");
+				_pendingHandle = null;
+				_store.Release(handle);
+				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {error}");
 				FinishCurrentJob();
 				return;
 			}
 
+			if (!_store.TryGetReady(handle, out var model))
+			{
+				// Стол не даёт прогресс на отдельный handle (общий на процесс) - фиксированное
+				// значение "идёт загрузка", вторая половина (см. ниже) - сам бейк.
+				_statusHandle!.Progress = 0.25f;
+				return;
+			}
+
+			_pendingHandle = null;
+
 			try
 			{
-				// ПОРЦИЯМИ, а не одним куском: FinalizeOnMainThread создавал все GPU-ресурсы модели за
-				// один вызов, то есть за один кадр - на сцене уровня Sponza редактор просто вставал
-				// (окно "Not Responding") ровно в тот момент, когда Asset Browser показывал папку с
-				// такой моделью и начинал печь её иконку. FinalizeChunk возвращает null, пока не
-				// закончил, - продолжим на следующем кадре.
-				var model = request.FinalizeChunk();
-				if (model == null)
-				{
-					return;
-				}
-
-				_loadRequest = null;
-				var resident = new ResidentModel { Model = model };
+				var resident = new ResidentModel { Handle = handle, Model = model };
+				var materials = _store.AcquireMaterialSet(handle);
 				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, resident.Model, resident.MeshIdMap, resident.MaterialIdMap,
-					_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap);
+					_graphicsApi, _env.SceneCopyTarget, _env.EnvironmentMap, materials);
 				// Помечаем модель резидентной только ПОСЛЕ успешной регистрации ресурсов - если
 				// RegisterModelResources упадёт на середине, MeshIdMap/MaterialIdMap останутся не
 				// полностью заполненными, и в кеш эта модель попадать не должна (см. StartNextJob).
@@ -309,7 +305,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				_loadRequest = null;
+				_store.Release(handle);
 				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {ex.Message}");
 				_currentResident = null;
 				FinishCurrentJob();
@@ -509,7 +505,28 @@ namespace DecaEngine.Editor
 			{
 				var oldest = _residentLru.Last!.Value;
 				_residentLru.RemoveLast();
-				_residentModels.Remove(oldest);
+				if (_residentModels.Remove(oldest, out var resident))
+				{
+					ReleaseResident(resident);
+				}
+			}
+		}
+
+		/// <summary>Снимает регистрации ЭТОГО бейкера (мешы/материалы/батчи в его батч-рендерере) для
+		/// вытесненного из LRU резидента и отпускает его заявку в столе. Безопасно без GPU-барьера
+		/// (см. тот же приём в ModelStreamer.OnStoreModelEvicted/DiligentBatchRenderer.UnregisterModel):
+		/// у вытесняемого резидента к этому моменту нет живых инстанс-сущностей - ClearStageEntities
+		/// снимает их сразу после КАЖДОГО этапа бейка (см. BakeNextStage), а вытесняется тут только НЕ
+		/// текущий (см. AddResident - только что добавленный/тронутый резидент всегда в голове LRU).</summary>
+		private void ReleaseResident(ResidentModel resident)
+		{
+			_env.BatchRenderer.UnregisterModel(resident.BatchCache.Values, resident.MaterialIdMap.Values,
+				resident.MeshIdMap.Values);
+			_store.Release(resident.Handle);
+
+			if (ReferenceEquals(_currentResident, resident))
+			{
+				_currentResident = null;
 			}
 		}
 
@@ -532,7 +549,7 @@ namespace DecaEngine.Editor
 				_queued.Remove(MakeQueueKey(_currentPath, _currentStage));
 			}
 
-			_loadRequest = null;
+			_pendingHandle = null;
 			_currentPath = null;
 			_currentProjectDirectory = null;
 		}

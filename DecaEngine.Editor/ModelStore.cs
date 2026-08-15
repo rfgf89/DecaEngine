@@ -5,6 +5,7 @@ using System.Threading;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
+using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Editor.ECS
 {
@@ -90,6 +91,13 @@ namespace DecaEngine.Editor.ECS
 			public readonly string Key;
 			public ModelLoader? Model;
 			public string? Error;
+
+			/// <summary>Permanently latched by the FIRST <see cref="AcquireMaterialSet"/> call on this
+			/// entry (never reset while the entry lives - a NEW entry after reload starts fresh): decides
+			/// whether that call (and every call after it, from any handle) gets the model's own
+			/// <see cref="ModelLoader.materialObjects"/> or a freshly built <see cref="ModelLoader.BuildAdditionalMaterialSet"/>
+			/// set. See <see cref="AcquireMaterialSet"/>.</summary>
+			internal bool PrimaryMaterialSetTaken;
 
 			internal readonly List<Handle> Handles = new();
 			internal float IdleSeconds;
@@ -266,6 +274,39 @@ namespace DecaEngine.Editor.ECS
 		{
 			error = handle.Error!;
 			return error != null;
+		}
+
+		/// <summary>
+		/// Hands the caller ONE independent set of <see cref="IMaterialObject"/>s for a ready model
+		/// (<see cref="Handle.Ready"/> must be true) to register into ITS OWN batch renderer - see the
+		/// class-doc invariant: materials cannot be shared across environments. The FIRST call ever made
+		/// on this handle's entry (by this handle or any other acquirer of the same key - whichever gets
+		/// there first) gets the model's own <see cref="ModelLoader.materialObjects"/>, built as a side
+		/// effect of the load; every call after that, from any handle, gets a fresh
+		/// <see cref="ModelLoader.BuildAdditionalMaterialSet"/> set instead. The decision is latched on
+		/// the ENTRY (<see cref="Entry.PrimaryMaterialSetTaken"/>), not the handle, so it is safe (and
+		/// expected - see <see cref="DecaEngine.Editor.ECS.ModelStreamer.MigrateEnvironment"/>) to call
+		/// this again later on the SAME handle after its previous set was abandoned (e.g. the environment
+		/// it was registered into was recreated): the second call always gets a fresh additional set,
+		/// never steals the primary one back.
+		/// </summary>
+		public OrderedDictionary<int, IMaterialObject> AcquireMaterialSet(Handle handle)
+		{
+			var entry = handle.Entry;
+			var model = entry.Model;
+			if (model == null)
+			{
+				throw new InvalidOperationException(
+					"Model store: AcquireMaterialSet called before the model finished loading.");
+			}
+
+			if (!entry.PrimaryMaterialSetTaken)
+			{
+				entry.PrimaryMaterialSetTaken = true;
+				return model.materialObjects;
+			}
+
+			return ModelLoader.BuildAdditionalMaterialSet(_graphicsApi, entry.Options, model);
 		}
 
 		/// <summary>
