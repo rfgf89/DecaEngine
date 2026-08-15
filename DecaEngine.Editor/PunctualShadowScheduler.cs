@@ -79,7 +79,13 @@ public static unsafe class PunctualShadowScheduler
 
             var position = entity.Position.value;
             float range = light.Range;
-            float near = MathF.Max(0.05f, range * 0.001f);
+            // near обязан остаться СТРОГО меньше far (= range): CreatePerspectiveFieldOfViewLeftHanded
+            // кидает ArgumentOutOfRangeException при near >= far. Для Range <= 0.05 (за пределами
+            // разумного, но встречается - декой-свет, тестовая сцена) near = max(0.05, range*0.001)
+            // раньше давал near == far == range и ронял ВЕСЬ кадр (сборка слайсов идёт до отрисовки,
+            // так что одна такая лампа в сцене убивала все тени, включая чужие). Зажимаем near снизу
+            // так, чтобы всегда оставался зазор.
+            float near = MathF.Min(MathF.Max(0.05f, range * 0.001f), range * 0.5f);
 
             if (light.Type == LightType.Spot)
             {

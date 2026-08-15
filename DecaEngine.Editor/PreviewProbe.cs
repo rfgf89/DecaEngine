@@ -485,6 +485,90 @@ public static class PreviewProbe
 
 		env.SetCameraTransform(eye, target);
 
+		// DECA_PROBE_SPOT=1 - завести один punctual spot-свет в env.Store (тот же ECS-стор, который
+		// читает SimpleCullingAndRenderSystem - см. её punctualLightsQuery) и репро баг-репорта
+		// "спот светит геометрию, но тень сквозь объект не ложится". Позиция/цель/угол/тень все
+		// управляются переменными окружения, чтобы гонять и параметры пользователя (SpotAngle=127.7
+		// и т.д.), и здравый контроль (SpotAngle=45) без пересборки:
+		//   DECA_PROBE_SPOT_POS="x,y,z"      - позиция света (по умолчанию eye + up*1.5, над камерой)
+		//   DECA_PROBE_SPOT_TARGET="x,y,z"   - точка, куда светит конус (по умолчанию model target)
+		//   DECA_PROBE_SPOT_ANGLE=<deg>      - SpotAngle, ПОЛНЫЙ внешний угол конуса (default 45)
+		//   DECA_PROBE_SPOT_INNER=<deg>      - InnerSpotAngle, ПОЛНЫЙ внутренний угол (default 0 = авто 80%)
+		//   DECA_PROBE_SPOT_RANGE=<float>    - Range (default 5)
+		//   DECA_PROBE_SPOT_INTENSITY=<float>- Intensity (default 8)
+		//   DECA_PROBE_SPOT_COLOR="r,g,b"    - Color (default 3.45,3.6,4.05 - как у пользователя)
+		//   DECA_PROBE_SPOT_SHADOW=<float>   - ShadowStrength ДО клампа (default 5.85, как у пользователя;
+		//                                       TryBuildPunctualLight клампит его к [0,1] сам)
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_SPOT") == "1")
+		{
+			var spotPos = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_SPOT_POS"))
+				?? eye + Vector3.UnitY * 1.5f;
+			var spotTarget = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_SPOT_TARGET")) ?? target;
+			var spotColor = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_SPOT_COLOR"))
+				?? new Vector3(3.45f, 3.6f, 4.05f);
+
+			float spotAngle = EnvFloat("DECA_PROBE_SPOT_ANGLE", 45f);
+			float spotInner = EnvFloat("DECA_PROBE_SPOT_INNER", 0f);
+			float spotRange = EnvFloat("DECA_PROBE_SPOT_RANGE", 5f);
+			float spotIntensity = EnvFloat("DECA_PROBE_SPOT_INTENSITY", 8f);
+			float spotShadow = EnvFloat("DECA_PROBE_SPOT_SHADOW", 5.85f);
+
+			var spotDir = Vector3.Normalize(spotTarget - spotPos);
+			var spotUp = MathF.Abs(spotDir.Y) > 0.95f ? Vector3.UnitX : Vector3.UnitY;
+			// Локальный +Z энтити должен смотреть вдоль spotDir - та же конвенция, что
+			// PunctualShadowScheduler.AddSlice/LightCulling.TryBuildPunctualLight (dir = Transform(UnitZ, rot)).
+			var spotView = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, spotDir, spotUp);
+			var spotRot = Quaternion.CreateFromRotationMatrix(Matrix4x4.Transpose(spotView));
+
+			env.Store.CreateEntity(
+				new Position(spotPos.X, spotPos.Y, spotPos.Z),
+				new Rotation { value = spotRot },
+				new LightComponent
+				{
+					Type = LightType.Spot,
+					Color = spotColor,
+					Intensity = spotIntensity,
+					Range = spotRange,
+					SpotAngle = spotAngle,
+					InnerSpotAngle = spotInner,
+					ShadowStrength = spotShadow,
+				});
+
+			Console.WriteLine($"[probe] spot light: pos={spotPos} target={spotTarget} dir={spotDir} " +
+				$"angle={spotAngle} inner={spotInner} range={spotRange} intensity={spotIntensity} " +
+				$"shadow={spotShadow} (clamped to 1 downstream)");
+
+			// DECA_PROBE_SPOT_DECOYS=<n> - засеять n СПОТ-светов (по одному слайсу каждый - точечный
+			// взял бы 6 и рассадка вышла бы иначе) с ShadowStrength=1 БЛИЖЕ к камере, чем наш спот, -
+			// проверка гипотезы "бюджет теневых слайсов (LightClusters.MaxShadowSlices=16) исчерпан
+			// ближними светами раньше, чем очередь дойдёт до этого спота" (PunctualShadowScheduler.
+			// BuildShadowSlices раздаёт слайсы по возрастанию дистанции до камеры; не влезший свет
+			// получает ShadowParams.x = -1 и светит БЕЗ тени - ровно симптом баг-репорта: геометрия
+			// освещена, но тень отсутствует целиком). Декои сидят прямо на луче камера->спот, ближе
+			// камеры, чтобы гарантированно попасть в раскладку раньше цели.
+			if (int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_SPOT_DECOYS"), out var decoyCount) && decoyCount > 0)
+			{
+				for (int i = 0; i < decoyCount; i++)
+				{
+					var decoyPos = eye + (spotPos - eye) * (0.01f + 0.001f * i);
+					env.Store.CreateEntity(
+						new Position(decoyPos.X, decoyPos.Y, decoyPos.Z),
+						new Rotation(),
+						new LightComponent
+						{
+							Type = LightType.Spot,
+							Color = new Vector3(1f, 1f, 1f),
+							Intensity = 0.001f, // почти невидим - нужен только для бюджета слайсов, не для картинки
+							Range = 1f,
+							SpotAngle = 30f,
+							ShadowStrength = 1f,
+						});
+				}
+				Console.WriteLine($"[probe] spot decoys: {decoyCount} shadow-casting SPOT lights (1 slice each) seeded " +
+					"closer to camera (budget-exhaustion test)");
+			}
+		}
+
 		// DECA_PROBE_RENDERSCALE=<0.25..1> - масштаб рендера сцены (см.
 		// GraphicsPipelineSimple.SetRenderScale): сценовые таргеты уменьшаются, ColorTarget остаётся
 		// display, кадр поднимает тонемап. Зеркало ресайз-пути вьюпорта, как DECA_PROBE_RESIZE.
@@ -1226,6 +1310,81 @@ public static class PreviewProbe
 			PngWriter.Write(pngPath, pixels, width, height);
 		}
 
+		// DECA_PROBE_PUNCTUALDEBUG=1 - диагностический канал 11 (см. UnlitInstancedPS.hlsl):
+		// визуализация punctual-теневого сэмплинга per-pixel - магента (ветка не выполнилась вовсе:
+		// нет назначенного слайса или атен. вклад <= 0), циан (точка приёмника вне UV слайса),
+		// оранжевый (UV в допуске, но за дальней плоскостью слайса), градация серого (реальный
+		// shadowLit сэмплера: 0 чёрный = окклюдер найден, 1 белый = свет). Числовая раскладка долей
+		// пикселей по категориям даёт то, что просто картинка не покажет однозначно: сколько экрана
+		// вообще ДОШЛО до сэмплера и с каким результатом.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_PUNCTUALDEBUG") == "1")
+		{
+			PushPreviewSettings(model, 3, 11, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			env.Pipeline.InvalidateGraph();
+
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+
+			var dbgPixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var dbgW, out var dbgH);
+
+			// Раскладка цветов - зеркало кодирования канала 11 в UnlitInstancedPS.hlsl:
+			// магента (1,0,1) - ветка не выполнилась; циан (0,1,1) - UV вне [0,1]; оранжевый
+			// (1,0.5,0) - UV в допуске, но ndc.z >= 1.0 (за дальней плоскостью); иначе - серое
+			// (r=g=b) с реальным shadowLit сэмплера.
+			long noBranch = 0, uvOut = 0, zOut = 0, sampled = 0, litSum = 0;
+			for (int i = 0; i < dbgPixels.Length; i += 4)
+			{
+				byte r = dbgPixels[i], g = dbgPixels[i + 1], b = dbgPixels[i + 2];
+				if (r > 200 && g < 50 && b > 200) noBranch++;
+				else if (r < 50 && g > 200 && b > 200) uvOut++;
+				else if (r > 200 && g is > 100 and < 180 && b < 50) zOut++;
+				else { sampled++; litSum += r; }
+			}
+
+			long totalPx = dbgW * (long)dbgH;
+			Console.WriteLine($"[probe] punctual shadow debug (channel 11): no-branch={100.0 * noBranch / totalPx:F1}% " +
+				$"uv-out={100.0 * uvOut / totalPx:F1}% z-out(far plane)={100.0 * zOut / totalPx:F1}% " +
+				$"sampled={100.0 * sampled / totalPx:F1}% " +
+				$"(sampled avg shadowLit={(sampled > 0 ? litSum / (double)sampled / 255.0 : -1):F3}, " +
+				"0=занавешено окклюдером, 1=не найден)");
+
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualdebug.png"), dbgPixels, dbgW, dbgH);
+
+			// Пересъёмка debug_direct СРАЗУ вслед, тем же временем/состоянием, что и канал 11 выше -
+			// сверка "точки, которые канал 11 считает shadowLit=0 (чёрные), действительно тёмные и в
+			// direct" или расхождение между двумя кадрами говорит о нестабильности per-frame раскладки
+			// теневых слайсов (PunctualShadowScheduler читает бюджет заново каждый кадр).
+			PushPreviewSettings(model, 3, 7, forceFlatWhite: false);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var recheckPixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var rw, out var rh);
+			ReportStats("debug_direct_recheck", recheckPixels, rw, rh);
+			PngWriter.Write(Path.Combine(outDir, "probe_debug_direct_recheck.png"), recheckPixels, rw, rh);
+
+			env.SetTonemapPassthrough(false);
+		}
+
 		// DECA_PROBE_SHARPNESS=1 - числовой замер детализации кадра: 48 кадров неподвижной камеры
 		// (темпоральному аккумулятору надо сойтись - 16-фазный джиттер плюс запас на вес 0.1), затем
 		// средний градиент яркости по кадру. Сам по себе ни о чём - смысл в СРАВНЕНИИ прогонов:
@@ -1585,6 +1744,76 @@ public static class PreviewProbe
 
 				PngWriter.Write(Path.Combine(outDir, $"shadow_c{slice}_raw.png"), raw, outW, outH);
 				PngWriter.Write(Path.Combine(outDir, $"shadow_c{slice}_norm.png"), norm, outW, outH);
+			}
+		}
+
+		// DECA_PROBE_SHADOWDUMP=3 - punctual-аналог дампа выше: слайсы PunctualShadowMaps (D32
+		// массив, 1024^2, до LightClusters.MaxShadowSlices слайсов, см. PunctualShadowScheduler/
+		// ShadowRenderer). Та же пара PNG (raw/norm) + статистика глубины на слайс - нужна отдельно
+		// от каскадного дампа: разное разрешение (1024 не 4096) и текстура (PunctualShadowMaps не
+		// ShadowMaps), а до первого punctual-дроу массив вообще смотрит на 1x1 заглушку
+		// (см. ShadowRenderer.PunctualShadowMapsTarget) - тогда ридбек честно вернёт один слайс 1x1.
+		if (shadows && shadowDumpMode == "3")
+		{
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+
+			var punctualTarget = (DiligentRenderTarget)env.BatchRenderer.WorldShadowRenderer.PunctualShadowMapsTarget;
+			var pSlices = DiligentTextureReadback.ReadFloatSlices(env.DilApi, punctualTarget,
+				out var pWidth, out var pHeight);
+
+			Console.WriteLine($"[probe] punctual shadow maps: {pSlices.Length} slice(s), {pWidth}x{pHeight} " +
+				$"(1x1 = ещё не заведён реальный массив, см. EnsurePunctualShadowMaps)");
+
+			const int pStep = 4;
+			int pOutW = Math.Max(1, pWidth / pStep), pOutH = Math.Max(1, pHeight / pStep);
+
+			for (int slice = 0; slice < pSlices.Length; slice++)
+			{
+				var data = pSlices[slice];
+				float depthMin = float.MaxValue, depthMax = float.MinValue;
+				double sum = 0;
+				long clearCount = 0;
+				foreach (var v in data)
+				{
+					if (v >= 1.0f) { clearCount++; continue; }
+					depthMin = Math.Min(depthMin, v);
+					depthMax = Math.Max(depthMax, v);
+					sum += v;
+				}
+
+				long geomCount = data.LongLength - clearCount;
+				float avg = geomCount > 0 ? (float)(sum / geomCount) : 0f;
+				if (geomCount == 0) { depthMin = 1f; depthMax = 1f; }
+
+				Console.WriteLine($"[probe] punctual shadow slice {slice}: geometry {100.0 * geomCount / data.LongLength:F1}% " +
+					$"of texels, depth min={depthMin:F4} max={depthMax:F4} avg={avg:F4}, clear(1.0)={100.0 * clearCount / data.LongLength:F1}%");
+
+				if (pWidth <= 1)
+				{
+					continue;
+				}
+
+				var raw = new byte[pOutW * pOutH * 4];
+				var norm = new byte[pOutW * pOutH * 4];
+				float range = MathF.Max(depthMax - depthMin, 1e-6f);
+				for (int y = 0; y < pOutH; y++)
+				{
+					for (int x = 0; x < pOutW; x++)
+					{
+						float v = data[(y * pStep) * pWidth + x * pStep];
+						byte rawB = (byte)Math.Clamp((int)(v * 255f), 0, 255);
+						byte normB = v >= 1.0f ? (byte)255 : (byte)Math.Clamp((int)((v - depthMin) / range * 230f), 0, 230);
+						int o = (y * pOutW + x) * 4;
+						raw[o] = raw[o + 1] = raw[o + 2] = rawB;
+						raw[o + 3] = 255;
+						norm[o] = norm[o + 1] = norm[o + 2] = normB;
+						norm[o + 3] = 255;
+					}
+				}
+
+				PngWriter.Write(Path.Combine(outDir, $"shadow_p{slice}_raw.png"), raw, pOutW, pOutH);
+				PngWriter.Write(Path.Combine(outDir, $"shadow_p{slice}_norm.png"), norm, pOutW, pOutH);
 			}
 		}
 

@@ -929,6 +929,12 @@ PSOutput Main(in PSInput input)
                + ShadeSheenLight(N, V, fillDir, fillColor, sheenColor, sheenRoughness);
 #endif
 
+        // ВРЕМЕННЫЙ отладочный хук (PreviewChannel == 11, см. ниже) - диагностика punctual-теней:
+        // x/y = shadowUv последнего обработанного punctual-света с назначенным слайсом, z = shadowNdc.z,
+        // w = shadowLit (1 = сэмплер не увидел окклюдер, 0 = увидел). -1 в w значит "ветка сэмплинга
+        // не выполнилась вовсе" (shadowClip.w <= 1e-4 или shadowUv/shadowNdc.z вне диапазона).
+        float4 dbgPunctual = float4(0, 0, 0, -1);
+
         // ----- Clustered punctual-света (point/spot) -------------------------------------------
         // Пиксель находит свой фроксел-кластер (тайл экрана + экспоненциальный срез по view-z,
         // обязано зеркалить прямое отображение в LightClusterCS.hlsl) и шейдит только света его
@@ -1010,7 +1016,10 @@ PSOutput Main(in PSInput input)
                     {
                         float3 shadowNdc = shadowClip.xyz / shadowClip.w;
                         float2 shadowUv = shadowNdc.xy * float2(0.5, -0.5) + 0.5;
-                        if (all(shadowUv >= 0.0) && all(shadowUv <= 1.0) && shadowNdc.z < 1.0)
+                        bool dbgUvOk = all(shadowUv >= 0.0) && all(shadowUv <= 1.0);
+                        bool dbgZOk = shadowNdc.z < 1.0;
+                        dbgPunctual = float4(shadowUv, shadowNdc.z, dbgUvOk ? (dbgZOk ? -2 : -4) : -3);
+                        if (dbgUvOk && dbgZOk)
                         {
                             // Депф-bias перспективного слайса. Каскады солнца - орто, там NDC-глубина
                             // ЛИНЕЙНА по view-Z, и константа в NDC-единицах работает на любой дистанции.
@@ -1033,6 +1042,7 @@ PSOutput Main(in PSInput input)
                             float shadowLit = PunctualShadowMaps.SampleCmpLevelZero(
                                 PunctualShadowMaps_sampler,
                                 float3(shadowUv, shadowSlice), shadowNdc.z - shadowBias);
+                            dbgPunctual.w = shadowLit;
                             punctualAtten *= lerp(1.0, shadowLit, saturate(punctual.ShadowParams.y));
                         }
                     }
@@ -1273,6 +1283,25 @@ PSOutput Main(in PSInput input)
         if (PreviewChannel == 6)
         {
             output.color = float4(envSpecular, 1.0);
+            return output;
+        }
+        // ВРЕМЕННЫЙ отладочный канал 11 - визуализация punctual-теневого сэмплинга (см. dbgPunctual
+        // выше), закодирован в цвет для 8-бит ридбека (PreviewProbe.ReadRgba8):
+        //   магента (1,0,1) - ветка сэмплинга не выполнилась вовсе (punctual.ShadowParams.x < 0
+        //     или punctualAtten <= 0 - свет без назначенного слайса/вне радиуса)
+        //   жёлтый  (1,1,0) - shadowClip посчитан, но отброшен guard'ом (shadowUv/shadowNdc.z вне
+        //     диапазона - точка приёмника вне фрустума слайса)
+        //   градация серого - реальный shadowLit сэмплера (0 чёрный = окклюдер найден/тень,
+        //     1 белый = не найден/свет)
+        if (PreviewChannel == 11)
+        {
+            float3 dbgColor =
+                dbgPunctual.w < -4.5 ? float3(1, 0, 1)   // -5 (default/no light path) сюда не попадает - оставлено на всякий
+                : dbgPunctual.w < -3.5 ? float3(1, 0.5, 0) // -4: UV в допуске, ndc.z >= 1.0 (за дальней плоскостью)
+                : dbgPunctual.w < -2.5 ? float3(0, 1, 1)   // -3: UV вне [0,1] (точка вне квадрата слайса)
+                : dbgPunctual.w < -1.5 ? float3(1, 0, 1)   // -1: ветка не выполнилась вовсе
+                : dbgPunctual.www;                          // сэмплировано: 0 (тень) .. 1 (свет)
+            output.color = float4(dbgColor, 1.0);
             return output;
         }
 
