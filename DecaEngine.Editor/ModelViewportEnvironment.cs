@@ -181,12 +181,13 @@ namespace DecaEngine.Editor
 		/// <summary>xyz = шаг сетки проб в мировых единицах, w = normal-бейас точки сэмпла.</summary>
 		public Vector4 ProbeGridCell;
 
-		/// <summary>xyz = число проб по осям ВИРТУАЛЬНОЙ сетки (реально выделены только пробы
-		/// кирпичей рядом с геометрией - см. <see cref="ProbeGiBakeResult"/>).</summary>
+		/// <summary>xyz = число проб по осям сетки. Сетка ПЛОТНАЯ: проба есть в каждом узле (см.
+		/// <see cref="ProbeGiBakeResult"/>).</summary>
 		public Vector4 ProbeGridCounts;
 
-		/// <summary>xyz = размер сетки кирпичей, w = кирпичей в ряду пула атласов.</summary>
-		public Vector4 ProbeGridBricks;
+		/// <summary>xyz = тороидальное смещение сетки в пробах: узел c лежит в текселе
+		/// (c + scroll) mod counts (см. <see cref="ProbeGiBakeResult.ScrollOffsetX"/>).</summary>
+		public Vector4 ProbeGridScroll;
 
 		/// <summary>Ручки probe-GI (см. GraphicsSettingsWindow): x = флор глушения солнечной доли
 		/// эмбиента тенью, y = флор глушения env-спекуляра видимостью неба, z = интенсивность
@@ -204,11 +205,11 @@ namespace DecaEngine.Editor
 		public Vector4 ProbeGridOrigin1;
 		public Vector4 ProbeGridCell1;
 		public Vector4 ProbeGridCounts1;
-		public Vector4 ProbeGridBricks1;
+		public Vector4 ProbeGridScroll1;
 		public Vector4 ProbeGridOrigin2;
 		public Vector4 ProbeGridCell2;
 		public Vector4 ProbeGridCounts2;
-		public Vector4 ProbeGridBricks2;
+		public Vector4 ProbeGridScroll2;
 
 		/// <summary>Режим кривой тонмапа (см. Tonemap.hlsl / <see cref="ToneCurveMode"/>). Действует
 		/// ТОЛЬКО в LDR-режиме: в HDR-конвейере кривую применяет TonemapPass в самом конце, а

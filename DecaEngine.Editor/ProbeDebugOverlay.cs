@@ -25,17 +25,23 @@ public sealed class ProbeDebugOverlay : IDisposable
 	{
 		public Vector4 GridOriginRadius;
 		public Vector4 GridCellCount;
-		public Vector4 Pool;
+
+		/// <summary>xyz - размер сетки проб; по нему VS разворачивает номер шарика в узел.</summary>
+		public Vector4 GridCounts;
+
+		/// <summary>xyz - тороидальное смещение (узел c лежит в текселе (c + scroll) mod counts),
+		/// w - не используется. Цвет шариков переехал в <see cref="Tint"/>.</summary>
+		public Vector4 GridScroll;
+
+		public Vector4 Tint;
 	}
 
 	private readonly IMaterialObject _material;
-	private readonly IBufferHandle _brickOrigins;
 	private readonly uint _vertexCount;
-	private readonly DiligentGraphicsApi _dilApi;
 	private readonly float _radius;
 	private readonly Vector3 _tint;
 
-	/// <summary>Раскладка, под которую залиты углы кирпичей и угол объёма. Прокрутка её меняет (см.
+	/// <summary>Положение, под которое залит кбуфер. Прокрутка его меняет (см.
 	/// ProbeGiBakeSession.LayoutGeneration), и без сверки шарики остались бы стоять там, откуда
 	/// объём уже уехал.</summary>
 	private int _layoutGeneration = -1;
@@ -77,29 +83,25 @@ public sealed class ProbeDebugOverlay : IDisposable
 
 		batchRenderer.BindViewConstants(_material);
 
-		_brickOrigins = dilApi.CreateBuffer<int>(session.BrickTotal * 4, new BufferInfo
-		{
-			name = "ProbeDebugBrickOrigin",
-			type = BufferHandleType.Structured,
-			access = HandleAccess.Vertex,
-		});
-
-		_material.SetBuffer("_ProbeBrickOrigin", _brickOrigins, HandleAccess.Vertex);
+		// Буфера углов кирпичей здесь больше нет: у плотной сетки координаты узла ЕСТЬ номер шарика,
+		// и VS разворачивает его делением с остатком (см. ProbeDebugVS.hlsl).
 		_material.SetTexture("_ProbeOffset", textures.Offset, HandleAccess.Vertex);
 		_material.SetTexture("_ProbeSh0", textures.Sh0, HandleAccess.Vertex);
 		_material.SetTexture("_ProbeSh1", textures.Sh1, HandleAccess.Vertex);
 
 		// Радиус шарика - доля минимального шага сетки: на плотной сетке шарики мельче и не
 		// сливаются в кашу, на редкой - крупнее и видны издалека.
-		_dilApi = dilApi;
 		_radius = textures.MinCellSize * 0.12f;
 		_tint = tint;
 		Refresh(session);
 	}
 
-	/// <summary>Догоняет раскладку объёма: углы кирпичей и угол сетки в мире. Дёшево (кирпичей
-	/// тысячи, не проб) и зовётся по номеру раскладки, то есть фактически только после прокрутки -
-	/// без этого шарики остались бы стоять там, откуда объём уехал.</summary>
+	/// <summary>Догоняет положение объёма: угол сетки в мире и тороидальное смещение. Зовётся по
+	/// номеру раскладки, то есть фактически только после прокрутки - без этого шарики остались бы
+	/// стоять там, откуда объём уехал.
+	///
+	/// Заливки буфера здесь больше нет вовсе: раньше на каждую прокрутку сюда ехали углы всех
+	/// кирпичей, теперь всё состояние - пять векторов кбуфера.</summary>
 	public void Refresh(ProbeGiBakeSession session)
 	{
 		if (_layoutGeneration == session.LayoutGeneration)
@@ -109,29 +111,13 @@ public sealed class ProbeDebugOverlay : IDisposable
 
 		_layoutGeneration = session.LayoutGeneration;
 
-		// Углы кирпичей: тот же формат и то же СОСТОЯНИЕ слота, что у compute-раунда (см.
-		// ProbeRoundGpu.BrickWord) - по нему VS восстанавливает мировую позицию узла и прячет
-		// шарики пустых слотов пула.
-		var brickData = new int[session.BrickTotal * 4];
-		for (int slot = 0; slot < session.BrickTotal; slot++)
-		{
-			brickData[slot * 4 + 0] = session.BrickCellOrigin[slot * 3 + 0];
-			brickData[slot * 4 + 1] = session.BrickCellOrigin[slot * 3 + 1];
-			brickData[slot * 4 + 2] = session.BrickCellOrigin[slot * 3 + 2];
-			brickData[slot * 4 + 3] = session.BrickAlive[slot]
-				? session.BrickLevel[slot] & 15
-				: 512;
-		}
-
-		// Stride буфера - int, а шейдер читает int4: размер совпадает, раскладка плоская.
-		_dilApi.ImmediateContext.UpdateBuffer<int>(((DiligentBufferHandle)_brickOrigins).Buffer, 0,
-			brickData.AsSpan(), global::Diligent.ResourceStateTransitionMode.Transition);
-
 		var constants = new ProbeDebugParams
 		{
 			GridOriginRadius = new Vector4(session.Origin, _radius),
 			GridCellCount = new Vector4(session.Cell, session.ProbeCount),
-			Pool = new Vector4(session.PoolColumns, _tint.X, _tint.Y, _tint.Z),
+			GridCounts = new Vector4(session.CountX, session.CountY, session.CountZ, 0f),
+			GridScroll = new Vector4(session.ScrollX, session.ScrollY, session.ScrollZ, 0f),
+			Tint = new Vector4(_tint, 0f),
 		};
 		_material.SetConstant("ProbeDebugParams", ref constants, HandleAccess.Vertex);
 	}
@@ -148,6 +134,5 @@ public sealed class ProbeDebugOverlay : IDisposable
 	public void Dispose()
 	{
 		_material.Release();
-		_brickOrigins.Release();
 	}
 }

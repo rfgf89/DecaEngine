@@ -153,7 +153,7 @@ internal static class ProbeGiViewportShared
 			textures.GridCell.X, textures.GridCell.Y, textures.GridCell.Z,
 			textures.MinCellSize * bias);
 		data.ProbeGridCounts = Counts(textures.GridCounts, view);
-		data.ProbeGridBricks = textures.GridBricks;
+		data.ProbeGridScroll = textures.GridScroll;
 
 		if (cascades.Count > 0)
 		{
@@ -162,7 +162,7 @@ internal static class ProbeGiViewportShared
 			data.ProbeGridCell1 = new Vector4(
 				t.GridCell.X, t.GridCell.Y, t.GridCell.Z, t.MinCellSize * bias);
 			data.ProbeGridCounts1 = Counts(t.GridCounts, view);
-			data.ProbeGridBricks1 = t.GridBricks;
+			data.ProbeGridScroll1 = t.GridScroll;
 		}
 
 		if (cascades.Count > 1)
@@ -172,7 +172,7 @@ internal static class ProbeGiViewportShared
 			data.ProbeGridCell2 = new Vector4(
 				t.GridCell.X, t.GridCell.Y, t.GridCell.Z, t.MinCellSize * bias);
 			data.ProbeGridCounts2 = Counts(t.GridCounts, view);
-			data.ProbeGridBricks2 = t.GridBricks;
+			data.ProbeGridScroll2 = t.GridScroll;
 		}
 	}
 

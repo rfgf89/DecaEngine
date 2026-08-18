@@ -1484,25 +1484,13 @@ public static class PreviewProbe
 					ProbeTextures = new ProbeGiTextures(api, bake, "_probeGiCli");
 					ProbeTextures.Bind(model);
 				}
-				// Кирпичи - мера разреженности: сколько ячеек сетки реально запечено против того,
-				// сколько заняла бы плотная сетка того же шага (см. ProbeGiBaker.ClassifyBricks).
-				int brickGrid = bake.BrickCountX * bake.BrickCountY * bake.BrickCountZ;
-				int probesPerBrick = ProbeGiBaker.BrickProbes * ProbeGiBaker.BrickProbes * ProbeGiBaker.BrickProbes;
-				Console.WriteLine($"[probe] probe-gi: {bake.CountX}x{bake.CountY}x{bake.CountZ} virtual grid, " +
-					$"{bake.BrickTotal} bricks over {brickGrid} cells, " +
-					$"levels [{string.Join('/', bake.BricksPerLevel)}], " +
-					$"{bake.BrickTotal * probesPerBrick} probes baked in {sw.ElapsedMilliseconds} ms");
-
-				// Во сколько раз разрежённость реально экономит - число, от которого зависит, имеет
-				// ли смысл переводить каскады на ПЛОТНУЮ тороидальную сетку по образцу RTXGI-DDGI
-				// (там объём плотный, и потому инвалидируется плоскость толщиной в ОДНУ пробу, а не
-				// кирпич в четыре). Если экономия мала, разрежённость каскаду не нужна, и вместе с
-				// ней уходят пул, индирекция, уверенность кирпича и весь механизм свежести.
-				long denseProbes = (long)bake.CountX * bake.CountY * bake.CountZ;
-				long sparseProbes = (long)bake.BrickTotal * probesPerBrick;
-				Console.WriteLine($"[probe] sparsity: dense grid would be {denseProbes} probes, " +
-					$"sparse pool is {sparseProbes} " +
-					$"(x{(double)denseProbes / Math.Max(sparseProbes, 1):F2} - во столько раз плотная дороже)");
+				// Сетка ПЛОТНАЯ: число проб есть произведение сторон, атлас - ровно по нему. Замер
+				// разреженности, стоявший здесь раньше, свою работу сделал и снят вместе с пулом: он
+				// показал, что кирпичи проигрывают плотной сетке вдвое на каскадах и уже проигрывают
+				// на базовом объёме (см. шапку ProbeGiBakeResult.CountX).
+				Console.WriteLine($"[probe] probe-gi: {bake.CountX}x{bake.CountY}x{bake.CountZ} dense grid, " +
+					$"{bake.ProbeCount} probes, atlas {bake.ShWidth}x{bake.ShHeight}, " +
+					$"baked in {sw.ElapsedMilliseconds} ms");
 
 				// Санити-статистика испечённого поля прямо из атласов (альфы Sh0/Sh1/Sh2 = sky
 				// visibility / валидность / солнечная доля) - чтобы отличать баги бейка от багов
@@ -2651,23 +2639,21 @@ public static class PreviewProbe
 				continue;
 			}
 
-			// Какие слоты этот переезд заселил с нуля - берётся из снимка ThawColdBricks, а не из
-			// счётчиков свежести: прогрев холодных кирпичей идёт ВНУТРИ первой порции раунда (см.
-			// ProbeRoundGpu.WarmColdBricks) и там же снимает с них холод, так что к этому моменту
-			// счётчики уже тикнуты и по ним свежих не видно вовсе.
-			int live = 0;
-			var freshSlots = session.LastThawed ?? new bool[session.BrickTotal];
-			int fresh = session.LastThawedCount;
-			for (int slot = 0; slot < session.BrickTotal; slot++)
+			// Какие пробы этот переезд привёз - снимок ДО того, как раунд дотикает окно свежести
+			// (AdvanceRound ниже). Прокрутка пометила их в ProbeFresh, а въехавшие плоскости
+			// обнулены внутри самого раунда (см. GridClear в ProbeRoundCS.hlsl).
+			var freshSlots = new bool[session.ProbeCount];
+			int fresh = 0;
+			for (int p = 0; p < session.ProbeCount; p++)
 			{
-				if (session.BrickAlive[slot])
+				if (session.ProbeFresh[p] != 0)
 				{
-					live++;
+					freshSlots[p] = true;
+					fresh++;
 				}
 			}
 
-			// Дожимаем холодный раунд въехавших проб - тот, после которого они появляются в
-			// индирекции. Первая его порция уже выпущена выше вместе с самим переездом.
+			// Дожимаем раунд въехавших проб. Первая его порция уже выпущена выше вместе с переездом.
 			while (!roundDone)
 			{
 				roundDone = gpu.RunRound(session, baker,
@@ -2679,69 +2665,41 @@ public static class PreviewProbe
 			env.DilApi.ImmediateContext.Flush();
 			env.DilApi.ImmediateContext.WaitForIdle();
 
-			// Главная проверка прокрутки: холодный раунд обязан ЗАПОЛНИТЬ въехавшие пробы, а не
-			// оставить в них ни ноль (тогда во въехавшей области дырка), ни поле прежнего жильца
-			// слота (тогда там вспыхнет освещение чужого угла сцены). Сравниваем среднюю яркость
-			// свежих проб с удержавшими своё поле - у здоровой прокрутки это один порядок.
+			// Главная проверка прокрутки: раунд обязан ЗАПОЛНИТЬ въехавшие пробы, а не оставить в них
+			// ни ноль (тогда во въехавшей полосе дырка), ни поле места, откуда объём уехал (тогда там
+			// вспыхнет освещение чужого угла сцены - тексель-то тот же самый). Сравниваем среднюю
+			// яркость свежих проб с удержавшими своё поле: у здоровой прокрутки это один порядок.
+			//
+			// Для тороидальной раскладки проверка СТРОЖЕ, чем была для пула: там свежий кирпич
+			// получал новый слот и мог отличаться от соседей законно, здесь свежая проба лежит
+			// ровно в том же текселе, где лежало старое поле, и «чужая яркость» означает, что
+			// обнуление плоскости не сработало.
 			var field = gpu.ReadField();
 			double keptLum = 0, freshLum = 0;
 			int keptProbes = 0, freshProbes = 0, freshZero = 0;
-			const int perBrick = ProbeGiBaker.BrickProbes * ProbeGiBaker.BrickProbes
-				* ProbeGiBaker.BrickProbes;
-			for (int slot = 0; slot < session.BrickTotal; slot++)
+			for (int p = 0; p < session.ProbeCount; p++)
 			{
-				if (!session.BrickAlive[slot])
+				var sh0 = field[p * 4];
+				double lum = 0.2126 * sh0.X + 0.7152 * sh0.Y + 0.0722 * sh0.Z;
+				if (freshSlots[p])
 				{
-					continue;
-				}
-
-				for (int i = 0; i < perBrick; i++)
-				{
-					var sh0 = field[(slot * perBrick + i) * 4];
-					double lum = 0.2126 * sh0.X + 0.7152 * sh0.Y + 0.0722 * sh0.Z;
-					if (freshSlots[slot])
+					freshLum += lum;
+					freshProbes++;
+					if (lum <= 0.0)
 					{
-						freshLum += lum;
-						freshProbes++;
-						if (lum <= 0.0)
-						{
-							freshZero++;
-						}
+						freshZero++;
 					}
-					else
-					{
-						keptLum += lum;
-						keptProbes++;
-					}
-				}
-			}
-
-			// Распределение уверенности кирпичей в индирекции (канал b): 0 - кирпича нет/не прогрет,
-			// 255 - прожил окно свежести целиком. Промежуточные значения и есть то самое плавное
-			// проявление въехавших кирпичей - если их нет, поправка не работает.
-			int confZero = 0, confFull = 0, confPartial = 0;
-			var ind = session.Result.Indirection;
-			for (int t = 0; t + 3 < ind.Length; t += 4)
-			{
-				byte b = ind[t + 2];
-				if (b == 0)
-				{
-					confZero++;
-				}
-				else if (b == 255)
-				{
-					confFull++;
 				}
 				else
 				{
-					confPartial++;
+					keptLum += lum;
+					keptProbes++;
 				}
 			}
 
-			Console.WriteLine($"[probe] cascade {cascade} scroll {s}: conf {confZero} none / " +
-				$"{confPartial} fading / {confFull} full");
 			Console.WriteLine($"[probe] cascade {cascade} scroll {s}: {scrollMs} ms, " +
-				$"pool {live}/{session.BrickTotal} live, {fresh} fresh ({live - fresh} kept), " +
+				$"{fresh}/{session.ProbeCount} fresh probes, scroll " +
+				$"({session.ScrollX},{session.ScrollY},{session.ScrollZ}), " +
 				$"origin x {session.Origin.X:F2}; field lum kept " +
 				$"{(keptProbes > 0 ? keptLum / keptProbes : 0):F3}, fresh " +
 				$"{(freshProbes > 0 ? freshLum / freshProbes : 0):F3} " +
@@ -2785,7 +2743,7 @@ public static class PreviewProbe
 			data.ProbeGridOrigin = ProbeTextures.GridOrigin;
 			data.ProbeGridCell = ProbeTextures.GridCell;
 			data.ProbeGridCounts = ProbeTextures.GridCounts;
-			data.ProbeGridBricks = ProbeTextures.GridBricks;
+			data.ProbeGridScroll = ProbeTextures.GridScroll;
 		}
 
 		// Каскады (DECA_PROBE_CASCADES > 1) - как во вьюпорте: нули = каскада нет.
@@ -2795,7 +2753,7 @@ public static class PreviewProbe
 			data.ProbeGridOrigin1 = t.GridOrigin;
 			data.ProbeGridCell1 = t.GridCell;
 			data.ProbeGridCounts1 = t.GridCounts;
-			data.ProbeGridBricks1 = t.GridBricks;
+			data.ProbeGridScroll1 = t.GridScroll;
 		}
 
 		if (CascadeTextures.Count > 1)
@@ -2804,7 +2762,7 @@ public static class PreviewProbe
 			data.ProbeGridOrigin2 = t.GridOrigin;
 			data.ProbeGridCell2 = t.GridCell;
 			data.ProbeGridCounts2 = t.GridCounts;
-			data.ProbeGridBricks2 = t.GridBricks;
+			data.ProbeGridScroll2 = t.GridScroll;
 		}
 
 		// Дефолты ручек probe-GI/солнца - те же, что в EditorSettings (см. кбуфер ProbeGiParams);

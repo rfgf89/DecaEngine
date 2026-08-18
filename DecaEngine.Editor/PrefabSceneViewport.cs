@@ -1868,15 +1868,32 @@ namespace DecaEngine.Editor
 				grid += _sceneGpu.Hardware ? ", трассировка аппаратная"
 					: ", трассировка программная";
 
-				// Холодные кирпичи по ВСЕМ объёмам: пока они есть, выборка на их месте проваливается
-				// на более крупный каскад - это и видно как протечку света при движении камеры.
-				var cold = s.ColdBrickCount;
-				foreach (var cascade in _sceneCascades)
+				// СВЕЖИЕ пробы по всем объёмам - те, что въехали прокруткой и ещё набирают своё поле.
+				// Прежде здесь считались холодные КИРПИЧИ, спрятанные из индирекции; прятать больше
+				// нечего (см. ProbeGiBakeSession.ProbeFresh), но мера «сколько поля сейчас
+				// пересобирается на ходу» осталась полезной ровно тем же: чем дольше и чем больше их
+				// держится, тем заметнее рябь по въехавшей полосе при движении камеры.
+				static int FreshProbes(ProbeGiBakeSession session)
 				{
-					cold += cascade.Session.ColdBrickCount;
+					int fresh = 0;
+					foreach (var f in session.ProbeFresh)
+					{
+						if (f != 0)
+						{
+							fresh++;
+						}
+					}
+
+					return fresh;
 				}
 
-				var coldText = cold > 0 ? $", холодных кирпичей {cold}" : string.Empty;
+				var cold = FreshProbes(s);
+				foreach (var cascade in _sceneCascades)
+				{
+					cold += FreshProbes(cascade.Session);
+				}
+
+				var coldText = cold > 0 ? $", свежих проб {cold}" : string.Empty;
 
 				return s.Realtime
 					? $"{grid}, реальное время{coldText}"

@@ -41,8 +41,19 @@ public sealed class ProbeRoundGpu : IDisposable
 	[StructLayout(LayoutKind.Sequential)]
 	private struct GridParams
 	{
-		public Vector4 GridCounts;      // xyz - размер виртуальной сетки проб, w - насыщенность отскока
-		public Vector4 BrickCounts;     // xyz - размер сетки кирпичей
+		public Vector4 GridCounts;      // xyz - размер плотной сетки проб, w - насыщенность отскока
+
+		// xyz - тороидальное смещение сетки в пробах: узел c лежит по индексу (c + scroll) mod count
+		// (см. ProbeGiBakeResult.ScrollOffsetX).
+		public Vector4 GridScroll;
+
+		// xyz - ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ: -1 - по
+		// этой оси не двигались, ProbeGiBakeSession.ClearWholeAxis - чистить ось целиком (камеру
+		// телепортировали дальше размера объёма, пересечения со старым положением нет).
+		public Vector4 GridClear;
+
+		// xyz - сколько плоскостей подряд въехало по каждой оси, начиная с GridClear.
+		public Vector4 GridClearSpan;
 		public Vector4 SurfaceVoxel;    // xyz - размер вокселя кэша, w - число живых вокселей
 		public Vector4 SurfaceCounts;   // xyz - размер воксельной сетки кэша
 		public Vector4 SkyParams;       // x - поворот энвайронмента, y - яркость неба, z - сторона окто-карты видимости, w - кирпичей в ряду пула
@@ -80,12 +91,10 @@ public sealed class ProbeRoundGpu : IDisposable
 
 	private readonly IBuffer _bvhNodes, _bvhOrder, _bvhTriangles;
 	private readonly IBuffer _rayDirections;
-	private readonly IBuffer _brickOrigin;
-	private readonly IBuffer _brickIndex;
 
 	/// <summary>Атласы объёма - нужны, чтобы прокрутка доехала до материалов одним движением
-	/// (см. <see cref="SyncBrickState"/>): буфер кирпичей и карта индирекции описывают ОДНУ
-	/// раскладку, и разъехаться им нельзя.</summary>
+	/// (см. <see cref="SyncScrollState"/>): кбуфер раунда и угол объёма в материалах описывают ОДНО
+	/// положение сетки, и разъехаться им нельзя.</summary>
 	private readonly ProbeGiTextures? _atlases;
 	private readonly IBuffer[] _field = new IBuffer[2];
 	private readonly IBuffer _counters;
@@ -147,6 +156,10 @@ public sealed class ProbeRoundGpu : IDisposable
 	// Состояния ресурсов уже выставлены первой порцией - дальше переходы не нужны (см. Dispatch).
 	// Сбрасывается после возврата атласов в ShaderResource в конце раунда.
 	private readonly IBuffer _gridParams;
+
+	/// <summary>CPU-копия содержимого <see cref="_gridParams"/>: прокрутка правит в нём три вектора
+	/// из восьми, а UpdateBuffer заливает структуру целиком - остальные надо откуда-то взять.</summary>
+	private GridParams _gridParamsValue;
 
 	// Кэш поверхностей: геометрия захвачена один раз, радианс пересчитывается своим проходом перед
 	// каждым раундом проб (см. mainSurface в ProbeRoundCS.hlsl).
@@ -232,17 +245,6 @@ public sealed class ProbeRoundGpu : IDisposable
 		_environmentSampler = api.CreateSampler("_ProbeEnvMap_Sampler", TextureFilter.Linear,
 			TextureAddress.Wrap, CompFunction.Always, Vector4.Zero);
 
-		// Углы кирпичей и их уровни - по ним шейдер восстанавливает мировую позицию пробы
-		// (плотных координат у пробы больше нет, см. разреженную сетку).
-		//
-		// Изменяемые, а НЕ Immutable, как было: прокручиваемый объём переселяет кирпичи по слотам
-		// пула на каждом сдвиге (см. ProbeGiBakeSession.Scroll), и обе карты обязаны за ним поспевать.
-		// Обе крошечные (кирпичей тысячи, а не проб), так что перезаливка целиком дешевле любой
-		// частичной хитрости.
-		_brickOrigin = CreateUpdatable(device, "ProbeBrickOrigin", BuildBrickOrigin(session),
-			sizeof(int) * 4);
-		_brickIndex = CreateUpdatable(device, "ProbeBrickIndex", BuildBrickIndex(session),
-			sizeof(int) * 2);
 		_atlases = atlases;
 
 		// Аккумуляторы обязаны стартовать с нуля (поле копится бегущим средним - мусор остался бы
@@ -309,7 +311,8 @@ public sealed class ProbeRoundGpu : IDisposable
 			Size = (ulong)(ParamsStride * ParamsSlots),
 		});
 
-		// Размеры сеток от раунда к раунду не меняются - заливается один раз.
+		// Размеры сеток от раунда к раунду не меняются, а вот смещение прокрутки и пометки чистки -
+		// меняются (см. SyncScrollState), поэтому кбуфер переливается на каждой прокрутке.
 		_gridParams = device.CreateBuffer(new BufferDesc
 		{
 			Name = "ProbeGridParams",
@@ -334,11 +337,15 @@ public sealed class ProbeRoundGpu : IDisposable
 			ToVector4(surface?.Albedo, surfaceSlots), sizeof(Vector4));
 		_surfaceRadiance = CreateRw<Vector4>(device, "SurfaceRadiance", surfaceSlots, sizeof(Vector4));
 
-		var gridParams = new GridParams
+		_gridParamsValue = new GridParams
 		{
 			GridCounts = new Vector4(session.CountX, session.CountY, session.CountZ,
 				session.BounceSaturation),
-			BrickCounts = new Vector4(session.BrickCountX, session.BrickCountY, session.BrickCountZ, 0f),
+			GridScroll = new Vector4(session.ScrollX, session.ScrollY, session.ScrollZ, 0f),
+			GridClear = new Vector4(session.ClearPlane[0], session.ClearPlane[1],
+				session.ClearPlane[2], 0f),
+			GridClearSpan = new Vector4(session.ClearPlaneSpan[0], session.ClearPlaneSpan[1],
+				session.ClearPlaneSpan[2], 0f),
 			SurfaceVoxel = surface != null
 				? new Vector4(surface.Voxel, _surfaceVoxelCount)
 				: Vector4.Zero,
@@ -347,11 +354,11 @@ public sealed class ProbeRoundGpu : IDisposable
 				: Vector4.Zero,
 			// z - сторона окто-карты видимости (ручка «Visibility res», см. ProbeGiBakeResult.VisRes):
 			// по ней шейдер раскладывает буфер глубин и пишет атлас, а пиксельный - читает его.
-			SkyParams = new Vector4(envYaw, session.SkyIntensity, VisRes, session.PoolColumns),
+			SkyParams = new Vector4(envYaw, session.SkyIntensity, VisRes, 0f),
 		};
 
 		api.ImmediateContext.UpdateBuffer<GridParams>(_gridParams, 0,
-			new ReadOnlySpan<GridParams>(in gridParams), ResourceStateTransitionMode.Transition);
+			new ReadOnlySpan<GridParams>(in _gridParamsValue), ResourceStateTransitionMode.Transition);
 
 		// Аккумуляторы - в ноль командой заполнения (см. ClearBuffers): дёшево и без динамической
 		// кучи, в отличие от прежней загрузки десятков мегабайт нулей с CPU.
@@ -404,8 +411,6 @@ public sealed class ProbeRoundGpu : IDisposable
 			TryBind(srb, "_SceneBvhOrder", bvhOrder, BufferViewType.ShaderResource);
 			TryBind(srb, "_SceneBvhTriangles", bvhTriangles, BufferViewType.ShaderResource);
 			BindSrv(srb, "_ProbeRayDirections", _rayDirections);
-			BindSrv(srb, "_ProbeBrickOrigin", _brickOrigin);
-			BindSrv(srb, "_ProbeBrickIndex", _brickIndex);
 
 			// Пинг-понг: пишем в _field[i], читаем из другого.
 			BindSrv(srb, "_ProbeFieldRead", _field[1 - i]);
@@ -449,82 +454,35 @@ public sealed class ProbeRoundGpu : IDisposable
 		SetupTiming = (msSurface, msExport, msBuffers, msShaders);
 	}
 
-	/// <summary>Состояние слота пула для шейдера, упакованное в w буфера углов кирпичей:
-	/// биты 0-3 - уровень подразделения, 256 - ХОЛОДНЫЙ раунд (слот только что заселён, поле в нём
-	/// от прежнего жильца и подлежит не смешиванию, а перезаписи), 512 - слот ПУСТ (запас пула,
-	/// раунд его не считает), 1024 - слоту разрешена релокация (окно свежести).
+	/// <summary>Догоняет прокрутку сессии: смещение и пометки чистки в кбуфере, угол объёма в атласах.
 	///
-	/// Отдельным буфером это делать не стали: w тут и так под уровень, а лишний ресурс - это ещё
-	/// одна привязка в двух наборах SRB и в обоих проходах шейдера.</summary>
-	private static int BrickWord(ProbeGiBakeSession session, int slot)
-	{
-		if (!session.BrickAlive[slot])
-		{
-			return 512;
-		}
-
-		int fresh = session.BrickFresh[slot];
-		int word = session.BrickLevel[slot] & 15;
-		if (fresh >= ProbeGiBaker.RelocationRounds)
-		{
-			word |= 256;
-		}
-
-		if (fresh > 0)
-		{
-			word |= 1024;
-		}
-
-		return word;
-	}
-
-	private static int[] BuildBrickOrigin(ProbeGiBakeSession session)
-	{
-		var data = new int[session.BrickTotal * 4];
-		for (int slot = 0; slot < session.BrickTotal; slot++)
-		{
-			data[slot * 4 + 0] = session.BrickCellOrigin[slot * 3 + 0];
-			data[slot * 4 + 1] = session.BrickCellOrigin[slot * 3 + 1];
-			data[slot * 4 + 2] = session.BrickCellOrigin[slot * 3 + 2];
-			data[slot * 4 + 3] = BrickWord(session, slot);
-		}
-
-		return data;
-	}
-
-	private static int[] BuildBrickIndex(ProbeGiBakeSession session)
-	{
-		var data = new int[session.BrickIndex.Length * 2];
-		for (int i = 0; i < session.BrickIndex.Length; i++)
-		{
-			data[i * 2 + 0] = session.BrickIndex[i];
-			data[i * 2 + 1] = session.BrickLevelAt[i];
-		}
-
-		return data;
-	}
-
-	/// <summary>Догоняет раскладку сессии: карты кирпичей на GPU и карта индирекции в атласах.
+	/// Двух буферов раскладки, которые здесь заливались раньше (углы кирпичей и карта индирекции),
+	/// больше нет вовсе. У плотной сетки координаты пробы ЕСТЬ её индекс, а состояние - свежая ли
+	/// она, разрешена ли ей релокация - выводится из трёх чисел, уже лежащих в кбуфере, а не читается
+	/// из таблицы на слот. Тем самым с раунда снялись две заливки буферов на каждую прокрутку.
 	///
 	/// Зовётся ТОЛЬКО из начала раунда (см. RunRound), сразу за применением отложенной прокрутки, и
-	/// это не перестраховка вдвойне. Раскладка описывает, где какая проба стоит в мире: поменяй её
+	/// это не перестраховка вдвойне. Смещение описывает, где какая проба стоит в мире: поменяй его
 	/// посреди раунда - первые порции досчитают пробы по старым позициям, остальные по новым, и
 	/// раунд запишет в поле шов ровно по границе порции (та же причина, по которой на границе раунда
-	/// пересобирается TLAS, см. AtRoundStart); а разведи её с применением прокрутки - разъедутся уже
+	/// пересобирается TLAS, см. AtRoundStart); а разведи его с применением прокрутки - разъедутся уже
 	/// не порции, а сами потребители позиций (см. ProbeGiBakeSession.Scroll).</summary>
-	private void SyncBrickState(ProbeGiBakeSession session)
+	private void SyncScrollState(ProbeGiBakeSession session)
 	{
-		if (!session.BrickStateDirty)
+		if (!session.ScrollStateDirty)
 		{
 			return;
 		}
 
-		session.BrickStateDirty = false;
-		var context = _api.ImmediateContext;
-		context.UpdateBuffer<int>(_brickOrigin, 0, BuildBrickOrigin(session).AsSpan(),
-			ResourceStateTransitionMode.Transition);
-		context.UpdateBuffer<int>(_brickIndex, 0, BuildBrickIndex(session).AsSpan(),
-			ResourceStateTransitionMode.Transition);
+		session.ScrollStateDirty = false;
+		_gridParamsValue.GridScroll = new Vector4(session.ScrollX, session.ScrollY, session.ScrollZ, 0f);
+		_gridParamsValue.GridClear = new Vector4(session.ClearPlane[0], session.ClearPlane[1],
+			session.ClearPlane[2], 0f);
+		_gridParamsValue.GridClearSpan = new Vector4(session.ClearPlaneSpan[0], session.ClearPlaneSpan[1],
+			session.ClearPlaneSpan[2], 0f);
+
+		_api.ImmediateContext.UpdateBuffer<GridParams>(_gridParams, 0,
+			new ReadOnlySpan<GridParams>(in _gridParamsValue), ResourceStateTransitionMode.Transition);
 		_atlases?.ApplyScroll(session.Result);
 	}
 
@@ -595,8 +553,6 @@ public sealed class ProbeRoundGpu : IDisposable
 		TryBind(srb, "_SceneBvhOrder", bvhOrder, BufferViewType.ShaderResource);
 		TryBind(srb, "_SceneBvhTriangles", bvhTriangles, BufferViewType.ShaderResource);
 		TryBind(srb, "_ProbeRayDirections", _rayDirections, BufferViewType.ShaderResource);
-		TryBind(srb, "_ProbeBrickOrigin", _brickOrigin, BufferViewType.ShaderResource);
-		TryBind(srb, "_ProbeBrickIndex", _brickIndex, BufferViewType.ShaderResource);
 		TryBind(srb, "_ProbeFieldRead", _field[1 - writeIndex], BufferViewType.ShaderResource);
 		TryBind(srb, "_ProbeField", _field[writeIndex], BufferViewType.UnorderedAccess);
 		TryBind(srb, "_ProbeCounters", _counters, BufferViewType.UnorderedAccess);
@@ -739,7 +695,7 @@ public sealed class ProbeRoundGpu : IDisposable
 	/// команд и не занимает GPU счётом.
 	///
 	/// Граница раунда всё же обязательна - раскладку нельзя менять между порциями одного раунда
-	/// (см. <see cref="SyncBrickState"/>), - но ждать её долго не приходится: порции идут внутри
+	/// (см. <see cref="SyncScrollState"/>), - но ждать её долго не приходится: порции идут внутри
 	/// кадра, а не через кадр.</summary>
 	public void SettlePendingScroll(ProbeGiBakeSession session, ProbeGiBaker baker)
 	{
@@ -749,7 +705,7 @@ public sealed class ProbeRoundGpu : IDisposable
 		}
 
 		session.ApplyPendingScroll(baker);
-		SyncBrickState(session);
+		SyncScrollState(session);
 	}
 
 	/// <summary>Продвигает раунд на одну порцию работы. Возвращает true, когда раунд ЗАВЕРШЁН -
@@ -788,7 +744,7 @@ public sealed class ProbeRoundGpu : IDisposable
 			// (см. ProbeGiBakeSession.Scroll). Ниже в этом же блоке session.Origin уходит в кбуфер
 			// раунда, так что заявка обязана исполниться именно ЗДЕСЬ, а не после.
 			session.ApplyPendingScroll(baker);
-			SyncBrickState(session);
+			SyncScrollState(session);
 
 			var dirs = new Vector4[MaxRaysPerRound];
 			for (int i = 0; i < rayDirections.Length; i++)
@@ -834,7 +790,11 @@ public sealed class ProbeRoundGpu : IDisposable
 				Scroll = new Vector4(session.FreshRelocationLimit, session.FixedRays, 0f, 0f),
 			};
 
-			WarmColdBricks(context, session);
+			// Прогревающего диспатча здесь больше нет. Он существовал, чтобы снять «холод» с
+			// въехавших кирпичей отдельным заходом, не дожидаясь конца раунда: слот доставался
+			// новому кирпичу вместе с ЧУЖИМ полем, показывать такое было нельзя, и индирекция
+			// прятала его до собственных значений. Тороидальной прокрутке прятать нечего - въехавшая
+			// плоскость обнуляется на месте, в том же диспатче, что и обычная работа (см. GridClear).
 		}
 
 		// Сначала до конца прогоняется кэш поверхностей: лучи раунда забирают из него радианс, так
@@ -906,58 +866,6 @@ public sealed class ProbeRoundGpu : IDisposable
 		_surfaceChunkStart = 0;
 		_probeChunkStart = 0;
 		return true;
-	}
-
-	/// <summary>
-	/// ПРОГРЕВ холодных кирпичей - лечение протечки света при движении камеры.
-	///
-	/// Прокрутка отбирает слоты у уехавших кирпичей, и въехавшие получают их вместе с ЧУЖИМ полем.
-	/// Показывать такое нельзя, поэтому индирекция прячет их (см. ProbeGiBakeSession.WriteIndirection),
-	/// а выборка на их месте проваливается на более крупный каскад - у него ячейка в разы больше, и
-	/// его тест видимости не держит тонкую геометрию: свет протекает сквозь арки и шторы. Пряталось
-	/// это до КОНЦА раунда, а раунд идёт порциями через кадры - отсюда и «протекает на несколько
-	/// кадров» при движении.
-	///
-	/// Здесь холодные кирпичи трассируются ОТДЕЛЬНЫМ диспатчем сразу после переезда, до обычных
-	/// порций раунда, и тут же возвращаются в индирекцию уже со СВОИМ полем. Стоит это ровно
-	/// въехавшей плиты (десятки кирпичей из тысяч), а не целого раунда, поэтому влезает в тот же
-	/// кадр. Заполнить их полем крупного каскада было бы дешевле, но бессмысленно: выборка и так
-	/// проваливается именно туда - то есть даёт ТОТ ЖЕ свет вместе с той же протечкой. Протечку
-	/// убирает не значение поля, а собственная карта видимости пробы, а её можно только оттрассировать.
-	/// </summary>
-	private void WarmColdBricks(IDeviceContext context, ProbeGiBakeSession session)
-	{
-		var runs = session.ColdBrickRuns();
-		if (runs.Count == 0)
-		{
-			return;
-		}
-
-		const int perBrick = ProbeGiBaker.BrickProbes * ProbeGiBaker.BrickProbes
-			* ProbeGiBaker.BrickProbes;
-
-		var firstOfPass = true;
-		foreach (var (start, end) in runs)
-		{
-			int probeStart = start * perBrick;
-			int probeEnd = Math.Min(end * perBrick, _probeCount);
-			if (probeEnd <= probeStart)
-			{
-				continue;
-			}
-
-			// firstOfPass у первого диспатча: атласы надо вернуть из ShaderResource в UAV ровно так
-			// же, как это делает первая порция обычного прохода проб.
-			Dispatch(context, _pso, _srb[_writeIndex], probeStart, probeEnd, firstOfPass);
-			firstOfPass = false;
-		}
-
-		// Поле у них теперь своё - снимаем холод и возвращаем в индирекцию НЕ ДОЖИДАЯСЬ конца раунда.
-		// Обычные порции этого же раунда увидят их уже тёплыми и подмешают результат обычным весом.
-		if (session.ThawColdBricks())
-		{
-			SyncBrickState(session);
-		}
 	}
 
 	/// <summary>Один диспатч по диапазону элементов [start, end).</summary>
@@ -1077,7 +985,7 @@ public sealed class ProbeRoundGpu : IDisposable
 	}
 
 	/// <summary>Структурированный буфер, который можно перезаливать: раскладка кирпичей у
-	/// прокручиваемого объёма меняется (см. <see cref="SyncBrickState"/>), а Immutable по
+	/// прокручиваемого объёма меняется (см. <see cref="SyncScrollState"/>), а Immutable по
 	/// определению нет. Начальные данные передаются сразу - до первого сдвига перезаливок не будет
 	/// вовсе, и лишнего UpdateBuffer в кадре создания не появляется.</summary>
 	private static unsafe IBuffer CreateUpdatable<T>(IRenderDevice device, string name, T[] data,
@@ -1297,8 +1205,6 @@ public sealed class ProbeRoundGpu : IDisposable
 		_counters.Dispose();
 		_field[0].Dispose();
 		_field[1].Dispose();
-		_brickIndex.Dispose();
-		_brickOrigin.Dispose();
 		_bvhTriangles.Dispose();
 		_bvhOrder.Dispose();
 		_bvhNodes.Dispose();
