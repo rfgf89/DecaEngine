@@ -76,9 +76,9 @@ cbuffer ProbeGridParams
     float4 ProbeGridCounts;
     // xyz = тороидальное смещение сетки в пробах: узел c лежит по индексу (c + scroll) mod counts.
     float4 ProbeGridScroll;
-    // xyz = ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ.
-    // -1 = по этой оси не двигались; очень большое значение (ProbeGiBakeSession.ClearWholeAxis) =
-    // чистить ось целиком: камеру телепортировали дальше размера объёма, беречь нечего.
+    // xyz = ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ,
+    // -1 = по этой оси не двигались. Телепорт дальше размера объёма выражается штатно: плоскость 0
+    // и размах во всю ось (см. ProbeGiBakeSession.MarkScrolled - почему тут нет сентинела).
     float4 ProbeGridClear;
     // xyz = сколько плоскостей подряд въехало по каждой оси, начиная с ProbeGridClear.
     float4 ProbeGridClearSpan;
@@ -120,15 +120,8 @@ bool ProbeScrolledIn(int3 storage)
             continue;
         }
 
-        int count = (int)ProbeGridCounts[axis];
-        if (plane >= count)
-        {
-            // Вся ось - телепорт дальше размера объёма.
-            cleared = true;
-            continue;
-        }
-
         // Плоскостей могло въехать несколько подряд; диапазон заворачивается по периоду сетки.
+        int count = (int)ProbeGridCounts[axis];
         int span = min((int)ProbeGridClearSpan[axis], count);
         int delta = (storage[axis] - plane % count + count) % count;
         if (delta < span)

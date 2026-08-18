@@ -2704,6 +2704,89 @@ public static class PreviewProbe
 				$"{(keptProbes > 0 ? keptLum / keptProbes : 0):F3}, fresh " +
 				$"{(freshProbes > 0 ? freshLum / freshProbes : 0):F3} " +
 				$"({freshZero}/{freshProbes} still empty)");
+
+			// ОТСТОЙ ПОСЛЕ ПРОКРУТКИ - проверка, что въехавшая плоскость чистится ОДИН раз, а не
+			// каждый раунд. Шаги выше её не ловят: там каждый шаг снова скроллит, пометка чистки
+			// успевает перезаписаться, и повторное обнуление неотличимо от штатного. А в редакторе
+			// между прокрутками идут десятки раундов, и пометка, которую забыли снять, обнуляет
+			// накопители снова и снова: проба в такой плоскости не сходится НИКОГДА. Выглядит это
+			// как мигающие полосы с повторяющимся узором (плоскость - полоса, период тороидального
+			// заворота - повтор), и ровно так этот баг и приехал из редактора.
+			//
+			// Мера - РАЗБРОС МЕЖДУ СОСЕДНИМИ РАУНДАМИ, а не яркость. Яркость тут ничего не скажет, и
+			// это проверено от обратного: с забытым снятием пометки среднее по свежим пробам растёт
+			// ровно так же. Причина в том, что холодная проба принимает поле ЦЕЛИКОМ (вес раунда 1),
+			// то есть переобнуляемая плоскость не темнеет - она каждый раунд получает НОВУЮ оценку
+			// по одному вееру лучей. Не тускнеет, а дёргается; именно это и видно как мигание.
+			//
+			// Сошедшаяся проба между спокойными раундами меняется на проценты (бегущее среднее с
+			// малым весом), переобнуляемая - на десятки процентов, потому что усреднения у неё нет
+			// вовсе.
+			if (s == steps - 1)
+			{
+				for (int extra = 0; extra < 3; extra++)
+				{
+					bool quiet = false;
+					while (!quiet)
+					{
+						quiet = gpu.RunRound(session, baker,
+							ProbeGiBaker.RoundRayDirections(session),
+							ProbeGiBaker.RoundBlendWeight(session));
+					}
+
+					session.AdvanceRound();
+				}
+
+				env.DilApi.ImmediateContext.Flush();
+				env.DilApi.ImmediateContext.WaitForIdle();
+				var beforeQuiet = (Vector4[])gpu.ReadField().Clone();
+
+				bool lastQuiet = false;
+				while (!lastQuiet)
+				{
+					lastQuiet = gpu.RunRound(session, baker,
+						ProbeGiBaker.RoundRayDirections(session),
+						ProbeGiBaker.RoundBlendWeight(session));
+				}
+
+				session.AdvanceRound();
+				env.DilApi.ImmediateContext.Flush();
+				env.DilApi.ImmediateContext.WaitForIdle();
+				var afterQuiet = gpu.ReadField();
+
+				double deltaSum = 0;
+				int deltaProbes = 0, jumpy = 0;
+				for (int p = 0; p < session.ProbeCount; p++)
+				{
+					if (!freshSlots[p])
+					{
+						continue;
+					}
+
+					var a = beforeQuiet[p * 4];
+					var b = afterQuiet[p * 4];
+					double lumA = 0.2126 * a.X + 0.7152 * a.Y + 0.0722 * a.Z;
+					double lumB = 0.2126 * b.X + 0.7152 * b.Y + 0.0722 * b.Z;
+					if (lumA <= 1e-4)
+					{
+						continue;
+					}
+
+					double rel = Math.Abs(lumB - lumA) / lumA;
+					deltaSum += rel;
+					deltaProbes++;
+					if (rel > 0.1)
+					{
+						jumpy++;
+					}
+				}
+
+				double meanDelta = deltaProbes > 0 ? deltaSum / deltaProbes : 0;
+				Console.WriteLine($"[probe] cascade {cascade} settle: fresh probes change " +
+					$"{meanDelta * 100:F1}% between two quiet rounds, " +
+					$"{jumpy}/{deltaProbes} above 10% " +
+					$"(десятки процентов = плоскость чистится каждый раунд)");
+			}
 		}
 	}
 

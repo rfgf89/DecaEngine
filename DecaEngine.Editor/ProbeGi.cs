@@ -314,12 +314,9 @@ public sealed class ProbeGiBakeSession
 	/// обязан обнулить их накопители перед первой же записью (см. эталон RTXGI,
 	/// DDGIClearScrolledPlane).
 	///
-	/// Ось, по которой объём проехал за раз больше своего размера, помечается значением
-	/// <see cref="ClearWholeAxis"/>: чистить надо всё, пересечения со старым положением нет.</summary>
+	/// Ось, по которой объём проехал за раз больше своего размера, получает плоскость 0 и размах во
+	/// весь <see cref="CountX"/>/Y/Z: чистить надо всё, пересечения со старым положением нет.</summary>
 	internal readonly int[] ClearPlane = { -1, -1, -1 };
-
-	/// <summary>Значение <see cref="ClearPlane"/>, означающее «по этой оси чистить весь объём».</summary>
-	internal const int ClearWholeAxis = int.MaxValue;
 
 	/// <summary>Номер раскладки: растёт на каждой прокрутке. По нему потребители (GPU-константы
 	/// сетки, дебаг-оверлей) понимают, что их копия смещений протухла.</summary>
@@ -646,6 +643,7 @@ public sealed class ProbeGiBakeSession
 		Round++;
 		ConsumeRelocationRound();
 		ConsumeFreshRound();
+		ConsumeClearPlanes();
 	}
 
 	/// <summary>Сколько раундов пробе ещё разрешена релокация - счётчик по индексу ХРАНЕНИЯ, взводится
@@ -753,8 +751,8 @@ public sealed class ProbeGiBakeSession
 			}
 
 			int count = axis == 0 ? CountX : axis == 1 ? CountY : CountZ;
-			int span = plane == ClearWholeAxis ? count : Math.Min(ClearPlaneSpan[axis], count);
-			int first = plane == ClearWholeAxis ? 0 : plane;
+			int span = Math.Min(ClearPlaneSpan[axis], count);
+			int first = plane;
 
 			for (int k = 0; k < span; k++)
 			{
@@ -786,31 +784,54 @@ public sealed class ProbeGiBakeSession
 		scroll = (scroll + shift) % count;
 
 		// Проехали больше своего размера за раз (телепорт камеры) - пересечения со старым положением
-		// нет вовсе, беречь нечего: чистится вся ось.
-		if (Math.Abs(shift) >= count)
+		// нет вовсе, беречь нечего: чистится вся ось. Отдельного сентинела для этого случая НЕТ, и
+		// это осознанно: пометки едут на GPU через float-кбуфер, а «очень большое int» туда не
+		// пролезает - (float)int.MaxValue это уже 2147483648, и обратное преобразование в int в HLSL
+		// на таком значении не определено (может выйти и INT_MIN, то есть «чистки нет» - ровно
+		// наоборот). Вся ось выражается штатным диапазоном: начать с нуля, накрыть count плоскостей.
+		int span = Math.Min(Math.Abs(shift), count);
+		int first = span >= count
+			? 0
+			: shift > 0
+				? ProbeGiBaker.Wrap(count - shift, scroll, count)
+				: ProbeGiBaker.Wrap(0, scroll, count);
+
+		// По оси уже помечали в этом же раунде (прокрутка успела произойти дважды до того, как раунд
+		// их отработал) - объединять диапазоны нечем, берём худший случай и чистим ось целиком.
+		if (ClearPlane[axis] >= 0 && ClearPlane[axis] != first)
 		{
-			ClearPlane[axis] = ClearWholeAxis;
-			return;
+			first = 0;
+			span = count;
 		}
 
-		// Иначе въехало |shift| плоскостей подряд. Первая из них в координатах ХРАНЕНИЯ - та, куда
-		// после сдвига попал крайний узел с той стороны, откуда объём приехал.
-		int first = shift > 0
-			? ProbeGiBaker.Wrap(count - shift, scroll, count)
-			: ProbeGiBaker.Wrap(0, scroll, count);
-		ClearPlane[axis] = ClearPlane[axis] == ClearWholeAxis ? ClearWholeAxis : first;
-		ClearPlaneSpan[axis] = Math.Abs(shift);
+		ClearPlane[axis] = first;
+		ClearPlaneSpan[axis] = Math.Max(ClearPlaneSpan[axis], span);
 	}
 
 	/// <summary>Сколько плоскостей подряд въехало по оси, начиная с <see cref="ClearPlane"/> (в
 	/// координатах хранения, с заворотом). Ноль - по этой оси не двигались.</summary>
 	internal readonly int[] ClearPlaneSpan = new int[3];
 
-	/// <summary>Снимает пометки чистки - зовётся раундом после того, как он их отработал.</summary>
+	/// <summary>Снимает пометки чистки - зовётся из <see cref="AdvanceRound"/>, то есть после того,
+	/// как раунд их отработал ЦЕЛИКОМ (раунд режется на порции через кадры, и каждая обязана видеть
+	/// одну и ту же пометку - иначе шов ляжет по границе порции).
+	///
+	/// Пропустить этот вызов - значит оставить плоскость взведённой навсегда: следующий раунд обнулит
+	/// ей накопители заново, и так каждый раунд. Проба в такой плоскости не сходится НИКОГДА и мигает
+	/// постоянно; плоскость - это полоса на экране, а период тороидального заворота делает узор
+	/// повторяющимся. Ровно так этот баг и выглядел в редакторе: «мигают линиями и зациклено».
+	///
+	/// Пометку надо не только снять на CPU, но и довезти снятие до GPU - отсюда флаг.</summary>
 	internal void ConsumeClearPlanes()
 	{
+		if (ClearPlane[0] < 0 && ClearPlane[1] < 0 && ClearPlane[2] < 0)
+		{
+			return;
+		}
+
 		ClearPlane[0] = ClearPlane[1] = ClearPlane[2] = -1;
 		ClearPlaneSpan[0] = ClearPlaneSpan[1] = ClearPlaneSpan[2] = 0;
+		ScrollStateDirty = true;
 	}
 
 	/// <summary>Куда объём хочет переехать; null - заявок нет.</summary>

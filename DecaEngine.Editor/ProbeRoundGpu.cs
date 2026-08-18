@@ -47,9 +47,9 @@ public sealed class ProbeRoundGpu : IDisposable
 		// (см. ProbeGiBakeResult.ScrollOffsetX).
 		public Vector4 GridScroll;
 
-		// xyz - ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ: -1 - по
-		// этой оси не двигались, ProbeGiBakeSession.ClearWholeAxis - чистить ось целиком (камеру
-		// телепортировали дальше размера объёма, пересечения со старым положением нет).
+		// xyz - ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ,
+		// -1 - по этой оси не двигались. Телепорт дальше размера объёма выражается плоскостью 0 и
+		// размахом во всю ось (см. ProbeGiBakeSession.MarkScrolled).
 		public Vector4 GridClear;
 
 		// xyz - сколько плоскостей подряд въехало по каждой оси, начиная с GridClear.
