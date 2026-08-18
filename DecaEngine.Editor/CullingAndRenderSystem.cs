@@ -184,6 +184,10 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             // текущего конца - пул один на все камеры, границы уходят в ClusterParams.
             int segmentOffset = punctualLightTotal;
             var cullDataCopy = cullData;
+            // Границы влияния светов сегмента по view-глубине - из них строится диапазон срезов
+            // кластерной сетки (см. LightCulling.ClusterDepthRange).
+            float minLightZ = float.MaxValue;
+            float maxLightZ = float.MinValue;
             punctualLightsQuery.ForEachEntity((ref LightComponent light, Entity lightEntity) =>
             {
                 if (punctualLightTotal >= LightClusters.MaxLights)
@@ -195,15 +199,22 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 {
                     UnsafeArray.Set(_renderCamerasData.punctualLights, punctualLightTotal, punctualLight);
                     punctualLightTotal++;
+
+                    float lightViewZ = Vector3.Transform(
+                        new Vector3(punctualLight.PositionRange.X, punctualLight.PositionRange.Y,
+                            punctualLight.PositionRange.Z), cullDataCopy.view).Z;
+                    minLightZ = MathF.Min(minLightZ, lightViewZ - punctualLight.PositionRange.W);
+                    maxLightZ = MathF.Max(maxLightZ, lightViewZ + punctualLight.PositionRange.W);
                 }
             });
 
+            var clusterDepth = LightCulling.ClusterDepthRange(in cullData, minLightZ, maxLightZ);
             var cameraLightData = sharedLightData;
             cameraLightData.ClusterParams = new Vector4(
                 segmentOffset,
                 punctualLightTotal - segmentOffset,
-                MathF.Max(cullData.znear, 0.01f),
-                MathF.Max(cullData.zfar, MathF.Max(cullData.znear, 0.01f) * 2f));
+                clusterDepth.X,
+                clusterDepth.Y);
             if (Environment.GetEnvironmentVariable("DECA_DEBUG_CAMERACOUNT") == "1")
             {
                 Console.WriteLine($"[debug]   camera entity={entity.Id} segmentOffset={segmentOffset} segCount={punctualLightTotal - segmentOffset}");
@@ -361,6 +372,13 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 radius = Math.Max(radius, Vector3.Distance(cornersViewSpace[j], center));
             }
 
+            // Кайма ВОКРУГ сферы каскада - см. ShadowRenderer.CascadeMarginTexels. Орто-матрица
+            // ниже строится по этому радиусу, то есть сфера ложится в карту не впритык, а с
+            // отступом от края: тот самый отступ, который шейдер требует пройти внутрь, прежде чем
+            // взять каскад, - иначе он отъедался у объёма изнутри и по границам каскадов шли
+            // просветы. Снап тоже по НОВОМУ размеру текселя, иначе сетка снапа разъедется с картой.
+            radius /= 1f - 2f * ShadowRenderer.CascadeMarginTexels / ShadowRenderer.ShadowMapSize;
+
             float worldUnitsPerTexel = (radius * 2.0f) / ShadowRenderer.ShadowMapSize;
             Matrix4x4 tempLightView = Matrix4x4.CreateLookAt(Vector3.Zero, lightDirection, lightUp);
             Vector3 lightSpaceCenter = Vector3.Transform(center, tempLightView);
@@ -376,7 +394,18 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             float casterExtension = radius * 2.0f;
             Vector3 lightPos = center - lightDirection * (radius + casterExtension);
             float znear = 0.01f;
-            float zfar = radius * 2.0f + casterExtension;
+
+            // ...а far - ЕЩЁ на половину радиуса за сферу. Без этого запаса дальняя плоскость
+            // касалась задней стенки сферы ровно (znear-glaz + 2r + casterExtension), то есть у
+            // приёмников на задней полусфере ndc.z выходил ровно 1 или чуть больше, а
+            // UnlitInstancedPS.SampleWorldLightShadow такой каскад ОТБРАСЫВАЕТ (lightNdc.z >= 1.0 ->
+            // continue). Выталкивают за единицу три вещи разом: normal-offset сдвигает точку выборки
+            // на полтора текселя ОТ поверхности, снап центра к сетке текселей двигает саму сферу, и
+            // сверху ложится погрешность float. Точка проваливалась в следующий каскад (грубее и с
+            // другим байасом), а на последнем - в «освещено», что и читается как просветы.
+            // Цена запаса - только точность глубины: диапазон 4r -> 4.5r, на D32_FLOAT это ничто.
+            float receiverExtension = radius * 0.5f;
+            float zfar = radius * 2.0f + casterExtension + receiverExtension;
 
             (&cascadeSizes.X)[i] = radius * 2.0f;
             (&cascadeNearPlanes.X)[i] = znear;

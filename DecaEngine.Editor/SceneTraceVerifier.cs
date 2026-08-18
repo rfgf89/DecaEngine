@@ -251,7 +251,7 @@ public static class SceneTraceVerifier
 		// среднее зависит от истории.
 		for (int i = 0; i < rounds; i++)
 		{
-			var directions = ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence);
+			var directions = ProbeGiBaker.RoundRayDirections(session);
 			float alpha = ProbeGiBaker.RoundBlendWeight(session);
 			// Раунд идёт порциями - здесь докручиваем его целиком, сверка сравнивает поля после
 			// ОДИНАКОВОГО числа раундов.
@@ -308,7 +308,7 @@ public static class SceneTraceVerifier
 		for (int i = 0; i < timedRounds; i++)
 		{
 			while (!gpu.RunRound(session, baker,
-				ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence + i),
+				ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence + i, session.FixedRays),
 				ProbeGiBaker.RoundBlendWeight(session)))
 			{
 			}
@@ -347,7 +347,8 @@ public static class SceneTraceVerifier
 	public readonly record struct FlickerReport(int Probes, int Rays, float Alpha, int Rounds,
 		float MeanRelativeDelta, float MaxRelativeDelta,
 		float MeanLuminanceMin, float MeanLuminanceMax, float MeanLuminanceAvg,
-		float P50, float P90, float P99, float ShareAbove10)
+		float P50, float P90, float P99, float ShareAbove10,
+		float Variability, float SkippedRoundShare)
 	{
 		/// <summary>Размах средней яркости в долях от неё самой: дыхание всей сцены.</summary>
 		public float GlobalSwing => MeanLuminanceAvg > 1e-6f
@@ -359,7 +360,8 @@ public static class SceneTraceVerifier
 		Vector3 boundsMin, Vector3 boundsMax, Vector3 sunDirection, Vector3 sunColor,
 		int raysPerRound, int settleRounds, int measureRounds, float maxRayLuminance = 0f,
 		float blend = 0f, float skyIntensity = 1f, float gridDensity = 0f, float maxStep = -1f,
-		float relocation = -1f, float gamma = -1f, bool hardware = false,
+		float relocation = -1f, float gamma = -1f, float variabilityThreshold = 0f,
+		bool hardware = false,
 		IGpuTexture? environmentMap = null, Func<Vector3, Vector3>? skyRadiance = null,
 		float envYaw = 0f)
 	{
@@ -384,6 +386,10 @@ public static class SceneTraceVerifier
 				? new ProbeGiBakeOptions().RealtimeRelocation
 				: relocation,
 			RealtimeGamma = gamma < 0f ? new ProbeGiBakeOptions().RealtimeGamma : gamma,
+			// По умолчанию остановка сошедшегося объёма ВЫКЛЮЧЕНА: замер меряет мерцание, а
+			// пропущенный раунд даёт нулевую разницу и подменил бы метрику нулями. Включается
+			// отдельно (DECA_PROBE_FLICKERVAR), чтобы померить долю пропусков.
+			RealtimeVariabilityThreshold = variabilityThreshold,
 			RealtimeBlend = blend > 0f ? blend : ProbeGiBaker.RealtimeBlend,
 			// Ради чего всё и меряется: в запечке вес раунда падает к нулю, и любое мерцание
 			// затухает само - вопрос стоит только для постоянного веса.
@@ -413,7 +419,7 @@ public static class SceneTraceVerifier
 		void RunOne()
 		{
 			while (!gpu.RunRound(session, baker,
-				ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence),
+				ProbeGiBaker.RoundRayDirections(session),
 				ProbeGiBaker.RoundBlendWeight(session)))
 			{
 			}
@@ -428,6 +434,7 @@ public static class SceneTraceVerifier
 			RunOne();
 		}
 
+		int skippedBefore = gpu.SkippedRounds;
 		var previous = gpu.ReadField();
 		double deltaSum = 0;
 		float lumMin = float.MaxValue, lumMax = 0f;
@@ -472,6 +479,9 @@ public static class SceneTraceVerifier
 			previous = current;
 		}
 
+		float variability = gpu.AverageVariability;
+		int skippedRounds = gpu.SkippedRounds - skippedBefore;
+
 		deltas.Sort();
 		float Percentile(double q) => deltas.Count == 0
 			? 0f
@@ -489,7 +499,8 @@ public static class SceneTraceVerifier
 			ProbeGiBaker.RoundBlendWeight(session), measureRounds,
 			(float)(deltaSum / Math.Max(measureRounds, 1)), worst,
 			lumMin, lumMax, (float)(lumSum / Math.Max(measureRounds, 1)),
-			Percentile(0.50), Percentile(0.90), Percentile(0.99), shareAbove10);
+			Percentile(0.50), Percentile(0.90), Percentile(0.99), shareAbove10,
+			variability, measureRounds > 0 ? skippedRounds / (float)measureRounds : 0f);
 	}
 
 	private static float Luminance(Vector3 c) => 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;

@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SharpGLTF.Schema2;
 using DecaEngine.Core;
+using DecaEngine.Graphics.Assets;
 using DecaEngine.Graphics.Core;
 using System.Runtime.InteropServices;
 using Diligent;
@@ -512,6 +513,15 @@ public struct Vertex
 /// Defaults follow the glTF spec (baseColor white, metallic 1, roughness 1) unless the material
 /// explicitly authored other values.
 /// </summary>
+/// <summary>Режим прозрачности материала из glTF (alphaMode). Отдельно от порога отсечения -
+/// см. <see cref="MaterialPbrFactors.AlphaMode"/>.</summary>
+public enum MaterialAlphaMode : byte
+{
+	Opaque = 0,
+	Mask = 1,
+	Blend = 2,
+}
+
 public struct MaterialPbrFactors
 {
 	public Vector4 BaseColorFactor;
@@ -577,6 +587,22 @@ public struct MaterialPbrFactors
 	/// mostly-opaque ones render solid - e.g. Intel Sponza's dirt_decal overlays at alpha 0.35
 	/// would otherwise cover the walls as fully opaque grime), OPAQUE to 0.</summary>
 	public float AlphaCutoff;
+
+	/// <summary>Режим прозрачности glTF, сохранённый ОТДЕЛЬНО от <see cref="AlphaCutoff"/>. Раньше он
+	/// в него схлопывался (MASK -> авторский порог, BLEND -> 0.5, OPAQUE -> 0), и после загрузки MASK
+	/// от BLEND было не отличить ничем.
+	///
+	/// Различие не косметическое: BLEND-накладка (декали грязи и потёков Intel Sponza) обязана не
+	/// отбрасывать тень ВООБЩЕ - она лежит в миллиметрах от стены, которую украшает, и её тень
+	/// дублирует её же рисунок на этой самой стене крупными тёмными кляксами. У MASK (листва,
+	/// решётки) тень наоборот нужна, просто вырезанная по альфе.</summary>
+	public MaterialAlphaMode AlphaMode;
+
+	/// <summary>Доля текселей base color с промежуточной альфой - насколько альфа-канал бинарен
+	/// (см. ModelLoader.ComputeSoftAlphaFraction). Разделяет вырезку (листва: почти 0) и мягкую
+	/// накладку (декаль грязи: заметно больше нуля), которые glTF помечает одним и тем же BLEND.
+	/// -1 = неизвестно (пикселей не было и в кеше значения нет).</summary>
+	public float SoftAlphaFraction;
 
 	/// <summary>KHR_texture_transform, предвычисленная в 2x2-матрицу UV (row-major: u' = X*u + Y*v,
 	/// v' = Z*u + W*v, затем + <see cref="UvOffset"/>). Одна на материал - берётся с baseColor-канала
@@ -743,8 +769,8 @@ public class ModelLoader
 		/// <summary>Сжатый исходник встроенной картинки (.glb / data-URI).</summary>
 		public byte[] EncodedPixels;
 
-		/// <summary>Есть ли ещё откуда декодировать (иначе стриминг этой текстуры окончен).</summary>
-		public bool HasSource => !Completed && (FilePath != null || EncodedPixels != null);
+		/// <summary>Есть ли ещё откуда брать ступени (иначе стриминг этой текстуры окончен).</summary>
+		public bool HasSource => !Completed && (FilePath != null || EncodedPixels != null || DtexPath != null);
 
 		/// <summary>Читает сжатый исходник. Дисковый I/O - звать только из фонового потока.</summary>
 		public byte[] ReadEncoded() => EncodedPixels ?? (FilePath != null ? File.ReadAllBytes(FilePath) : null);
@@ -755,6 +781,7 @@ public class ModelLoader
 			Completed = true;
 			EncodedPixels = null;
 			FilePath = null;
+			DtexPath = null;
 		}
 
 		/// <summary>Бо́льшая сторона текущего GPU-декода (0 = ещё 1x1-филлер).</summary>
@@ -777,6 +804,95 @@ public class ModelLoader
 		public IGpuTexture Texture;
 
 		public readonly List<(IMaterialObject Material, string Slot)> Bindings = new();
+
+		/// <summary>Запечённая .dtex этой текстуры (см. DecaEngine.Graphics.Assets.DtexFile) - источник
+		/// ступеней, когда модель пришла из кеша ассетов. Ступень здесь не декодируется вовсе: она
+		/// ЧИТАЕТСЯ хвостом мип-цепочки прямо с диска и уезжает в VRAM теми же байтами.</summary>
+		public string DtexPath;
+
+		/// <summary>Размеры нулевого уровня <see cref="DtexPath"/> - из cooked-модели, чтобы перевести
+		/// запрошенную сторону в номер мип-уровня без открытия файла.</summary>
+		public int DtexWidth;
+		public int DtexHeight;
+
+		/// <summary>Ступени этой текстуры блочно-сжатые - она занимает вчетверо меньше VRAM, чем
+		/// RGBA8 той же стороны. Отдельным полем от <see cref="DtexPath"/> именно потому, что путь
+		/// обнуляется по завершении стриминга (<see cref="ReleaseCpuData"/>), а учёт занятой памяти
+		/// живёт дальше - см. ModelStore.EstimateTextureBytes.</summary>
+		public bool IsBlockCompressed;
+	}
+
+	/// <summary>
+	/// Одна ступень качества стримимой текстуры - то, что фоновая задача подготовила, а заливка
+	/// отдаёт графическому API.
+	///
+	/// Два источника с общим интерфейсом: несжатые RGBA8-пиксели (декод PNG/JPG - путь без кеша
+	/// ассетов) и готовый хвост BC-цепочки из .dtex (путь с кешем). Различие не размазано по
+	/// стримеру: он оперирует ступенями, а чем ступень является внутри - знает только она сама.
+	/// </summary>
+	public sealed class StreamedTextureLevel
+	{
+		/// <summary>Данные уровней: ровно один элемент для RGBA8 (мипы достроит GPU), хвост цепочки
+		/// от этой ступени и ниже - для блочно-сжатых (их GPU достроить не может).</summary>
+		public required byte[][] Mips { get; init; }
+
+		/// <summary>Формат блочно-сжатых данных; <see cref="TextureObjectFormat.Unknown"/> - RGBA8.</summary>
+		public required TextureObjectFormat Format { get; init; }
+
+		public required int Width { get; init; }
+		public required int Height { get; init; }
+
+		/// <summary>Бо́льшая сторона - ею стример меряет качество ступени.</summary>
+		public int Size => Math.Max(Width, Height);
+
+		public long ByteLength
+		{
+			get
+			{
+				long total = 0;
+				foreach (var mip in Mips)
+				{
+					total += mip?.LongLength ?? 0;
+				}
+
+				return total;
+			}
+		}
+
+		public static StreamedTextureLevel FromDecodedPixels(byte[] pixels, int width, int height) => new()
+		{
+			Mips = [pixels],
+			Format = TextureObjectFormat.Unknown,
+			Width = width,
+			Height = height,
+		};
+
+		public static StreamedTextureLevel FromCompressed(TextureObjectFormat format, byte[][] mips,
+			int width, int height) => new()
+		{
+			Mips = mips,
+			Format = format,
+			Width = width,
+			Height = height,
+		};
+
+		public CpuTextureData ToCpuTextureData(string name) => Format == TextureObjectFormat.Unknown
+			? new CpuTextureData
+			{
+				Name = name,
+				DecodedPixels = Mips[0],
+				DecodedWidth = Width,
+				DecodedHeight = Height,
+			}
+			: new CpuTextureData
+			{
+				Name = name,
+				CompressedMips = Mips,
+				CompressedFormat = Format,
+				CompressedWidth = Width,
+				CompressedHeight = Height,
+				GenerateMips = false,
+			};
 	}
 
 	/// <summary>Что привязано в слот _MainTex материала - текстура, её (immutable) сэмплер и запись
@@ -1001,9 +1117,35 @@ public class ModelLoader
 		return request.FinalizeOnMainThread();
 	}
 
+	/// <summary>Подготовка МИМО кеша - вход для фоновой печки (см. <see cref="AssetBakeQueue"/>).
+	/// Рекурсии не даёт сам вызывающий: он снимает CacheDirectory в переданных опциях.</summary>
+	internal static PreparedModel PrepareForBake(string modelPath, ModelLoadOptions options,
+		CancellationToken cancellationToken) => PrepareModel(modelPath, options, null, cancellationToken);
+
 	private static PreparedModel PrepareModel(string modelPath, ModelLoadOptions options,
 		IProgress<float> progress, CancellationToken cancellationToken)
 	{
+		// Ассет-пайплайн. При ПОПАДАНИИ всё, что ниже, не выполняется вовсе: ни разбора glTF, ни
+		// декода картинок, ни meshopt, ни упрощения под LOD - только чтение линейного .dmdl. Именно
+		// эти четыре фазы и составляют почти всё время загрузки, и все они - чистые функции от
+		// исходника и опций, то есть считать их заново при каждом открытии сцены незачем.
+		var cache = options.Cache;
+		if (cache != null)
+		{
+			var modelKey = AssetCache.ModelKey(modelPath, options.CookSignature());
+			var cooked = CookedModelFile.TryRead(cache.ModelPath(modelKey));
+
+			if (cooked != null && ModelAssetBaker.AllTexturesPresent(cooked, cache))
+			{
+				progress?.Report(1f);
+				return cooked;
+			}
+
+			// Промах. Загрузка НЕ ждёт печку и идёт дальше обычным путём - включение пайплайна не
+			// имеет права сделать первое открытие модели медленнее, чем оно было без него.
+			AssetBakeQueue.Enqueue(modelPath, options, modelKey);
+		}
+
 		// Строгая валидация SharpGLTF на больших сценах заметно небесплатна; TryFix заодно чинит
 		// мелкие огрехи экспортёров вместо жёсткого отказа.
 		var swPhase = System.Diagnostics.Stopwatch.StartNew();
@@ -1155,6 +1297,14 @@ public class ModelLoader
 				AlphaMode.MASK => logicalMaterial.AlphaCutoff,
 				AlphaMode.BLEND => 0.5f,
 				_ => 0f,
+			};
+
+			// Сам режим - ОТДЕЛЬНЫМ полем: порог выше его теряет (см. PreparedMaterial.AlphaMode).
+			preparedMaterial.AlphaMode = logicalMaterial.Alpha switch
+			{
+				AlphaMode.MASK => MaterialAlphaMode.Mask,
+				AlphaMode.BLEND => MaterialAlphaMode.Blend,
+				_ => MaterialAlphaMode.Opaque,
 			};
 
 			bool metallicAuthored = false;
@@ -1947,12 +2097,33 @@ public class ModelLoader
 			// В режиме стриминга Pixels у всех каналов null (заливки на этой фазе нет вовсе) - оценка
 			// честно выходит в «почти ноль», и финализация материалов не тратит кадровый бюджет.
 			long bytes = 4096;
-			bytes += pm.BaseColorTexture?.Pixels?.Length ?? 0;
-			bytes += pm.MetallicRoughnessTexture?.Pixels?.Length ?? 0;
-			bytes += pm.NormalTexture?.Pixels?.Length ?? 0;
-			bytes += pm.OcclusionTexture?.Pixels?.Length ?? 0;
-			bytes += pm.TransmissionFactor > 0f ? pm.ThicknessTexture?.Pixels?.Length ?? 0 : 0;
+			bytes += SlotBytes(pm.BaseColorTexture);
+			bytes += SlotBytes(pm.MetallicRoughnessTexture);
+			bytes += SlotBytes(pm.NormalTexture);
+			bytes += SlotBytes(pm.OcclusionTexture);
+			bytes += pm.TransmissionFactor > 0f ? SlotBytes(pm.ThicknessTexture) : 0;
 			return bytes;
+
+			// Запечённый слот пикселей не несёт, но заливка в VRAM всё равно стоит времени, и
+			// пропорциональна она объёму данных: BC7/BC5 - байт на тексель, плюс треть на хвост
+			// мип-цепочки. Считать такие слоты бесплатными значило бы финализировать всю сцену
+			// одним куском в одном кадре.
+			static long SlotBytes(PreparedTexture texture)
+			{
+				if (texture == null)
+				{
+					return 0;
+				}
+
+				if (texture.Pixels != null)
+				{
+					return texture.Pixels.Length;
+				}
+
+				return texture.CacheKey != null
+					? (long)texture.Width * texture.Height * 4 / 3
+					: 0;
+			}
 		}
 
 		// KHR_materials_volume: толщина задана в ЛОКАЛЬНЫХ координатах меша и по спеке умножается
@@ -1971,6 +2142,55 @@ public class ModelLoader
 		// Реестр стрим-текстур по исходнику: один image шарится несколькими слотами/материалами
 		// (типовая ORM-текстура), апгрейд декодируется один раз и раскладывается по всем привязкам.
 		var streamEntries = new Dictionary<TextureStreamSource, StreamedTexture>();
+
+		// Кеш ассетов этой загрузки: из него берутся запечённые .dtex, когда модель пришла из .dmdl.
+		// Один экземпляр на всю финализацию - он всего лишь держит пути, но создавать его на каждый
+		// из сотен слотов незачем.
+		var assetCache = options.Cache;
+
+		// Уже созданные GPU-текстуры по ключу кеша. Одна запечённая картинка (типовая ORM) шарится
+		// несколькими слотами и материалами; без этой карты один и тот же .dtex читался бы с диска и
+		// заливался в VRAM столько раз, сколько на него ссылок, - то есть кеш экономил бы время
+		// загрузки и при этом РАЗДУВАЛ бы видеопамять против некешированного пути.
+		var bakedTextures = new Dictionary<string, IGpuTexture>(StringComparer.Ordinal);
+
+		// Записи стриминга запечённых текстур по ключу кеша - тот же приём, что и streamEntries выше:
+		// одна .dtex, на которую ссылаются несколько слотов, обязана стримиться ОДНОЙ записью, иначе
+		// её ступени читались бы и заливались по разу на ссылку.
+		var bakedStreamEntries = new Dictionary<string, StreamedTexture>(StringComparer.Ordinal);
+
+		// Читает .dtex и создаёт GPU-текстуру, разделяя результат между всеми слотами с тем же
+		// ключом. null - файла нет (кеш чистили прямо во время загрузки).
+		IGpuTexture GetOrCreateBakedTexture(string cacheKey, string slot)
+		{
+			if (bakedTextures.TryGetValue(cacheKey, out var existing))
+			{
+				return existing;
+			}
+
+			if (assetCache == null)
+			{
+				return null;
+			}
+
+			var payload = DtexFile.TryRead(assetCache.TexturePath(cacheKey));
+			if (payload == null)
+			{
+				return null;
+			}
+
+			// Тот же замер, что и у обычного пути: именно по нему видно, что кеш действительно
+			// убирает время из финализации, а не переносит его в другое место.
+			var swBaked = System.Diagnostics.Stopwatch.StartNew();
+			var texture = new Core.Texture(slot, payload.ToCpuTextureData(slot));
+			texture.Upload(graphicsApi, true);
+			result._textureMs += swBaked.ElapsedMilliseconds;
+			result._textureCount++;
+
+			result._ownedTextures.Add(texture.GpuHandle);
+			bakedTextures[cacheKey] = texture.GpuHandle;
+			return texture.GpuHandle;
+		}
 
 		// Возвращает привязку (текстура + сэмплер + запись стриминга) - её переиспользует теневой
 		// материал с альфа-тестом (см. ModelLoader.MaterialBaseColor). null - слот получил филлер.
@@ -2043,6 +2263,89 @@ public class ModelLoader
 					Texture = slot == "_NormalTex" ? flatNormalTexture.GpuHandle : fallbackTexture.GpuHandle,
 					Sampler = streamSampler,
 					Stream = streamEntry,
+				};
+			}
+
+			// Запечённая текстура: мип-цепочка лежит на диске готовой к заливке. Ни декода, ни
+			// RGBA8-буфера, ни GenerateMips на GPU.
+			if (preparedTexture.CacheKey != null)
+			{
+				var bakedFilter = preparedTexture.FilterMode == TextureFilter.Linear && options.AnisotropicFiltering
+					? TextureFilter.Anisotropic
+					: preparedTexture.FilterMode;
+
+				var bakedSampler = graphicsApi.CreateSampler(
+					name: slot + "_Sampler",
+					filter: bakedFilter,
+					address: preparedTexture.AddressMode,
+					comparisonFunction: CompFunction.Always,
+					border: Vector4.Zero,
+					mipLodBias: options.MipLodBias);
+
+				result._samplerCount++;
+
+				// Стриминг поверх кеша: слот получает 1x1-филлер и запись стриминга, а ступени
+				// приезжают ХВОСТАМИ мип-цепочки прямо из .dtex (см. ModelStore). Верхние - самые
+				// тяжёлые - уровни при этом не читаются с диска вовсе, пока качество до них не дошло,
+				// и ни одна ступень не стоит ни декода, ни пересжатия.
+				if (options.StreamTextures && assetCache != null)
+				{
+					if (!bakedStreamEntries.TryGetValue(preparedTexture.CacheKey, out var bakedStream))
+					{
+						bakedStream = new StreamedTexture
+						{
+							DtexPath = assetCache.TexturePath(preparedTexture.CacheKey),
+							DtexWidth = preparedTexture.Width,
+							DtexHeight = preparedTexture.Height,
+							IsBlockCompressed = true,
+							CurrentSize = 0,
+
+							// Потолок качества - СОБСТВЕННЫЙ верхний уровень .dtex, а не предел
+							// импорта: файл уже запечён с этим пределом, и мелкий исходник (256px при
+							// пределе 2048) иначе вечно считался бы «недогруженным» - стример гонялся
+							// бы за качеством, которого в файле нет.
+							TargetSize = Math.Max(preparedTexture.Width, preparedTexture.Height),
+							Texture = null,
+							AddressMode = preparedTexture.AddressMode,
+							FilterMode = preparedTexture.FilterMode,
+						};
+
+						bakedStreamEntries[preparedTexture.CacheKey] = bakedStream;
+						result.StreamedTextures.Add(bakedStream);
+					}
+
+					EnsureFallbackTextures();
+					var filler = slot == "_NormalTex" ? flatNormalTexture.GpuHandle : fallbackTexture.GpuHandle;
+
+					materialObj.SetTexture(slot, filler);
+					materialObj.SetSampler(slot + "_sampler", bakedSampler);
+					bakedStream.Bindings.Add((materialObj, slot));
+
+					return new BaseColorBinding
+					{
+						Texture = filler,
+						Sampler = bakedSampler,
+						Stream = bakedStream,
+					};
+				}
+
+				var bakedTexture = GetOrCreateBakedTexture(preparedTexture.CacheKey, slot);
+				if (bakedTexture == null)
+				{
+					// .dtex исчез между проверкой кеша и заливкой (кто-то чистил папку прямо во время
+					// загрузки). Пикселей в cooked-модели нет и взять их неоткуда, поэтому слот
+					// получает филлер - следующая загрузка увидит промах и перепечёт.
+					BindFallbackTexture(materialObj, slot);
+					return null;
+				}
+
+				materialObj.SetTexture(slot, bakedTexture);
+				materialObj.SetSampler(slot + "_sampler", bakedSampler);
+
+				return new BaseColorBinding
+				{
+					Texture = bakedTexture,
+					Sampler = bakedSampler,
 				};
 			}
 
@@ -2199,6 +2502,8 @@ public class ModelLoader
 			UvOffset = pm.UvOffset,
 			HasUvTransform = pm.HasUvTransform,
 			AlphaCutoff = pm.AlphaCutoff,
+			AlphaMode = pm.AlphaMode,
+			SoftAlphaFraction = pm.SoftAlphaFraction,
 			TransmissionFactor = pm.TransmissionFactor,
 			Ior = pm.Ior,
 			Dispersion = pm.Dispersion,
@@ -2620,6 +2925,7 @@ public class ModelLoader
 		{
 			AddressMode = sampler != null ? ToAddressMode(sampler.WrapS) : TextureAddress.Wrap,
 			FilterMode = sampler != null ? ToFilter(sampler.MinFilter, sampler.MagFilter) : TextureFilter.Linear,
+			SourceImage = texture.PrimaryImage,
 		};
 
 		if (streamSources != null)
@@ -2797,6 +3103,62 @@ public class ModelLoader
 		return (pixels, width, height);
 	}
 
+	/// <summary>
+	/// Декод сжатой картинки СРАЗУ ВСЕЙ ЛЕСТНИЦЕЙ качества - от <paramref name="firstSize"/> до
+	/// <paramref name="maxSize"/> с шагом <paramref name="stepFactor"/> (степени двойки), в порядке
+	/// ВОЗРАСТАНИЯ. Существует ради прогрессивного стриминга (см. DecaEngine.Editor.ECS.ModelStore):
+	/// stb декодирует файл только в полном разрешении, поэтому ступень "64px" стоит ровно столько же,
+	/// сколько полный декод - и лестница из четырёх ступеней раньше означала ЧЕТЫРЕ полных декода
+	/// одного и того же файла. Здесь файл декодируется РОВНО ОДИН РАЗ, а ступени снимаются с той же
+	/// цепочки половинных даунскейлов, которую даунскейл до целевого размера и так проходит: младшие
+	/// ступени достаются практически даром.
+	///
+	/// Пустой список - декодировать нечего. Уровни отдаются отдельными массивами: потребитель заливает
+	/// их по одному, начиная с самого маленького (модель появляется в кадре сразу), и держит остаток в
+	/// памяти до заливки - см. ModelStore.PendingDecodeBytesBudget про потолок этого остатка.
+	/// </summary>
+	public static List<(byte[] Pixels, int Width, int Height)> DecodeEncodedImageLadder(
+		byte[] encodedBytes, int maxSize, int firstSize, int stepFactor)
+	{
+		var decoded = ImageResult.FromMemory(encodedBytes, ColorComponents.RedGreenBlueAlpha);
+
+		var pixels = decoded.Data;
+		int width = decoded.Width;
+		int height = decoded.Height;
+		while (maxSize > 0 && (width > maxSize || height > maxSize))
+		{
+			(pixels, width, height) = DownscaleHalf(pixels, width, height);
+		}
+
+		// Верхняя ступень - то, что получилось после даунскейла до потолка; ниже неё идут ступени,
+		// каждая в stepFactor раз мельче, пока не пройдена firstSize. Порядок в списке - по
+		// возрастанию, поэтому собираем с конца.
+		var levels = new List<(byte[] Pixels, int Width, int Height)> { (pixels, width, height) };
+		var halvings = 1;
+		for (int step = Math.Max(2, stepFactor); step > 2; step >>= 1)
+		{
+			halvings++;
+		}
+
+		while (firstSize > 0 && Math.Max(width, height) > firstSize)
+		{
+			for (int i = 0; i < halvings && Math.Max(width, height) > 1; i++)
+			{
+				(pixels, width, height) = DownscaleHalf(pixels, width, height);
+			}
+
+			levels.Add((pixels, width, height));
+
+			if (Math.Max(width, height) <= 1)
+			{
+				break;
+			}
+		}
+
+		levels.Reverse();
+		return levels;
+	}
+
 	/// <summary>Бокс-фильтр 2x2 в один шаг вдвое - то же усреднение, что GPU GenerateMips, поэтому
 	/// картинка после даунскейла совпадает с тем, что сэмплер и так показал бы на этом мипе.
 	/// Нечётные размеры клампятся к краю (последние строка/столбец усредняются сами с собой).</summary>
@@ -2837,11 +3199,94 @@ public class ModelLoader
 	/// экспортер зачем-то пометил MASK/BLEND (камень с альфой ~1) - см. ProbeGiBaker.</summary>
 	private static Vector4 ComputeAverageBaseColor(PreparedMaterial pm)
 	{
+		EnsureAverageBaseColor(pm);
+		return pm.AverageBaseColorRgba.Value;
+	}
+
+	/// <summary>Считает <see cref="PreparedMaterial.AverageBaseColorRgba"/>, если он ещё не посчитан.
+	/// Вызывать ОБЯЗАТЕЛЬНО пока живы пиксели base color: и при обычной загрузке (лениво, из
+	/// BuildFactors), и перед записью .dmdl - у печки свой экземпляр PreparedModel, который через
+	/// финализацию не проходит, так что лениво он бы остался пустым и в кеш уехал бы фактор.</summary>
+	internal static void EnsureAverageBaseColor(PreparedMaterial pm)
+	{
+		if (pm.AverageBaseColorRgba.HasValue)
+		{
+			return;
+		}
+
+		pm.AverageBaseColorRgba = ComputeAverageBaseColorCore(pm);
+		pm.SoftAlphaFraction = ComputeSoftAlphaFraction(pm);
+	}
+
+	/// <summary>Доля текселей base color с «промежуточной» альфой (0.1..0.9) - насколько альфа-канал
+	/// БИНАРЕН.
+	///
+	/// Отвечает на вопрос, который alphaMode не решает: у экспортов сплошь и листва, и накладные
+	/// декали помечены одним и тем же BLEND (Intel Sponza: LeafSpring, dirt_decal - все BLEND), а
+	/// вести себя в тени они обязаны противоположно. Листва - вырезка: альфа почти везде 0 или 1,
+	/// бинарная тень по ней осмысленна и нужна. Декаль грязи - мягкая размазка по всему диапазону,
+	/// бинарной тени у неё быть не может в принципе, и любая попытка её отбросить даёт тёмную кляксу
+	/// формы своей же текстуры на стене, к которой декаль приклеена.
+	///
+	/// -1 = не считалось (пикселей не было).</summary>
+	private static float ComputeSoftAlphaFraction(PreparedMaterial pm)
+	{
+		var texture = pm.BaseColorTexture;
+		if (texture?.Pixels == null || texture.Width <= 0 || texture.Height <= 0)
+		{
+			return -1f;
+		}
+
+		int pixelCount = texture.Width * texture.Height;
+		int stride = Math.Max(1, pixelCount / 4096);
+		int soft = 0;
+		int count = 0;
+		for (int i = 0; i < pixelCount; i += stride)
+		{
+			int idx = i * 4;
+			if (idx + 3 >= texture.Pixels.Length)
+			{
+				break;
+			}
+
+			float a = texture.Pixels[idx + 3] / 255f;
+			if (a > 0.1f && a < 0.9f)
+			{
+				soft++;
+			}
+
+			count++;
+		}
+
+		return count > 0 ? (float)soft / count : -1f;
+	}
+
+	private static Vector4 ComputeAverageBaseColorCore(PreparedMaterial pm)
+	{
 		var factor = new Vector3(pm.BaseColorFactor.X, pm.BaseColorFactor.Y, pm.BaseColorFactor.Z);
 		var texture = pm.BaseColorTexture;
 		if (texture?.Pixels == null || texture.Width <= 0 || texture.Height <= 0)
 		{
-			return new Vector4(factor, pm.BaseColorFactor.W);
+			// Пикселей нет. Два разных случая, и путать их нельзя:
+			//
+			// 1. Текстуры у слота нет вовсе - материал целиком описан фактором, среднее и есть фактор.
+			//
+			// 2. Текстура ЕСТЬ, но пикселей нет: режим стриминга (см. ModelLoadOptions.StreamTextures -
+			//    им грузит Scene View) при ПРОМАХЕ кеша, то есть пока фоновый бейк не положил .dmdl со
+			//    средним. Здесь фактор - не ответ, а тихая ложь: у glTF-материалов он почти всегда
+			//    (1,1,1,1), то есть альфа выходит единицей, и по ней отбор «дырявой» геометрии
+			//    (AverageAlpha < 0.6, см. ModelViewportEnvironment и ProbeGi) молча выключается. Плата
+			//    за это - альфа-тест в тени пропадает у ВСЕЙ MASK/BLEND-геометрии: занавеси и накладные
+			//    планки грязи/потёков Intel Sponza начинают отбрасывать тень СПЛОШНЫМ квадратом, что на
+			//    стене читается крупными гладкими кляксами.
+			//
+			//    Поэтому неизвестная альфа объявляется НУЛЁМ - то есть «считать дырявым», - и только у
+			//    материалов, которые glTF пометил MASK/BLEND (AlphaCutoff > 0). Цена ошибки в эту
+			//    сторону - лишний дроу-колл на каскад у пары материалов, пока не приехал бейк; в
+			//    обратную - тот самый сплошной квад в тени. RGB при этом остаётся фактором: его
+			//    альфа-режим не касается, а по нему красит баунс probe-GI.
+			float unknownAlpha = texture != null && pm.AlphaCutoff > 0f ? 0f : pm.BaseColorFactor.W;
+			return new Vector4(factor, unknownAlpha);
 		}
 
 		// Каждый ~16-й пиксель: среднему хватает, а гигантские атласы не тормозят загрузку.
@@ -2875,7 +3320,7 @@ public class ModelLoader
 	/// <summary>Сжатый исходник одной glTF-картинки для стриминга качества - один на image, шарится
 	/// всеми PreparedTexture его каналов/материалов; в финализации по нему группируются привязки в
 	/// один <see cref="StreamedTexture"/>.</summary>
-	private sealed class TextureStreamSource
+	internal sealed class TextureStreamSource
 	{
 		/// <summary>Внешний файл картинки (предпочтительно - ничего не держим в памяти).</summary>
 		public string FilePath;
@@ -2884,7 +3329,7 @@ public class ModelLoader
 		public byte[] EncodedBytes;
 	}
 
-	private sealed class PreparedTexture
+	internal sealed class PreparedTexture
 	{
 		public byte[] Pixels;
 		public int Width;
@@ -2894,9 +3339,20 @@ public class ModelLoader
 
 		/// <summary>null = стриминг выключен (обычный полноразмерный декод).</summary>
 		public TextureStreamSource StreamSource;
+
+		/// <summary>Ключ запечённой BC-текстуры в кеше ассетов (см. DecaEngine.Graphics.Assets.AssetCache).
+		/// Когда не null, пиксели брать неоткуда и не нужно: слот заливается прямо из .dtex готовой
+		/// мип-цепочкой. Это и есть штатный путь при попадании в кеш - именно он убирает из загрузки
+		/// и декод PNG, и RGBA8-буферы, и генерацию мипов на GPU.</summary>
+		public string CacheKey;
+
+		/// <summary>Картинка glTF, из которой декодирован слот. Нужна только фазе бейка - по её
+		/// СЖАТЫМ байтам считается ключ кеша (см. AssetCache.TextureKey). В .dmdl не попадает и при
+		/// загрузке из кеша всегда null: там glTF не открывается вовсе.</summary>
+		public SharpGLTF.Schema2.Image SourceImage;
 	}
 
-	private sealed class PreparedMaterial
+	internal sealed class PreparedMaterial
 	{
 		public int LogicalIndex;
 		public bool IsNull;
@@ -2922,6 +3378,11 @@ public class ModelLoader
 		public float MetallicFactor = 1f;
 		public float RoughnessFactor = 1f;
 		public float AlphaCutoff;
+		public MaterialAlphaMode AlphaMode;
+
+		/// <summary>См. <see cref="ComputeSoftAlphaFraction"/>. Считается по ПИКСЕЛЯМ, поэтому обязана
+		/// попадать в .dmdl - в cooked-модели пикселей нет. -1 = не считалось.</summary>
+		public float SoftAlphaFraction = -1f;
 		public float TransmissionFactor;
 		public float Ior = 1.5f;
 		public float Dispersion;
@@ -2935,6 +3396,16 @@ public class ModelLoader
 		// KHR_materials_specular (дефолты спеки: белый цвет, вес 1 = тождественно).
 		public Vector3 SpecularColorFactor = Vector3.One;
 		public float SpecularFactor = 1f;
+
+		/// <summary>Среднее base color: rgb - линейное альбедо, w - средняя альфа (см.
+		/// <see cref="EnsureAverageBaseColor"/>). Считается ПО ПИКСЕЛЯМ текстуры, поэтому обязано
+		/// попадать в .dmdl: в cooked-модели пикселей нет вовсе (CookedModelFile.WriteTexture), и
+		/// пересчитать это при загрузке из кеша не из чего. Пока поле не сохранялось, у всей
+		/// cooked-сцены альфа выходила равной фактору (=1), а по ней отбираются «дырявые» материалы -
+		/// листва теряла и альфа-тест в тенях (ModelViewportEnvironment), и исключение из BVH
+		/// probe-GI (ProbeGi), то есть кроны отбрасывали тень сплошными квадратами.
+		/// null = ещё не считалось.</summary>
+		public Vector4? AverageBaseColorRgba;
 	}
 
 	/// <summary>Сырьё одного glTF-примитива, собранное последовательной фазой PrepareModel (чтение
@@ -2951,7 +3422,7 @@ public class ModelLoader
 		public bool HasTangents;
 	}
 
-	private sealed class PreparedMesh
+	internal sealed class PreparedMesh
 	{
 		public string Name;
 		public Vertex[] Vertices;
@@ -2965,7 +3436,7 @@ public class ModelLoader
 		public int Topology;
 	}
 
-	private sealed class PreparedModel
+	internal sealed class PreparedModel
 	{
 		public List<PreparedMaterial> Materials = new();
 		public List<PreparedMesh> Meshes = new();

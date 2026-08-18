@@ -249,6 +249,86 @@ public static class PreviewProbe
 		Console.WriteLine($"[probe] load materials-gpu: {loadTimings.MaterialsBuilt} built, " +
 			$"{loadTimings.MaterialBuildMs} ms (внутри finalize): " +
 			$"CreateMaterial {loadTimings.MatCreateMs} ms, SetShader {loadTimings.MatShaderMs} ms");
+		// DECA_ASSET_CACHE=<путь> + DECA_PROBE_ASSETCACHE=1 - СВЕРКА ассет-пайплайна на живой модели.
+		// Первая загрузка выше неизбежно промахнулась (кеш пуст) и поставила бейк в фоновую очередь;
+		// здесь мы её дожидаемся и грузим ту же модель ВТОРОЙ раз - уже из кеша. Проверяется ровно
+		// то, что нельзя проверить на CPU: что запечённые BC-текстуры реально создаются на GPU и что
+		// cooked-модель даёт ту же геометрию, что и разбор glTF.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_ASSETCACHE") == "1")
+		{
+			var cacheRoot = DecaEngine.Graphics.Assets.AssetCache.DefaultRoot;
+			if (string.IsNullOrEmpty(cacheRoot))
+			{
+				Console.WriteLine("[probe] asset cache: DECA_ASSET_CACHE не задан - проверка пропущена");
+			}
+			else
+			{
+				Console.WriteLine($"[probe] asset cache: ждём фоновый бейк в {cacheRoot}");
+
+				var swBake = System.Diagnostics.Stopwatch.StartNew();
+				bool baked = DecaEngine.Graphics.Assets.AssetBakeQueue.WaitForIdle(TimeSpan.FromMinutes(10));
+				Console.WriteLine($"[probe] asset cache: бейк {(baked ? "завершён" : "НЕ УСПЕЛ")} за {swBake.ElapsedMilliseconds} ms");
+
+				long dtexBytes = 0;
+				int dtexCount = 0;
+				var textureDirectory = Path.Combine(cacheRoot, "textures");
+				if (Directory.Exists(textureDirectory))
+				{
+					foreach (var file in Directory.EnumerateFiles(textureDirectory, "*.dtex"))
+					{
+						dtexCount++;
+						dtexBytes += new FileInfo(file).Length;
+					}
+				}
+
+				Console.WriteLine($"[probe] asset cache: {dtexCount} .dtex, {dtexBytes / (1024 * 1024)} MB");
+
+				var swSecond = System.Diagnostics.Stopwatch.StartNew();
+				var cachedModel = ModelLoader.Load(api, modelPath, new ModelLoadOptions
+				{
+					AnisotropicFiltering = anisotropic,
+					MipLodBias = probeMipBias,
+					VertexShader = new EditorRef("shader/UnlitInstancedVS.hlsl"),
+					PixelShader = new EditorRef("shader/UnlitInstancedPS.hlsl"),
+					OptimizeMesh = false,
+					GenerateLods = false,
+					MaxTextureSize = int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_TEXSIZE"), out var cachedTexSize)
+						? Math.Clamp(cachedTexSize, 128, 8192)
+						: 2048,
+				});
+				long secondMs = swSecond.ElapsedMilliseconds;
+
+				var cachedTimings = cachedModel.Timings;
+				Console.WriteLine($"[probe] asset cache: вторая загрузка {secondMs} ms " +
+					$"(parse {cachedTimings.ParseMs}, decode {cachedTimings.DecodeMs}, " +
+					$"materials {cachedTimings.MaterialsMs}, meshes {cachedTimings.MeshesMs}, " +
+					$"finalize {cachedTimings.FinalizeMs}); textures {cachedTimings.TextureUploads} uploads, " +
+					$"{cachedTimings.TextureMs} ms");
+
+				// Геометрия обязана совпасть один в один: cooked-модель - это та же PrepareModel,
+				// только прочитанная с диска. Расхождение здесь означало бы, что сериализация теряет
+				// или переставляет данные, а такое проявляется дырами в мешах, а не исключением.
+				bool sameShape = cachedModel.Meshes.Count == model.Meshes.Count &&
+					cachedModel.materialObjects.Count == model.materialObjects.Count &&
+					cachedModel.instances.Count == model.instances.Count;
+
+				Console.WriteLine($"[probe] asset cache: geometry match {(sameShape ? "OK" : "MISMATCH")} - " +
+					$"meshes {cachedModel.Meshes.Count}/{model.Meshes.Count}, " +
+					$"materials {cachedModel.materialObjects.Count}/{model.materialObjects.Count}, " +
+					$"instances {cachedModel.instances.Count}/{model.instances.Count}");
+
+				var boundsA = model.ComputeBounds();
+				var boundsB = cachedModel.ComputeBounds();
+				bool sameBounds = Vector3.Distance(boundsA.min, boundsB.min) < 1e-3f &&
+					Vector3.Distance(boundsA.max, boundsB.max) < 1e-3f;
+
+				Console.WriteLine($"[probe] asset cache: bounds match {(sameBounds ? "OK" : "MISMATCH")} - " +
+					$"{boundsA.min}..{boundsA.max} против {boundsB.min}..{boundsB.max}");
+
+				cachedModel.Release();
+			}
+		}
+
 		// DECA_PROBE_VISRES=<8..24> - сторона окто-карты видимости (ручка «Visibility res»).
 		// Нужна для A/B: качество теста Чебышёва зависит и от неё, и от числа лучей на пробу.
 		if (int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_VISRES"), out var visResOverride))
@@ -432,7 +512,24 @@ public static class PreviewProbe
 		// Сколько материалов пишут тень с альфа-тестом (листва). Ноль на сцене с деревом означает,
 		// что критерий отбора её не признал, - и тогда никакие god rays сквозь крону не пойдут по
 		// причине, не имеющей к объёмному свету никакого отношения (см. ShadowMaskedPS.hlsl).
-		Console.WriteLine($"[probe] alpha-tested shadows: {env.BatchRenderer.WorldShadowRenderer.AlphaTestedMaterialCount} materials");
+		Console.WriteLine($"[probe] alpha-tested shadows: {env.BatchRenderer.WorldShadowRenderer.AlphaTestedMaterialCount} materials, " +
+			// BLEND-накладки, выброшенные из кастеров (см. IBatchRenderer.SetMaterialShadowCasting):
+			// «декали перестали отбрасывать тень» и «декалей в сцене не нашлось» на картинке выглядят
+			// одинаково, а числа - нет.
+			$"не кастеры: {env.BatchRenderer.WorldShadowRenderer.NonCastingMaterialCount}");
+
+		// Прозрачные материалы поимённо: по каким числам решался их теневой статус. Разница между
+		// вырезкой и мягкой накладкой (см. ModelViewportEnvironment) - это ОДНО число на материал, и
+		// проверять порог по картинке невозможно.
+		foreach (var kvp in model.MaterialPbr)
+		{
+			if (kvp.Value.AlphaCutoff > 0f)
+			{
+				Console.WriteLine($"[probe] transparent material {kvp.Key}: mode={kvp.Value.AlphaMode} " +
+					$"cutoff={kvp.Value.AlphaCutoff:F2} avgAlpha={kvp.Value.AverageAlpha:F3} " +
+					$"soft={kvp.Value.SoftAlphaFraction:F3}");
+			}
+		}
 
 		int created = 0;
 		foreach (var instance in model.instances)
@@ -452,11 +549,97 @@ public static class PreviewProbe
 		}
 		Console.WriteLine($"[probe] entities created: {created} (subMesh={subMesh})");
 
+		// DECA_PROBE_MODEL2=<путь> - завести ВТОРУЮ модель ОДНОВРЕМЕННО с первой (не вместо, как
+		// DECA_PROBE_RELOAD выше) в заданном мировом TRS, зеркало обнаруженной у пользователя сцены:
+		// большая (масштаб 3.07x, повёрнута ~90°) плоская панель, прижатая к точечному свету рядом с
+		// Sponza. Каждый инстанс второй модели несёт СВОЙ локальный TRS относительно её собственного
+		// корня (instance.transform) - он компонуется (локальный * заданный мировой) в одну матрицу,
+		// декомпозируется обратно в Position/Rotation/Scale3, ровно как GpuInstanceBufferSystem делает
+		// для дочерних сущностей с WorldMatrix (см. RenderingSystems.cs).
+		//   DECA_PROBE_MODEL2_POS="x,y,z"        - мировая позиция (default 0,0,0)
+		//   DECA_PROBE_MODEL2_ROT="x,y,z,w"      - мировой поворот, кватернион (default identity)
+		//   DECA_PROBE_MODEL2_SCALE="x,y,z"      - мировой масштаб (default 1,1,1)
+		var model2Path = Environment.GetEnvironmentVariable("DECA_PROBE_MODEL2");
+		if (!string.IsNullOrEmpty(model2Path))
+		{
+			var model2Pos = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_MODEL2_POS")) ?? Vector3.Zero;
+			var model2ScaleV = ParseVec(Environment.GetEnvironmentVariable("DECA_PROBE_MODEL2_SCALE")) ?? Vector3.One;
+			var model2Rot = Quaternion.Identity;
+			var rotStr = Environment.GetEnvironmentVariable("DECA_PROBE_MODEL2_ROT");
+			if (!string.IsNullOrWhiteSpace(rotStr))
+			{
+				var rp = rotStr.Split(',');
+				if (rp.Length == 4
+					&& float.TryParse(rp[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rx)
+					&& float.TryParse(rp[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ry)
+					&& float.TryParse(rp[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rz)
+					&& float.TryParse(rp[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rw))
+				{
+					model2Rot = new Quaternion(rx, ry, rz, rw);
+				}
+			}
+
+			Console.WriteLine($"[probe] model2: {model2Path} pos={model2Pos} rot={model2Rot} scale={model2ScaleV}");
+
+			var model2 = ModelLoader.Load(api, model2Path, new ModelLoadOptions
+			{
+				AnisotropicFiltering = anisotropic,
+				VertexShader = new EditorRef("shader/UnlitInstancedVS.hlsl"),
+				PixelShader = new EditorRef("shader/UnlitInstancedPS.hlsl"),
+				OptimizeMesh = false,
+				GenerateLods = false
+			});
+
+			var meshIdMap2 = new Dictionary<int, MeshId>();
+			var materialIdMap2 = new Dictionary<int, MaterialId>();
+			var batchCache2 = new Dictionary<(int, int), BatchId>();
+			ModelViewportGeometry.RegisterModelResources(env.BatchRenderer, model2, meshIdMap2, materialIdMap2,
+				sharedResources.EnvMapSampler, env.SceneCopyTarget, env.EnvironmentMap,
+				sceneCopySampler: sharedResources.SceneColorSampler);
+
+			// Локальный * мировой (тот же порядок композиции, что TransformSystem/GpuInstanceBufferSystem:
+			// System.Numerics, местный TRS слева, родитель справа).
+			var model2World = Matrix4x4.CreateScale(model2ScaleV) * Matrix4x4.CreateFromQuaternion(model2Rot)
+				* Matrix4x4.CreateTranslation(model2Pos);
+
+			int created2 = 0;
+			foreach (var instance in model2.instances)
+			{
+				var localTrs = Matrix4x4.CreateScale(instance.transform.scale)
+					* Matrix4x4.CreateFromQuaternion(instance.transform.rotation)
+					* Matrix4x4.CreateTranslation(instance.transform.position);
+				var worldTrs = localTrs * model2World;
+				if (!Matrix4x4.Decompose(worldTrs, out var wScale, out var wRot, out var wPos))
+				{
+					continue;
+				}
+
+				var worldTransform = new DecaEngine.Graphics.Transform
+				{
+					position = wPos,
+					rotation = wRot,
+					scale = wScale,
+				};
+
+				var entity2 = ModelViewportGeometry.CreateInstanceEntity(env.Store, env.ResourceManager,
+					env.BatchRenderer, meshIdMap2, materialIdMap2, batchCache2,
+					instance.meshId, instance.materialId, worldTransform);
+				if (entity2 != null)
+				{
+					created2++;
+				}
+			}
+			Console.WriteLine($"[probe] model2 entities created: {created2}");
+		}
+
 		var (min, max) = subMesh >= 0
 			? ModelViewportGeometry.ComputeSubMeshBounds(model, subMesh)
 			: model.ComputeBounds();
 		var target = (min + max) * 0.5f;
 		var radius = MathF.Max(0.05f, (max - min).Length() * 0.5f);
+		// Габариты печатаются всегда: без них DECA_PROBE_EYE/TARGET подбираются вслепую (интерьерный
+		// ракурс внутри двора орбитой недостижим, а промах на масштаб модели даёт кадр в стене).
+		Console.WriteLine($"[probe] bounds: min={min} max={max} size={max - min}");
 		var distance = ModelViewportGeometry.ComputeFramingDistance(radius, ModelViewportEnvironment.CameraFovDegrees) * zoom;
 		var eye = ModelViewportGeometry.ComputeOrbitEye(target, distance, yaw, 0.35f);
 
@@ -915,6 +1098,15 @@ public static class PreviewProbe
 							System.Globalization.CultureInfo.InvariantCulture, out var flickerGamma)
 							? flickerGamma
 							: -1f,
+						// DECA_PROBE_FLICKERVAR=<порог изменчивости>, 0 = не останавливать раунды.
+						// По умолчанию выключено: пропущенный раунд даёт нулевую разницу и подменил
+						// бы метрику мерцания нулями (см. MeasureFlicker).
+						variabilityThreshold: float.TryParse(
+							Environment.GetEnvironmentVariable("DECA_PROBE_FLICKERVAR"),
+							System.Globalization.NumberStyles.Float,
+							System.Globalization.CultureInfo.InvariantCulture, out var flickerVar)
+							? flickerVar
+							: 0f,
 						hardware: api.RayTracing >= RayTracingSupport.Inline,
 						environmentMap: env.EnvironmentMap,
 						skyRadiance: env.EnvironmentRadiance,
@@ -923,7 +1115,9 @@ public static class PreviewProbe
 						$"alpha {flicker.Alpha:F3}, global swing {flicker.GlobalSwing:P1}, " +
 						$"per-probe p50 {flicker.P50:P1} p90 {flicker.P90:P1} p99 {flicker.P99:P1} " +
 						$"max {flicker.MaxRelativeDelta:P0}, above 10% {flicker.ShareAbove10:P1} " +
-						$"(mean lum {flicker.MeanLuminanceAvg:F4})");
+						$"(mean lum {flicker.MeanLuminanceAvg:F4}), " +
+						$"variability {flicker.Variability:F4}, " +
+						$"skipped rounds {flicker.SkippedRoundShare:P0}");
 				}
 
 				// DECA_PROBE_TRACETEST=1 - сверить compute-обход BVH с CPU-эталоном (см.
@@ -1094,7 +1288,7 @@ public static class PreviewProbe
 								cycleAtlases, env.EnvironmentMap, env.ShadowSettings.EnvYawRadians,
 								gpuAccel);
 							while (!probe.RunRound(session, baker,
-								ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence),
+								ProbeGiBaker.RoundRayDirections(session),
 								ProbeGiBaker.RoundBlendWeight(session)))
 							{
 							}
@@ -1142,17 +1336,34 @@ public static class PreviewProbe
 					if (int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_CASCADES"),
 							out var cascadeCount) && cascadeCount > 1)
 					{
+						// DECA_PROBE_SCROLL=<n> - смоук ПРОКРУТКИ каскада (см.
+						// ProbeGiBakeSession.Scroll): единственный headless-способ проверить её
+						// целиком - раздачу слотов пула, перезаливку карт кирпичей и холодный раунд
+						// въехавших проб - до запуска редактора.
+						int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_SCROLL"),
+							out var scrollSteps);
+
 						var cascadeCenter = (fullMin + fullMax) * 0.5f;
 						var cascadeHalf = (fullMax - fullMin) * 0.5f;
 						for (int c = 1; c < Math.Min(cascadeCount, 3); c++)
 						{
 							var half = cascadeHalf / (1 << c);
+
+							// Область прокрутки - те же границы, что даёт вьюпорт (см.
+							// ProbeGiViewportShared.CreateCascade): по ней меряется ёмкость пула.
+							// Смоук обязан идти тем же путём, иначе он не проверяет сизинг вовсе -
+							// а ровно на нём и разваливался каскад в редакторе.
+							bakeOptions.ScrollOriginRange = scrollSteps > 0
+								? (fullMin, fullMax - half * 2f)
+								: null;
+							var cascadeOptions = bakeOptions;
+
 							var cascadeSession = baker.BeginBake(cascadeCenter - half,
 								cascadeCenter + half,
 								Vector3.Normalize(-env.ShadowSettings.LightDirection),
 								new Vector3(1f, 0.98f, 0.92f) * 2f,
 								env.ShadowSettings.EnvYawRadians, env.EnvironmentRadiance,
-								bakeOptions);
+								cascadeOptions, scrollable: scrollSteps > 0);
 							baker.EnsureSurfaceCache(cascadeSession);
 
 							var cascadeAtlases = new ProbeGiTextures(api, cascadeSession.Result,
@@ -1167,8 +1378,7 @@ public static class PreviewProbe
 								&& cascadeSession.Round < cascadeSession.TargetRounds)
 							{
 								if (cascadeGpu.RunRound(cascadeSession, baker,
-										ProbeGiBaker.RoundRayDirections(cascadeSession.RaysPerRound,
-											cascadeSession.Sequence),
+										ProbeGiBaker.RoundRayDirections(cascadeSession),
 										ProbeGiBaker.RoundBlendWeight(cascadeSession)))
 								{
 									cascadeSession.AdvanceRound();
@@ -1177,10 +1387,22 @@ public static class PreviewProbe
 
 							env.DilApi.ImmediateContext.Flush();
 							env.DilApi.ImmediateContext.WaitForIdle();
+							// Разрежённость КАСКАДА - число, решающее, во что обойдётся перевод каскадов
+							// на плотную тороидальную сетку по образцу RTXGI-DDGI. У базового объёма
+							// она заведомо выгоднее (он накрывает всю сцену с её пустотами), а
+							// решение принимается по каскаду: коробка у него маленькая и почти вся в
+							// геометрии, там плотная сетка должна быть почти бесплатной.
+							long cascadeDense = (long)cascadeSession.CountX * cascadeSession.CountY
+								* cascadeSession.CountZ;
 							Console.WriteLine($"[probe] cascade {c}: " +
 								$"{cascadeSession.CountX}x{cascadeSession.CountY}x{cascadeSession.CountZ} " +
 								$"virtual grid, {cascadeSession.ProbeCount} probes, cell " +
-								$"{cascadeSession.Cell.X:F2}");
+								$"{cascadeSession.Cell.X:F2}; dense would be {cascadeDense} " +
+								$"(x{(double)cascadeDense / Math.Max(cascadeSession.ProbeCount, 1):F2})");
+
+							ScrollCascadeSmoke(env, baker, cascadeSession, cascadeGpu, c,
+								half, scrollSteps);
+
 							// Раунд держит привязки на атласы - жить им до конца прогона, Dispose
 							// только раунду.
 							cascadeGpu.Dispose();
@@ -1219,7 +1441,7 @@ public static class PreviewProbe
 					{
 						// Раунд идёт порциями - headless-у ждать между кадрами нечего, докручиваем сразу.
 						while (!gpuRound.RunRound(session, baker,
-							ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence),
+							ProbeGiBaker.RoundRayDirections(session),
 							ProbeGiBaker.RoundBlendWeight(session)))
 						{
 							chunkCount++;
@@ -1270,6 +1492,17 @@ public static class PreviewProbe
 					$"{bake.BrickTotal} bricks over {brickGrid} cells, " +
 					$"levels [{string.Join('/', bake.BricksPerLevel)}], " +
 					$"{bake.BrickTotal * probesPerBrick} probes baked in {sw.ElapsedMilliseconds} ms");
+
+				// Во сколько раз разрежённость реально экономит - число, от которого зависит, имеет
+				// ли смысл переводить каскады на ПЛОТНУЮ тороидальную сетку по образцу RTXGI-DDGI
+				// (там объём плотный, и потому инвалидируется плоскость толщиной в ОДНУ пробу, а не
+				// кирпич в четыре). Если экономия мала, разрежённость каскаду не нужна, и вместе с
+				// ней уходят пул, индирекция, уверенность кирпича и весь механизм свежести.
+				long denseProbes = (long)bake.CountX * bake.CountY * bake.CountZ;
+				long sparseProbes = (long)bake.BrickTotal * probesPerBrick;
+				Console.WriteLine($"[probe] sparsity: dense grid would be {denseProbes} probes, " +
+					$"sparse pool is {sparseProbes} " +
+					$"(x{(double)denseProbes / Math.Max(sparseProbes, 1):F2} - во столько раз плотная дороже)");
 
 				// Санити-статистика испечённого поля прямо из атласов (альфы Sh0/Sh1/Sh2 = sky
 				// visibility / валидность / солнечная доля) - чтобы отличать баги бейка от багов
@@ -1380,9 +1613,16 @@ public static class PreviewProbe
 			// магента (1,0,1) - ветка не выполнилась; циан (0,1,1) - UV вне [0,1]; оранжевый
 			// (1,0.5,0) - UV в допуске, но ndc.z >= 1.0 (за дальней плоскостью); иначе - серое
 			// (r=g=b) с реальным shadowLit сэмплера.
-			long noBranch = 0, uvOut = 0, zOut = 0, sampled = 0, litSum = 0;
+			// Фон (пиксели без геометрии) ОБЯЗАН быть исключён: таргет очищается с alpha 0, шейдер на
+			// таких пикселях не запускается вовсе, и они несут цвет очистки. Раньше они не отсеивались
+			// и падали в корзину "sampled" - при модели, занимающей малую долю кадра, доли по
+			// категориям считались практически по фону, а средний shadowLit выходил равен яркости
+			// фона (0.53), что бы ни происходило со светом. Знаменатель - тоже только геометрия.
+			long noBranch = 0, uvOut = 0, zOut = 0, sampled = 0, litSum = 0, geomPx = 0;
 			for (int i = 0; i < dbgPixels.Length; i += 4)
 			{
+				if (dbgPixels[i + 3] < 128) continue;
+				geomPx++;
 				byte r = dbgPixels[i], g = dbgPixels[i + 1], b = dbgPixels[i + 2];
 				if (r > 200 && g < 50 && b > 200) noBranch++;
 				else if (r < 50 && g > 200 && b > 200) uvOut++;
@@ -1390,7 +1630,9 @@ public static class PreviewProbe
 				else { sampled++; litSum += r; }
 			}
 
-			long totalPx = dbgW * (long)dbgH;
+			long totalPx = Math.Max(geomPx, 1);
+			Console.WriteLine($"[probe] punctual debug coverage: geometry={geomPx} px of {dbgW * (long)dbgH} " +
+				"(доли ниже - от геометрии, не от кадра)");
 			Console.WriteLine($"[probe] punctual shadow debug (channel 11): no-branch={100.0 * noBranch / totalPx:F1}% " +
 				$"uv-out={100.0 * uvOut / totalPx:F1}% z-out(far plane)={100.0 * zOut / totalPx:F1}% " +
 				$"sampled={100.0 * sampled / totalPx:F1}% " +
@@ -1525,6 +1767,221 @@ public static class PreviewProbe
 			Console.WriteLine($"[probe] punctual cluster raw light count (channel 14): no-branch(punctualCount==0)={100.0 * countNoBranch / countTotalPx:F1}% " +
 				$"per-count pixel share: {(countHistStr.Length > 0 ? countHistStr : "(none)")}");
 			PngWriter.Write(Path.Combine(outDir, "probe_punctualcount.png"), countPixels, cw, ch);
+
+			// Канал 15 - величина выхода shadowUv за [0,1] у циан-пикселей канала 11 (см. HLSL): не
+			// просто "внутри/снаружи", а НАСКОЛЬКО снаружи - отличает пограничный перехлёст (чуть
+			// больше 1.0, ожидаемо у краёв слайса) от грубо неверного слайса/матрицы (UV в разы за
+			// пределами, что цвет канала 11 сам по себе не показывает).
+			PushPreviewSettings(model, 3, 15, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var excessPixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var ew, out var eh);
+
+			long excessCount = 0, excessMarginal = 0;
+			byte excessMaxByte = 0;
+			double excessSum = 0;
+			for (int i = 0; i < excessPixels.Length; i += 4)
+			{
+				byte r = excessPixels[i];
+				if (r == 0) continue;
+				excessCount++;
+				excessSum += r / 255.0 * 2.0;
+				if (r > excessMaxByte) excessMaxByte = r;
+				// "marginal" = excess < 0.05 world/NDC units past the edge - the face-overlap margin
+				// (91.8 deg fov vs 90 deg needed) is meant to absorb exactly this much.
+				if (r / 255.0 * 2.0 < 0.05) excessMarginal++;
+			}
+			double excessMax = excessMaxByte / 255.0 * 2.0;
+			Console.WriteLine($"[probe] punctual shadowUv excess magnitude (channel 15): " +
+				$"cyan-with-data={excessCount} px, avg excess={(excessCount > 0 ? excessSum / excessCount : 0):F4}, " +
+				$"max excess={excessMax:F4}, marginal(<0.05)={(excessCount > 0 ? 100.0 * excessMarginal / excessCount : 0):F1}% of cyan px");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualexcess.png"), excessPixels, ew, eh);
+
+			// Канал 16 - dbgShadowSlice (кодировка *16/255, как каналы 12/13), но ТОЛЬКО у циан-пикселей
+			// канала 11 (остальные чёрные). Прямой ответ на вопрос "у циан-пикселей вообще тот же слайс,
+			// что и у соседних белых", без визуального сравнения двух картинок глазами.
+			PushPreviewSettings(model, 3, 16, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var cyanSlicePixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var csw, out var csh);
+
+			var cyanSliceHistogram = new long[16];
+			long cyanSliceNoBranch = 0, cyanSliceBlack = 0;
+			for (int i = 0; i < cyanSlicePixels.Length; i += 4)
+			{
+				byte r = cyanSlicePixels[i], g = cyanSlicePixels[i + 1], b = cyanSlicePixels[i + 2];
+				if (r == 0 && g == 0 && b == 0) { cyanSliceBlack++; continue; }
+				if (r > 200 && g < 50 && b > 200) { cyanSliceNoBranch++; continue; }
+				int slice = (int)Math.Round(r / 16.0);
+				if (slice is >= 0 and < 16) cyanSliceHistogram[slice]++;
+			}
+			long cyanSliceTotalPx = csw * (long)csh;
+			var cyanSliceHistStr = string.Join(", ", cyanSliceHistogram.Select((count, idx) => $"{idx}:{100.0 * count / cyanSliceTotalPx:F2}%")
+				.Where((_, idx) => cyanSliceHistogram[idx] > 0));
+			Console.WriteLine($"[probe] slice index AT cyan pixels only (channel 16): non-cyan(black)={100.0 * cyanSliceBlack / cyanSliceTotalPx:F1}% " +
+				$"per-slice pixel share among cyan: {(cyanSliceHistStr.Length > 0 ? cyanSliceHistStr : "(none)")}");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualcyanslice.png"), cyanSlicePixels, csw, csh);
+
+			// Канал 17 - сырой shadowUv.xy циан-пикселей (см. HLSL): r=(u/8+0.5), g=(v/8+0.5), чёрный
+			// (0,0) = не циан. Печатаем min/max/avg декодированных u,v - видно ли реальный масштаб
+			// промаха (чуть за край vs улетело в другую грань) и есть ли систематический знак/сторона.
+			PushPreviewSettings(model, 3, 17, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var uvPixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var uvw, out var uvh);
+
+			double uMin = double.MaxValue, uMax = double.MinValue, uSum = 0;
+			double vMin = double.MaxValue, vMax = double.MinValue, vSum = 0;
+			long uvCount = 0;
+			for (int i = 0; i < uvPixels.Length; i += 4)
+			{
+				byte r = uvPixels[i], g = uvPixels[i + 1];
+				if (r == 0 && g == 0) continue;
+				double u = (r / 255.0 - 0.5) * 8.0;
+				double v = (g / 255.0 - 0.5) * 8.0;
+				uMin = Math.Min(uMin, u); uMax = Math.Max(uMax, u); uSum += u;
+				vMin = Math.Min(vMin, v); vMax = Math.Max(vMax, v); vSum += v;
+				uvCount++;
+			}
+			Console.WriteLine($"[probe] raw shadowUv at cyan pixels (channel 17): n={uvCount} " +
+				$"u: min={uMin:F3} max={uMax:F3} avg={(uvCount > 0 ? uSum / uvCount : 0):F3}, " +
+				$"v: min={vMin:F3} max={vMax:F3} avg={(uvCount > 0 ? vSum / uvCount : 0):F3}");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualuv.png"), uvPixels, uvw, uvh);
+
+			// Канал 18 - toFrag (worldPos - light) циан-пикселей, r/g/b=(toFrag.xyz/16+0.5): по нему
+			// вручную пересчитываем на CPU, какую грань куба ДОЛЖНА была выбрать доминирующая ось для
+			// этой мировой точки, и печатаем распределение "ожидаемая грань" рядом с уже известной
+			// per-slice раскладкой (канал 16) - расхождение изолирует, врёт выбор грани или проекция.
+			PushPreviewSettings(model, 3, 18, forceFlatWhite: false);
+			env.SetTonemapPassthrough(true);
+			env.Pipeline.InvalidateGraph();
+			for (int frame = 0; frame < 3; frame++)
+			{
+				time += 1f / 60f;
+				env.SetEyeAdaptationDeltaTime(1f / 60f);
+				env.Root.Update(new UpdateTick(1f / 60f, time));
+				env.Pipeline.Execute();
+			}
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+			var toFragPixels = DiligentTextureReadback.ReadRgba8(env.DilApi, (DiligentRenderTarget)env.ColorTarget,
+				out var tfw, out var tfh);
+
+			var expectedFaceHistogram = new long[6];
+			long toFragCount = 0;
+			for (int i = 0; i < toFragPixels.Length; i += 4)
+			{
+				byte r = toFragPixels[i], g = toFragPixels[i + 1], b = toFragPixels[i + 2];
+				if (r == 0 && g == 0 && b == 0) continue;
+				float tx = (r / 255f - 0.5f) * 16f;
+				float ty = (g / 255f - 0.5f) * 16f;
+				float tz = (b / 255f - 0.5f) * 16f;
+				float ax = MathF.Abs(tx), ay = MathF.Abs(ty), az = MathF.Abs(tz);
+				int face = ax >= ay && ax >= az ? (tx > 0 ? 0 : 1)
+					: ay >= az ? (ty > 0 ? 2 : 3)
+					: (tz > 0 ? 4 : 5);
+				expectedFaceHistogram[face]++;
+				toFragCount++;
+			}
+			var expectedFaceStr = string.Join(", ", expectedFaceHistogram.Select((count, idx) => $"{idx}:{100.0 * count / Math.Max(1, toFragCount):F1}%")
+				.Where((_, idx) => expectedFaceHistogram[idx] > 0));
+			Console.WriteLine($"[probe] expected face from CPU-recomputed toFrag at cyan pixels (channel 18): n={toFragCount} " +
+				$"per-face share: {(expectedFaceStr.Length > 0 ? expectedFaceStr : "(none)")}");
+			PngWriter.Write(Path.Combine(outDir, "probe_punctualtofrag.png"), toFragPixels, tfw, tfh);
+
+			env.SetTonemapPassthrough(false);
+		}
+
+		// DECA_PROBE_CHANNELS=<список номеров через запятую> - снять произвольный набор
+		// диагностических каналов UnlitInstancedPS одним прогоном, по PNG на канал
+		// (probe_channel<N>.png) плюс гистограмма цветов. Заведено потому, что блок PUNCTUALDEBUG
+		// выше жёстко зашит под теневые каналы 11..19 со своей числовой раскладкой у каждого: под
+		// каждый новый канал (кластерные 20/21, глубинные 22..24) там пришлось бы дописывать
+		// отдельную ветку, хотя для сравнения картинок достаточно самих картинок.
+		//
+		// Гистограмма - по 12 бинам цвета, чтобы не разглядывать PNG пипеткой: доминирующий бин на
+		// весь кадр сразу отвечает "канал показывает ОДНО значение" (то есть сетка/слайс/глубина
+		// вырождены), а доля магенты - какая часть геометрии до ветки канала вообще не дошла.
+		// Фон (alpha < 128) исключён везде: шейдер на пикселях без геометрии не запускается, и они
+		// несут цвет очистки таргета (грабли из блока PUNCTUALDEBUG, см. комментарий там).
+		var channelList = Environment.GetEnvironmentVariable("DECA_PROBE_CHANNELS");
+		if (!string.IsNullOrWhiteSpace(channelList))
+		{
+			var channels = channelList
+				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+				.Select(s => int.TryParse(s, out var n) ? n : -1)
+				.Where(n => n >= 0)
+				.ToArray();
+
+			env.SetTonemapPassthrough(true);
+
+			foreach (var channel in channels)
+			{
+				PushPreviewSettings(model, 3, channel, forceFlatWhite: false);
+				env.Pipeline.InvalidateGraph();
+				env.DilApi.ImmediateContext.Flush();
+				env.DilApi.ImmediateContext.WaitForIdle();
+
+				for (int frame = 0; frame < 3; frame++)
+				{
+					time += 1f / 60f;
+					env.SetEyeAdaptationDeltaTime(1f / 60f);
+					env.Root.Update(new UpdateTick(1f / 60f, time));
+					env.Pipeline.Execute();
+				}
+
+				env.DilApi.ImmediateContext.Flush();
+				env.DilApi.ImmediateContext.WaitForIdle();
+
+				var chPixels = DiligentTextureReadback.ReadRgba8(env.DilApi,
+					(DiligentRenderTarget)env.ColorTarget, out var chW, out var chH);
+				PngWriter.Write(Path.Combine(outDir, $"probe_channel{channel}.png"), chPixels, chW, chH);
+
+				var bins = new Dictionary<string, long>();
+				long chGeom = 0;
+				for (int i = 0; i < chPixels.Length; i += 4)
+				{
+					if (chPixels[i + 3] < 128) continue;
+					chGeom++;
+					bins[ColorBin(chPixels[i], chPixels[i + 1], chPixels[i + 2])] =
+						bins.GetValueOrDefault(ColorBin(chPixels[i], chPixels[i + 1], chPixels[i + 2])) + 1;
+				}
+
+				var top = bins.OrderByDescending(kv => kv.Value).Take(6)
+					.Select(kv => $"{kv.Key} {100.0 * kv.Value / Math.Max(1, chGeom):F1}%");
+				Console.WriteLine($"[probe] channel {channel}: geometry={chGeom} px of {chW * (long)chH}, " +
+					$"colors: {string.Join(", ", top)}");
+			}
 
 			env.SetTonemapPassthrough(false);
 		}
@@ -1972,6 +2429,12 @@ public static class PreviewProbe
 		if (longRunFrames > 0)
 		{
 			Console.WriteLine($"[probe] long run: {longRunFrames} frames...");
+			// Стенные часы вокруг прогона: единственный способ увидеть цену того, что происходит в
+			// ПИКСЕЛЬНОМ шейдере (выборка probe-GI, её билинейка по картам видимости) - на неё нет
+			// ни счётчика раундов, ни таймера диспатча. Число грубое и включает всё подряд, поэтому
+			// сравнивать им можно только один и тот же прогон до и после правки, и только если
+			// разница выходит за разброс между повторами.
+			var swLongRun = System.Diagnostics.Stopwatch.StartNew();
 			for (int frame = 0; frame < longRunFrames; frame++)
 			{
 				// Зеркало редакторного привода (ModelPreviewViewport.PollProbeBake): по раунду на
@@ -2022,7 +2485,9 @@ public static class PreviewProbe
 
 			env.DilApi.ImmediateContext.Flush();
 			env.DilApi.ImmediateContext.WaitForIdle();
-			Console.WriteLine("[probe] long run complete" +
+			double frameMs = swLongRun.Elapsed.TotalMilliseconds / Math.Max(longRunFrames, 1);
+			Console.WriteLine($"[probe] long run complete in {swLongRun.ElapsedMilliseconds} ms " +
+				$"({frameMs:F2} ms/frame)" +
 				(_gpuRoundLongRun != null
 					? $"; gpu rounds run {_gpuRoundsRun}, skipped by fence {_gpuRoundsSkipped}"
 					: string.Empty));
@@ -2081,8 +2546,59 @@ public static class PreviewProbe
 			PngWriter.Write(Path.Combine(outDir, "probe_resized.png"), resizedPixels, resizedWidth, resizedHeight);
 		}
 
+		// Итоговые счётчики компиляции/PSO - ИМЕННО здесь, после всех отрисованных кадров: шейдеры
+		// компилируются в SetShader на загрузке, а PSO создаётся лениво в первом SetPipelineState,
+		// поэтому строки "[probe] load pso/compile" выше всегда снимают состояние ДО первого draw.
+		Console.WriteLine($"[probe] final compile: {DecaEngine.Graphics.Diligent.DiligentShader.DiagCompileCalls} calls, " +
+			$"{DecaEngine.Graphics.Diligent.DiligentShader.DiagCompileActual} РЕАЛЬНЫХ, " +
+			$"{DecaEngine.Graphics.Diligent.DiligentShader.DiagCompileMs} ms");
+
+		var psoByName = DecaEngine.Graphics.Diligent.DiligentPsoManager.DiagByName;
+		Console.WriteLine($"[probe] final pso: {DecaEngine.Graphics.Diligent.DiligentPsoManager.DiagCreateCount} created, " +
+			$"{DecaEngine.Graphics.Diligent.DiligentPsoManager.DiagCreateMs} ms, " +
+			$"{psoByName.Count} УНИКАЛЬНЫХ имён, " +
+			$"{DecaEngine.Graphics.Diligent.DiligentPsoManager.DiagSharedHits} переиспользований");
+
+		// DECA_PSO_DIAG=1 - поимённая раскладка: видно и сколько PSO дала модель (по одному на
+		// материал), и какие имена пересобирались повторно.
+		if (Environment.GetEnvironmentVariable("DECA_PSO_DIAG") == "1")
+		{
+			foreach (var entry in psoByName.OrderByDescending(e => e.Value.Ms))
+			{
+				Console.WriteLine($"[probe]   pso x{entry.Value.Count} {entry.Value.Ms,5} ms  {entry.Key}");
+			}
+		}
+
 		Console.WriteLine("[probe] done");
 		Environment.Exit(0);
+	}
+
+	/// <summary>Грубая корзина цвета для гистограммы DECA_PROBE_CHANNELS. Именно оттенок, а не
+	/// точный RGB: у каналов рампы (22/23) соседние пиксели различаются на единицы, и гистограмма по
+	/// точным цветам выродилась бы в тысячи корзин по 0.1%, ничего не сказав. Магента вынесена
+	/// отдельной корзиной во всех каналах - это общий код "ветка сюда не дошла".</summary>
+	private static string ColorBin(byte r, byte g, byte b)
+	{
+		if (r > 200 && g < 60 && b > 200) return "magenta(no-branch)";
+		if (r < 40 && g < 40 && b < 40) return "black";
+		if (r > 215 && g > 215 && b > 215) return "white";
+
+		int max = Math.Max(r, Math.Max(g, b));
+		int min = Math.Min(r, Math.Min(g, b));
+		if (max - min < 30) return $"grey~{max / 32 * 32}";
+
+		// Доминирующая пара каналов - имя оттенка; яркость огрубляется до трёх ступеней, чтобы
+		// «тусклый красный» и «яркий красный» (у каналов 20 и 24 это разные вещи) не слипались.
+		string hue =
+			  r == max && g >= b + 60 ? "yellow"
+			: r == max && b >= g + 60 ? "magenta-ish"
+			: r == max ? "red"
+			: g == max && b >= r + 60 ? "cyan"
+			: g == max ? "green"
+			: b == max && r >= g + 60 ? "violet"
+			: "blue";
+		string level = max > 200 ? "bright" : max > 110 ? "mid" : "dim";
+		return $"{level}-{hue}";
 	}
 
 	/// <summary>Зеркало <see cref="ModelPreviewViewport.ApplyPreviewSettingsToMaterials"/>: Mode/Channel
@@ -2096,6 +2612,142 @@ public static class PreviewProbe
 	/// <summary>Атласы мелких каскадов (DECA_PROBE_CASCADES, зеркало
 	/// ModelPreviewViewport._probeCascades) - индекс 0 уходит в слоты _C1, 1 - в _C2.</summary>
 	private static readonly List<ProbeGiTextures> CascadeTextures = new();
+
+	/// <summary>Смоук ПРОКРУТКИ каскада (DECA_PROBE_SCROLL): гоняет объём шагами вдоль X, как это
+	/// делает камера во вьюпорте, и печатает то, ради чего прокрутка и написана, - сколько слотов
+	/// пула УДЕРЖАЛО своё поле против того, сколько заселено заново, и во что обошёлся сам сдвиг.
+	///
+	/// Это не декорация: в редакторе прокрутка живёт в кадре движения камеры, воспроизвести её
+	/// руками дорого, а сломать легко - раздача слотов, выравнивание якорей слитых кирпичей и
+	/// холодный раунд въехавших проб связаны между собой и молча деградируют в «поле мигает»
+	/// вместо честного отказа.</summary>
+	private static void ScrollCascadeSmoke(ModelViewportEnvironment env, ProbeGiBaker baker,
+		ProbeGiBakeSession session, ProbeRoundGpu gpu, int cascade, Vector3 half, int steps)
+	{
+		if (steps <= 0)
+		{
+			return;
+		}
+
+		// Шаг - четверть бокса по X: ровно тот порог, на котором вьюпорт решает, что объёму пора
+		// ехать (см. ProbeGiViewportShared.NeedsRecenter).
+		var step = new Vector3(half.X * 0.5f, 0f, 0f);
+		for (int s = 0; s < steps; s++)
+		{
+			var before = session.Origin;
+			ProbeGiViewportShared.ScrollVolume(session, ProbeGiViewportShared.VolumeCenter(session) + step);
+
+			// Заявка исполняется на границе раунда, а не в момент подачи (см.
+			// ProbeGiBakeSession.RequestScroll), поэтому переезд меряется вместе с первой порцией
+			// раунда - это и есть та работа, которую в редакторе видит кадр движения камеры.
+			var sw = System.Diagnostics.Stopwatch.StartNew();
+			bool roundDone = gpu.RunRound(session, baker,
+				ProbeGiBaker.RoundRayDirections(session),
+				ProbeGiBaker.RoundBlendWeight(session));
+			long scrollMs = sw.ElapsedMilliseconds;
+			if (session.Origin == before)
+			{
+				Console.WriteLine($"[probe] cascade {cascade} scroll {s}: refused (step below quantum)");
+				continue;
+			}
+
+			// Какие слоты этот переезд заселил с нуля - берётся из снимка ThawColdBricks, а не из
+			// счётчиков свежести: прогрев холодных кирпичей идёт ВНУТРИ первой порции раунда (см.
+			// ProbeRoundGpu.WarmColdBricks) и там же снимает с них холод, так что к этому моменту
+			// счётчики уже тикнуты и по ним свежих не видно вовсе.
+			int live = 0;
+			var freshSlots = session.LastThawed ?? new bool[session.BrickTotal];
+			int fresh = session.LastThawedCount;
+			for (int slot = 0; slot < session.BrickTotal; slot++)
+			{
+				if (session.BrickAlive[slot])
+				{
+					live++;
+				}
+			}
+
+			// Дожимаем холодный раунд въехавших проб - тот, после которого они появляются в
+			// индирекции. Первая его порция уже выпущена выше вместе с самим переездом.
+			while (!roundDone)
+			{
+				roundDone = gpu.RunRound(session, baker,
+					ProbeGiBaker.RoundRayDirections(session),
+					ProbeGiBaker.RoundBlendWeight(session));
+			}
+
+			session.AdvanceRound();
+			env.DilApi.ImmediateContext.Flush();
+			env.DilApi.ImmediateContext.WaitForIdle();
+
+			// Главная проверка прокрутки: холодный раунд обязан ЗАПОЛНИТЬ въехавшие пробы, а не
+			// оставить в них ни ноль (тогда во въехавшей области дырка), ни поле прежнего жильца
+			// слота (тогда там вспыхнет освещение чужого угла сцены). Сравниваем среднюю яркость
+			// свежих проб с удержавшими своё поле - у здоровой прокрутки это один порядок.
+			var field = gpu.ReadField();
+			double keptLum = 0, freshLum = 0;
+			int keptProbes = 0, freshProbes = 0, freshZero = 0;
+			const int perBrick = ProbeGiBaker.BrickProbes * ProbeGiBaker.BrickProbes
+				* ProbeGiBaker.BrickProbes;
+			for (int slot = 0; slot < session.BrickTotal; slot++)
+			{
+				if (!session.BrickAlive[slot])
+				{
+					continue;
+				}
+
+				for (int i = 0; i < perBrick; i++)
+				{
+					var sh0 = field[(slot * perBrick + i) * 4];
+					double lum = 0.2126 * sh0.X + 0.7152 * sh0.Y + 0.0722 * sh0.Z;
+					if (freshSlots[slot])
+					{
+						freshLum += lum;
+						freshProbes++;
+						if (lum <= 0.0)
+						{
+							freshZero++;
+						}
+					}
+					else
+					{
+						keptLum += lum;
+						keptProbes++;
+					}
+				}
+			}
+
+			// Распределение уверенности кирпичей в индирекции (канал b): 0 - кирпича нет/не прогрет,
+			// 255 - прожил окно свежести целиком. Промежуточные значения и есть то самое плавное
+			// проявление въехавших кирпичей - если их нет, поправка не работает.
+			int confZero = 0, confFull = 0, confPartial = 0;
+			var ind = session.Result.Indirection;
+			for (int t = 0; t + 3 < ind.Length; t += 4)
+			{
+				byte b = ind[t + 2];
+				if (b == 0)
+				{
+					confZero++;
+				}
+				else if (b == 255)
+				{
+					confFull++;
+				}
+				else
+				{
+					confPartial++;
+				}
+			}
+
+			Console.WriteLine($"[probe] cascade {cascade} scroll {s}: conf {confZero} none / " +
+				$"{confPartial} fading / {confFull} full");
+			Console.WriteLine($"[probe] cascade {cascade} scroll {s}: {scrollMs} ms, " +
+				$"pool {live}/{session.BrickTotal} live, {fresh} fresh ({live - fresh} kept), " +
+				$"origin x {session.Origin.X:F2}; field lum kept " +
+				$"{(keptProbes > 0 ? keptLum / keptProbes : 0):F3}, fresh " +
+				$"{(freshProbes > 0 ? freshLum / freshProbes : 0):F3} " +
+				$"({freshZero}/{freshProbes} still empty)");
+		}
+	}
 
 	// GPU-путь для длинного прогона (DECA_PROBE_FRAMES): раунд на кадр, как в редакторе.
 	private static ProbeRoundGpu? _gpuRoundLongRun;

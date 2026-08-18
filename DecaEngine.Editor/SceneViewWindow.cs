@@ -13,8 +13,15 @@ namespace DecaEngine.Editor
 	/// </summary>
 	public class SceneViewWindow : ImGuiDockingWindow
 	{
+		// Порядок ОБЯЗАН совпадать с PrefabSceneViewport.ShadingMode - Combo отдаёт индекс, который
+		// приводится к перечислению напрямую.
 		private static readonly string[] ShadingLabels =
-			{ "Lighting", "Textured", "Normal", "UV", "Tangent", "Punctual Shadow Debug" };
+		{
+			"Lighting", "Textured", "Normal", "UV", "Tangent", "Punctual Shadow Debug",
+			"Cluster Depth Slices", "Cluster Screen Tiles", "Cluster Light Count",
+			"Light Depth: Receiver", "Light Depth: Occluder", "Light Depth: Gap",
+			"Sun Shadow Cascades",
+		};
 
 		private readonly InspectorWindow _inspectorWindow;
 		private readonly PrefabSceneViewport _sceneViewport;
@@ -60,13 +67,18 @@ namespace DecaEngine.Editor
 				_inspectorWindow.NotifyTransformChangedExternally();
 			}
 
-			if (root is null)
+			// Сцена на паузе (Inspector показывает превью модели) снята с GPU целиком - модель
+			// редактора грузится ровно в одном месте, см. PrefabSceneViewport.SetActive. Кадр при
+			// этом пишется, но пустой, поэтому объясняем пустоту подсказкой, как и закрытый префаб.
+			var hint = !_sceneViewport.IsActive
+				? "Scene paused - Inspector is showing a model preview"
+				: root is null ? "No prefab loaded" : null;
+			if (hint != null)
 			{
 				var center = cursor + canvasSize * 0.5f;
-				var text = "No prefab loaded";
-				var textSize = ImGui.CalcTextSize(text);
+				var textSize = ImGui.CalcTextSize(hint);
 				ImGui.GetWindowDrawList().AddText(center - textSize * 0.5f,
-					ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.6f)), text);
+					ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.6f)), hint);
 			}
 
 			// Клик по вьюпорту: объект - выделяем его в Inspector-е (и гизмо переезжает на него),
@@ -122,18 +134,13 @@ namespace DecaEngine.Editor
 			{
 				_sceneViewport.SetShading((PrefabSceneViewport.ShadingMode)shadingIndex);
 			}
-			if (ImGui.IsItemHovered())
+			// Легенда ВЫБРАННОГО отладочного режима - у каждого своя (см.
+			// PrefabSceneViewport.ClusterLegend): у кластерных видов ценность целиком в том, что
+			// ожидаемая картинка известна заранее, и держать её надо перед глазами, а не в статье.
+			var hoveredShading = (PrefabSceneViewport.ShadingMode)shadingIndex;
+			if (ImGui.IsItemHovered() && hoveredShading >= PrefabSceneViewport.ShadingMode.PunctualShadowDebug)
 			{
-				// "Punctual Shadow Debug" - см. PrefabSceneViewport.ShadingMode.PunctualShadowDebug и
-				// UnlitInstancedPS.hlsl PreviewChannel == 11: цветовая легенда сэмплинга теней
-				// point/spot светов, тот же канал, что диагностирует DECA_PROBE_PUNCTUALDEBUG.
-				ImGui.SetTooltip(
-					"Punctual Shadow Debug legend:\n" +
-					"magenta - shadow sampling branch didn't run (light has no assigned shadow slice,\n" +
-					"          or the point is outside the light's radius)\n" +
-					"orange  - receiver point is beyond the shadow slice's far plane\n" +
-					"cyan    - receiver point is outside the shadow slice's UV square\n" +
-					"grey    - actual sampled shadow result (black = shadowed, white = lit)");
+				ImGui.SetTooltip(PrefabSceneViewport.ClusterLegend(hoveredShading));
 			}
 
 			// HDR+GI: одна галочка включает и авто-экспозицию (HDR-конвейер), и probe-GI сцены.

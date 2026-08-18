@@ -27,6 +27,7 @@ internal static class ProbeGiViewportShared
 		session.RealtimeBlend = Math.Clamp(settings.ProbeGiRealtimeBlend, 0.01f, 0.5f);
 		session.RealtimeMaxStep = Math.Clamp(settings.ProbeGiRealtimeMaxStep, 0f, 0.2f);
 		session.RealtimeGamma = Math.Clamp(settings.ProbeGiRealtimeGamma, 1f, 8f);
+		session.VariabilityThreshold = MathF.Max(settings.ProbeGiVariabilityThreshold, 0f);
 		session.RealtimeRelocation = Math.Clamp(settings.ProbeGiRealtimeRelocation, 0f, 0.45f);
 	}
 
@@ -81,7 +82,7 @@ internal static class ProbeGiViewportShared
 			}
 
 			if (!gpu.RunRound(session, baker,
-					ProbeGiBaker.RoundRayDirections(session.RaysPerRound, session.Sequence),
+					ProbeGiBaker.RoundRayDirections(session),
 					ProbeGiBaker.RoundBlendWeight(session)))
 			{
 				continue;
@@ -121,8 +122,10 @@ internal static class ProbeGiViewportShared
 			lo.Z <= hi.Z ? Math.Clamp(target.Z, lo.Z, hi.Z) : mid.Z);
 	}
 
-	/// <summary>Гистерезис перецентровки: пересоздавать каскад, только если желаемый центр ушёл
-	/// дальше четверти бокса - мелкие движения камеры не трогают ничего.</summary>
+	/// <summary>Гистерезис перецентровки: двигать объём, только если желаемый центр ушёл дальше
+	/// четверти бокса - мелкие движения камеры не трогают ничего. Порог не снижен вместе с
+	/// удешевлением переезда (см. ScrollVolume) сознательно: сдвиг квантуется кирпичом, и на
+	/// каскаде в четыре кирпича по оси четверть бокса - это ровно один квант.</summary>
 	internal static bool NeedsRecenter(Vector3 center, Vector3 desired, Vector3 half)
 	{
 		var delta = Vector3.Abs(desired - center);
@@ -131,17 +134,25 @@ internal static class ProbeGiViewportShared
 
 	/// <summary>Сетки базового объёма и каскадов - в кбуфер материала. Origin.w = 1 - тумблер
 	/// шейдера; незаполненные каскады остаются нулями, и шейдер их не трогает.</summary>
+	/// <param name="viewBias">Доля ВЗГЛЯДА в направлении сдвига точки сэмпла, 0..1 (уходит в
+	/// свободную .w счётчиков сетки - см. ProbeGiSampleBody). 1 - сдвиг строго к камере, 0 - строго
+	/// по нормали.</param>
 	internal static void PushGrid(ref PreviewSettingsData data, ProbeGiTextures textures,
-		IReadOnlyList<(ProbeGiBakeSession Session, ProbeGiTextures Textures, ProbeRoundGpu Gpu,
-			Vector3 Center)> cascades,
-		float normalBias)
+		IReadOnlyList<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
+			ProbeRoundGpu Gpu)> cascades,
+		float normalBias, float viewBias)
 	{
 		float bias = 0.75f * Math.Clamp(normalBias, 0f, 2f);
+		float view = Math.Clamp(viewBias, 0f, 1f);
+
+		static Vector4 Counts(Vector4 counts, float view) =>
+			new(counts.X, counts.Y, counts.Z, view);
+
 		data.ProbeGridOrigin = textures.GridOrigin;
 		data.ProbeGridCell = new Vector4(
 			textures.GridCell.X, textures.GridCell.Y, textures.GridCell.Z,
 			textures.MinCellSize * bias);
-		data.ProbeGridCounts = textures.GridCounts;
+		data.ProbeGridCounts = Counts(textures.GridCounts, view);
 		data.ProbeGridBricks = textures.GridBricks;
 
 		if (cascades.Count > 0)
@@ -150,7 +161,7 @@ internal static class ProbeGiViewportShared
 			data.ProbeGridOrigin1 = t.GridOrigin;
 			data.ProbeGridCell1 = new Vector4(
 				t.GridCell.X, t.GridCell.Y, t.GridCell.Z, t.MinCellSize * bias);
-			data.ProbeGridCounts1 = t.GridCounts;
+			data.ProbeGridCounts1 = Counts(t.GridCounts, view);
 			data.ProbeGridBricks1 = t.GridBricks;
 		}
 
@@ -160,7 +171,7 @@ internal static class ProbeGiViewportShared
 			data.ProbeGridOrigin2 = t.GridOrigin;
 			data.ProbeGridCell2 = new Vector4(
 				t.GridCell.X, t.GridCell.Y, t.GridCell.Z, t.MinCellSize * bias);
-			data.ProbeGridCounts2 = t.GridCounts;
+			data.ProbeGridCounts2 = Counts(t.GridCounts, view);
 			data.ProbeGridBricks2 = t.GridBricks;
 		}
 	}
@@ -189,8 +200,8 @@ internal static class ProbeGiViewportShared
 	/// Кэш поверхностей здесь НЕ захватывается сознательно: каскады существуют только в реальном
 	/// времени, где кэш не читается (см. этап 3), а его захват стоил сотен миллисекунд - превью
 	/// платило их за каждый каскад впустую, пока создание жило в двух копиях.</summary>
-	internal static (ProbeGiBakeSession Session, ProbeGiTextures Textures, ProbeRoundGpu Gpu,
-		Vector3 Center) CreateCascade(
+	internal static (ProbeGiBakeSession Session, ProbeGiTextures Textures, ProbeRoundGpu Gpu)
+		CreateCascade(
 		ProbeGiBaker baker, ProbeRoundPipelines pipelines, ProbeSceneAccel? accel,
 		ModelViewportEnvironment env, IGraphicsApi graphicsApi, EditorSettings settings,
 		IEnumerable<ModelLoader> models, string atlasName, int index, Vector3 target,
@@ -198,9 +209,25 @@ internal static class ProbeGiViewportShared
 	{
 		var half = CascadeHalfExtent(boundsMin, boundsMax, index);
 		var center = ClampCascadeCenter(boundsMin, boundsMax, target, half);
+
+		// Область, по которой меряется ёмкость пула: те же границы, в которые ClampCascadeCenter
+		// загоняет ЦЕНТР коробки, пересчитанные в её УГОЛ. Без этого ёмкость считалась бы по месту
+		// создания каскада - то есть по тому, куда случайно смотрела камера в момент включения
+		// probe-GI, - и каскад, созданный над пустым местом, разваливался бы, как только камера
+		// влетит внутрь здания (см. BeginBake, там числа).
+		var options = BuildOptions(settings);
+		var lo = boundsMin + half;
+		var hi = boundsMax - half;
+		options.ScrollOriginRange = (
+			Vector3.Min(lo, hi) - half,
+			Vector3.Max(lo, hi) - half);
+
+		// scrollable: каскад ездит за камерой ПРОКРУТКОЙ, а не пересозданием (см.
+		// ProbeGiBakeSession.Scroll) - пул заводится с запасом слотов, осмотр геометрии кэшируется.
 		var session = baker.BeginBake(center - half, center + half,
 			Vector3.Normalize(-env.ShadowSettings!.LightDirection), sunColor,
-			env.ShadowSettings.EnvYawRadians, env.EnvironmentRadiance, BuildOptions(settings));
+			env.ShadowSettings.EnvYawRadians, env.EnvironmentRadiance, options,
+			scrollable: true);
 
 		var textures = new ProbeGiTextures(graphicsApi, session.Result, atlasName, gpuWritable: true);
 		foreach (var model in models)
@@ -210,8 +237,76 @@ internal static class ProbeGiViewportShared
 
 		return (session, textures,
 			new ProbeRoundGpu(env.DilApi, pipelines, session, baker, textures,
-				env.EnvironmentMap, env.ShadowSettings.EnvYawRadians, accel),
-			center);
+				env.EnvironmentMap, env.ShadowSettings.EnvYawRadians, accel));
+	}
+
+	/// <summary>Переехал ли хоть один каскад с прошлого опроса - по номерам раскладок.
+	///
+	/// Нужно ровно для одного: после переезда угол сетки каскада обязан заново уехать в кбуферы
+	/// материалов (см. PushGrid). Пуш идёт НЕ каждый кадр, а по изменениям, и пока это место
+	/// пустовало, материалы продолжали сэмплить каскад по СТАРОМУ углу: свет оставался там, откуда
+	/// объём уехал, и рвался по границе с базовым объёмом. Симптом был обманчиво «графическим» -
+	/// включение и выключение дебаг-вида проб чинило картинку, потому что смена настроек переталкивает
+	/// те же константы.
+	///
+	/// Раньше этот пуш делала сама перецентровка: она пересоздавала каскад и звала ApplyMaterialSettings
+	/// следом. Прокрутка ничего не пересоздаёт, поэтому о переезде надо спрашивать явно.</summary>
+	internal static bool CascadeLayoutChanged(
+		IReadOnlyList<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
+			ProbeRoundGpu Gpu)> cascades,
+		ref int stamp)
+	{
+		int current = cascades.Count;
+		for (int i = 0; i < cascades.Count; i++)
+		{
+			current = current * 397 + cascades[i].Session.LayoutGeneration;
+		}
+
+		if (current == stamp)
+		{
+			return false;
+		}
+
+		stamp = current;
+		return true;
+	}
+
+	/// <summary>Фактический центр объёма по его текущему углу - ЕДИНСТВЕННЫЙ источник правды о том,
+	/// где каскад сейчас стоит.
+	///
+	/// Копию центра рядом с сессией держать нельзя, и это ровно та ошибка, из-за которой каскады
+	/// разъезжались: заказанный центр не равен фактическому (сдвиг квантуется кирпичами), а с
+	/// отложенным исполнением заявки он вдобавок опережает переезд на несколько кадров. Вьюпорт,
+	/// сверявшийся с такой копией, считал объём уже переехавшим и переставал слать заявки.</summary>
+	internal static Vector3 VolumeCenter(ProbeGiBakeSession session) =>
+		session.Origin + new Vector3(
+			session.Cell.X * (session.CountX - 1),
+			session.Cell.Y * (session.CountY - 1),
+			session.Cell.Z * (session.CountZ - 1)) * 0.5f;
+
+	/// <summary>Ведёт каскад за точкой интереса ПРОКРУТКОЙ - единственная реализация на оба вьюпорта.
+	///
+	/// Здесь раньше стояло пересоздание объёма (новая сессия, новый комплект GPU-буферов с выгрузкой
+	/// всего BVH сцены, семь атласов, переприязка материалов, Flush + WaitForIdle), и именно оно
+	/// давало рывок на каждое движение камеры - настолько заметный, что пересоздание пришлось
+	/// откладывать дебаунсом до полной остановки камеры, отчего каскады переставали успевать за
+	/// взглядом. Прокрутка не создаёт и не освобождает НИЧЕГО: она сдвигает объём на целое число
+	/// кирпичей, оставляет каждому уцелевшему кирпичу его слот пула вместе с накопленным полем и
+	/// осматривает геометрией только въехавшую область. Поэтому её можно и нужно гонять прямо в
+	/// движении - никакого дебаунса.
+	///
+	/// Заявка исполняется не здесь, а на границе раунда, атомарно с выгрузкой раскладки на GPU (см.
+	/// ProbeGiBakeSession.RequestScroll): позиции проб читают и материалы, и раунд, и дебаг-оверлей,
+	/// и применить переезд в стороне от выгрузки значит развести их по разным поколениям раскладки.
+	/// Поэтому здесь ничего и не возвращается - «переехал ли объём» на этот момент ещё не решено, а
+	/// вьюпорту знать это и не нужно: он сверяется с ФАКТИЧЕСКИМ центром (см. VolumeCenter).</summary>
+	internal static void ScrollVolume(ProbeGiBakeSession session, Vector3 target)
+	{
+		var half = new Vector3(
+			session.Cell.X * (session.CountX - 1),
+			session.Cell.Y * (session.CountY - 1),
+			session.Cell.Z * (session.CountZ - 1)) * 0.5f;
+		session.RequestScroll(target - half);
 	}
 
 	/// <summary>Ведёт набор дебаг-оверлеев (шарики проб) за галочкой и жизнью атласов: base +
@@ -222,8 +317,8 @@ internal static class ProbeGiViewportShared
 		List<(ProbeDebugOverlay Overlay, ProbeGiTextures Textures)> overlays,
 		bool want, ref bool failed, ModelViewportEnvironment env, IGraphicsApi graphicsApi,
 		ProbeGiBakeSession? session, ProbeGiTextures? textures,
-		IReadOnlyList<(ProbeGiBakeSession Session, ProbeGiTextures Textures, ProbeRoundGpu Gpu,
-			Vector3 Center)> cascades)
+		IReadOnlyList<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
+			ProbeRoundGpu Gpu)> cascades)
 	{
 		want = want && session != null && textures != null && !failed;
 
@@ -239,7 +334,20 @@ internal static class ProbeGiViewportShared
 			ReleaseOverlays(overlays, env);
 		}
 
-		if (!want || overlays.Count > 0)
+		if (overlays.Count > 0)
+		{
+			// Объёмы ездят прокруткой (см. ScrollVolume), и шарики обязаны ехать с ними: оверлей
+			// сверяет номер раскладки сам и в неподвижном кадре не делает ничего.
+			overlays[0].Overlay.Refresh(session!);
+			for (int i = 0; i < cascades.Count && i + 1 < overlays.Count; i++)
+			{
+				overlays[i + 1].Overlay.Refresh(cascades[i].Session);
+			}
+
+			return;
+		}
+
+		if (!want)
 		{
 			return;
 		}
@@ -331,5 +439,6 @@ internal static class ProbeGiViewportShared
 		RealtimeMaxStep = settings.ProbeGiRealtimeMaxStep,
 		RealtimeRelocation = settings.ProbeGiRealtimeRelocation,
 		RealtimeGamma = settings.ProbeGiRealtimeGamma,
+		RealtimeVariabilityThreshold = settings.ProbeGiVariabilityThreshold,
 	};
 }

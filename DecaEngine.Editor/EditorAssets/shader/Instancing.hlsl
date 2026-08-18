@@ -88,7 +88,14 @@ struct LightData
 #define CLUSTER_GRID_Z 24
 #define CLUSTER_COUNT (CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z)
 #define CLUSTER_MAX_LIGHTS 32
+// Тредов в группе кластеризации (LightClusterCS.hlsl): один тред - один кластер, и он же за батч
+// подтягивает один свет в groupshared. Зеркалит LightClusters.CullGroupSize - им же считается
+// число групп в ExecuteLightClustering.
+#define CLUSTER_CULL_GROUP 64
 #define PUNCTUAL_SHADOW_SLICES 16
+// Сторона одного слайса теней punctual-света. Зеркалит LightClusters.ShadowMapSize (LightData.cs) -
+// у каскадов солнца своё разрешение (4096), так что общей константы на все тени нет.
+#define PUNCTUAL_SHADOW_MAP_SIZE 1024.0
 
 // Зеркало PunctualLight (LightData.cs): позиция/направление МИРОВЫЕ, кластеризация переводит их во
 // view сама (LightClusterCS.hlsl), шейдинг работает в мировом пространстве (UnlitInstancedPS.hlsl).
@@ -98,7 +105,8 @@ struct PunctualLight
     float4 ColorIntensity; // rgb - линейный цвет, w - интенсивность
     float4 DirectionType;  // xyz - мировое направление конуса (спот), w - тип: 0 point, 1 spot
     float4 SpotAngles;     // x - cos внешнего полуугла, y - 1/(cosInner-cosOuter), z - sin внешнего
-    float4 ShadowParams;   // x - первый слайс тени (-1 = нет; точечный: 6 граней подряд), y - сила
+    float4 ShadowParams;   // x - первый слайс тени (-1 = нет; точечный: 6 граней подряд), y - сила,
+                           // z - ближняя плоскость слайса (far = PositionRange.w)
 };
 
 // Плоский индекс кластера: тайлы экрана идут строками, срезы глубины - самым старшим измерением.

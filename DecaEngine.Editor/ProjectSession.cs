@@ -1,5 +1,6 @@
 using DecaEngine.Core;
 using DecaEngine.Core.Build;
+using DecaEngine.Graphics.Assets;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 
@@ -118,6 +119,12 @@ namespace DecaEngine.Editor
 
 				_projectSlnPath = slnPath;
 				_projectCsprojPath = csprojPath;
+
+				// Asset pipeline cache lives inside the opened project (see AssetCache.DefaultRoot):
+				// every ModelLoadOptions built from here on picks it up by default, so baked textures
+				// and cooked models follow the project rather than the editor install.
+				AssetCache.SetProjectRoot(ProjectDirectory);
+
 				StatusMessage = "?????? ????????, ????? ? ???????";
 			}
 			catch (Exception ex)

@@ -45,7 +45,113 @@ namespace DecaEngine.Editor
 			// голубой - точка приёмника вне квадрата UV слайса, градация серого - реальный
 			// shadowLit сэмплера (чёрный = в тени/окклюдер найден, белый = свет/не найден).
 			PunctualShadowDebug,
+
+			// Кластеризация punctual-светов (LightClusterCS.hlsl) - три вида на ОТДЕЛЬНЫХ пунктах меню,
+			// а не через env-переменную: вопрос "почему свет не светит" начинается именно с них, а
+			// каналы теней выше о кластерах не говорят ничего. Ожидаемый вид каждого - в легенде
+			// ClusterLegend ниже и в комментариях каналов 20/21/14 в UnlitInstancedPS.hlsl.
+			ClusterDepthSlices,  // канал 20 - срез глубины фроксела цветом
+			ClusterScreenTiles,  // канал 21 - тайл фроксела по экрану
+			ClusterLightCount,   // канал 14 - число светов в кластере пикселя
+
+			// Проецируемая глубина света на поверхность - обе глубины, которые сравнивает теневой
+			// сэмплер, в мировых единицах вдоль оси слайса (каналы 22..24 в UnlitInstancedPS.hlsl).
+			LightDepthReceiver,  // канал 22 - глубина приёмника (этой поверхности) от света
+			LightDepthOccluder,  // канал 23 - глубина окклюдера, записанная в слайсе по тому же UV
+			LightDepthGap,       // канал 24 - их зазор в единицах применённого байаса
+
+			// Каскадные тени СОЛНЦА (канал 28) - отдельно от punctual-каналов выше: у них общий
+			// только сэмплер, а вопросы разные. Тон = номер каскада, яркость = множитель тени.
+			SunShadowCascades,
 		}
+
+		/// <summary>Легенда кластерных режимов для тултипа меню - здесь, а не в SceneViewWindow, чтобы
+		/// текст жил рядом с перечислением каналов, которые он описывает.</summary>
+		public static string ClusterLegend(ShadingMode mode) => mode switch
+		{
+			ShadingMode.ClusterDepthSlices =>
+				"Cluster Depth Slices (channel 20) - froxel depth slice, one color per slice.\n" +
+				"Expected: bands run with DEPTH, not across the screen - a floor receding from the\n" +
+				"camera gets bands across the view direction, packing tighter with distance; a wall\n" +
+				"facing the camera is ONE flat color. Color must change as the camera moves forward\n" +
+				"and stay put as it rotates in place.\n" +
+				"Whole frame one color = depth slices are degenerate; vertical/horizontal screen\n" +
+				"bands = screen x/y leaked into the slice. Magenta = grid undefined.",
+			ShadingMode.ClusterScreenTiles =>
+				"Cluster Screen Tiles (channel 21) - froxel screen tile, checkerboarded.\n" +
+				"Expected: an even 16x8 grid over the WHOLE frame (red = tile x, green = tile y).\n" +
+				"Fewer cells squeezed into a corner = SV_Position and viewport.zw are in different\n" +
+				"resolutions (render scale); grid drifting on resize = camera viewport lags the target.",
+			ShadingMode.ClusterLightCount =>
+				"Cluster Light Count (channel 14) - lights in this pixel's cluster, raw (before the\n" +
+				"32-per-cluster clamp).\n" +
+				"black - 0 lights: the cluster is empty\n" +
+				"blue -> cyan -> green -> yellow -> red - 1 .. 32 lights, ascending\n" +
+				"white - MORE than 32: the cluster overflows and the tail of its lights is dropped\n" +
+				"magenta - the cluster branch never ran (the camera has no punctual lights)",
+			ShadingMode.LightDepthReceiver or ShadingMode.LightDepthOccluder =>
+				"Light Depth - Receiver (ch 22) / Occluder (ch 23): the two depths the shadow sampler\n" +
+				"compares, in WORLD units along the slice axis, on a shared ramp\n" +
+				"(black at the light -> blue -> cyan -> green -> yellow -> red at the slice far plane).\n" +
+				"Receiver = how far THIS surface is from the light. Occluder = what the slice actually\n" +
+				"stores at the same UV, i.e. how far the light got in that direction.\n" +
+				"Expected: wherever the surface is NOT shadowed, the two views must MATCH - flip\n" +
+				"between them and look for differences. A difference means either a real occluder in\n" +
+				"front (legit shadow, localized) or the WRONG slice being sampled (mismatch is then\n" +
+				"wholesale and patternless). Magenta = shadow sampling never ran here.",
+			ShadingMode.LightDepthGap =>
+				"Light Depth Gap (channel 24) - (receiver - occluder) measured in units of the bias\n" +
+				"actually applied at that pixel, which is the sampler's verdict itself.\n" +
+				"green - gap within the bias: the surface is its own occluder, pixel lit (normal)\n" +
+				"red   - gap larger than the bias: a real occluder in front, pixel shadowed\n" +
+				"blue  - NEGATIVE gap (receiver closer to the light than anything stored): normal only\n" +
+				"        where no caster was drawn; a solid blue field means an empty or wrong slice\n" +
+				"Brightness is |gap|/bias capped at 4. A thin red rim along contacts over a green field\n" +
+				"is the healthy picture; a wide red band trailing an object = bias too large\n" +
+				"(peter-panning); ragged red speckle over a lit plane = bias too small (acne).",
+			ShadingMode.SunShadowCascades =>
+				"Sun Shadow Cascades (channel 28) - the sun's cascaded shadow and WHICH cascade it\n" +
+				"came from, in one image. Hue = cascade, brightness = shadow factor.\n" +
+				"magenta - no world light (shadows off, or LightDirection is empty)\n" +
+				"BLACK   - no cascade was picked at all; the point is declared lit. On geometry that\n" +
+				"          should be inside the cascade volumes this IS the gap\n" +
+				"red / green / blue / yellow - cascade 0 / 1 / 2 / 3\n" +
+				"full hue = lit, darkening toward black = shadowed\n" +
+				"\n" +
+				"A shadow from a real occluder follows a silhouette and does NOT change hue across\n" +
+				"its own edge. A cascade switch IS a hue change - if the darkness starts exactly on\n" +
+				"one, the cascade fit is at fault, not the occluder. Acne is fine speckle WITHIN a\n" +
+				"single hue, following the shadow map's texel grid.",
+			_ =>
+				"Punctual Shadow Debug legend:\n" +
+				"magenta - shadow sampling branch didn't run (light has no assigned shadow slice,\n" +
+				"          or the point is outside the light's radius)\n" +
+				"orange  - receiver point is beyond the shadow slice's far plane\n" +
+				"cyan    - receiver point is outside the shadow slice's UV square\n" +
+				"grey    - actual sampled shadow result (black = shadowed, white = lit)\n" +
+				"\n" +
+				"DECA_PUNCTUAL_CHANNEL=N switches THIS mode to any other temporary channel\n" +
+				"(15 UV excess, 16 slice of cyan pixels, 17 raw UV, 18 toFrag, 19 cube face).",
+		};
+
+		/// <summary>Какой именно диагностический канал UnlitInstancedPS показывает режим
+		/// <see cref="ShadingMode.PunctualShadowDebug"/>. По умолчанию 11 (сводная легенда сэмплинга),
+		/// DECA_PUNCTUAL_CHANNEL=N переключает на любой другой временный канал без правки кода и
+		/// пересборки UI: 15 - величина выхода UV за диапазон, 16 - слайс у циан-пикселей, 17 - сырой
+		/// UV, 18 - toFrag, 19 - ВЫБРАННАЯ ГРАНЬ КУБА своим цветом. Перебирать их через меню незачем -
+		/// они временные и живут ровно до починки punctual-теней.
+		///
+		/// Отдельно от теней - диагностика КЛАСТЕРИЗАЦИИ (LightClusterCS): 20 - срез глубины
+		/// фроксел-сетки цветом (аналог "Display depth Slices" из статьи aortiz, по которой сделан
+		/// компьют), 21 - тайл сетки по экрану шахматкой, 14 - число светов в кластере пикселя.
+		/// Каналы теней о кластерах не говорят ничего, так что вопрос "почему свет не светит"
+		/// начинается с 20/21/14, а не с 11.</summary>
+		private static readonly int PunctualDebugChannel =
+			// System.Environment полным именем: у класса есть собственное свойство Environment
+			// (вьюпортное окружение рендера), и короткое имя разрешается в него.
+			int.TryParse(System.Environment.GetEnvironmentVariable("DECA_PUNCTUAL_CHANNEL"), out var ch) && ch > 0
+				? ch
+				: 11;
 
 		private const uint InitialWidth = 256;
 		private const uint InitialHeight = 256;
@@ -102,6 +208,12 @@ namespace DecaEngine.Editor
 		private bool _appliedSky;
 		private string _appliedHdrPath = "";
 		private bool _appliedAniso;
+
+		/// <summary>Потолок стороны текстуры, под которым перечитаны резидентные модели. Как и
+		/// анизотропия, он печётся при ЗАГРУЗКЕ (текстура ужимается до заливки), поэтому его смена
+		/// требует не пересоздания окружения, а перечитывания моделей с диска.</summary>
+		private int _appliedMaxTextureSize;
+
 		private bool _appliedSceneHdr;
 
 		// Туман - опция УРОВНЯ СОЗДАНИЯ окружения: пассу нужны депт и scene-copy, поэтому он
@@ -130,6 +242,16 @@ namespace DecaEngine.Editor
 		/// <summary>Резидентный кеш стримера на чтение - прежний словарь _models (материалы, probe-GI
 		/// и прочие обходы загруженных моделей продолжают работать без изменений).</summary>
 		private IReadOnlyDictionary<string, ModelStreamer.Resident> _models => _streamer.Models;
+
+		// --- Активность вьюпорта -------------------------------------------------------------------
+		// Модель редактора грузится РОВНО В ОДНОМ месте: либо здесь (открыт префаб), либо в
+		// ModelPreviewViewport (Inspector в режиме Model), но никогда в обоих сразу - иначе одна и та
+		// же модель держит два набора материалов/инстансов. Переключает EditorManager.OnUpdate по
+		// режиму Inspector-а (см. SetActive). В отличие от превью, кадр здесь пишется и в паузе:
+		// окно Scene View живёт отдельно от Inspector-а и видно всегда, поэтому на паузе оно
+		// показывает пустое небо окружения с подсказкой (см. SceneViewWindow), а не подвисший
+		// последний кадр.
+		private bool _active = true;
 
 		private readonly Dictionary<int, RenderedModel> _rendered = new();
 		private readonly HashSet<int> _visitedThisSync = new();
@@ -238,12 +360,15 @@ namespace DecaEngine.Editor
 		private readonly List<Matrix4x4> _probeScenePoses = new();
 		private bool _sceneTlasDirty;
 
-		/// <summary>Мелкие каскады сцены (см. SampleProbeGi): сессия + атласы + GPU-раунд + центр
-		/// бокса. Каскад i покрывает бокс в 2^i раз меньше баундов сцены вокруг точки интереса
-		/// камеры, той же плотностью - то есть ячейкой в 2^i раз мельче. Зеркало
-		/// ModelPreviewViewport._probeCascades; базовый объём остаётся гарантией покрытия.</summary>
-		private readonly List<(ProbeGiBakeSession Session, ProbeGiTextures Textures, ProbeRoundGpu Gpu,
-			Vector3 Center)> _sceneCascades = new();
+		/// <summary>Мелкие каскады сцены (см. SampleProbeGi): сессия + атласы + GPU-раунд. Каскад i
+		/// покрывает бокс в 2^i раз меньше баундов сцены вокруг точки интереса камеры, той же
+		/// плотностью - то есть ячейкой в 2^i раз мельче. Зеркало ModelPreviewViewport._probeCascades;
+		/// базовый объём остаётся гарантией покрытия.
+		///
+		/// Центра бокса здесь НЕТ: где объём стоит, знает он сам (см.
+		/// ProbeGiViewportShared.VolumeCenter) - копия рядом с сессией разъезжалась бы с ней.</summary>
+		private readonly List<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
+			ProbeRoundGpu Gpu)> _sceneCascades = new();
 
 		/// <summary>Дебаг-вид проб сцены - общий жизненный цикл с превью (см.
 		/// ProbeGiViewportShared.PollOverlays): база + каскады, по оверлею на объём.</summary>
@@ -379,6 +504,7 @@ namespace DecaEngine.Editor
 			_appliedSky = _editorSettings.PreviewSkyBackground;
 			_appliedHdrPath = ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "";
 			_appliedAniso = _editorSettings.PreviewAnisotropicFiltering;
+			_appliedMaxTextureSize = ClampedMaxTextureSize();
 			_appliedSceneHdr = _editorSettings.SceneViewHdr;
 			_appliedFog = _editorSettings.PreviewFog;
 			_appliedVolumetric = _editorSettings.PreviewVolumetric;
@@ -510,7 +636,10 @@ namespace DecaEngine.Editor
 			bool needsRecreate =
 				_appliedMsaa != (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8) ||
 				_appliedHdrPath != (ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "") ||
-				_appliedAniso != _editorSettings.PreviewAnisotropicFiltering;
+				_appliedAniso != _editorSettings.PreviewAnisotropicFiltering ||
+				// Потолок текстуры печётся при загрузке - как анизотропия, требует перечитывания
+				// моделей, а не просто пересоздания конвейера (см. dropModels в RecreateEnvironment).
+				_appliedMaxTextureSize != ClampedMaxTextureSize();
 
 			_pendingEnvironmentRecreate |= needsRecreate;
 
@@ -535,6 +664,12 @@ namespace DecaEngine.Editor
 				// трассировать тем путём, с которым сессию завели (по умолчанию - программным), и включение
 				// аппаратной не давало РОВНО НИЧЕГО до ребейка по другой ручке.
 				_editorSettings.ProbeGiHardwareRayTracing,
+				// Число каскадов сетки - раскладка, а не live-ручка: сессия читает его при сборке
+				// (см. BeginSceneProbeSession), но САМА ручка сюда не входила, и её смена не
+				// перезаводила сессию. То есть в Scene View каскады молча не менялись вовсе - до
+				// следующего ребейка по любой другой ручке. В превью слот был с самого начала
+				// (см. ModelPreviewViewport.ApplyGiSettings).
+				_editorSettings.ProbeGiCascades,
 				// Сторона окто-карты видимости - раскладка атласов (см. ProbeGiBakeResult.VisRes).
 				_editorSettings.ProbeGiVisRes);
 			if (wantedBake != _appliedProbeBake)
@@ -548,7 +683,7 @@ namespace DecaEngine.Editor
 
 		// Снимок ручек запечки, под которыми заведена текущая сценовая сессия проб.
 		private (bool On, float Sky, int Rays, int Bounces, float Sat, float Density, int Max,
-			bool HardwareTrace, int VisRes) _appliedProbeBake;
+			bool HardwareTrace, int Cascades, int VisRes) _appliedProbeBake;
 
 		/// <summary>Пересоздаёт окружение сцены под новые env-level опции БЕЗ перезагрузки сцены:
 		/// резидентные ModelLoader-ы переезжают в новый батч-рендерер перерегистрацией (CPU-копии
@@ -586,7 +721,8 @@ namespace DecaEngine.Editor
 			_transformsDirty = false;
 			_structuralDirtySelection = false;
 
-			bool dropModels = _appliedAniso != _editorSettings.PreviewAnisotropicFiltering;
+			bool dropModels = _appliedAniso != _editorSettings.PreviewAnisotropicFiltering ||
+				_appliedMaxTextureSize != ClampedMaxTextureSize();
 
 			_env.Release();
 			_env = CreateEnvironment();
@@ -676,6 +812,22 @@ namespace DecaEngine.Editor
 			_env.Pipeline.MotionVectorResources?.ResetHistory();
 		}
 
+		/// <summary>Рисует ли вьюпорт сцену прямо сейчас. На паузе (Inspector показывает превью
+		/// модели) префаб снят со сцены и в кадре только небо окружения - см. <see cref="SetActive"/>.</summary>
+		public bool IsActive => _active;
+
+		/// <summary>
+		/// Включает/ставит на паузу сцену префаба. Зовёт EditorManager.OnUpdate по режиму Inspector-а,
+		/// чтобы модель редактора была загружена ровно в одном месте - здесь ИЛИ в
+		/// <see cref="ModelPreviewViewport"/>. Само снятие сцены с GPU делает ближайший
+		/// <see cref="Update"/> (там мы под GPU-локом редактора), ровно тем же путём, что и закрытие
+		/// префаба.
+		/// </summary>
+		public void SetActive(bool active)
+		{
+			_active = active;
+		}
+
 		/// <summary>
 		/// Покадровый привод: синхронизирует env-сцену с префабом (загрузки по AssetRef, трансформы,
 		/// удаления), двигает камеру и исполняет офскрин-конвейер. Звать из EditorManager.OnUpdate
@@ -684,6 +836,11 @@ namespace DecaEngine.Editor
 		public void Update(float deltaTime, float time, Entity? root, string? prefabPath, Entity? selected = null)
 		{
 			_currentPrefabPath = prefabPath;
+
+			// Пауза (Inspector показывает превью модели) неотличима здесь от закрытого префаба: сцена
+			// и её резидентные модели снимаются тем же ClearScene ниже, кадр пишется пустым. При
+			// возврате в активное состояние _lastStore уже сброшен - SyncScene инстанцирует сцену
+			// заново и стример перезапросит модели.
 
 			// Заявка на пересоздание окружения (смена env-level настроек графики/галочки HDR) -
 			// исполняется здесь, до записи кадра: старые биндинги ещё нигде не задействованы.
@@ -697,7 +854,7 @@ namespace DecaEngine.Editor
 			// смены бэкенда апскейлера (GPU-барьер + init-команды NGX), см. ModelPreviewViewport.
 			ApplyPendingUpscalerSettings();
 
-			bool hasRoot = root.HasValue && !root.Value.IsNull;
+			bool hasRoot = _active && root.HasValue && !root.Value.IsNull;
 			if (!hasRoot)
 			{
 				// Префаб закрыт: снимаем сцену И резидентные модели с загрузками - стримеру без
@@ -729,7 +886,7 @@ namespace DecaEngine.Editor
 				SyncScene(root.Value);
 				SyncSelectionHighlight(selected);
 				PollProbeBake(deltaTime);
-				PollSceneCascadeRecenter(deltaTime);
+				PollSceneCascadeRecenter();
 				PollSceneProbeDebugOverlay();
 			}
 
@@ -1200,10 +1357,22 @@ namespace DecaEngine.Editor
 			AnisotropicFiltering = _editorSettings.PreviewAnisotropicFiltering,
 			// log2 масштаба рендера - см. ModelPreviewViewport.BuildLoadOptions.
 			MipLodBias = MathF.Log2(Math.Clamp(_editorSettings.RenderScale, 0.25f, 1f)),
-			// Меши сцены появляются почти сразу с текстурами первой ступени (64px), дальше стример
-			// поднимает качество ступенями по приоритету от камеры (см. ModelStreamer).
+			// Потолок стороны текстуры - та же ручка окна Graphics, что и в превью, и до сих пор её
+			// здесь просто не было: в Scene View «Max texture size» не действовал вовсе. Это не
+			// косметика, а ПИК памяти запечки и заливки - сцена тянет на порядок больше текстур, чем
+			// одиночная модель (см. EditorSettings.PreviewMaxTextureSize).
+			MaxTextureSize = ClampedMaxTextureSize(),
+			// Текстуры не декодируются в фоновой фазе загрузки вовсе - они приезжают из стола по
+			// приоритету от камеры (см. ModelStore). В кадр модель попадает уже с ними: показ ждёт
+			// ModelStore.ModelTexturesReady, иначе она появлялась бы на 1x1-филлерах и домигивала
+			// текстуры десятки кадров.
 			StreamTextures = true
 		};
+
+		/// <summary>Потолок текстуры в том виде, в каком он уходит в загрузчик - тем же методом, что
+		/// и в превью: сравнивать сырую настройку с заклампленной значило бы вечно видеть расхождение
+		/// на значениях вне [128, 8192] и перечитывать сцену каждым нажатием OK.</summary>
+		private int ClampedMaxTextureSize() => Math.Clamp(_editorSettings.PreviewMaxTextureSize, 128, 8192);
 
 		/// <summary>Модель догрузилась и зарегистрирована стримером: атласы проб уже живут -
 		/// новорождённой модели вместо плейсхолдеров сразу привязываются настоящие (кбуфер с сеткой
@@ -1699,9 +1868,21 @@ namespace DecaEngine.Editor
 				grid += _sceneGpu.Hardware ? ", трассировка аппаратная"
 					: ", трассировка программная";
 
+				// Холодные кирпичи по ВСЕМ объёмам: пока они есть, выборка на их месте проваливается
+				// на более крупный каскад - это и видно как протечку света при движении камеры.
+				var cold = s.ColdBrickCount;
+				foreach (var cascade in _sceneCascades)
+				{
+					cold += cascade.Session.ColdBrickCount;
+				}
+
+				var coldText = cold > 0 ? $", холодных кирпичей {cold}" : string.Empty;
+
 				return s.Realtime
-					? $"{grid}, реальное время"
-					: s.Converged ? $"{grid}, готово" : $"{grid}, раунд {s.Round}/{s.TargetRounds}";
+					? $"{grid}, реальное время{coldText}"
+					: s.Converged
+						? $"{grid}, готово{coldText}"
+						: $"{grid}, раунд {s.Round}/{s.TargetRounds}{coldText}";
 			}
 		}
 
@@ -1827,9 +2008,57 @@ namespace DecaEngine.Editor
 			ProbeGiViewportShared.ClampCascadeCenter(_probeSceneBoundsMin, _probeSceneBoundsMax,
 				target, half);
 
+		/// <summary>Точка, за которой следуют каскады probe-GI. Гибрид, и оба его случая выстраданы.
+		///
+		/// ВНУТРИ сцены якорь - сама позиция камеры. Она ротационно-инвариантна по построению, и
+		/// только этим лечится исходный дефект: точка интереса камеры (Eye + Forward * FocusDistance)
+		/// ездит по сфере при ЧИСТОМ ПОВОРОТЕ, когда камера стоит на месте, - при дистанции фокуса 8
+		/// поворот на 90° уводит её на 11 единиц, а порог перецентровки у второго каскада около двух.
+		/// Оглядеться по сторонам означало прокрутить каскады по нескольку раз, а въехавшие кирпичи
+		/// стартуют холодными и пересходятся заново.
+		///
+		/// СНАРУЖИ сцены одной позиции камеры мало, и это вторая половина той же истории. Отлетев от
+		/// здания, камера выходит за баунды, ClampCascadeCenter прижимает объём к краю - и дальше
+		/// движение камеры на него не влияет вовсе: каскады замирают у стенки и перестают следить за
+		/// тем, что ты разглядываешь. Поэтому снаружи якорь - точка, КУДА СМОТРИТ камера: пересечение
+		/// луча взгляда с коробкой сцены. Прокрутка от поворота здесь возвращается, но снаружи она
+		/// безобидна - плотное поле нужно там, куда смотришь, а не за спиной.
+		///
+		/// Луч мимо коробки (смотрим в небо) - остаётся позиция камеры, её и прижмёт кламп: это
+		/// честнее, чем уводить объём в сторону по касательной.</summary>
+		private Vector3 SceneCascadeAnchor()
+		{
+			var eye = _camera.Eye;
+			if (eye.X >= _probeSceneBoundsMin.X && eye.X <= _probeSceneBoundsMax.X
+				&& eye.Y >= _probeSceneBoundsMin.Y && eye.Y <= _probeSceneBoundsMax.Y
+				&& eye.Z >= _probeSceneBoundsMin.Z && eye.Z <= _probeSceneBoundsMax.Z)
+			{
+				return eye;
+			}
+
+			// Пересечение луча с коробкой методом слэбов. Нулевые компоненты направления дают
+			// бесконечности, и это ровно то поведение, которое нужно: ось, вдоль которой луч не
+			// движется, интервал не ограничивает.
+			var dir = _camera.Forward;
+			var inv = new Vector3(
+				MathF.Abs(dir.X) > 1e-6f ? 1f / dir.X : float.PositiveInfinity,
+				MathF.Abs(dir.Y) > 1e-6f ? 1f / dir.Y : float.PositiveInfinity,
+				MathF.Abs(dir.Z) > 1e-6f ? 1f / dir.Z : float.PositiveInfinity);
+
+			var t0 = (_probeSceneBoundsMin - eye) * inv;
+			var t1 = (_probeSceneBoundsMax - eye) * inv;
+			var tNear = Vector3.Min(t0, t1);
+			var tFar = Vector3.Max(t0, t1);
+
+			float enter = MathF.Max(tNear.X, MathF.Max(tNear.Y, tNear.Z));
+			float exit = MathF.Min(tFar.X, MathF.Min(tFar.Y, tFar.Z));
+
+			return exit >= MathF.Max(enter, 0f) ? eye + dir * MathF.Max(enter, 0f) : eye;
+		}
+
 		/// <summary>Создаёт каскад сцены: сессия + атласы (слоты _Ci) + GPU-раунд вокруг точки
 		/// интереса. Зеркало ModelPreviewViewport.CreateProbeCascade.</summary>
-		private (ProbeGiBakeSession, ProbeGiTextures, ProbeRoundGpu, Vector3) CreateSceneCascade(
+		private (ProbeGiBakeSession, ProbeGiTextures, ProbeRoundGpu) CreateSceneCascade(
 			int index, Vector3 target) =>
 			ProbeGiViewportShared.CreateCascade(_probeBaker!, _scenePipelines!, _sceneAccel, _env,
 				_graphicsApi, _editorSettings,
@@ -1837,80 +2066,72 @@ namespace DecaEngine.Editor
 				$"_sceneProbeGiC{index}_{_probeTextureGeneration++}", index, target,
 				_probeSceneBoundsMin, _probeSceneBoundsMax, ProbeSunColor());
 
-		/// <summary>Ведёт каскады сцены за точкой интереса камеры - пересоздаёт каскад, когда та ушла
-		/// от его центра дальше четверти бокса. Пересоздание = холодный старт каскада за фолбэком на
-		/// крупный объём (см. ModelPreviewViewport.PollProbeCascadeRecenter - там же о том, почему не
-		/// тороидальный скролл); не больше одного каскада за кадр.</summary>
-		/// <summary>Дебаунс перецентровки каскадов: пересоздавать их можно только когда камера
-		/// УСПОКОИЛАСЬ.
+		/// <summary>Ведёт каскады сцены за точкой интереса камеры ПРОКРУТКОЙ объёма (см.
+		/// ProbeGiViewportShared.ScrollVolume): каскад сдвигается на целое число кирпичей, сохраняя
+		/// поле там, где пересёкся сам с собой.
 		///
-		/// Перецентровка - это не сдвиг, а полное пересоздание объёма: Dispose GPU-раунда, Release
-		/// атласов, Flush + WaitForIdle (полный стоп GPU на потоке рендера) и новая сессия с
-		/// обнулённым полем. За один драг средней кнопки (пан камеры двигает _camera.Target) порог
-		/// смещения пересекается многократно, и всё это происходило по нескольку раз подряд - отсюда
-		/// и рывки, и «все пробы перестраиваются» на ровном месте.
+		/// Дебаунса здесь больше НЕТ, и это главный итог перехода. Раньше перецентровка означала
+		/// полное пересоздание объёма - Dispose GPU-раунда с выгрузкой всего BVH сцены, Release семи
+		/// атласов, Flush + WaitForIdle (полный стоп GPU на потоке рендера), новая сессия с
+		/// обнулённым полем и переприязка материалов, - и стоила видимого рывка. За один драг камеры
+		/// порог смещения пересекается многократно, поэтому пересоздание приходилось откладывать до
+		/// момента, когда камера ЗАМРЁТ: отсюда и «пробы перестраиваются только когда отпускаешь
+		/// камеру», и сами рывки. Прокрутка не создаёт и не освобождает ничего, стоит осмотра одной
+		/// въехавшей полоски кирпичей - её можно гонять в каждом кадре движения.
 		///
-		/// Правильное лечение - тороидальная прокрутка объёма вместо пересоздания, но это отдельная
-		/// крупная работа; дебаунс убирает повторные пересоздания за копейки и той же механикой, что
-		/// уже применена к пересозданию сессии (см. RequestProbeSession).</summary>
-		private const float CascadeRecenterIdleSeconds = 0.35f;
-		private Vector3 _cascadeRecenterTarget;
-		private float _cascadeRecenterIdle;
+		/// Заявки подаются ВСЕМ каскадам, которым пора ехать. Ограничение «не больше одного за
+		/// кадр» осталось от пересоздания, стоившего сотен миллисекунд; с прокруткой переезд стоит
+		/// около миллисекунды, а вреда от ограничения теперь много: заявка исполняется не в момент
+		/// подачи, поэтому первый каскад оставался бы «требующим переезда» на КАЖДОМ кадре, навсегда
+		/// забирая очередь себе и морозя остальные.</summary>
+		/// <summary>Номера раскладок каскадов на прошлом опросе - см. CascadeLayoutChanged.</summary>
+		private int _sceneCascadeLayoutStamp;
 
-		private void PollSceneCascadeRecenter(float deltaTime)
+		private void PollSceneCascadeRecenter()
 		{
-			// Камера ещё движется - ждём (см. док выше).
-			if (_camera.Target != _cascadeRecenterTarget)
+			// Переехавший каскад обязан доехать углом сетки до кбуферов материалов, иначе они
+			// продолжат сэмплить его по старому углу (см. ProbeGiViewportShared.CascadeLayoutChanged).
+			if (ProbeGiViewportShared.CascadeLayoutChanged(_sceneCascades, ref _sceneCascadeLayoutStamp))
 			{
-				_cascadeRecenterTarget = _camera.Target;
-				_cascadeRecenterIdle = 0f;
-				return;
+				ApplyMaterialSettings();
 			}
 
-			_cascadeRecenterIdle += deltaTime;
-			if (_cascadeRecenterIdle < CascadeRecenterIdleSeconds)
+			if (_sceneCascades.Count == 0 || _probeBaker == null)
 			{
 				return;
 			}
 
-			if (_sceneCascades.Count == 0 || _probeBaker == null || _env.ShadowSettings == null
-				|| _scenePipelines == null)
-			{
-				return;
-			}
-
+			// Якорь каскадов - ПОЗИЦИЯ камеры, а не её точка интереса. Target у летающей камеры
+			// вычисляется как Eye + Forward * FocusDistance (см. SceneCamera.Target), то есть ездит
+			// по сфере при ЧИСТОМ ПОВОРОТЕ, когда камера физически стоит на месте. При дефолтной
+			// дистанции фокуса 8 поворот на 90° уводит Target на 11 единиц, а порог перецентровки -
+			// четверть бокса каскада (на Sponza это 4.5 у первого и 2.2 у второго, см.
+			// CascadeHalfExtent и NeedsRecenter). Оглядеться по сторонам означало прокрутить оба
+			// каскада по нескольку раз: въехавшие с краю кирпичи стартуют холодными и переcходятся
+			// заново - это и есть «пробы пересчитываются при повороте камеры».
+			// Eye ротационно-инвариантен по построению, поэтому лечит симптом целиком, а не
+			// поднимает порог. Так же предписывает и эталон (RTXGI, docs/DDGIVolume.md, Infinite
+			// Scrolling Movement: «Anchor the infinite scrolling volume to the camera view or a
+			// player character»). Плата - половина бокса каскада оказывается позади камеры; она
+			// приемлема, потому что каскад лишь УПЛОТНЯЕТ поле, а покрытие держит базовый объём.
+			// ModelPreviewViewport этой беды не имеет: там камера орбитальная, и её _orbitTarget при
+			// вращении неподвижен по определению - поэтому правка нужна только здесь.
 			for (int j = 0; j < _sceneCascades.Count; j++)
 			{
-				int index = j + 1;
-				var half = SceneCascadeHalfExtent(index);
-				var desired = ClampSceneCascadeCenter(_camera.Target, half);
-				if (!ProbeGiViewportShared.NeedsRecenter(_sceneCascades[j].Center, desired, half))
+				var session = _sceneCascades[j].Session;
+				var half = SceneCascadeHalfExtent(j + 1);
+				var desired = ClampSceneCascadeCenter(SceneCascadeAnchor(), half);
+
+				// Сверка с ФАКТИЧЕСКИМ центром объёма, а не с заказанным в прошлый раз: заявка на
+				// переезд исполняется на границе раунда, и пока она ждёт, объём стоит там же, где
+				// стоял. Сверяйся мы с заказом - вьюпорт считал бы каскад уже уехавшим.
+				if (!ProbeGiViewportShared.NeedsRecenter(
+						ProbeGiViewportShared.VolumeCenter(session), desired, half))
 				{
 					continue;
 				}
 
-				try
-				{
-					ReleaseSceneProbeDebugOverlay();
-					_env.DilApi.ImmediateContext.Flush();
-					_env.DilApi.ImmediateContext.WaitForIdle();
-					RebindSceneCascadePlaceholders($"_C{index}");
-					_sceneCascades[j].Gpu.Dispose();
-					_sceneCascades[j].Textures.Release();
-
-					_sceneCascades[j] = CreateSceneCascade(index, _camera.Target);
-					ApplyMaterialSettings();
-				}
-				catch (Exception ex)
-				{
-					EditorConsoleLog.Add(LogLevel.Error,
-						$"Scene probe GI: cascade {index} recenter failed, dropping it: {ex.Message}");
-					RebindSceneCascadePlaceholders($"_C{index}");
-					_sceneCascades.RemoveAt(j);
-					ApplyMaterialSettings();
-				}
-
-				break;
+				ProbeGiViewportShared.ScrollVolume(session, desired);
 			}
 		}
 
@@ -2008,13 +2229,14 @@ namespace DecaEngine.Editor
 					_probeTextures, _env.EnvironmentMap, _env.ShadowSettings!.EnvYawRadians, _sceneAccel);
 
 				// Каскады - только в реальном времени (запечке нужен один сходящийся объём), вокруг
-				// точки интереса камеры; дальше за ней следит PollSceneCascadeRecenter.
+				// ПОЗИЦИИ камеры; дальше за ней следит PollSceneCascadeRecenter (там же объяснено,
+				// почему якорь - Eye, а не Target).
 				int cascades = _editorSettings.ProbeGiRealtime
 					? Math.Clamp(_editorSettings.ProbeGiCascades, 1, 3)
 					: 1;
 				for (int i = 1; i < cascades; i++)
 				{
-					_sceneCascades.Add(CreateSceneCascade(i, _camera.Target));
+					_sceneCascades.Add(CreateSceneCascade(i, SceneCascadeAnchor()));
 				}
 			}
 			catch (Exception ex)
@@ -2214,8 +2436,20 @@ namespace DecaEngine.Editor
 			session.RealtimeBlend = Math.Clamp(_editorSettings.ProbeGiRealtimeBlend, 0.01f, 0.5f);
 			session.RealtimeMaxStep = Math.Clamp(_editorSettings.ProbeGiRealtimeMaxStep, 0f, 0.2f);
 			session.RealtimeGamma = Math.Clamp(_editorSettings.ProbeGiRealtimeGamma, 1f, 8f);
+			// Релокация проб - такая же live-ручка, как соседние, но её здесь не было: в Scene View
+			// ручка «Relocation» окна Graphics не делала НИЧЕГО, а пробы, замурованные в стенах,
+			// оставались замурованными (в превью слот есть, см. ModelPreviewViewport.PollProbeBake).
+			session.RealtimeRelocation = Math.Clamp(_editorSettings.ProbeGiRealtimeRelocation, 0f, 0.45f);
 
 			PollSceneProbePoses();
+
+			// Переезды каскадов доводятся до GPU ДО всех проверок ниже: сходимость базового объёма,
+			// его забор и бюджет порций гасят раунды каскадов, но не должны морозить их на месте -
+			// камера уезжает, а объём стоит (см. ProbeRoundGpu.SettlePendingScroll).
+			foreach (var cascade in _sceneCascades)
+			{
+				cascade.Gpu.SettlePendingScroll(cascade.Session, baker);
+			}
 
 			// Свет подтягивается перед каждым раундом: поворот солнца откатывает сходимость, и поле
 			// само перетекает к новому решению, не выбрасывая накопленное (см.
@@ -2749,14 +2983,50 @@ namespace DecaEngine.Editor
 				ShadingMode.Tangent => 2,
 				// PunctualShadowDebug требует Mode == 3 (см. mode switch выше: попадает в default => 3)
 				// и Channel == 11 - тот же канал, что читает DECA_PROBE_PUNCTUALDEBUG в PreviewProbe.cs.
-				ShadingMode.PunctualShadowDebug => 11,
+				ShadingMode.PunctualShadowDebug => PunctualDebugChannel,
+				// Кластерные виды - тоже поверх Mode == 3 (default выше), каналы фиксированные.
+				ShadingMode.ClusterDepthSlices => 20,
+				ShadingMode.ClusterScreenTiles => 21,
+				ShadingMode.ClusterLightCount => 14,
+				// Проецируемая глубина света на поверхность - тоже поверх Mode == 3.
+				ShadingMode.LightDepthReceiver => 22,
+				ShadingMode.LightDepthOccluder => 23,
+				ShadingMode.LightDepthGap => 24,
+				// Каскадные тени солнца - тоже поверх Mode == 3.
+				ShadingMode.SunShadowCascades => 28,
 				_ => 0,
 			};
 
+			// Отладочные виды probe-GI живут не в комбо шейдинга, а галками в окне Graphics - ровно
+			// как в превью (см. ModelPreviewViewport.ApplyPreviewSettingsToMaterials). В Scene View
+			// они не читались вовсе: галка ставилась, картинка не менялась.
+			//
+			// Расстановка проб (канал 10) старше вида поля (канал 9): попросили оба - показываем
+			// более частный, где пробы стоят. Комбо шейдинга старше обоих: если выбран явный
+			// диагностический вид, он и остаётся - его выбрали руками только что.
+			if (channel == 0)
+			{
+				if (_editorSettings.ProbeGiDebugProbes)
+				{
+					channel = 10;
+				}
+				else if (_editorSettings.ProbeGiDebugView)
+				{
+					channel = 9;
+				}
+			}
+
 			// Отладочные виды (Textured/каналы) пишут в кадр уже отображаемые значения - HDR-конвейер
 			// обязан прокинуть их мимо экспозиции и кривой (no-op без HDR, см.
-			// ModelViewportEnvironment.SetTonemapPassthrough).
-			_env.SetTonemapPassthrough(mode != 3);
+			// ModelViewportEnvironment.SetTonemapPassthrough). Условие именно по каналу, а не только
+			// по mode: диагностические каналы (11..21) живут ПОВЕРХ mode == 3, и без этого их палитра
+			// уезжала через авто-экспозицию - у кластерных видов цвет и есть всё содержание картинки
+			// (номер среза кодируется яркостью восьмёрки), тонемап делал соседние срезы неразличимыми.
+			// AoDebugView сюда входит по той же причине, что и каналы: он тоже пишет в кадр уже
+			// отображаемые значения, но идёт мимо PreviewSettings (его читает сам AO-пасс), поэтому
+			// условие по mode/channel его не ловило - в Scene View отладочный вид AO уезжал через
+			// авто-экспозицию. В превью он в этом условии есть.
+			_env.SetTonemapPassthrough(mode != 3 || channel != 0 || _editorSettings.AoDebugView);
 
 			foreach (var state in _models.Values)
 			{
@@ -2793,7 +3063,7 @@ namespace DecaEngine.Editor
 				if (_probeTextures != null && ProbesEnabled)
 				{
 					ProbeGiViewportShared.PushGrid(ref data, _probeTextures, _sceneCascades,
-						_editorSettings.ProbeGiNormalBias);
+						_editorSettings.ProbeGiNormalBias, _editorSettings.ProbeGiViewBias);
 				}
 
 				for (int i = 0; i < model.materialObjects.Count; i++)

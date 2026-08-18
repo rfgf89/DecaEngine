@@ -131,6 +131,10 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             // текущего конца - пул один на все камеры, границы уходят в ClusterParams.
             int segmentOffset = punctualLightTotal;
             var cullDataCopy = cullData;
+            // Границы влияния светов сегмента по view-глубине - из них строится диапазон срезов
+            // кластерной сетки (см. LightCulling.ClusterDepthRange).
+            float minLightZ = float.MaxValue;
+            float maxLightZ = float.MinValue;
             punctualLightsQuery.ForEachEntity((ref LightComponent light, Entity lightEntity) =>
             {
                 if (punctualLightTotal >= LightClusters.MaxLights)
@@ -140,17 +144,25 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
 
                 if (LightCulling.TryBuildPunctualLight(ref light, lightEntity, in cullDataCopy, _punctualShadowSlices, out var punctualLight))
                 {
+                    LightCulling.DumpPunctualLight(lightEntity, in light, in punctualLight);
                     UnsafeArray.Set(_renderCamerasData.punctualLights, punctualLightTotal, punctualLight);
                     punctualLightTotal++;
+
+                    float lightViewZ = Vector3.Transform(
+                        new Vector3(punctualLight.PositionRange.X, punctualLight.PositionRange.Y,
+                            punctualLight.PositionRange.Z), cullDataCopy.view).Z;
+                    minLightZ = MathF.Min(minLightZ, lightViewZ - punctualLight.PositionRange.W);
+                    maxLightZ = MathF.Max(maxLightZ, lightViewZ + punctualLight.PositionRange.W);
                 }
             });
 
+            var clusterDepth = LightCulling.ClusterDepthRange(in cullData, minLightZ, maxLightZ);
             var cameraLightData = lightData;
             cameraLightData.ClusterParams = new Vector4(
                 segmentOffset,
                 punctualLightTotal - segmentOffset,
-                MathF.Max(cullData.znear, 0.01f),
-                MathF.Max(cullData.zfar, MathF.Max(cullData.znear, 0.01f) * 2f));
+                clusterDepth.X,
+                clusterDepth.Y);
 
             _renderCamerasData.viewData.Add(viewData);
             _renderCamerasData.cullData.Add(cullData);
@@ -244,6 +256,11 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
                 radius = sceneRadius;
             }
 
+            // Кайма ВОКРУГ сферы каскада - см. ShadowRenderer.CascadeMarginTexels: шейдер не берёт
+            // каскад, пока точка не ушла от края карты внутрь, и без каймы этот отступ съедал край
+            // самого объёма.
+            radius /= 1f - 2f * ShadowRenderer.CascadeMarginTexels / ShadowRenderer.ShadowMapSize;
+
             // Снап центра к сетке текселей shadow map в осях света (Floor, как в UpdateCascades) -
             // без него тень мерцает при движении камеры: центр каскада двигается субтексельными
             // шагами.
@@ -260,7 +277,12 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             var view = Matrix4x4.CreateLookAtLeftHanded(eye, center, up);
 
             float near = 0.01f;
-            float far = radius * 2f + casterExtension;
+
+            // Запас ЗА сферой каскада - см. подробный разбор в UpdateCascades: без него приёмники на
+            // задней полусфере получают ndc.z >= 1 (normal-offset + снап центра + float) и
+            // UnlitInstancedPS отбрасывает каскад, оставляя просветы.
+            float receiverExtension = radius * 0.5f;
+            float far = radius * 2f + casterExtension + receiverExtension;
 
             var proj = new Matrix4x4(
                 1f / radius, 0, 0, 0,

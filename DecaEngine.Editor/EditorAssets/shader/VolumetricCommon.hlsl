@@ -217,7 +217,16 @@ float VolumetricShadow(float3 worldPos)
         float3 lightNdc = lightClip.xyz / max(lightClip.w, 1e-6);
         float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 0.5 - lightNdc.y * 0.5);
 
-        if (any(shadowUv < 0.0) || any(shadowUv > 1.0) || lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
+        // Отступ от края карты - тот же, что у поверхностей (см.
+        // UnlitInstancedPS.SUN_CASCADE_MARGIN_TEXELS), только уже: PCF здесь нет, за край тянет
+        // лишь собственная фильтрация сравнивающего сэмплера (полтекселя). Без отступа краевые
+        // выборки читают глубину чужого места сцены, и столб света получает прямую границу на
+        // стыке каскадов. Полосы перехода здесь НЕТ сознательно: она стоила бы второй выборки на
+        // каждом из 32-64 шагов марша, а ступенька резкости в объёме не читается - её съедает
+        // джиттер шага.
+        const float volMargin = 1.0 / VolShadowMapSize;
+        if (any(shadowUv < volMargin) || any(shadowUv > 1.0 - volMargin)
+            || lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
         {
             // Точка вне этого каскада - пробуем следующий, крупнее.
             continue;

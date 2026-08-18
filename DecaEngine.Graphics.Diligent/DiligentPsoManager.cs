@@ -117,6 +117,12 @@ public class DiligentPsoManager : IDisposable
 	public static long DiagCreateMs;
 	public static int DiagCreateCount;
 
+	/// <summary>Сколько раз каждое ИМЯ PSO прошло через создание, и во что это обошлось. Имя целиком
+	/// описывает конфигурацию (см. DiligentMaterial.RebuildPipelineIfNeeded), поэтому разбивка по нему
+	/// отвечает на два вопроса сразу: сколько РАЗНЫХ конфигураций реально нужно кадру и сколько из
+	/// созданий - пересборка того же самого материала (взведённый _isDirty при доборе переменных).</summary>
+	public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Count, long Ms)> DiagByName = new();
+
 	/// <summary>Имена PSO, уже прошедшие через <see cref="_psoCache"/> В ЭТОМ ПРОЦЕССЕ - см.
 	/// <see cref="CreateGraphicsPipelineState"/>. Не персистентно (в отличие от файла кэша) и живёт
 	/// ровно для того, чтобы поймать ПОВТОРНОЕ создание PSO под уже виденным именем.</summary>
@@ -150,9 +156,81 @@ public class DiligentPsoManager : IDisposable
 
 		var sw = System.Diagnostics.Stopwatch.StartNew();
 		var pso = _device.CreateGraphicsPipelineState(createInfo);
-		DiagCreateMs += sw.ElapsedMilliseconds;
+		var ms = sw.ElapsedMilliseconds;
+		DiagCreateMs += ms;
 		DiagCreateCount++;
+		DiagByName.AddOrUpdate(name, (1, ms), (_, prev) => (prev.Count + 1, prev.Ms + ms));
 		return pso;
+	}
+
+	/// <summary>Готовые графические PSO, разделяемые между материалами, по ключу конфигурации.
+	/// Владелец - менеджер: материалы такой PSO НЕ диспозят (см. DiligentMaterial.Release).</summary>
+	private readonly Dictionary<string, IPipelineState> _sharedPsos = new();
+	private readonly object _sharedPsosLock = new();
+
+	/// <summary>Сколько раз общий PSO выдан из кэша вместо создания. Пара к
+	/// <see cref="DiagCreateCount"/>: их сумма - это число запросов PSO у материалов.</summary>
+	public static int DiagSharedHits;
+
+	/// <summary>Стабильные на процесс номера для объектов, участвующих в ключе PSO (нативные шейдеры,
+	/// стейт-объекты). Нужны именно номера, а не хэши: ключ решает, ПЕРЕИСПОЛЬЗОВАТЬ ли чужой PSO,
+	/// и коллизия здесь означала бы отрисовку чужим пайплайном. Таблица слабая - объект в ней не
+	/// удерживается.</summary>
+	private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> _objectIds = new();
+	private int _nextObjectId;
+
+	/// <summary>Номер объекта для ключа PSO. Разным объектам - разные номера, одному и тому же
+	/// объекту всегда один и тот же.</summary>
+	public int ObjectId(object obj)
+	{
+		lock (_objectIds)
+		{
+			if (_objectIds.TryGetValue(obj, out var existing))
+			{
+				return (int)existing;
+			}
+
+			int id = ++_nextObjectId;
+			_objectIds.Add(obj, id);
+			return id;
+		}
+	}
+
+	/// <summary>
+	/// Отдаёт графический PSO для КОНФИГУРАЦИИ, а не для материала: одинаково настроенные материалы
+	/// получают один и тот же нативный объект.
+	///
+	/// Раньше PSO создавался на каждый материал, потому что его имя включало имя материала модели
+	/// (<c>"{Name} Material PSO..."</c>), а имя - это ключ дискового кэша. На Sponza-подобной сцене
+	/// это 71 создание с 71 уникальным именем и ~2.9 с при том, что РАЗНЫХ конфигураций там единицы:
+	/// вариантов пиксельного шейдера всего четыре, а стейт-объекты материалы и так делят (см.
+	/// ModelViewportEnvironment - baseMaterialState раздаётся всем). Дублировались, соответственно, и
+	/// записи в дисковой библиотеке PSO.
+	///
+	/// Ключ обязан описывать конфигурацию ПОЛНОСТЬЮ - иначе материал поедет чужим пайплайном, и это
+	/// не поймается ни варнингом, ни null'ом. Собирает его вызывающая сторона
+	/// (DiligentMaterial.RebuildPipelineIfNeeded), потому что только она знает, из чего createInfo
+	/// собран: стейт-объект + нативные шейдеры + immutable-сэмплеры + лейаут переменных.
+	/// </summary>
+	public IPipelineState? GetOrCreateSharedGraphicsPipelineState(string key,
+		GraphicsPipelineStateCreateInfo createInfo)
+	{
+		lock (_sharedPsosLock)
+		{
+			if (_sharedPsos.TryGetValue(key, out var cached))
+			{
+				DiagSharedHits++;
+				return cached;
+			}
+
+			var pso = CreateGraphicsPipelineState(createInfo);
+			if (pso != null)
+			{
+				_sharedPsos[key] = pso;
+			}
+
+			return pso;
+		}
 	}
 
 	/// <summary>
@@ -223,6 +301,17 @@ public class DiligentPsoManager : IDisposable
 	public void Dispose()
 	{
 		SaveCache();
+
+		lock (_sharedPsosLock)
+		{
+			foreach (var pso in _sharedPsos.Values)
+			{
+				pso.Dispose();
+			}
+
+			_sharedPsos.Clear();
+		}
+
 		_psoCache?.Dispose();
 	}
 }

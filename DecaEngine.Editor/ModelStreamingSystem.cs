@@ -65,7 +65,21 @@ namespace DecaEngine.Editor.ECS
 			/// заявки (либо ещё не потребовалась, либо путь оказался с ошибкой - см. Error).</summary>
 			internal ModelStore.Handle? StoreHandle;
 
-			public bool Ready => Model != null;
+			/// <summary>Текстуры модели доведены до целевого качества - см.
+			/// <see cref="ModelStore.ModelTexturesReady"/>. Именно этим (а не одной лишь регистрацией
+			/// геометрии) гейтится <see cref="Ready"/>.</summary>
+			internal bool TexturesReady;
+
+			/// <summary>Модель зарегистрирована в батч-рендерере этого окружения (MeshIds/MaterialIds/
+			/// BatchCache заполнены). ПОКАЗЫВАТЬ её ещё рано - для этого есть <see cref="Ready"/>.</summary>
+			public bool Registered => Model != null;
+
+			/// <summary>Модель можно инстанцировать: она зарегистрирована И её текстуры доехали до
+			/// целевого качества. Раньше здесь стояло просто Model != null, и модель появлялась в кадре
+			/// на 1x1-филлерах, домигивая текстуры ступенями 64/256/1024 десятки кадров - см.
+			/// <see cref="ModelStore.ModelTexturesReady"/> о том, почему показ ждёт текстуры.</summary>
+			public bool Ready => Model != null && TexturesReady;
+
 			public bool Failed => Error != null;
 
 			internal Resident(string path)
@@ -83,6 +97,9 @@ namespace DecaEngine.Editor.ECS
 
 		// Скретч выселения абандонированных/ошибочных записей - без аллокаций на кадр.
 		private readonly List<Resident> _evictScratch = new();
+
+		// Скретч резидентов, ставших готовыми в этом Tick - событие шлётся вне обхода _models.
+		private readonly List<Resident> _readyScratch = new();
 
 		/// <summary>Гистерезис выгрузки: уже резидентная модель отпускается только за
 		/// <see cref="StreamRadius"/> * этот множитель - иначе на самой границе радиуса она бы
@@ -122,6 +139,7 @@ namespace DecaEngine.Editor.ECS
 			// Живут всю сессию редактора вместе с этим ModelStreamer-ом (он не пересоздаётся при
 			// RecreateEnvironment - меняется только _env) - отписка не требуется.
 			_store.ModelReady += OnStoreModelReady;
+			_store.ModelTexturesReady += OnStoreModelTexturesReady;
 			_store.BeforeModelEvicted += OnStoreModelEvicted;
 		}
 
@@ -129,15 +147,15 @@ namespace DecaEngine.Editor.ECS
 		/// (материалы, probe-GI и т.п.). Не мутировать.</summary>
 		public IReadOnlyDictionary<string, Resident> Models => _models;
 
-		/// <summary>Есть ли незавершённая работа (модель запрошена, но стол её ещё не выдал ни
-		/// готовой, ни ошибкой).</summary>
+		/// <summary>Есть ли незавершённая работа (модель запрошена, но ещё не готова к показу - стол
+		/// либо её ещё не выдал, либо не догнал качество текстур - и не признана ошибочной).</summary>
 		public bool HasPendingLoads
 		{
 			get
 			{
 				foreach (var resident in _models.Values)
 				{
-					if (resident.Model == null && resident.Error == null)
+					if (!resident.Ready && resident.Error == null)
 					{
 						return true;
 					}
@@ -207,14 +225,31 @@ namespace DecaEngine.Editor.ECS
 		{
 			_cameraPos = cameraPos;
 
+			_readyScratch.Clear();
 			foreach (var resident in _models.Values)
 			{
 				if (resident.StoreHandle != null)
 				{
 					_store.SetPriority(resident.StoreHandle, DistanceToCamera(resident));
 				}
+
+				// Подстраховка к событиям стола: заявка, поданная на УЖЕ резидентную (и уже готовую по
+				// текстурам) запись, никаких событий не получит - стол шлёт их один раз на модель, а не
+				// на каждый handle.
+				if (SyncResident(resident))
+				{
+					_readyScratch.Add(resident);
+				}
 			}
 
+			// Событие - вне обхода _models: подписчик на нём инстанцирует модель и вполне может взять
+			// новые заявки (Acquire мутирует словарь).
+			foreach (var resident in _readyScratch)
+			{
+				ModelReady?.Invoke(resident);
+			}
+
+			_readyScratch.Clear();
 			EvictAbandoned();
 		}
 
@@ -242,37 +277,78 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>Модель СТОЛА догрузилась (в общем-то любая, для любого окружения процесса) -
-		/// проверяем, не наша ли это заявка, и если да - регистрируем в СВОЁМ батч-рендерере.</summary>
-		private void OnStoreModelReady(ModelLoader model)
+		/// проверяем, не наша ли это заявка, и если да - регистрируем в СВОЁМ батч-рендерере. Показывать
+		/// её пока рано: <see cref="ModelReady"/> ждёт текстур (см. <see cref="OnStoreModelTexturesReady"/>).</summary>
+		private void OnStoreModelReady(ModelLoader model) => SyncStoreModel(model);
+
+		/// <summary>Текстуры модели стола доехали до целевого качества (см.
+		/// <see cref="ModelStore.ModelTexturesReady"/>) - если это наша заявка, модель наконец можно
+		/// показывать: шлём <see cref="ModelReady"/> и открываем <see cref="Resident.Ready"/>.</summary>
+		private void OnStoreModelTexturesReady(ModelLoader model) => SyncStoreModel(model);
+
+		/// <summary>Ищет резидента, чья заявка ссылается на эту модель стола, и догоняет его состояние
+		/// (регистрация и/или готовность текстур). Пути - уникальные ключи, так что резидент максимум
+		/// один.</summary>
+		private void SyncStoreModel(ModelLoader model)
 		{
 			foreach (var resident in _models.Values)
 			{
-				if (resident.Model != null || resident.StoreHandle == null)
+				if (resident.StoreHandle == null ||
+					!_store.TryGetReady(resident.StoreHandle, out var readyModel) ||
+					!ReferenceEquals(readyModel, model))
 				{
 					continue;
 				}
 
-				if (!_store.TryGetReady(resident.StoreHandle, out var readyModel) ||
-					!ReferenceEquals(readyModel, model))
+				if (SyncResident(resident))
 				{
-					continue;
+					ModelReady?.Invoke(resident);
+				}
+
+				return;
+			}
+		}
+
+		/// <summary>Догоняет состояние резидента по его заявке в столе: регистрирует модель в батч-
+		/// рендерере этого окружения, как только стол её выдал, и отдельно - открывает
+		/// <see cref="Resident.Ready"/>, когда текстуры доехали. Возвращает true РОВНО ОДИН раз - в тот
+		/// вызов, где резидент стал готов к показу (звать <see cref="ModelReady"/> - дело вызывающего:
+		/// подписчик может брать новые заявки, а значит мутировать <see cref="_models"/>).</summary>
+		private bool SyncResident(Resident resident)
+		{
+			if (resident.StoreHandle == null || resident.Error != null || resident.TexturesReady)
+			{
+				return false;
+			}
+
+			if (resident.Model == null)
+			{
+				if (!_store.TryGetReady(resident.StoreHandle, out var readyModel))
+				{
+					return false;
 				}
 
 				try
 				{
 					RegisterResident(resident, readyModel);
 					resident.Model = readyModel;
-					ModelReady?.Invoke(resident);
 				}
 				catch (Exception ex)
 				{
 					resident.Error = ex.Message;
 					EditorConsoleLog.Add(LogLevel.Error,
 						$"Model streaming: failed to register '{resident.Path}': {ex.Message}");
+					return false;
 				}
-
-				return; // пути уникальные ключи - максимум один резидент может ссылаться на эту модель
 			}
+
+			if (!_store.AreTexturesReady(resident.StoreHandle))
+			{
+				return false;
+			}
+
+			resident.TexturesReady = true;
+			return true;
 		}
 
 		/// <summary>Стол СЕЙЧАС выселит эту модель (см. <see cref="ModelStore.BeforeModelEvicted"/>) -
@@ -303,6 +379,7 @@ namespace DecaEngine.Editor.ECS
 
 			_env.BatchRenderer.UnregisterModel(found.BatchCache.Values, found.MaterialIds.Values, found.MeshIds.Values);
 			found.Model = null;
+			found.TexturesReady = false;
 			found.MeshIds.Clear();
 			found.MaterialIds.Clear();
 			found.BatchCache.Clear();
@@ -380,6 +457,7 @@ namespace DecaEngine.Editor.ECS
 				}
 
 				resident.Model = null;
+				resident.TexturesReady = false;
 				resident.MeshIds.Clear();
 				resident.MaterialIds.Clear();
 				resident.BatchCache.Clear();
@@ -446,6 +524,7 @@ namespace DecaEngine.Editor.ECS
 				{
 					resident.Error = ex.Message;
 					resident.Model = null;
+					resident.TexturesReady = false;
 					EditorConsoleLog.Add(LogLevel.Error,
 						$"Model streaming: failed to re-register '{resident.Path}' after environment recreate: {ex.Message}");
 				}

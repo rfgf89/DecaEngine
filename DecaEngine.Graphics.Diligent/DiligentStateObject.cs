@@ -124,7 +124,8 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 		CullMode = ToNativeCullMode(info.CullMode),
 		FillMode = ToNativeFillMode(info.FillMode),
 		DepthBias = info.DepthBias,
-		SlopeScaledDepthBias = info.SlopeScaledDepthBias
+		SlopeScaledDepthBias = info.SlopeScaledDepthBias,
+		DepthClipEnable = !info.DepthClipDisable
 	};
 
 	private static DepthStencilStateDesc ToNativeDepthStencilDesc(DepthStencilStateInfo info) => new()

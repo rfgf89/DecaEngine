@@ -23,9 +23,13 @@ cbuffer ProbeDebugParams
     float4 DebugPool;
 };
 
-// Углы кирпичей - тот же буфер, что у compute-раунда (см. ProbeRoundGpu): xyz = угол в координатах
-// виртуальной сетки, w = уровень подразделения.
+// Углы кирпичей - тот же буфер, что у compute-раунда (см. ProbeRoundGpu.BrickWord): xyz = угол в
+// координатах виртуальной сетки, w = состояние слота (биты 0-3 - уровень подразделения, 512 - слот
+// пуст).
 StructuredBuffer<int4> _ProbeBrickOrigin;
+
+#define PROBE_BRICK_LEVEL_MASK 15
+#define PROBE_BRICK_EMPTY      512
 
 // Атласы проб: смещение релокации, поле L0 (цвет) и валидность (альфа Sh1).
 Texture2D _ProbeOffset;
@@ -85,7 +89,7 @@ PSInput Main(uint vid : SV_VertexID)
     uint brick = probe / perBrick;
     uint local = probe - brick * perBrick;
     int4 brickOrigin = _ProbeBrickOrigin[brick];
-    int step = 1 << brickOrigin.w;
+    int step = 1 << (brickOrigin.w & PROBE_BRICK_LEVEL_MASK);
     int3 cell = brickOrigin.xyz + int3(
         (int)(local % PROBE_BRICK_PROBES) * step,
         (int)(local / PROBE_BRICK_PROBES % PROBE_BRICK_PROBES) * step,
@@ -95,7 +99,10 @@ PSInput Main(uint vid : SV_VertexID)
     float3 offset = _ProbeOffset.Load(texel).rgb;
     float3 probePos = DebugGridOrigin.xyz + (float3)cell * DebugGridCell.xyz + offset;
 
-    float radius = DebugGridOrigin.w;
+    // Пустой слот пула (запас под прокрутку объёма, см. ProbeGiBaker.ScrollHeadroom) - схлопываем
+    // шарик в точку: пробы там нет, а рисовать её у угла объёма значило бы показывать кучу
+    // фантомов, которых в поле не существует.
+    float radius = (brickOrigin.w & PROBE_BRICK_EMPTY) != 0 ? 0.0 : DebugGridOrigin.w;
     float3 n = normalize(OctaVerts[corner]);
 
     PSInput result;

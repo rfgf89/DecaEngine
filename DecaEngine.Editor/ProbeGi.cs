@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
@@ -172,6 +172,35 @@ public sealed class ProbeGiBakeOptions
 	/// аппаратной трассировке остаётся единицами миллисекунд на раунд.</summary>
 	public int RealtimeRaysPerRound = 64;
 
+	/// <summary>Порог средней изменчивости объёма, ниже которого раунды останавливаются целиком
+	/// (0 = приём выключен). Перенос «Probe Variability» из RTXGI-DDGI, см. ProbeVariabilityCS.hlsl.
+	///
+	/// Смысл: сон проб (см. <see cref="ProbeGiBakeSession"/>) экономит до трёх четвертей лучей, а
+	/// классификация снимает ещё часть, но диспатч раунда всё равно идёт каждый кадр. На статичной
+	/// сцене со статичным светом это чистая трата: поле сошлось, и следующая сотня раундов повторит
+	/// то же значение. Изменчивость - коэффициент вариации яркости проб, усреднённый по объёму -
+	/// даёт признак «повторять больше нечего», и раунд можно не пускать вовсе.
+	///
+	/// Возврат к работе обеспечивают те же события, что будят спящие пробы: смена света
+	/// (<c>SetLighting</c>) и движение геометрии (<c>ReopenRelocation</c>) откатывают вес раунда,
+	/// а пока вес выше пола, остановка запрещена. Сверх этого раз в
+	/// <c>ProbeRoundGpu.VariabilityRefreshPeriod</c> раундов пускается полный раунд независимо ни от
+	/// чего - страховка от изменения, которое не подняло ни одного из этих флагов.
+	///
+	/// Величина зависит от сцены и от числа лучей (шум оценки идёт как 1/sqrt(N), и изменчивость
+	/// вместе с ним), поэтому она вынесена ручкой, а не зашита. Замерено на Sponza при 128 лучах:
+	/// установившаяся изменчивость 0.058, при пороге 0.08 пропускается 94% раундов, а средняя
+	/// яркость поля не меняется (0.8953 против 0.8954). Дефолт 0.08 - это измеренное значение с
+	/// запасом на шум; восьмипроцентный разброс яркости пробы на глаз неразличим.</summary>
+	public float RealtimeVariabilityThreshold = 0.08f;
+
+	/// <summary>Куда может уехать УГОЛ коробки прокручиваемого объёма: минимальное и максимальное
+	/// положение. По этой области меряется ёмкость пула - см. <see cref="ProbeGiBaker.BeginBake"/>,
+	/// там же о том, почему мерить её по месту создания объёма нельзя. null - объём не прокручивается
+	/// либо вызывающий области не знает; тогда ёмкость считается по-старому, от стартового места.
+	/// </summary>
+	public (Vector3 Min, Vector3 Max)? ScrollOriginRange;
+
 	/// <summary>Потолок яркости ОДНОГО луча в режиме реального времени (0 = без ограничения) -
 	/// подавление выбросов, тот же приём и по той же причине, что
 	/// <see cref="EditorSettings.SsgiMaxLuminance"/> в экранном GI.
@@ -283,22 +312,50 @@ public sealed class ProbeGiBakeSession
 
 	/// <summary>Карта индирекции: индекс накрывающего кирпича по координатам в САМОЙ МЕЛКОЙ сетке
 	/// кирпичей, -1 = пусто. Крупный кирпич прописан во все свои ячейки. Чистая геометрия -
-	/// переживает и смену света, и любые раунды.</summary>
-	internal readonly int[] BrickIndex;
+	/// переживает и смену света, и любые раунды (но не прокрутку объёма, см.
+	/// <see cref="Scroll"/>).</summary>
+	internal int[] BrickIndex;
 
 	/// <summary>Уровень подразделения накрывающего кирпича, по ячейке мелкой сетки - зеркало
 	/// альфы карты индирекции.</summary>
-	internal readonly byte[] BrickLevelAt;
+	internal byte[] BrickLevelAt;
 
 	/// <summary>Обратная карта: по три int на кирпич пула - его угол в координатах виртуальной
 	/// сетки проб (уже домноженный на BrickCells).</summary>
-	internal readonly int[] BrickCellOrigin;
+	internal int[] BrickCellOrigin;
 
 	/// <summary>Уровень кирпича пула: шаг между его пробами равен Cell * 2^Level.</summary>
-	internal readonly byte[] BrickLevel;
+	internal byte[] BrickLevel;
+
+	/// <summary>Занят ли слот пула кирпичом. У прокручиваемого объёма пул заводится С ЗАПАСОМ (см.
+	/// <see cref="ProbeGiBaker.ScrollHeadroom"/>), и часть слотов в любой момент пустует: их пробы
+	/// существуют в буферах, но раунд их не считает, а индирекция на них не смотрит.</summary>
+	internal bool[] BrickAlive;
+
+	/// <summary>Сколько раундов слот ещё считается СВЕЖИМ - счётчик заводится при заселении слота
+	/// новым кирпичом (прокрутка) и тикает вместе с раундами.
+	///
+	/// Первый из этих раундов «холодный»: поле принимается целиком (вес 1), а накопители - счётчики
+	/// лучей, окто-карта глубин и смещение релокации - обнуляются, иначе новый кирпич унаследовал бы
+	/// геометрию прежнего жильца слота. Всё окно (столько же раундов, сколько даёт инициализация,
+	/// см. <see cref="ProbeGiBaker.RelocationRounds"/>) пробам слота разрешена релокация - они только
+	/// что появились и половина из них стоит в стенах.</summary>
+	internal byte[] BrickFresh;
+
+	/// <summary>Номер раскладки: растёт на каждой прокрутке. По нему потребители кэшей раскладки
+	/// (GPU-буферы кирпичей, дебаг-оверлей) понимают, что их копия протухла.</summary>
+	internal int LayoutGeneration;
+
+	/// <summary>Раскладка изменилась и ещё не доехала до GPU (буферы кирпичей, карта индирекции).
+	/// Снимает <see cref="ProbeRoundGpu.SyncBrickState"/> на границе раунда.</summary>
+	internal bool BrickStateDirty;
+
+	/// <summary>Кэш осмотра геометрии под прокрутку - живёт ровно у прокручиваемых объёмов (см.
+	/// <see cref="Scroll"/>). У базового объёма null: он никуда не едет.</summary>
+	internal ProbeGiBaker.BrickScratch? Scratch;
 
 	public int ProbeCount { get; }
-	public Vector3 Origin { get; }
+	public Vector3 Origin { get; internal set; }
 	public Vector3 Cell { get; }
 
 	/// <summary>Сколько раундов влито в поле ПОСЛЕ последней смены освещения. Задаёт вес нового
@@ -350,6 +407,10 @@ public sealed class ProbeGiBakeSession
 	/// <summary>Лучей за ТЕКУЩИЙ раунд - зависит от режима: запечка копит качество раундами и может
 	/// позволить себе редкий веер, реальное время платит за него мерцанием.</summary>
 	internal int RaysPerRound => Realtime ? RealtimeRaysPerRound : _bakeRaysPerRound;
+
+	/// <summary>Сколько первых лучей веера - ФИКСИРОВАННЫЕ (см.
+	/// <see cref="ProbeGiBaker.FixedRayCount"/>).</summary>
+	internal int FixedRays => ProbeGiBaker.FixedRayCount(RaysPerRound, Realtime);
 
 	/// <summary>Потолок яркости луча в реальном времени - живая ручка (см.
 	/// <see cref="ProbeGiBakeOptions.RealtimeMaxRayLuminance"/>).</summary>
@@ -426,7 +487,23 @@ public sealed class ProbeGiBakeSession
 		{
 			Round = Math.Min(Round, ProbeGiBaker.RestartRound);
 		}
+
+		// В реальном времени вес раунда НЕ откатывается (см. вызывающий код в PrefabSceneViewport -
+		// там разобрано, почему глобальный откат на каждый кадр драга гизмо хуже болезни). Но
+		// остановку сошедшегося объёма снять обязательно: она проверяет ровно то состояние, которое
+		// движение объекта не трогает - вес на полу и закрытое окно релокации, - и без этой отметки
+		// объём, признанный сошедшимся, замирает НАВСЕГДА. На картинке это выглядит как след:
+		// объект уехал, а его освещение осталось лежать на прежнем месте, потому что раунды больше
+		// не идут и экспоненциальному среднему нечем работать.
+		// Отметка снимается один раз, следующим же раундом (см. ProbeRoundGpu.IsConverged): дальше
+		// объём сходится заново обычным порядком и, если сцена успокоилась, снова остановится.
+		GeometryVersion++;
 	}
+
+	/// <summary>Счётчик изменений геометрии сцены. Растёт на каждый <see cref="InvalidateGeometry"/>;
+	/// <see cref="ProbeRoundGpu"/> сравнивает его со своим снимком и по расхождению снимает
+	/// остановку сошедшегося объёма.</summary>
+	internal int GeometryVersion { get; private set; }
 
 	/// <summary>Тратит раунд окна релокации - зовут оба пути, продвигая раунд.</summary>
 	internal void ConsumeRelocationRound()
@@ -501,7 +578,18 @@ public sealed class ProbeGiBakeSession
 		BrickIndex = layout.Index;
 		BrickLevelAt = layout.LevelAt;
 		BrickLevel = layout.Level;
+		BrickAlive = layout.Alive;
 		BrickTotal = layout.Total;
+
+		// На инициализации свежесть НЕ взводится до конца: холодный раунд тут не нужен (буферы и
+		// так нулевые), а спрятать объём до первого раунда значило бы поменять поведение CPU-пути,
+		// который свежесть не тикает вовсе. Окно релокации на старте открывает сама сессия
+		// (RelocationRoundsLeft), поэтому слоту достаётся ровно «не холодный, но виден».
+		BrickFresh = new byte[layout.Total];
+		for (int slot = 0; slot < layout.Total; slot++)
+		{
+			BrickFresh[slot] = layout.Alive[slot] ? (byte)(ProbeGiBaker.RelocationRounds - 1) : (byte)0;
+		}
 		PoolColumns = poolColumns;
 		ProbeCount = layout.Total * ProbeGiBaker.BrickProbes
 			* ProbeGiBaker.BrickProbes * ProbeGiBaker.BrickProbes;
@@ -526,6 +614,7 @@ public sealed class ProbeGiBakeSession
 		RealtimeMaxStep = MathF.Max(options.RealtimeMaxStep, 0f);
 		RealtimeRelocation = Math.Clamp(options.RealtimeRelocation, 0f, 0.45f);
 		RealtimeGamma = Math.Clamp(options.RealtimeGamma, 1f, 8f);
+		VariabilityThreshold = MathF.Max(options.RealtimeVariabilityThreshold, 0f);
 		// Свежая сессия - пробы стоят в узлах сетки, часть из них внутри стен: окно открыто.
 		RelocationRoundsLeft = ProbeGiBaker.RelocationRounds;
 		Realtime = options.Realtime;
@@ -568,9 +657,12 @@ public sealed class ProbeGiBakeSession
 			BricksPerLevel = new int[ProbeGiBaker.MaxBrickLevel],
 		};
 
-		foreach (var level in BrickLevel)
+		for (int slot = 0; slot < BrickTotal; slot++)
 		{
-			Result.BricksPerLevel[level]++;
+			if (BrickAlive[slot])
+			{
+				Result.BricksPerLevel[BrickLevel[slot]]++;
+			}
 		}
 
 		// Пул может быть шире, чем есть кирпичей (последний ряд неполон) - атласы выделяем под всю
@@ -583,11 +675,27 @@ public sealed class ProbeGiBakeSession
 		Result.Offset = new byte[poolProbes * 8];
 		Result.Vis = new byte[poolProbes * ProbeGiBakeResult.VisRes * ProbeGiBakeResult.VisRes * 8];
 
-		// Карта индирекции геометрична - пишется один раз здесь, снимки её не трогают.
+		WriteIndirection();
+	}
+
+	/// <summary>Пересобирает карту индирекции из текущей раскладки. У неподвижного объёма это
+	/// делается один раз (геометрия сетки не меняется), у прокручиваемого - на каждой прокрутке и
+	/// на выходе кирпича из свежести.
+	///
+	/// СВЕЖИЙ кирпич помечается как НЕСУЩЕСТВУЮЩИЙ (b = 0), хотя слот у него уже есть, и это
+	/// главная деталь всей прокрутки. Слот только что отобрали у прежнего жильца, а его тексели в
+	/// атласах ещё держат СТАРОЕ поле - поле места, откуда объём уехал. Покажи мы такой кирпич
+	/// сразу, во въехавшей области вспыхнули бы блоки чужого освещения; спрятанный, он честно
+	/// проваливается на более крупный каскад (см. ProbeGiSampleBody: b &lt; 0.5 - промах) ровно до
+	/// того раунда, который запишет его собственные значения.</summary>
+	internal void WriteIndirection()
+	{
+		int nbx = BrickCountX, nby = BrickCountY;
+		Array.Clear(Result.Indirection);
 		for (int i = 0; i < BrickIndex.Length; i++)
 		{
 			int slot = BrickIndex[i];
-			if (slot < 0)
+			if (slot < 0 || BrickFresh[slot] >= ProbeGiBaker.RelocationRounds)
 			{
 				continue;
 			}
@@ -596,9 +704,35 @@ public sealed class ProbeGiBakeSession
 			int texel = ((bz * nby + by) * nbx + bx) * 4;
 			Result.Indirection[texel + 0] = (byte)(slot & 255);
 			Result.Indirection[texel + 1] = (byte)(slot >> 8 & 255);
-			Result.Indirection[texel + 2] = 255;
+			Result.Indirection[texel + 2] = BrickConfidence(slot);
 			Result.Indirection[texel + 3] = BrickLevelAt[i];
 		}
+	}
+
+	/// <summary>Насколько кирпичу можно верить, 0..255 - канал b индирекции. Прогретый кирпич даёт
+	/// 255; кирпич, ещё доживающий своё окно свежести, - пропорционально прожитому.
+	///
+	/// Зачем полутон вместо флага. Прогревающий диспатч (см. ProbeRoundGpu.WarmColdBricks) снимает
+	/// с въехавшего кирпича холод за один заход, и до этой поправки он тут же появлялся В ПОЛНУЮ
+	/// СИЛУ - с полем, собранным одним веером лучей, то есть шумным. Прокрутка приводит такие
+	/// кирпичи непрерывно, пока летит камера, и вся въехавшая полоса рябила: ровно то, что читается
+	/// как «пробы пересчитываются, когда двигаешь камеру». Проявление за окно свежести отдаёт эти
+	/// раунды более крупному каскаду, который там давно сошёлся.
+	///
+	/// Только для ПРОКРУЧИВАЕМЫХ объёмов. У базового полутон был бы опасен: его свежесть тикает
+	/// лишь GPU-путь, а CPU-путь не тикает её вовсе (см. конструктор сессии), и там кирпичи
+	/// застряли бы на стартовом весе навсегда - весь объём светил бы в пятую силу.</summary>
+	private byte BrickConfidence(int slot)
+	{
+		int fresh = BrickFresh[slot];
+		if (Scratch == null || fresh <= 0)
+		{
+			return 255;
+		}
+
+		// fresh падает от RelocationRounds-1 (только прогрет) до нуля (прожил окно целиком).
+		int lived = ProbeGiBaker.RelocationRounds - fresh;
+		return (byte)Math.Clamp(lived * 255 / ProbeGiBaker.RelocationRounds, 1, 255);
 	}
 
 	/// <summary>Обновляет освещение между раундами. Если оно реально изменилось, сходимость
@@ -638,7 +772,287 @@ public sealed class ProbeGiBakeSession
 		Sequence++;
 		Round++;
 		ConsumeRelocationRound();
+		ConsumeFreshRound();
 	}
+
+	/// <summary>Сколько кирпичей СЕЙЧАС спрятано из индирекции как холодные (слот только что отобран
+	/// прокруткой, своего поля в нём ещё нет - см. <see cref="WriteIndirection"/>). Это ровно те
+	/// кирпичи, на месте которых выборка проваливается на более крупный каскад, то есть прямая мера
+	/// «протечки при движении»: чем дольше и чем больше их держится, тем заметнее артефакт.</summary>
+	internal int ColdBrickCount
+	{
+		get
+		{
+			int cold = 0;
+			for (int slot = 0; slot < BrickTotal; slot++)
+			{
+				if (BrickFresh[slot] >= ProbeGiBaker.RelocationRounds)
+				{
+					cold++;
+				}
+			}
+
+			return cold;
+		}
+	}
+
+	/// <summary>Слоты, прогретые ПОСЛЕДНИМ <see cref="ThawColdBricks"/>, и сколько их. Снаружи это
+	/// единственный способ узнать, какие именно слоты этот раунд заселял с нуля: сами счётчики
+	/// свежести к моменту проверки уже тикнуты (см. смоук прокрутки в PreviewProbe).</summary>
+	internal bool[]? LastThawed;
+
+	internal int LastThawedCount;
+
+	/// <summary>Снимает холод со ВСЕХ холодных слотов и возвращает их в индирекцию: зовётся сразу
+	/// после того, как прогревающий диспатч записал им собственное поле (см.
+	/// ProbeRoundGpu.WarmColdBricks). Это тот же переход, что делает <see cref="ConsumeFreshRound"/>
+	/// в конце раунда, но выполненный НЕ ДОЖИДАЯСЬ конца раунда - именно ожидание и растягивало
+	/// протечку на несколько кадров, потому что раунд идёт порциями через кадры.
+	///
+	/// Окно релокации слоту при этом остаётся открытым (счётчик падает на единицу, а не в ноль): у
+	/// свежих проб половина стоит в стенах, и выбираться им ещё нужно.</summary>
+	internal bool ThawColdBricks()
+	{
+		bool thawed = false;
+		LastThawed ??= new bool[BrickTotal];
+		Array.Clear(LastThawed);
+		LastThawedCount = 0;
+
+		for (int slot = 0; slot < BrickTotal; slot++)
+		{
+			if (BrickFresh[slot] >= ProbeGiBaker.RelocationRounds)
+			{
+				BrickFresh[slot]--;
+				LastThawed[slot] = true;
+				LastThawedCount++;
+				thawed = true;
+			}
+		}
+
+		if (thawed)
+		{
+			WriteIndirection();
+			BrickStateDirty = true;
+		}
+
+		return thawed;
+	}
+
+	/// <summary>Диапазоны слотов, которые СЕЙЧАС холодны, слитые в непрерывные отрезки. Пробы одного
+	/// кирпича лежат в буферах подряд (probe = slot * BrickProbes³ + local), поэтому отрезок слотов -
+	/// это готовый диапазон диспатча, а слияние соседних экономит сами диспатчи: прокрутка заселяет
+	/// плиту соседних слотов, и их обычно десятки.</summary>
+	internal List<(int Start, int End)> ColdBrickRuns()
+	{
+		var runs = new List<(int Start, int End)>();
+		int runStart = -1;
+
+		for (int slot = 0; slot <= BrickTotal; slot++)
+		{
+			bool cold = slot < BrickTotal && BrickFresh[slot] >= ProbeGiBaker.RelocationRounds;
+			if (cold)
+			{
+				if (runStart < 0)
+				{
+					runStart = slot;
+				}
+
+				continue;
+			}
+
+			if (runStart >= 0)
+			{
+				runs.Add((runStart, slot));
+				runStart = -1;
+			}
+		}
+
+		return runs;
+	}
+
+	/// <summary>Тикает свежесть слотов, заселённых прокруткой (см. <see cref="BrickFresh"/>).
+	/// Раунд, который только что закончился, уже записал их собственное поле - значит холодный старт
+	/// позади, кирпич можно показывать материалам, а окно релокации у него ещё открыто.</summary>
+	private void ConsumeFreshRound()
+	{
+		bool wasCold = false, changed = false;
+		for (int slot = 0; slot < BrickTotal; slot++)
+		{
+			if (BrickFresh[slot] == 0)
+			{
+				continue;
+			}
+
+			wasCold |= BrickFresh[slot] >= ProbeGiBaker.RelocationRounds;
+			BrickFresh[slot]--;
+			changed = true;
+		}
+
+		if (!changed)
+		{
+			return;
+		}
+
+		// У ПРОКРУЧИВАЕМОГО объёма индирекцию переписывает каждый шаг счётчика: там b - это
+		// уверенность кирпича (см. BrickConfidence), и она растёт с каждым прожитым раундом.
+		// У остальных - только когда холодный раунд у кого-то ЗАКОНЧИЛСЯ: прочие шаги меняют лишь
+		// право на релокацию, а его читает буфер кирпичей, не текстура.
+		if (wasCold || Scratch != null)
+		{
+			WriteIndirection();
+		}
+
+		BrickStateDirty = true;
+	}
+
+	/// <summary>ТОРОИДАЛЬНАЯ ПРОКРУТКА объёма: сдвигает его на целое число кирпичей вслед за точкой
+	/// интереса, СОХРАНЯЯ поле там, где объём с собой пересёкся.
+	///
+	/// Это замена пересозданию каскада, и разница принципиальная, а не в скорости. Пересоздание
+	/// означало новую сессию (десятки мегабайт аккумуляторов), новый комплект GPU-буферов вместе с
+	/// выгрузкой ВСЕГО BVH сцены, семь новых атласов, переприязку материалов, Flush + WaitForIdle и
+	/// холодный старт поля целиком - отсюда и рывок на каждое движение камеры, и дебаунс, который
+	/// откладывал его до остановки. Прокрутка не создаёт НИЧЕГО: кирпич, оставшийся в объёме,
+	/// удерживает свой слот пула вместе с накопленным полем, освободившиеся слоты переселяются во
+	/// въехавшую область, и заново осматривается только она.
+	///
+	/// Сдвиг квантуется <see cref="ProbeGiBaker.ScrollQuantumBricks"/> кирпичами: мельче сетки проб
+	/// ехать нельзя, иначе решётка проб сойдёт со своих мировых позиций и вся экономия прокрутки
+	/// (кирпич остался на месте - поле уцелело) пропадёт вместе с ней.
+	///
+	/// Метод ПРИВАТНЫЙ, и это часть лечения. Прокрутка меняет мировые позиции проб, а их читают трое:
+	/// материалы (угол сетки в кбуфере плюс карта индирекции), compute-раунд (буферы кирпичей) и
+	/// дебаг-оверлей. Пока прокрутку разрешалось звать откуда угодно, она правила состояние на CPU
+	/// немедленно, а на GPU уезжала только на границе раунда - и в промежутке эти трое читали РАЗНЫЕ
+	/// поколения раскладки: шарики проб уже уехали за камерой, освещение ещё лежало по-старому.
+	/// Границы раунда при этом ждать приходится долго - забор регулярно пропускает кадры, - так что
+	/// расхождение держалось на экране, а не мелькало. Снаружи теперь есть только
+	/// <see cref="RequestScroll"/>, а применяется заявка в одном месте - там же, откуда раскладка
+	/// тем же вызовом уходит на GPU (см. ProbeRoundGpu.RunRound).</summary>
+	/// <param name="desiredOrigin">Желаемый угол объёма; фактический округляется к сетке кирпичей.</param>
+	/// <returns>true, если объём реально переехал.</returns>
+	private bool Scroll(ProbeGiBaker baker, Vector3 desiredOrigin)
+	{
+		if (Scratch == null)
+		{
+			return false;
+		}
+
+		int quantum = ProbeGiBaker.ScrollQuantumBricks;
+		var brickSize = Cell * ProbeGiBaker.BrickCells;
+		var delta = desiredOrigin - Origin;
+		int sx = (int)MathF.Round(delta.X / (brickSize.X * quantum)) * quantum;
+		int sy = (int)MathF.Round(delta.Y / (brickSize.Y * quantum)) * quantum;
+		int sz = (int)MathF.Round(delta.Z / (brickSize.Z * quantum)) * quantum;
+		if (sx == 0 && sy == 0 && sz == 0)
+		{
+			return false;
+		}
+
+		// Кто где стоял - в координатах НОВОЙ сетки: по этой карте раскладка узнаёт кирпич, который
+		// никуда не уехал, и оставляет ему слот. Без неё прокрутка выродилась бы в пересоздание с
+		// сохранением буферов - поле всё равно начиналось бы с нуля.
+		int cells = BrickCountX * BrickCountY * BrickCountZ;
+		var reuseSlot = new int[cells];
+		Array.Fill(reuseSlot, -1);
+		var reuseLevel = new byte[cells];
+		for (int slot = 0; slot < BrickTotal; slot++)
+		{
+			if (!BrickAlive[slot])
+			{
+				continue;
+			}
+
+			int ax = BrickCellOrigin[slot * 3 + 0] / ProbeGiBaker.BrickCells - sx;
+			int ay = BrickCellOrigin[slot * 3 + 1] / ProbeGiBaker.BrickCells - sy;
+			int az = BrickCellOrigin[slot * 3 + 2] / ProbeGiBaker.BrickCells - sz;
+			if (ax < 0 || ay < 0 || az < 0
+				|| ax >= BrickCountX || ay >= BrickCountY || az >= BrickCountZ)
+			{
+				continue;
+			}
+
+			int at = (az * BrickCountY + ay) * BrickCountX + ax;
+			reuseSlot[at] = slot;
+			reuseLevel[at] = BrickLevel[slot];
+		}
+
+		Origin += new Vector3(sx * brickSize.X, sy * brickSize.Y, sz * brickSize.Z);
+		Result.Origin = Origin;
+		Scratch.Shift(sx, sy, sz);
+
+		var layout = baker.ClassifyBricks(Origin, Cell, BrickCountX, BrickCountY, BrickCountZ,
+			Scratch, reuseSlot, reuseLevel, BrickTotal);
+
+		BrickIndex = layout.Index;
+		BrickLevelAt = layout.LevelAt;
+		BrickLevel = layout.Level;
+		BrickAlive = layout.Alive;
+		for (int slot = 0; slot < BrickTotal; slot++)
+		{
+			BrickCellOrigin[slot * 3 + 0] = layout.Anchor[slot * 3 + 0] * ProbeGiBaker.BrickCells;
+			BrickCellOrigin[slot * 3 + 1] = layout.Anchor[slot * 3 + 1] * ProbeGiBaker.BrickCells;
+			BrickCellOrigin[slot * 3 + 2] = layout.Anchor[slot * 3 + 2] * ProbeGiBaker.BrickCells;
+
+			if (layout.Fresh[slot] != 0)
+			{
+				BrickFresh[slot] = ProbeGiBaker.RelocationRounds;
+			}
+			else if (!layout.Alive[slot])
+			{
+				BrickFresh[slot] = 0;
+			}
+		}
+
+		WriteIndirection();
+		LayoutGeneration++;
+		BrickStateDirty = true;
+		return true;
+	}
+
+	/// <summary>Куда объём хочет переехать; null - заявок нет.</summary>
+	private Vector3? _scrollRequest;
+
+	/// <summary>Просит объём переехать углом в <paramref name="desiredOrigin"/>. Заявка НЕ исполняется
+	/// на месте: раскладку двигает <see cref="ApplyPendingScroll"/> на границе раунда, атомарно с
+	/// выгрузкой на GPU (см. <see cref="Scroll"/> о том, почему иначе разъезжаются шарики и свет).
+	///
+	/// Заявка перезаписывается, а не копится: пока камера летит, вьюпорт шлёт новую каждый кадр, и
+	/// исполнить осмысленно можно только последнюю.</summary>
+	internal void RequestScroll(Vector3 desiredOrigin) => _scrollRequest = desiredOrigin;
+
+	/// <summary>Есть неисполненная заявка на переезд. Читает <see cref="ProbeRoundGpu"/>: объём с
+	/// незакрытой заявкой сошедшимся считать нельзя, ему вот-вот привезут пустые кирпичи с краю.
+	/// </summary>
+	internal bool HasPendingScroll => _scrollRequest.HasValue;
+
+	/// <summary>Порог средней изменчивости, ниже которого объём считается сошедшимся и раунды
+	/// останавливаются (см. <see cref="ProbeGiBakeOptions.RealtimeVariabilityThreshold"/>). Живая
+	/// ручка - меняется между раундами.</summary>
+	public float VariabilityThreshold { get; set; }
+
+	/// <summary>Исполняет отложенную заявку на переезд. Зовётся ТОЛЬКО с границы раунда и только
+	/// оттуда, где следом идёт выгрузка раскладки на GPU.</summary>
+	/// <returns>true, если объём переехал.</returns>
+	internal bool ApplyPendingScroll(ProbeGiBaker baker)
+	{
+		if (_scrollRequest is not { } desired)
+		{
+			return false;
+		}
+
+		_scrollRequest = null;
+		return Scroll(baker, desired);
+	}
+
+	/// <summary>Предел релокации для СВЕЖИХ проб (см. <see cref="BrickFresh"/>) - у них своё окно,
+	/// не общесеточное: прокрутка приводит новые пробы непрерывно, пока летит камера, а открывать
+	/// ради них релокацию всему объёму запрещает Majercik 2021 §5 (см.
+	/// <see cref="RelocationRoundsLeft"/>) - это расшатало бы поле, которое прокрутка как раз и
+	/// бережёт.</summary>
+	internal float FreshRelocationLimit => Realtime
+		? MathF.Max(RealtimeRelocation, 0f) * MathF.Min(Cell.X, MathF.Min(Cell.Y, Cell.Z))
+		: 0f;
 
 	/// <summary>Меняет местами читающий и пишущий буферы поля - конец раунда.</summary>
 	internal void Swap()
@@ -1080,6 +1494,55 @@ public sealed class ProbeGiBaker
 	/// и сверка с CPU-эталоном перестала бы что-либо значить (см. ProbeRoundCS.hlsl).</summary>
 	public static Vector3[] RoundRayDirections(int rays, int sequence) =>
 		BuildRotatedFibonacciSphere(rays, sequence);
+
+	/// <summary>Сколько первых лучей веера не вращать (RTXGI-DDGI, RTXGI_DDGI_NUM_FIXED_RAYS).
+	///
+	/// Смысл приёма (ProbeRayCommon.hlsl: «Don't rotate fixed rays so relocation/classification are
+	/// temporally stable»): решения о ПЕРЕЕЗДЕ пробы и о её отключении принимаются по геометрии -
+	/// доле задних граней, ближайшему выходу наружу, запасу свободного места. Считать их по вееру,
+	/// который каждый раунд повёрнут заново, значит мерить дрожащей линейкой: у пробы на кромке
+	/// геометрии доля задних граней гуляет от раунда к раунду просто из-за смены направлений, и
+	/// проба то уезжает, то возвращается, каждый раз сбрасывая накопители. Небольшой набор лучей,
+	/// НЕ зависящий от номера раунда, даёт этим решениям устойчивую опору.
+	///
+	/// Фиксированные лучи не участвуют в оценке радианса и в карте глубин (см. ProbeRoundCS): они
+	/// не вращаются, поэтому их направления представлены в среднем вдвое чаще остальных, и подмешать
+	/// их значило бы внести в оценку постоянное смещение по этим направлениям. Трассируются они не
+	/// впустую - именно они и делают всю геометрическую работу.
+	///
+	/// ТОЛЬКО в реальном времени. В запечке веер вращается по номеру раунда, оба пути (CPU и GPU)
+	/// обязаны совпасть луч в луч ради сверки, и делить веер значило бы зеркалить всю раскладку ещё
+	/// и в CPU-бейкере; выгоды при этом нет - в запечке проба переезжает один раз на инициализации.
+	/// Доля - восьмая часть веера (у эталона 32 из 288, тот же порядок) с полом 16 и потолком 32,
+	/// и только начиная с 64 лучей. Пол не занижен сознательно: по этим лучам ищется БЛИЖАЙШАЯ
+	/// передняя грань, и на слишком редком веере проба рискует не заметить рядом стоящую
+	/// поверхность и решить, что вокруг просторно (ветка возврата к узлу в ProbeRoundCS). Потолок
+	/// держит цену: сверх 32 устойчивость решений уже не растёт, а лучи из оценки радианса
+	/// вычитаются. На коротком веере (меньше 64) деления нет вовсе - отдать четверть выборки ради
+	/// устойчивости релокации невыгодно, шум радианса дороже.</summary>
+	public static int FixedRayCount(int rays, bool realtime) =>
+		realtime && rays >= 64 ? Math.Min(32, Math.Max(rays / 8, 16)) : 0;
+
+	/// <summary>Направления раунда с учётом фиксированных лучей: [0, FixedRays) - НЕвращаемый веер
+	/// Фибоначчи, [FixedRays, rays) - обычный, повёрнутый по номеру раунда. Оба - равномерные
+	/// сферические выборки, поэтому каждая часть остаётся корректной сама по себе.</summary>
+	public static Vector3[] RoundRayDirections(ProbeGiBakeSession session) =>
+		RoundRayDirections(session.RaysPerRound, session.Sequence, session.FixedRays);
+
+	/// <inheritdoc cref="RoundRayDirections(ProbeGiBakeSession)"/>
+	public static Vector3[] RoundRayDirections(int rays, int sequence, int fixedRays)
+	{
+		if (fixedRays <= 0)
+		{
+			return BuildRotatedFibonacciSphere(rays, sequence);
+		}
+
+		var dirs = new Vector3[rays];
+		Array.Copy(BuildFibonacciSphere(fixedRays), dirs, fixedRays);
+		Array.Copy(BuildRotatedFibonacciSphere(rays - fixedRays, sequence), 0,
+			dirs, fixedRays, rays - fixedRays);
+		return dirs;
+	}
 
 	/// <summary>Вес раунда в бегущем среднем - GPU-путь считает его тем же способом, что и
 	/// <see cref="RunRound"/>, иначе поля разойдутся по яркости.
@@ -1867,9 +2330,12 @@ public sealed class ProbeGiBaker
 	/// skyRadiance - линейный радианс неба по мировому направлению ДО пользовательского поворота
 	/// (envYaw применяется внутри, той же конвенцией, что SampleEnvironment в шейдере).
 	/// sunDirection - НА солнце.</summary>
+	/// <param name="scrollable">Объём будет ездить за камерой (см.
+	/// <see cref="ProbeGiBakeSession.Scroll"/>): пул заводится с запасом слотов, а осмотр геометрии
+	/// сохраняется в кэше, чтобы сдвиг стоил только въехавшей области.</param>
 	public ProbeGiBakeSession BeginBake(Vector3 boundsMin, Vector3 boundsMax, Vector3 sunDirection,
 		Vector3 sunColor, float envYawRadians, Func<Vector3, Vector3> skyRadiance,
-		ProbeGiBakeOptions? options = null)
+		ProbeGiBakeOptions? options = null, bool scrollable = false)
 	{
 		options ??= new ProbeGiBakeOptions();
 		float density = Math.Clamp(options.GridDensity, 4f, 64f);
@@ -1887,8 +2353,9 @@ public sealed class ProbeGiBaker
 		// пространство занимает большую часть коробки, и раньше оно съедало бюджет наравне с
 		// геометрией, заставляя грубеть сетку у поверхностей.
 		float cellTarget = MathF.Max(maxDim, 1e-3f) / density;
-		int cx, cy, cz, nbx, nby, nbz;
+		int cx, cy, cz, nbx, nby, nbz, poolSlots;
 		BrickLayout layout;
+		BrickScratch? scratch = null;
 		while (true)
 		{
 			nbx = BricksPerAxis(full.X, cellTarget);
@@ -1900,12 +2367,50 @@ public sealed class ProbeGiBaker
 			cz = nbz * BrickCells + 1;
 			var probeCell = new Vector3(full.X / (cx - 1), full.Y / (cy - 1), full.Z / (cz - 1));
 
-			layout = ClassifyBricks(min, probeCell, nbx, nby, nbz);
+			// Кэш осмотра заводится под КАЖДЫЙ пробный размер сетки и переживает только принятый:
+			// он привязан к раскладке кирпичей, а укрупнение ячейки её меняет целиком.
+			if (scrollable)
+			{
+				scratch = new BrickScratch();
+				scratch.Resize(nbx, nby, nbz);
+			}
 
-			int brickTotal = layout.Total;
-			long probes = (long)brickTotal * BrickProbes * BrickProbes * BrickProbes;
-			int poolColumns = ChoosePoolColumns(brickTotal);
-			int poolRows = poolColumns > 0 ? (brickTotal + poolColumns - 1) / poolColumns : 0;
+			layout = ClassifyBricks(min, probeCell, nbx, nby, nbz, scratch);
+
+			// Бюджет и атласы меряются по ЁМКОСТИ пула, а не по насчитанным кирпичам: запас
+			// прокрутки - это настоящие пробы, они занимают и атлас, и время раунда.
+			//
+			// У ПРОКРУЧИВАЕМОГО объёма ёмкость меряется по ХУДШЕМУ размещению коробки, а не по тому,
+			// где объём оказался в момент создания. Разница принципиальна и стоила блочных дыр в
+			// освещении: каскад создаётся там, где стоит камера, и если она в этот момент смотрела
+			// на сцену снаружи или из пустого места, коробка накрывала почти пустоту. Дальше камера
+			// влетает внутрь здания, прокрутка приносит плотную геометрию - а слотов под неё нет, и
+			// AssignSlots выбрасывает лишние кирпичи. Замерено в редакторе: пул 234 слота против
+			// 4471 требуемых, то есть в двадцать раз, и 95% каскада просто отсутствовало (в логе -
+			// «ran out of pool slots ... x19,1»). Запасом ScrollHeadroom такое не лечится: он взят
+			// под смену плотности на треть, а не в двадцать раз.
+			//
+			// Худшее ищется перебором размещений по решётке внутри области прокрутки. Своя разметка
+			// (BrickScratch) на каждую пробу обязательна: кэш осмотра привязан к КОНКРЕТНОМУ углу
+			// коробки, и переиспользование вернуло бы чужие ответы. Стоит это по осмотру на позицию
+			// (единицы миллисекунд) и происходит один раз на создание каскада - против рывка от
+			// пересоздания объёма посреди полёта камеры это ничто.
+			int worstTotal = layout.Total;
+			if (scrollable && options.ScrollOriginRange is { } originRange)
+			{
+				// Область задана в координатах УГЛА КОРОБКИ без поля (его добавляет min выше), так
+				// что тот же отступ надо снять и здесь - иначе развёртка поедет на его величину.
+				worstTotal = Math.Max(worstTotal, WorstBrickTotal(
+					(originRange.Min - margin, originRange.Max - margin),
+					probeCell, nbx, nby, nbz));
+			}
+
+			poolSlots = scrollable
+				? Math.Max(layout.Total, (int)MathF.Ceiling(worstTotal * ScrollHeadroom))
+				: layout.Total;
+			long probes = (long)poolSlots * BrickProbes * BrickProbes * BrickProbes;
+			int poolColumns = ChoosePoolColumns(poolSlots);
+			int poolRows = poolColumns > 0 ? (poolSlots + poolColumns - 1) / poolColumns : 0;
 
 			// Кроме бюджета проб пул обязан влезть в атласы (см. MaxAtlasDimension): окто-карта
 			// видимости крупнее SH-атласа в VisRes раз по обеим осям и упирается в предел первой.
@@ -1930,9 +2435,13 @@ public sealed class ProbeGiBaker
 			(int)MathF.Ceiling(Math.Clamp(options.RaysPerProbe, 16, 512)
 				/ (float)Math.Clamp(options.RaysPerRound, 4, 128)));
 
+		layout = layout.Pad(poolSlots);
 		var session = new ProbeGiBakeSession(min, cell, cx, cy, cz, nbx, nby, nbz, layout,
 			ChoosePoolColumns(layout.Total), options, Vector3.Normalize(sunDirection), sunColor,
-			envYawRadians, skyRadiance, BootstrapRounds + averagedRounds);
+			envYawRadians, skyRadiance, BootstrapRounds + averagedRounds)
+		{
+			Scratch = scratch,
+		};
 
 		// Захват поверхностей (сотни миллисекунд на сцене-уровне) откладывается до первого раунда:
 		// BeginBake зовётся с ГЛАВНОГО потока, и здесь он встал бы видимым фризом редактора.
@@ -1950,7 +2459,116 @@ public sealed class ProbeGiBaker
 	/// сетки кирпичей: индекс накрывающего её кирпича в пуле или -1 (пусто); крупный кирпич
 	/// прописан во все свои ячейки, поэтому шейдеру хватает одного чтения. Anchor/Level - по три
 	/// int и по байту на кирпич пула: угол (в координатах мелкой сетки кирпичей) и уровень.</summary>
-	internal readonly record struct BrickLayout(int[] Index, byte[] LevelAt, int[] Anchor, byte[] Level, int Total);
+	/// <param name="Alive">Занят ли слот пула - у прокручиваемого объёма пул с запасом (см.
+	/// <see cref="ScrollHeadroom"/>), и часть слотов пустует.</param>
+	/// <param name="Fresh">Слот ЗАСЕЛЁН ЗАНОВО этой раскладкой (кирпич в нём другой, чем был):
+	/// накопленное поле прежнего жильца к нему отношения не имеет.</param>
+	/// <param name="Live">Сколько кирпичей раскладка насчитала - против <paramref name="Total"/>
+	/// (ёмкость пула) это диагностика того, влезла ли она.</param>
+	internal readonly record struct BrickLayout(int[] Index, byte[] LevelAt, int[] Anchor,
+		byte[] Level, int Total, bool[] Alive, byte[] Fresh, int Live)
+	{
+		/// <summary>Расширяет раскладку до ёмкости пула: слоты сверх насчитанных кирпичей остаются
+		/// пустыми и достаются въезжающим кирпичам при первой же прокрутке.</summary>
+		internal BrickLayout Pad(int slots)
+		{
+			if (slots <= Total)
+			{
+				return this;
+			}
+
+			var anchor = new int[slots * 3];
+			var level = new byte[slots];
+			var alive = new bool[slots];
+			var fresh = new byte[slots];
+			Array.Copy(Anchor, anchor, Anchor.Length);
+			Array.Copy(Level, level, Level.Length);
+			Array.Copy(Alive, alive, Alive.Length);
+			Array.Copy(Fresh, fresh, Fresh.Length);
+			return this with { Anchor = anchor, Level = level, Alive = alive, Fresh = fresh, Total = slots };
+		}
+	}
+
+	/// <summary>Кэш осмотра геометрии под прокрутку объёма: занятость кирпичей по сетке ТЕКУЩЕГО
+	/// положения объёма.
+	///
+	/// Смысл в одном: осмотр коробки - это обход BVH, и на инициализации их тысячи. Прокрутка
+	/// сдвигает объём на кирпич, то есть подавляющее большинство его кирпичей остаётся на прежних
+	/// МЕСТАХ МИРА, и повторять их осмотр незачем - въехавших в кадре десятки, а не тысячи. Кэш и
+	/// делает прокрутку дешёвой настолько, чтобы гонять её прямо в движении камеры.</summary>
+	internal sealed class BrickScratch
+	{
+		private int _nbx, _nby, _nbz;
+
+		internal bool[] Has = Array.Empty<bool>();
+		internal bool[] HasKnown = Array.Empty<bool>();
+
+		internal void Resize(int nbx, int nby, int nbz)
+		{
+			int n = nbx * nby * nbz;
+			_nbx = nbx;
+			_nby = nby;
+			_nbz = nbz;
+			Has = new bool[n];
+			HasKnown = new bool[n];
+		}
+
+		/// <summary>Сдвигает кэш на целое число кирпичей: то, что осталось в объёме, переезжает
+		/// вместе с ним и остаётся известным, въехавшее объявляется неизвестным - его и осмотрит
+		/// раскладка. Осмотр привязан к МЕСТУ В МИРЕ, а не к индексу, поэтому сдвиг честен.</summary>
+		internal void Shift(int sx, int sy, int sz)
+		{
+			int n = _nbx * _nby * _nbz;
+			var has = new bool[n];
+			var known = new bool[n];
+
+			for (int z = 0; z < _nbz; z++)
+			for (int y = 0; y < _nby; y++)
+			for (int x = 0; x < _nbx; x++)
+			{
+				int sourceX = x + sx, sourceY = y + sy, sourceZ = z + sz;
+				if (sourceX < 0 || sourceY < 0 || sourceZ < 0
+					|| sourceX >= _nbx || sourceY >= _nby || sourceZ >= _nbz)
+				{
+					continue;
+				}
+
+				int to = (z * _nby + y) * _nbx + x;
+				int from = (sourceZ * _nby + sourceY) * _nbx + sourceX;
+				has[to] = Has[from];
+				known[to] = HasKnown[from];
+			}
+
+			Has = has;
+			HasKnown = known;
+		}
+	}
+
+	/// <summary>Квант прокрутки объёма - ОДИН кирпич, мельче сетки проб уже нельзя: сдвиг на долю
+	/// кирпича увёл бы решётку проб с её мировых позиций, и вся экономия прокрутки (кирпич остался
+	/// на месте - поле уцелело) исчезла бы вместе с ней.
+	///
+	/// Соблазнительно было взять квант по размеру самой крупной группы слияния (четыре кирпича):
+	/// якоря слитых кирпичей кратны их размеру, шейдер выборки восстанавливает угол кирпича
+	/// округлением вниз по этому же шагу (см. ProbeGiSampleBody), и кратный сдвиг сохранял бы
+	/// слияния при переезде. Замер это отверг: каскад Sponza - 13x13x13 проб, то есть ЧЕТЫРЕ кирпича
+	/// по оси, и такой квант означал бы «объём умеет ездить только целиком» - прокрутка не
+	/// срабатывала вовсе (в смоуке DECA_PROBE_SCROLL все шаги уходили в отказ).
+	///
+	/// Ценой стало то, что слитая группа, не попавшая на свой шаг после сдвига, не переиспользуется:
+	/// разметка соберёт на её месте мелкие кирпичи, и они заселятся как свежие. Это корректно
+	/// (шейдер видит только выровненные группы - разметка других не выпускает) и дёшево ровно там,
+	/// где слияние и работает - на ровных полах и стенах, где поле меняется медленно.</summary>
+	internal const int ScrollQuantumBricks = 1;
+
+	/// <summary>Запас слотов пула у прокручиваемого объёма, долей от насчитанных кирпичей.
+	///
+	/// Прокрутка переселяет кирпичи из уехавшей области во въехавшую, и если новая область плотнее
+	/// старой, свободных слотов не хватит: лишние кирпичи останутся без поля, и в них будет дырка до
+	/// следующей прокрутки. Запас - страховка ровно от этого. Он не бесплатен (пул задаёт и размер
+	/// атласов, и число проб в раунде), поэтому взят скромным: смена плотности геометрии на треть за
+	/// один шаг прокрутки - это уже въезд в принципиально другую часть сцены.</summary>
+	internal const float ScrollHeadroom = 1.35f;
 
 	/// <summary>Насколько сонаправлены нормали геометрии в кирпиче: |Σn|/N. Единица - всё лежит в
 	/// одной плоскости и смотрит в одну сторону.</summary>
@@ -1961,21 +2579,69 @@ public sealed class ProbeGiBaker
 	/// Дальше группы кирпичей, вся геометрия которых ПЛОСКАЯ, сливаются в один крупный: над ровной
 	/// стеной или полом поле меняется почти линейно, и мельчить там нечего - сэкономленный бюджет
 	/// уходит на углы, ниши и основания колонн, где поле как раз ломается. Идём от крупного уровня
-	/// к мелкому, чтобы слияние побеждало там, где возможно.</summary>
-	private BrickLayout ClassifyBricks(Vector3 origin, Vector3 cell, int nbx, int nby, int nbz)
+	/// к мелкому, чтобы слияние побеждало там, где возможно.
+	///
+	/// Слоты пула раздаются ОТДЕЛЬНЫМ шагом, после разметки, и это нужно прокрутке объёма (см.
+	/// <see cref="ProbeGiBakeSession.Scroll"/>): кирпич, который после сдвига остался на прежнем
+	/// месте мира, обязан удержать свой слот вместе с накопленным в нём полем. Раздача по порядку
+	/// разметки, как было раньше, перетасовала бы слоты при каждом сдвиге, и прокрутка ничем не
+	/// отличалась бы от пересоздания.</summary>
+	/// <param name="scratch">Кэш осмотра геометрии (см. <see cref="BrickScratch"/>) - при прокрутке
+	/// избавляет от обхода BVH по всей области, оставляя только въехавшую.</param>
+	/// <param name="reuseSlot">Слот, стоявший в этой ячейке до сдвига, или -1 - карта в координатах
+	/// НОВОЙ сетки.</param>
+	/// <param name="capacity">Ёмкость пула; 0 - раздать ровно столько слотов, сколько кирпичей.</param>
+	/// <summary>Наибольшее число живых кирпичей, какое коробка объёма может набрать, гуляя по
+	/// области прокрутки. Ёмкость пула прокручиваемого объёма считается по нему, а не по месту, где
+	/// объём оказался при создании (см. вызов в <see cref="BeginBake"/> - там же, почему).
+	///
+	/// Решётка 3x3x3 по области прокрутки: углы ловят «камера забралась в тесный угол сцены», центр
+	/// - «камера посреди самого плотного зала». Дробить мельче смысла нет - коробка сама размером с
+	/// заметную долю сцены, и соседние узлы решётки накрывают почти одно и то же.</summary>
+	private int WorstBrickTotal((Vector3 Min, Vector3 Max) originRange, Vector3 cell,
+		int nbx, int nby, int nbz)
+	{
+		var span = originRange.Max - originRange.Min;
+		int worst = 0;
+		for (int i = 0; i < 27; i++)
+		{
+			var t = new Vector3(i % 3, i / 3 % 3, i / 9) * 0.5f;
+			var probe = new BrickScratch();
+			probe.Resize(nbx, nby, nbz);
+			worst = Math.Max(worst,
+				ClassifyBricks(originRange.Min + span * t, cell, nbx, nby, nbz, probe).Total);
+		}
+
+		return worst;
+	}
+
+	internal BrickLayout ClassifyBricks(Vector3 origin, Vector3 cell, int nbx, int nby, int nbz,
+		BrickScratch? scratch = null, int[]? reuseSlot = null, byte[]? reuseLevel = null,
+		int capacity = 0)
 	{
 		int n = nbx * nby * nbz;
-		var has = new bool[n];
+		var has = scratch?.Has ?? new bool[n];
+		var hasKnown = scratch?.HasKnown;
 		var brickSize = cell * BrickCells;
 
 		Parallel.For(0, n, i =>
 		{
+			if (hasKnown != null && hasKnown[i])
+			{
+				return;
+			}
+
 			int bx = i % nbx;
 			int by = i / nbx % nby;
 			int bz = i / (nbx * nby);
 			var boxMin = origin + new Vector3(bx * brickSize.X, by * brickSize.Y, bz * brickSize.Z) - cell;
 			has[i] = InspectBox(boxMin, boxMin + brickSize + cell * 2f).HasGeometry;
 		});
+
+		if (hasKnown != null)
+		{
+			Array.Fill(hasKnown, true);
+		}
 
 		var index = new int[n];
 		Array.Fill(index, -1);
@@ -1984,7 +2650,21 @@ public sealed class ProbeGiBaker
 		var anchors = new List<int>();
 		var levels = new List<byte>();
 
-		for (int level = MaxBrickLevel - 1; level >= 1; level--)
+		// ПРОКРУЧИВАЕМЫЙ объём кирпичи не сливает, и это результат замера, а не упрощение.
+		//
+		// Слияние держится на выравнивании: якорь группы кратен её размеру в координатах сетки, и
+		// шейдер выборки восстанавливает угол кирпича округлением вниз по этому же шагу. Сдвиг на
+		// один кирпич (мельче нельзя, см. ScrollQuantumBricks) сбивает фазу выравнивания, поэтому
+		// кэш «плоскости» после него недействителен - а его пересчёт это обход BVH по коробкам
+		// размером с группу, и мерилось это в 30-50 мс на сдвиг: ровно тот рывок, ради устранения
+		// которого прокрутка и писалась.
+		//
+		// Платы при этом почти нет: слияние срабатывает на КРУПНЫХ ровных поверхностях, а каскад -
+		// это маленькая коробка вокруг камеры, плотно занятая геометрией. На Sponza разметка не
+		// сливает ни одного кирпича даже у базового объёма (levels [96/0/0] в выводе смоука), и
+		// число проб каскада от этого не меняется.
+		int mergeFrom = scratch == null ? MaxBrickLevel - 1 : 0;
+		for (int level = mergeFrom; level >= 1; level--)
 		{
 			int step = 1 << level;
 			for (int az = 0; az + step <= nbz; az += step)
@@ -2017,7 +2697,7 @@ public sealed class ProbeGiBaker
 					continue;
 				}
 
-				int slot = levels.Count;
+				int brick = levels.Count;
 				anchors.Add(ax); anchors.Add(ay); anchors.Add(az);
 				levels.Add((byte)level);
 				for (int dz = 0; dz < step; dz++)
@@ -2025,7 +2705,7 @@ public sealed class ProbeGiBaker
 				for (int dx = 0; dx < step; dx++)
 				{
 					int s = ((az + dz) * nby + (ay + dy)) * nbx + (ax + dx);
-					index[s] = slot;
+					index[s] = brick;
 					levelAt[s] = (byte)level;
 					taken[s] = true;
 				}
@@ -2054,7 +2734,99 @@ public sealed class ProbeGiBaker
 			levels.Add(0);
 		}
 
-		return new BrickLayout(index, levelAt, anchors.ToArray(), levels.ToArray(), levels.Count);
+		return AssignSlots(index, levelAt, anchors, levels, nbx, nby, nbz,
+			reuseSlot, reuseLevel, capacity);
+	}
+
+	/// <summary>Раздаёт кирпичам разметки слоты пула. Кирпич, стоявший на этом же месте с этим же
+	/// уровнем до сдвига, получает СВОЙ прежний слот - в нём накопленное поле, ради сохранения
+	/// которого прокрутка и делается; остальные разбирают освободившиеся слоты и объявляются
+	/// свежими (см. <see cref="ProbeGiBakeSession.BrickFresh"/>).
+	///
+	/// Без карты переиспользования (обычная разметка) раздача выходит тождественной - слоты идут
+	/// по порядку разметки, ровно как раньше.</summary>
+	private static BrickLayout AssignSlots(int[] index, byte[] levelAt, List<int> anchors,
+		List<byte> levels, int nbx, int nby, int nbz, int[]? reuseSlot, byte[]? reuseLevel,
+		int capacity)
+	{
+		int live = levels.Count;
+		int slots = capacity > 0 ? capacity : live;
+		var slotOf = new int[live];
+		Array.Fill(slotOf, -1);
+		var slotTaken = new bool[slots];
+
+		if (reuseSlot != null && reuseLevel != null)
+		{
+			for (int brick = 0; brick < live; brick++)
+			{
+				int at = (anchors[brick * 3 + 2] * nby + anchors[brick * 3 + 1]) * nbx
+					+ anchors[brick * 3 + 0];
+				int slot = reuseSlot[at];
+				if (slot >= 0 && slot < slots && !slotTaken[slot] && reuseLevel[at] == levels[brick])
+				{
+					slotOf[brick] = slot;
+					slotTaken[slot] = true;
+				}
+			}
+		}
+
+		var alive = new bool[slots];
+		var fresh = new byte[slots];
+		var anchorOut = new int[slots * 3];
+		var levelOut = new byte[slots];
+		int next = 0;
+		int dropped = 0;
+
+		for (int brick = 0; brick < live; brick++)
+		{
+			if (slotOf[brick] < 0)
+			{
+				while (next < slots && slotTaken[next])
+				{
+					next++;
+				}
+
+				if (next >= slots)
+				{
+					// Пул исчерпан: въехавшая область плотнее уехавшей сильнее, чем взят запас (см.
+					// ScrollHeadroom). Кирпич остаётся без слота - в индирекции дырка, и выборка
+					// провалится на более крупный каскад. Хуже, чем полное поле, но лучше, чем
+					// пересоздание объёма посреди движения камеры.
+					dropped++;
+					continue;
+				}
+
+				slotOf[brick] = next;
+				slotTaken[next] = true;
+				fresh[next] = 1;
+			}
+
+			int slot = slotOf[brick];
+			alive[slot] = true;
+			levelOut[slot] = levels[brick];
+			anchorOut[slot * 3 + 0] = anchors[brick * 3 + 0];
+			anchorOut[slot * 3 + 1] = anchors[brick * 3 + 1];
+			anchorOut[slot * 3 + 2] = anchors[brick * 3 + 2];
+		}
+
+		for (int i = 0; i < index.Length; i++)
+		{
+			index[i] = index[i] >= 0 ? slotOf[index[i]] : -1;
+		}
+
+		if (dropped > 0)
+		{
+			// Числа в тексте - не украшение: по одному лишь «сколько потеряли» нельзя отличить
+			// нехватку запаса (въехали в область на треть плотнее - ровно то, подо что взят
+			// ScrollHeadroom) от того, что ёмкость посчитана по принципиально другому месту сцены.
+			// Второе лечится не запасом, а тем, где и когда меряется пул, поэтому в лог идут и
+			// требуемое число кирпичей, и ёмкость, и во сколько раз одно больше другого.
+			EditorConsoleLog.Add(LogLevel.Warning,
+				$"Probe GI: scrolled volume ran out of pool slots, {dropped} brick(s) dropped " +
+				$"(need {live}, pool {slots}, x{(float)live / Math.Max(slots, 1):F1})");
+		}
+
+		return new BrickLayout(index, levelAt, anchorOut, levelOut, slots, alive, fresh, live);
 	}
 
 	/// <summary>Осматривает коробку: есть ли в ней геометрия и насколько сонаправлены нормали её
@@ -2783,7 +3555,10 @@ public sealed class ProbeGiTextures : IReleaseObject
 	/// первой и по ней находит блок пробы в пуле.</summary>
 	public IGpuTexture Indirection { get; }
 
-	public Vector4 GridOrigin { get; }
+	/// <summary>Угол объёма в мире. НЕ константа: прокручиваемый объём ездит за камерой, и материалы
+	/// читают его отсюда каждый кадр (см. ProbeGiViewportShared.PushGrid).</summary>
+	public Vector4 GridOrigin { get; private set; }
+
 	public Vector4 GridCell { get; }
 	public Vector4 GridCounts { get; }
 
@@ -2870,6 +3645,15 @@ public sealed class ProbeGiTextures : IReleaseObject
 
 		// Индирекция геометрична и от раунда к раунду не меняется, но заливать её всё равно надо -
 		// текстура создаётся пустой, а стоит это один RGBA8 размером с сетку кирпичей.
+		_api.UpdateTexture2D(Indirection, result.Indirection);
+	}
+
+	/// <summary>Догоняет прокрутку объёма: новый угол в мире и переписанная карта индирекции. Сами
+	/// атласы не трогаются - в этом и смысл прокрутки: их содержимое (поле проб) переезжает вместе
+	/// со слотами пула, а не пересчитывается (см. ProbeGiBakeSession.Scroll).</summary>
+	public void ApplyScroll(ProbeGiBakeResult result)
+	{
+		GridOrigin = new Vector4(result.Origin, 1f);
 		_api.UpdateTexture2D(Indirection, result.Indirection);
 	}
 

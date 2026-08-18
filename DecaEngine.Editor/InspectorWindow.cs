@@ -102,6 +102,11 @@ namespace DecaEngine.Editor
 		/// <summary>True while Play Mode is running (see <see cref="Play"/>/<see cref="Stop"/>).</summary>
 		public bool IsPlaying => _isPlaying;
 
+		/// <summary>Показывает ли Inspector сейчас превью модели (а не дерево префаба). По этому флагу
+		/// EditorManager решает, КТО из двух вьюпортов держит модель: превью или сцена префаба - обе
+		/// сразу её не грузят (см. <see cref="ModelPreviewViewport.SetActive"/>).</summary>
+		public bool IsModelPreviewMode => _mode == InspectorMode.Model;
+
 		/// <summary>
 		/// Starts Play Mode: snapshots the current prefab subtree (ECS-side, in memory - see
 		/// <see cref="_playSnapshot"/>) and starts ticking <see cref="RotateSystem"/> (and any future

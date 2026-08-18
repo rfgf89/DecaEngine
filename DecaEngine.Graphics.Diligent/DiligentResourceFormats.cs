@@ -29,6 +29,14 @@ public static class DiligentResourceFormats
 			TextureObjectFormat.D32Float => TextureFormat.D32_Float,
 			TextureObjectFormat.D24UNormS8UInt => TextureFormat.D24_UNorm_S8_UInt,
 			TextureObjectFormat.D32FloatS8X24UInt => TextureFormat.D32_Float_S8X24_UInt,
+			// Блочно-сжатые форматы ассет-пайплайна. Все *_UNorm, а не *_UNorm_sRGB: шейдер
+			// материалов сам разворачивает базовый цвет в линейное пространство (см. комментарий
+			// у TextureObjectFormat.BC1UNorm).
+			TextureObjectFormat.BC1UNorm => TextureFormat.BC1_UNorm,
+			TextureObjectFormat.BC3UNorm => TextureFormat.BC3_UNorm,
+			TextureObjectFormat.BC4UNorm => TextureFormat.BC4_UNorm,
+			TextureObjectFormat.BC5UNorm => TextureFormat.BC5_UNorm,
+			TextureObjectFormat.BC7UNorm => TextureFormat.BC7_UNorm,
 			_ => TextureFormat.Unknown
 		};
 	}
@@ -49,6 +57,11 @@ public static class DiligentResourceFormats
 			TextureFormat.D32_Float => TextureObjectFormat.D32Float,
 			TextureFormat.D24_UNorm_S8_UInt => TextureObjectFormat.D24UNormS8UInt,
 			TextureFormat.D32_Float_S8X24_UInt => TextureObjectFormat.D32FloatS8X24UInt,
+			TextureFormat.BC1_UNorm => TextureObjectFormat.BC1UNorm,
+			TextureFormat.BC3_UNorm => TextureObjectFormat.BC3UNorm,
+			TextureFormat.BC4_UNorm => TextureObjectFormat.BC4UNorm,
+			TextureFormat.BC5_UNorm => TextureObjectFormat.BC5UNorm,
+			TextureFormat.BC7_UNorm => TextureObjectFormat.BC7UNorm,
 			_ => TextureObjectFormat.Unknown
 		};
 	}

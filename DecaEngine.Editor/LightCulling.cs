@@ -113,8 +113,12 @@ public static class LightCulling
         GetWorldPositionRotation(lightEntity, out Vector3 worldPos, out Quaternion worldRot);
         Vector3 viewPos = Vector3.Transform(worldPos, cullData.view);
 
+        // z - ближняя плоскость слайса ТЕМ ЖЕ выражением, каким её строил планировщик
+        // (PunctualShadowScheduler.SliceNearPlane): шейдер обязан получать её готовой, а не выводить
+        // из Range повторной копией формулы - такая копия у него уже была и уже разошлась.
         var shadowParams = shadowSlices.TryGetValue(lightEntity.Id, out var firstSlice)
-            ? new Vector4(firstSlice, Math.Clamp(light.ShadowStrength, 0f, 1f), 0f, 0f)
+            ? new Vector4(firstSlice, Math.Clamp(light.ShadowStrength, 0f, 1f),
+                PunctualShadowScheduler.SliceNearPlane(light.Range), 0f)
             : new Vector4(-1f, 0f, 0f, 0f);
 
         switch (light.Type)
@@ -171,6 +175,77 @@ public static class LightCulling
             default:
                 return false;
         }
+    }
+
+    /// <summary>Диапазон глубин экспоненциальной кластерной сетки камеры (LightData.ClusterParams.zw)
+    /// по её сегменту punctual-светов: <paramref name="minLightZ"/>/<paramref name="maxLightZ"/> -
+    /// границы влияния светов во view-глубине (для света на view-z с радиусом R это z ± R),
+    /// накопленные сборщиком пула.
+    ///
+    /// Раньше сюда шли znear/zfar САМОЙ КАМЕРЫ, и это выбрасывало почти всю сетку впустую: far
+    /// камеры - 2000 (а проекция вообще бесконечная reversed-Z, см. MakePerspectiveReversedZ, так что
+    /// это число ни на что больше не влияет), near - 0.05, отношение 40000:1. Двадцать четыре среза
+    /// экспоненциальны по этому отношению, то есть шаг среза - множитель 1.55, и реальная глубина
+    /// кадра (замер на Sponza: 25..75, отношение 3:1) забирала ТРИ среза из двадцати четырёх. Сетка
+    /// вырождалась в почти двумерный тайлинг: фроксел огромен по z, тест сфера-против-AABB проходит
+    /// для куда большего числа кластеров, чем нужно, и в каждый набивается больше светов.
+    ///
+    /// Границы именно по СВЕТАМ, а не по геометрии: кластеры существуют ровно для того, чтобы
+    /// разложить punctual-света, и вне их влияния кластер пуст по определению. Обрезка при этом
+    /// безопасна с обеих сторон - приёмник ближе minLightZ или дальше maxLightZ отстоит от любого
+    /// света дальше его радиуса уже по одной только оси z, и тест радиуса в шейдинге отбросил бы его
+    /// всё равно. (Пиксели вне [near, far] клампятся в крайний срез, чей AABB их не содержит - вот
+    /// почему это надо было проверить, а не просто сжать диапазон.)</summary>
+    public static Vector2 ClusterDepthRange(in CullData cullData, float minLightZ, float maxLightZ)
+    {
+        float cameraNear = MathF.Max(cullData.znear, 0.01f);
+        if (minLightZ > maxLightZ)
+        {
+            // Сегмент пуст - кластерная ветка мертва, но вырожденный диапазон в кбуфере оставлять
+            // нельзя: шейдер считает log2(far/near) безусловно.
+            return new Vector2(cameraNear, MathF.Max(cullData.zfar, cameraNear * 2f));
+        }
+
+        float near = MathF.Max(cameraNear, minLightZ);
+        float far = MathF.Max(maxLightZ, near * 2f);
+        return new Vector2(near, far);
+    }
+
+    /// <summary>DECA_PUNCTUAL_DUMP=1 - печать GPU-записи каждого punctual-света ровно в том виде, в
+    /// каком её прочтёт UnlitInstancedPS. Заведено потому, что визуальные каналы отладки этот вопрос
+    /// НЕ решают: в канале 11 серый цвет означает и "фон, шейдер не запускался", и "сэмпл вернул 0.85",
+    /// а по картинке не отличить конусный отсев спота от промаха по UV. Здесь же видно буквально:
+    /// DirType.w (0 = точечный, шейдер добавит смещение грани куба; 1 = спот, смещение НЕ добавляется
+    /// и весь кадр уходит в один слайс) и Shadow.x (база слайса, -1 = тени нет).
+    ///
+    /// Печатается только при ИЗМЕНЕНИИ строки - иначе это шестьдесят строк в секунду.</summary>
+    private static readonly bool DumpPunctual =
+        Environment.GetEnvironmentVariable("DECA_PUNCTUAL_DUMP") == "1";
+
+    private static readonly Dictionary<int, string> LastDump = new();
+
+    /// <summary>См. <see cref="DumpPunctual"/>. Зовётся сборщиками пула ПОСЛЕ
+    /// <see cref="TryBuildPunctualLight"/>, чтобы дамп отражал ровно то, что уходит в буфер.</summary>
+    public static void DumpPunctualLight(Entity lightEntity, in LightComponent light, in PunctualLight gpu)
+    {
+        if (!DumpPunctual)
+        {
+            return;
+        }
+
+        var line = $"[punctual] entity={lightEntity.Id} type={light.Type} " +
+            $"pos=({gpu.PositionRange.X:F4},{gpu.PositionRange.Y:F4},{gpu.PositionRange.Z:F4}) range={gpu.PositionRange.W:F4} " +
+            $"dir=({gpu.DirectionType.X:F3},{gpu.DirectionType.Y:F3},{gpu.DirectionType.Z:F3}) dirType.w={gpu.DirectionType.W:F1} " +
+            $"spot(cosOuter={gpu.SpotAngles.X:F4},scale={gpu.SpotAngles.Y:F3},sinOuter={gpu.SpotAngles.Z:F4}) " +
+            $"shadow(slice={gpu.ShadowParams.X:F0},strength={gpu.ShadowParams.Y:F3},near={gpu.ShadowParams.Z:F4})";
+
+        if (LastDump.TryGetValue(lightEntity.Id, out var prev) && prev == line)
+        {
+            return;
+        }
+
+        LastDump[lightEntity.Id] = line;
+        Console.WriteLine(line);
     }
 
     /// <summary>Мировые позиция/поворот сущности света: если TransformSystem сложил иерархию в

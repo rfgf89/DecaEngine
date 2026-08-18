@@ -34,6 +34,21 @@ namespace DecaEngine.Graphics.Diligent
 		public const int MaxCascades = 4;
 		public const int ShadowMapSize = 4096;
 
+		/// <summary>Поле каймы у ортокаскада, в текселях shadow map: орто-матрица описывается не
+		/// вокруг сферы каскада, а вокруг сферы ПЛЮС эта кайма (см. UpdateCascades /
+		/// SimpleCullingAndRenderSystem.BuildLightData).
+		///
+		/// Без каймы объём каскада ложится в карту ровно от края до края, а шейдер точки у края
+		/// НЕ БЕРЁТ: SampleWorldLightShadow отбрасывает каскад, пока точка не ушла внутрь на
+		/// SUN_CASCADE_MARGIN_TEXELS (иначе тапы PCF адресуются за карту и читают краевой тексель,
+		/// то есть глубину другого места сцены). Получалось, что кайма отъедалась ИЗНУТРИ объёма:
+		/// точка проваливалась в следующий каскад - грубее и с другим байасом, - а на последнем в
+		/// «освещено». Это и есть просветы по границам каскадов.
+		///
+		/// Восемь = 3 (отступ шейдера) + 1 (тап PCF) + 1.5 (normal-offset) + 1 (снап центра к сетке
+		/// текселей двигает саму сферу) с запасом. Цена - 0.4% линейного разрешения каскада.</summary>
+		public const float CascadeMarginTexels = 8f;
+
 		/// <summary>Реальный каскадный массив, если уже заведён (был хотя бы один каскадный дроу),
 		/// иначе временная заглушка - геттер безопасен ДО первого кадра теней: его дергает КАЖДЫЙ
 		/// батчинг-дроу (см. DiligentBatchRenderer.ExecuteDrawBatching) вне зависимости от того,
@@ -80,6 +95,28 @@ namespace DecaEngine.Graphics.Diligent
 		/// Ноль на сцене с листвой означает, что критерий отбора её не признал, - без этого числа
 		/// отличить «крона монолитная» от «крона не помечена» можно только в RenderDoc.</summary>
 		public int AlphaTestedMaterialCount => _alphaTestedMaterials.Count;
+
+		/// <summary>Материалы, которые в shadow map не пишутся вовсе - см.
+		/// <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
+		private readonly HashSet<int> _nonCastingMaterials = new();
+
+		/// <summary>Сколько материалов исключено из кастеров. Парная к
+		/// <see cref="AlphaTestedMaterialCount"/> диагностика: «декали перестали отбрасывать тень» и
+		/// «декалей в сцене не нашлось» на картинке выглядят одинаково.</summary>
+		public int NonCastingMaterialCount => _nonCastingMaterials.Count;
+
+		/// <summary>См. <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
+		public void SetMaterialShadowCasting(int materialId, bool casts)
+		{
+			if (casts)
+			{
+				_nonCastingMaterials.Remove(materialId);
+			}
+			else
+			{
+				_nonCastingMaterials.Add(materialId);
+			}
+		}
 
 		private readonly struct AlphaTestedMaterialParams
 		{
@@ -429,7 +466,7 @@ namespace DecaEngine.Graphics.Diligent
 			//
 			// Разделение по материалам стоит по дроу-коллу на материал НА КАЖДЫЙ каскад, и платить
 			// эту цену на сцене без листвы не за что.
-			if (_alphaTestedMaterials.Count == 0)
+			if (_alphaTestedMaterials.Count == 0 && _nonCastingMaterials.Count == 0)
 			{
 				cmd.SetPipelineState(_shadowMaterial);
 				cmd.CommitShaderResources(_shadowMaterial);
@@ -450,6 +487,12 @@ namespace DecaEngine.Graphics.Diligent
 				foreach (var kvp in cullResult.MaterialDrawRanges)
 				{
 					if (kvp.Value.DrawCount == 0)
+					{
+						continue;
+					}
+
+					// Материал вообще не кастер (BLEND-накладки) - его дроу просто не делаем.
+					if (_nonCastingMaterials.Contains(kvp.Key))
 					{
 						continue;
 					}
@@ -505,7 +548,7 @@ namespace DecaEngine.Graphics.Diligent
 			// punctual-набору - _shadowMaterial/_alphaTestedMaterials калиброваны под 4096^2
 			// ортографический каскад и дают акне/peter-panning на 1024^2 перспективном срезе (см.
 			// GetPunctualBaseState).
-			if (_punctualAlphaTestedMaterials.Count == 0)
+			if (_punctualAlphaTestedMaterials.Count == 0 && _nonCastingMaterials.Count == 0)
 			{
 				cmd.SetPipelineState(_punctualShadowMaterial);
 				cmd.CommitShaderResources(_punctualShadowMaterial);
@@ -523,6 +566,12 @@ namespace DecaEngine.Graphics.Diligent
 				foreach (var kvp in cullResult.MaterialDrawRanges)
 				{
 					if (kvp.Value.DrawCount == 0)
+					{
+						continue;
+					}
+
+					// Не кастер - не кастер и для punctual-светов (см. ExecuteDrawShadows).
+					if (_nonCastingMaterials.Contains(kvp.Key))
 					{
 						continue;
 					}
@@ -551,14 +600,19 @@ namespace DecaEngine.Graphics.Diligent
 
 		private GraphicsStateInfo GetBaseState() => GetBaseState(2000, 2f);
 
-		/// <summary>Байас для punctual-среза (1024^2 ПЕРСПЕКТИВНАЯ проекция) - на порядок меньше
-		/// каскадного (см. GetBaseState): у перспективы глубинная точность нелинейна и у самого
-		/// источника света на порядки выше, чем у равномерной ортографической сетки каскада, так что
-		/// те же 2000/2 единицы там избыточны и дают peter-panning. Шейдерный slope-scaled байас
-		/// (UnlitInstancedPS.hlsl, мировое пространство, переведён в NDC под глубину приёмника) уже
-		/// берёт на себя основную анти-акне работу - растеризационный байас здесь только гасит
-		/// квантование самого растра. Числа консервативные, точный тюнинг - по месту.</summary>
-		private GraphicsStateInfo GetPunctualBaseState() => GetBaseState(100, 1f);
+		/// <summary>Байас для punctual-среза (1024^2 ПЕРСПЕКТИВНАЯ проекция). Основную анти-акне работу
+		/// делает шейдерный байас в масштабе текселя (UnlitInstancedPS.hlsl, мировые единицы, переведён
+		/// в NDC под глубину приёмника) - здесь гасится только квантование самого растра.
+		///
+		/// Прежние 100 единиц были назначены "на порядок меньше каскадных" по аналогии, и это не
+		/// работает: у D32_FLOAT константный байас масштабируется как bias * 2^(exp(z) - 23), где exp -
+		/// экспонента максимальной глубины примитива. У перспективного слайса вся геометрия жмётся к
+		/// единице (замеренный кадр: лампа near 0.05 / far 6.4, пол на 5.15 даёт ndc 0.998), то есть
+		/// exp = -1 и шаг равен 2^-24. Сотня таких шагов - 6e-6 NDC, а это на той же дистанции ~3 мм
+		/// против следа текселя в ~10 мм. У ортокаскада глубина размазана по всему [0,1], экспонента в
+		/// среднем много меньше, и его 2000 единиц весят несопоставимо больше. Тысяча даёт ~3 см на
+		/// пяти метрах - ниже порога заметного peter-panning и выше кванта растра.</summary>
+		private GraphicsStateInfo GetPunctualBaseState() => GetBaseState(1000, 2f);
 
 		private GraphicsStateInfo GetBaseState(int depthBias, float slopeScaledDepthBias)
 		{
@@ -578,6 +632,13 @@ namespace DecaEngine.Graphics.Diligent
 					CullMode = CullModeType.None,
 					DepthBias = depthBias,
 					SlopeScaledDepthBias = slopeScaledDepthBias,
+
+					// Кастеры перед ближней плоскостью не отсекаются, а кламмятся к ней - см.
+					// RasterizerStateInfo.DepthClipDisable. Оттяжка глаза каскада считается от его
+					// РАДИУСА, а до реальных окклюдеров расстояние своё у сцены, поэтому первому,
+					// самому мелкому каскаду ближняя плоскость режет кастеров раньше всех - в его
+					// тени появляются дыры, которых у крупных каскадов на том же месте нет.
+					DepthClipDisable = true,
 				},
 				DepthStencilState = new DepthStencilStateInfo
 				{
@@ -621,6 +682,7 @@ namespace DecaEngine.Graphics.Diligent
 				material.Release();
 			}
 			_alphaTestedMaterials.Clear();
+			_nonCastingMaterials.Clear();
 
 			foreach (var material in _punctualAlphaTestedMaterials.Values)
 			{

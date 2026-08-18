@@ -522,6 +522,15 @@ public class EditorSettings
 	/// сквозь тонкие стены. Live.</summary>
 	public float ProbeGiNormalBias { get; set; } = 0.3f;
 
+	/// <summary>Доля ВЗГЛЯДА в направлении этого сдвига, 0..1 (остальное - нормаль). Live.
+	///
+	/// Ручка нужна потому, что края шкалы дают разные артефакты и универсально верного нет:
+	/// 1 - сдвиг строго к камере: фасеток нет, но освещение видозависимо (при движении камеры
+	/// пробы будто съезжают и меняют яркость); 0 - строго по нормали: от камеры не зависит вовсе,
+	/// но на жёстких рёбрах в эмбиенте проступают грани треугольников. У статьи (Majercik 2021,
+	/// §4.1) - 0.8. Дефолт 1 сохраняет прежнее поведение движка.</summary>
+	public float ProbeGiViewBias { get; set; } = 1f;
+
 	/// <summary>Лучей на пробу (16-512). Больше = глаже поле, линейно дольше бейк. Ребейк.</summary>
 	public int ProbeGiRaysPerProbe { get; set; } = ProbeGiBaker.DefaultRaysPerProbe;
 
@@ -588,6 +597,11 @@ public class EditorSettings
 	/// <see cref="ProbeGiBakeOptions.RealtimeGamma"/>): светлячки давятся, переход свет→тень
 	/// ускоряется, ценой лёгкого смещения уровня вниз на шумной оценке. Live.</summary>
 	public float ProbeGiRealtimeGamma { get; set; } = 5f;
+
+	/// <summary>Порог средней изменчивости, ниже которого объём считается сошедшимся и раунды
+	/// останавливаются целиком, 0 = выключено (см.
+	/// <see cref="ProbeGiBakeOptions.RealtimeVariabilityThreshold"/>). Live.</summary>
+	public float ProbeGiVariabilityThreshold { get; set; } = 0.08f;
 
 	/// <summary>Число объёмов probe-GI (1-3): 1 = одна сетка на всю сцену (как раньше), выше -
 	/// дополнительные вдвое/вчетверо более мелкие каскады вокруг центра сцены тем же бюджетом

@@ -117,6 +117,16 @@ public interface IBatchRenderer
 	void SetMaterialAlphaTestedShadow(int materialId, DecaEngine.Graphics.ModelLoader.BaseColorBinding baseColor,
 		float alphaCutoff);
 
+	/// <summary>Убирает материал из кастеров тени СОВСЕМ (сырой id материала - <c>MaterialId.materialId</c>).
+	/// По умолчанию тень отбрасывают все.
+	///
+	/// Нужно BLEND-накладкам: декали грязи и потёков (Intel Sponza) лежат в миллиметрах от стены,
+	/// которую украшают, и любая их тень - хоть сплошным квадом, хоть вырезанная по альфе - падает на
+	/// эту же стену и дублирует их собственный рисунок крупными тёмными кляксами. Альфа-тест здесь не
+	/// лечит ничего: он лишь меняет форму кляксы на форму текстуры. Не путать с MASK (листва,
+	/// решётки): у той тень настоящая и нужна, см. <see cref="SetMaterialAlphaTestedShadow"/>.</summary>
+	void SetMaterialShadowCasting(int materialId, bool casts);
+
 	/// <summary>Marks a registered material as transparent/transmissive for <see cref="BatchDrawFilter"/>
 	/// purposes (raw material id - <c>MaterialId.materialId</c>). Materials default to opaque.</summary>
 	void SetMaterialTransparent(int materialId, bool transparent);

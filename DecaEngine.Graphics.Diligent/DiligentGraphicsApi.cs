@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
@@ -298,6 +298,13 @@ namespace DecaEngine
 
 		public unsafe IGpuTexture CreateTexture(CpuTextureData data)
 		{
+			// Запечённая BC-текстура из кеша ассетов: мип-цепочка уже готова, ужимать и генерировать
+			// нечего - данные уезжают в VRAM ровно теми байтами, какими лежали на диске.
+			if (data.IsCompressed)
+			{
+				return CreateCompressedTexture(data);
+			}
+
 			byte[] pixels;
 			int width, height;
 
@@ -400,6 +407,114 @@ namespace DecaEngine
 				width = (uint)width,
 				height = (uint)height,
 				format = TextureObjectFormat.R8G8B8A8UNorm,
+				type = TextureType.Texture2D,
+			};
+
+			return new DiligentGpuTexture(data.Name, textureInfo, nativeTexture);
+		}
+
+		/// <summary>
+		/// Создаёт текстуру из готовой блочно-сжатой мип-цепочки (см. DtexFile / ассет-пайплайн).
+		///
+		/// Ни GenerateMips, ни RenderTarget-бинда здесь нет и быть не может: BC-формат не
+		/// фильтруется и не пишется как render target, а цепочка и так забейкана оффлайн. Ресурс
+		/// создаётся Immutable одним вызовом со всеми уровнями сразу - это самый дешёвый путь
+		/// «данные -&gt; VRAM», который вообще даёт API.
+		/// </summary>
+		private IGpuTexture CreateCompressedTexture(CpuTextureData data)
+		{
+			var format = data.CompressedFormat;
+			var nativeFormat = DiligentResourceFormats.ToNativeFormat(format);
+			if (nativeFormat == TextureFormat.Unknown)
+			{
+				throw new InvalidOperationException(
+					$"Texture '{data.Name}' declares compressed format {format}, which has no Diligent mapping.");
+			}
+
+			var mips = data.CompressedMips;
+			int width = data.CompressedWidth;
+			int height = data.CompressedHeight;
+
+			var desc = new TextureDesc
+			{
+				Name = data.Name,
+				Type = ResourceDimension.Tex2d,
+				Width = (uint)width,
+				Height = (uint)height,
+				Format = nativeFormat,
+				BindFlags = BindFlags.ShaderResource,
+				Usage = Usage.Immutable,
+				MipLevels = (uint)mips.Length,
+			};
+
+			var handles = new GCHandle[mips.Length];
+			var subResources = new TextureSubResData[mips.Length];
+			ITexture nativeTexture;
+
+			try
+			{
+				for (int i = 0; i < mips.Length; i++)
+				{
+					handles[i] = GCHandle.Alloc(mips[i], GCHandleType.Pinned);
+
+					// Stride блочного формата - это длина РЯДА БЛОКОВ, а не строки текселей: один ряд
+					// покрывает 4 строки по высоте, а ширина округляется вверх до кратной 4. Ошибка
+					// здесь не падает, а тихо разъезжает текстуру по диагонали.
+					int mipWidth = Math.Max(1, width >> i);
+					subResources[i] = new TextureSubResData
+					{
+						Data = handles[i].AddrOfPinnedObject(),
+						Stride = (uint)TextureFormatLayout.RowPitch(format, mipWidth),
+					};
+				}
+
+				var textureData = new TextureData { SubResources = subResources, Context = ImmediateContext };
+				nativeTexture = Device.CreateTexture(desc, textureData);
+			}
+			finally
+			{
+				foreach (var handle in handles)
+				{
+					if (handle.IsAllocated)
+					{
+						handle.Free();
+					}
+				}
+			}
+
+			// Как и в CreateTexture: при нехватке VRAM Diligent пишет ошибку в лог и возвращает null,
+			// а использование null-хендла дальше - AV без managed-исключения.
+			if (nativeTexture == null)
+			{
+				throw new InvalidOperationException(
+					$"Failed to create compressed texture '{data.Name}' ({width}x{height}, {format}, " +
+					$"{mips.Length} mips) - likely out of GPU memory.");
+			}
+
+			if (Environment.GetEnvironmentVariable("DECA_TEX_DIAG") == "1")
+			{
+				Console.WriteLine($"[texdiag] {data.Name}: {width}x{height} {format} mips={mips.Length} (baked)");
+			}
+
+			// Тот же явный переход в ShaderResource, что и в CreateTexture - см. комментарий там.
+			ImmediateContext.TransitionResourceStates(
+			[
+				new StateTransitionDesc()
+				{
+					Resource = nativeTexture,
+					OldState = ResourceState.Unknown,
+					NewState = ResourceState.ShaderResource,
+					Flags = StateTransitionFlags.UpdateState
+				}
+			]);
+
+			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			{
+				name = data.Name,
+				width = (uint)width,
+				height = (uint)height,
+				mipLevels = (uint)mips.Length,
+				format = format,
 				type = TextureType.Texture2D,
 			};
 

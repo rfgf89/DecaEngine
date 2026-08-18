@@ -126,6 +126,26 @@ namespace DecaEngine.Editor
 		private string? _loadingPath;
 		private int _loadingSubMesh = -1;
 
+		// --- Активность вьюпорта -------------------------------------------------------------------
+		// Модель редактора грузится РОВНО В ОДНОМ месте: либо здесь (Inspector в режиме Model), либо в
+		// PrefabSceneViewport (открыт префаб), но никогда в обоих сразу - иначе одна и та же модель
+		// держит два набора материалов/инстансов и два полных кадра офскрин-конвейера. Переключает
+		// EditorManager.OnUpdate по режиму Inspector-а (см. SetActive); неактивное превью отдаёт
+		// модель с GPU и не пишет кадр вовсе (его никто не видит: RenderModelPreview зовётся только в
+		// режиме Model). По умолчанию активно - пробы (PreviewLoopProbe/FullLoopProbe) гоняют вьюпорт
+		// без EditorManager-а и SetActive не зовут.
+		private bool _active = true;
+		private bool _activeRequested = true;
+
+		/// <summary>Путь/сабмеш, снятые уходом в паузу, - возвращаются загрузкой при активации, если к
+		/// тому моменту не запрошена другая модель (см. <see cref="ApplyPendingActiveChange"/>).</summary>
+		private string? _suspendedPath;
+		private int _suspendedSubMesh = -1;
+
+		/// <summary>Идёт возврат сохранённой моделью после паузы - гасит диагностику «FULL reload» в
+		/// <see cref="LoadModel"/>: резидента здесь нет по построению.</summary>
+		private bool _restoringAfterResume;
+
 		/// <summary>Стриминг модели превью (см. <see cref="ModelStreamer"/>): фоновая загрузка,
 		/// покадровая финализация и владение жизненным циклом ModelLoader-а. Превью - эксклюзивный
 		/// потребитель: перед загрузкой нового файла предыдущий ПОЛНОСТЬЮ очищается (ClearAll),
@@ -217,9 +237,12 @@ namespace DecaEngine.Editor
 		/// вокруг центра сцены той же плотностью, то есть ячейкой в 2^i раз мельче. Базовый объём
 		/// остаётся в старых полях (_probeSession и далее) - он гарантия покрытия, каскады только
 		/// уточняют. Существуют ТОЛЬКО в GPU-пути реального времени: CPU-фолбэк остаётся
-		/// однообъёмным, каскады - фича динамики, а не запечки.</summary>
-		private readonly List<(ProbeGiBakeSession Session, ProbeGiTextures Textures, ProbeRoundGpu Gpu,
-			Vector3 Center)> _probeCascades = new();
+		/// однообъёмным, каскады - фича динамики, а не запечки.
+		///
+		/// Центра бокса здесь НЕТ: где объём стоит, знает он сам (см.
+		/// ProbeGiViewportShared.VolumeCenter) - копия рядом с сессией разъезжалась бы с ней.</summary>
+		private readonly List<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
+			ProbeRoundGpu Gpu)> _probeCascades = new();
 
 		/// <summary>Дебаг-вид проб (шарики, см. ProbeDebugOverlay) - по оверлею на ОБЪЁМ: базовый
 		/// плюс каскады. Каждый помнит атласы, под которые создан, - их пересоздание (новая сессия,
@@ -1049,7 +1072,7 @@ namespace DecaEngine.Editor
 			if (_probeTextures != null && _editorSettings.PreviewProbeGi)
 			{
 				ProbeGiViewportShared.PushGrid(ref data, _probeTextures, _probeCascades,
-					_editorSettings.ProbeGiNormalBias);
+					_editorSettings.ProbeGiNormalBias, _editorSettings.ProbeGiViewBias);
 			}
 
 			// Live-ручки probe-GI/солнца (см. кбуфер ProbeGiParams в UnlitInstancedPS.hlsl).
@@ -1517,17 +1540,40 @@ namespace DecaEngine.Editor
 
 			CancelPendingLoad();
 
-			EditorConsoleLog.Add(LogLevel.Warning,
-				$"Model preview: FULL reload for '{modelPath}' subMesh={subMeshIndex} " +
-				$"(resident was '{_residentPath}', model={(_residentModel is null ? "null" : "loaded")}) - " +
-				"resident path did not match, re-parsing from disk instead of reusing it.");
+			// Возврат из паузы резидента заведомо не имеет (мы сами его отдали при уходе) - это
+			// штатный путь, а не потерянный кеш, о котором предупреждает диагностика ниже.
+			if (!_restoringAfterResume)
+			{
+				EditorConsoleLog.Add(LogLevel.Warning,
+					$"Model preview: FULL reload for '{modelPath}' subMesh={subMeshIndex} " +
+					$"(resident was '{_residentPath}', model={(_residentModel is null ? "null" : "loaded")}) - " +
+					"resident path did not match, re-parsing from disk instead of reusing it.");
+			}
 
-			// «Сначала очистить предыдущее, потом грузить новое»: инстансы и резидентная модель
-			// снимаются НЕМЕДЛЕННО, а не при готовности новой, - контент прошлого выбора не висит на
-			// GPU всё время фоновой загрузки. ClearAll стримера выполняет обязательный протокол
-			// освобождения (барьер GPU -> сброс регистраций батч-рендерера -> Release модели ->
-			// пересборка графа - см. комментарии в PopulateFromScene про мега-буферы и замороженные
-			// команды).
+			UnloadResidentModel();
+
+			// Сама загрузка стартует из ModelStreamingSystem (в SystemRoot окружения) ближайшим
+			// кадром; готовность опрашивает PollPendingLoad. Ошибки (файл пропал, битый glTF)
+			// приходят через Resident.Failed тем же путём.
+			_streamingModel = _streamer.Acquire(modelPath, _orbitTarget);
+			_loadingPath = modelPath;
+			_loadingSubMesh = subMeshIndex;
+			_loadError = null;
+		}
+
+		/// <summary>
+		/// Полностью снимает текущую модель превью с GPU: инстансы, резидентную модель, регистрации в
+		/// батч-рендерере и пробы. «Сначала очистить предыдущее, потом грузить новое»: контент
+		/// прошлого выбора не висит на GPU всё время фоновой загрузки следующего. ClearAll стримера
+		/// выполняет обязательный протокол освобождения (барьер GPU -> сброс регистраций
+		/// батч-рендерера -> Release модели -> пересборка графа - см. комментарии в PopulateFromScene
+		/// про мега-буферы и замороженные команды). Зовётся из <see cref="LoadModel"/> перед новой
+		/// загрузкой и из <see cref="ApplyPendingActiveChange"/>, когда превью уходит в паузу (модель
+		/// в этот момент обязана остаться ровно одна на редактор - см. <see cref="SetActive"/>).
+		/// Вызывать ТОЛЬКО под GPU-локом редактора: внутри есть Flush/WaitForIdle.
+		/// </summary>
+		private void UnloadResidentModel()
+		{
 			ClearInstances();
 
 			// Фоновая сборка BVH под пробы могла ещё читать геометрию старой модели, а ClearAll ниже
@@ -1567,14 +1613,6 @@ namespace DecaEngine.Editor
 			// Пробы ссылались на материалы/BVH только что освобождённой модели - сброс за барьером,
 			// который ClearAll уже сделал.
 			ResetProbeGi();
-
-			// Сама загрузка стартует из ModelStreamingSystem (в SystemRoot окружения) ближайшим
-			// кадром; готовность опрашивает PollPendingLoad. Ошибки (файл пропал, битый glTF)
-			// приходят через Resident.Failed тем же путём.
-			_streamingModel = _streamer.Acquire(modelPath, _orbitTarget);
-			_loadingPath = modelPath;
-			_loadingSubMesh = subMeshIndex;
-			_loadError = null;
 		}
 
 		/// <summary>Опции загрузки для стримера - прежние опции прямого BeginLoadAsync. Фабрика, а не
@@ -1593,8 +1631,10 @@ namespace DecaEngine.Editor
 			// загрузки, как анизотропия: смена масштаба подхватится следующей загрузкой модели.
 			MipLodBias = MathF.Log2(Math.Clamp(_editorSettings.RenderScale, 0.25f, 1f)),
 			MaxTextureSize = ClampedMaxTextureSize(),
-			// Меш появляется почти сразу с текстурами первой ступени (64px), дальше стример
-			// поднимает качество ступенями по приоритету от камеры (см. ModelStreamer).
+			// Текстуры не декодируются в фоновой фазе загрузки вовсе - они приезжают из стола по
+			// приоритету от камеры (см. ModelStore). В кадр модель попадает уже с ними: показ ждёт
+			// ModelStore.ModelTexturesReady, иначе она появлялась бы на 1x1-филлерах и домигивала
+			// текстуры десятки кадров.
 			StreamTextures = true
 		};
 
@@ -2000,7 +2040,7 @@ namespace DecaEngine.Editor
 
 		/// <summary>Создаёт каскад i вокруг точки интереса: сессия + атласы (слоты _Ci) + GPU-раунд.
 		/// Тот же бюджет и плотность на бокс в 2^i раз меньше = ячейка в 2^i раз мельче.</summary>
-		private (ProbeGiBakeSession, ProbeGiTextures, ProbeRoundGpu, Vector3) CreateProbeCascade(
+		private (ProbeGiBakeSession, ProbeGiTextures, ProbeRoundGpu) CreateProbeCascade(
 			int index, Vector3 target) =>
 			ProbeGiViewportShared.CreateCascade(_probeBaker!, _probePipelines!, _probeAccel, _env,
 				_graphicsApi, _editorSettings, new[] { _residentModel! },
@@ -2008,90 +2048,53 @@ namespace DecaEngine.Editor
 				_probeBoundsMin, _probeBoundsMax, ProbeSunColor());
 
 		/// <summary>Ведёт каскады за точкой интереса камеры - это и делает их каскадами, а не просто
-		/// вложенными сетками. Каскад пересоздаётся вокруг новой точки, когда та ушла от его центра
-		/// дальше четверти бокса (гистерезис: мелкие движения камеры не трогают ничего).
+		/// вложенными сетками. Объём сдвигается ПРОКРУТКОЙ (см. ProbeGiViewportShared.ScrollVolume),
+		/// когда точка ушла от его центра дальше четверти бокса (гистерезис: мелкие движения камеры
+		/// не трогают ничего).
 		///
-		/// Пересоздание - это ХОЛОДНЫЙ СТАРТ каскада, а не тороидальный скролл с переносом
-		/// накопленного: провал прикрыт фолбэком выборки на крупный объём (см. SampleProbeGi), и за
-		/// разгонные раунды (~доли секунды) мелкий каскад дотекает заново. Скролл со сдвигом
-		/// индирекции - следующий шаг, если холодный старт окажется виден глазом; не больше одного
-		/// каскада за кадр, чтобы не собирать все пересоздания в один хитч.</summary>
-		/// <summary>Дебаунс перецентровки каскадов: пересоздавать их можно только когда камера
-		/// УСПОКОИЛАСЬ.
+		/// Раньше здесь стояло пересоздание каскада с холодным стартом поля - и с дебаунсом, потому
+		/// что стоило оно видимого рывка (Dispose GPU-раунда с выгрузкой всего BVH, Release атласов,
+		/// Flush + WaitForIdle, новая сессия). Прокрутка сохраняет поле в уцелевшей части объёма и не
+		/// создаёт ни одного ресурса, поэтому ни холодного старта, ни дебаунса больше нет.
 		///
-		/// Перецентровка - это не сдвиг, а полное пересоздание объёма: Dispose GPU-раунда, Release
-		/// атласов, Flush + WaitForIdle (полный стоп GPU на потоке рендера) и новая сессия с
-		/// обнулённым полем. За один драг средней кнопки (пан камеры двигает _orbitTarget) порог
-		/// смещения пересекается многократно, и всё это происходило по нескольку раз подряд - отсюда
-		/// и рывки, и «все пробы перестраиваются» на ровном месте.
-		///
-		/// Правильное лечение - тороидальная прокрутка объёма вместо пересоздания, но это отдельная
-		/// крупная работа; дебаунс убирает повторные пересоздания за копейки и той же механикой, что
-		/// уже применена к пересозданию сессии (см. ProbeRebakeDebounceSeconds).</summary>
-		private const float CascadeRecenterIdleSeconds = 0.35f;
-		private Vector3 _cascadeRecenterTarget;
-		private float _cascadeRecenterIdle;
+		/// Заявки подаются ВСЕМ каскадам, которым пора ехать. Ограничение «не больше одного за кадр»
+		/// осталось от пересоздания, стоившего сотен миллисекунд; с прокруткой переезд стоит около
+		/// миллисекунды, а вреда от ограничения теперь много: заявка исполняется не в момент подачи,
+		/// поэтому первый каскад оставался бы «требующим переезда» на КАЖДОМ кадре, навсегда забирая
+		/// очередь себе и морозя остальные.</summary>
+		/// <summary>Номера раскладок каскадов на прошлом опросе - см. CascadeLayoutChanged.</summary>
+		private int _probeCascadeLayoutStamp;
 
-		private void PollProbeCascadeRecenter(float deltaTime)
+		private void PollProbeCascadeRecenter()
 		{
-			if (_probeCascades.Count == 0 || _probeBaker == null || _env.ShadowSettings == null
-				|| _residentModel == null || _probePipelines == null)
+			// Переехавший каскад обязан доехать углом сетки до кбуферов материалов, иначе они
+			// продолжат сэмплить его по старому углу (см. ProbeGiViewportShared.CascadeLayoutChanged).
+			if (ProbeGiViewportShared.CascadeLayoutChanged(_probeCascades, ref _probeCascadeLayoutStamp))
 			{
-				return;
+				ApplyPreviewSettingsToMaterials();
 			}
 
-			// Камера ещё движется - ждём. Сравнение с ПРЕДЫДУЩИМ кадром, а не с центром каскада:
-			// нас интересует именно «мышь отпустили», а не «уехали далеко».
-			if (_orbitTarget != _cascadeRecenterTarget)
-			{
-				_cascadeRecenterTarget = _orbitTarget;
-				_cascadeRecenterIdle = 0f;
-				return;
-			}
-
-			_cascadeRecenterIdle += deltaTime;
-			if (_cascadeRecenterIdle < CascadeRecenterIdleSeconds)
+			if (_probeCascades.Count == 0 || _probeBaker == null)
 			{
 				return;
 			}
 
 			for (int j = 0; j < _probeCascades.Count; j++)
 			{
-				int index = j + 1;
-				var half = CascadeHalfExtent(index);
+				var session = _probeCascades[j].Session;
+				var half = CascadeHalfExtent(j + 1);
 				var desired = ClampCascadeCenter(_orbitTarget, half);
-				if (!ProbeGiViewportShared.NeedsRecenter(_probeCascades[j].Center, desired, half))
+
+				// Сверка с ФАКТИЧЕСКИМ центром объёма, а не с заказанным в прошлый раз: заявка на
+				// переезд исполняется на границе раунда, и пока она ждёт, объём стоит там же, где
+				// стоял. Сверяйся мы с заказом - вьюпорт считал бы каскад уже уехавшим.
+				if (!ProbeGiViewportShared.NeedsRecenter(
+						ProbeGiViewportShared.VolumeCenter(session), desired, half))
 				{
 					continue;
 				}
 
-				try
-				{
-					// Старый каскад держат и замороженные команды графа (оверлей), и SRB материалов -
-					// порядок тот же, что при любом освобождении атласов: оверлей, барьер,
-					// плейсхолдеры, и только потом ресурсы.
-					ReleaseProbeDebugOverlay();
-					_env.DilApi.ImmediateContext.Flush();
-					_env.DilApi.ImmediateContext.WaitForIdle();
-					RebindCascadePlaceholders($"_C{index}");
-					_probeCascades[j].Gpu.Dispose();
-					_probeCascades[j].Textures.Release();
-
-					_probeCascades[j] = CreateProbeCascade(index, _orbitTarget);
-					ApplyPreviewSettingsToMaterials();
-				}
-				catch (Exception ex)
-				{
-					// Каскад умер - выкидываем его целиком: выборка сама провалится на следующий
-					// объём, а бесконечно повторять отказ каждый кадр движения нельзя.
-					EditorConsoleLog.Add(LogLevel.Error,
-						$"Probe GI: cascade {index} recenter failed, dropping it: {ex.Message}");
-					RebindCascadePlaceholders($"_C{index}");
-					_probeCascades.RemoveAt(j);
-					ApplyPreviewSettingsToMaterials();
-				}
-
-				break;
+				ProbeGiViewportShared.ScrollVolume(session, desired);
 			}
 		}
 
@@ -2260,6 +2263,14 @@ namespace DecaEngine.Editor
 			{
 				session.SetLighting(Vector3.Normalize(-_env.ShadowSettings.LightDirection),
 					ProbeSunColor(), _env.ShadowSettings.EnvYawRadians, _env.EnvironmentRadiance);
+			}
+
+			// Переезды каскадов доводятся до GPU ДО всех проверок ниже: сходимость базового объёма,
+			// его забор и бюджет порций гасят раунды каскадов, но не должны морозить их на месте -
+			// камера уезжает, а объём стоит (см. ProbeRoundGpu.SettlePendingScroll).
+			foreach (var cascade in _probeCascades)
+			{
+				cascade.Gpu.SettlePendingScroll(cascade.Session, baker);
 			}
 
 			if (session.Converged)
@@ -2587,6 +2598,59 @@ namespace DecaEngine.Editor
 			_pitch = 0.35f;
 		}
 
+		/// <summary>Показывается ли превью прямо сейчас (Inspector в режиме Model). В паузе модель с
+		/// GPU снята и кадр не пишется - см. <see cref="SetActive"/>.</summary>
+		public bool IsActive => _activeRequested;
+
+		/// <summary>
+		/// Включает/ставит на паузу превью модели. Заявка исполняется в начале ближайшего
+		/// <see cref="Update"/> (там мы под GPU-локом редактора): пауза отдаёт модель с GPU целиком,
+		/// активация грузит обратно ту же, если за время паузы не выбрали другую. Зовёт
+		/// EditorManager.OnUpdate по режиму Inspector-а, чтобы модель редактора была загружена ровно в
+		/// одном месте - здесь ИЛИ в <see cref="PrefabSceneViewport"/>.
+		/// </summary>
+		public void SetActive(bool active)
+		{
+			_activeRequested = active;
+		}
+
+		private void ApplyPendingActiveChange()
+		{
+			_active = _activeRequested;
+
+			if (!_active)
+			{
+				// Что показывали (или как раз грузили) - вернём при активации.
+				_suspendedPath = _loadedPath ?? _loadingPath;
+				_suspendedSubMesh = _loadedPath != null ? _loadedSubMesh : _loadingSubMesh;
+
+				CancelPendingLoad();
+				UnloadResidentModel();
+				return;
+			}
+
+			var restorePath = _suspendedPath;
+			var restoreSubMesh = _suspendedSubMesh;
+			_suspendedPath = null;
+			_suspendedSubMesh = -1;
+
+			// Заявка, пришедшая ПОКА мы стояли на паузе (Asset Browser -> InspectorWindow.ShowModel
+			// зовёт LoadModel сразу, а активность переключается лишь следующим кадром), главнее
+			// сохранённого выбора - иначе клик по новой модели откатывался бы на старую.
+			if (restorePath != null && _loadedPath == null && _loadingPath == null)
+			{
+				_restoringAfterResume = true;
+				try
+				{
+					LoadModel(restorePath, restoreSubMesh);
+				}
+				finally
+				{
+					_restoringAfterResume = false;
+				}
+			}
+		}
+
 		/// <summary>
 		/// ?????????? ??????????? (?????????) ECS/render-graph ?????? ?? ???? ????. ??????
 		/// ?????????? ??? ? ???? ????????? (??. EditorManager.OnUpdate) ??? ??? ?? GPU-?????, ??? ?
@@ -2594,6 +2658,19 @@ namespace DecaEngine.Editor
 		/// </summary>
 		public void Update(float deltaTime, float time)
 		{
+			// Переход активности исполняется ЗДЕСЬ, а не в SetActive: внутри выгрузка с барьером
+			// GPU (см. UnloadResidentModel), а под локом редактора мы только в Update.
+			if (_activeRequested != _active)
+			{
+				ApplyPendingActiveChange();
+			}
+
+			// Пауза: модель уже отдана, кадр не пишем - его всё равно некому показать (см. _active).
+			if (!_active)
+			{
+				return;
+			}
+
 			if (_pendingEnvironmentRecreate)
 			{
 				_pendingEnvironmentRecreate = false;
@@ -2607,7 +2684,7 @@ namespace DecaEngine.Editor
 			PollPendingLoad();
 			PollProbeBake(deltaTime);
 			PollBvhDebugOverlay();
-			PollProbeCascadeRecenter(deltaTime);
+			PollProbeCascadeRecenter();
 			PollProbeDebugOverlay();
 
 			// Live-ручки probe-GI/солнца из окна Graphics - пуш по факту изменения значения

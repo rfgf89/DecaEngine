@@ -127,7 +127,26 @@ StructuredBuffer<uint> ClusterIndices;
 // viewProj-матрицы слайсов (см. PunctualShadowScheduler). Обычный Z (запись Less, clear 1.0),
 // сравнение LessEqual - та же конвенция, что у каскадов солнца. Объявлены безусловно: при
 // ShadowParams.x < 0 ветка мёртвая, а лейаут текстуры держит валидным ForwardPass.
-StructuredBuffer<float4x4> PunctualShadowMatrices;
+// ЧЕТЫРЕ float4-СТРОКИ НА СЛАЙС, а не float4x4. Матрицу в структурном буфере держать нельзя:
+// PackMatrixRowMajor (DiligentShader) задаёт раскладку матриц в кбуферах, но на элементы
+// StructuredBuffer не распространяется, и majorness там оказывается РАЗНОЙ У БЭКЕНДОВ - D3D12
+// отдавал элемент транспонированным, Vulkan нет. Симптом был односторонний и потому обманчивый:
+// mul(pos, M) считал не то произведение, w (глубина вдоль оси грани) уходила в минус у 57.5%
+// пикселей и они молча отсекались guard'ом, у остальных 8% shadowUv улетал за квадрат слайса, до
+// сэмплера доходило 5.7% кадра со средним shadowLit 0.957 - теней от punctual-светов не было вовсе.
+// Сборка строк вручную (см. LoadPunctualShadowMatrix) от раскладки не зависит в принципе.
+// Каскады солнца этим не болели и подсказать не могли: их матрицы едут в КБУФЕРЕ
+// (LightData.CascadeMatrix*), а этот буфер - единственное место во всём движке, где матрица лежала
+// в структурном буфере.
+StructuredBuffer<float4> PunctualShadowMatrices;
+
+// viewProj слайса как row-major матрица: строки лежат подряд, слайс занимает четыре элемента.
+float4x4 LoadPunctualShadowMatrix(uint slice)
+{
+    uint row = slice * 4;
+    return float4x4(PunctualShadowMatrices[row + 0], PunctualShadowMatrices[row + 1],
+                    PunctualShadowMatrices[row + 2], PunctualShadowMatrices[row + 3]);
+}
 Texture2DArray PunctualShadowMaps;
 SamplerComparisonState PunctualShadowMaps_sampler;
 
@@ -262,11 +281,57 @@ static const int FeatureHdrOutput = 8;
 // он самый детальный. Валидность каскада - ненулевая ширина в CascadeSizes (превью моделей
 // по-прежнему заполняет один каскад, и цикл вырождается в прежний код). За пределами всех
 // каскадов - освещено.
-float SampleWorldLightShadow(float3 worldPos, float3 N)
+// Сторона карты теней солнца в текселях (см. ShadowRenderer.ShadowMapSize).
+#define SUN_SHADOW_TEXELS 4096.0
+
+// ОТСТУП от края каскада, в текселях. Каскад не берётся, пока точка не окажется глубже отступа
+// внутрь, - иначе фильтр вылезает за карту. PCF 3x3 тянет тапы на тексель в стороны, сравнивающий
+// сэмплер добавляет свои полтекселя фильтрации, а normal-offset выше уже сдвинул точку на полтора
+// текселя. У края всё это адресуется ЗА пределы карты, сэмплер кламмит адрес - и тапы читают
+// краевой тексель, то есть глубину совсем другого места сцены. На экране это прямой шов поперёк
+// стены на границе каскада (ровно та геометричная линия, что видна на скриншотах).
+#define SUN_CASCADE_MARGIN_TEXELS 3.0
+
+// Ширина полосы перехода в долях стороны каскада. В ней тень берётся из ДВУХ каскадов и
+// смешивается: без неё переход остаётся видимым и после отступа - у соседних каскадов разное
+// разрешение карты, а значит разная мягкость PCF и разный масштаб байеса, и граница читается как
+// ступенька резкости.
+#define SUN_CASCADE_BLEND_UV 0.06
+
+// firstCascade - индекс ПЕРВОГО каскада, который реально дал вклад (-1: точка не попала ни в один и
+// объявлена освещённой). Нужен отладочному каналу 26: «пятно тени» и «пятно от смены каскада»
+// выглядят на экране одинаково, и без индекса их не разделить.
+float SampleWorldLightShadow(float3 worldPos, float3 N, out float firstCascade)
 {
+    firstCascade = -1.0;
+
+    const float texel = 1.0 / SUN_SHADOW_TEXELS;
+    const float margin = SUN_CASCADE_MARGIN_TEXELS * texel;
+
+    // Последний заполненный каскад: ему полосу перехода не даём - смешивать не с чем, а фейд в
+    // «освещено» на его краю выглядел бы как срез тени в воздухе. Он же покрывает случай превью
+    // одиночной модели, где каскад ровно один.
+    int lastValid = -1;
+    [unroll]
+    for (int k = 0; k < 4; k++)
+    {
+        if (lightData.CascadeSizes[k] > 0.0)
+        {
+            lastValid = k;
+        }
+    }
+
+    float shadow = 0.0;
+    float acc = 0.0;
+
     [unroll]
     for (int c = 0; c < 4; c++)
     {
+        if (acc >= 1.0)
+        {
+            continue;
+        }
+
         float cascadeWorld = lightData.CascadeSizes[c];
         if (cascadeWorld <= 0.0)
         {
@@ -278,16 +343,34 @@ float SampleWorldLightShadow(float3 worldPos, float3 N)
         // Депф-bias один не спасает тонкую геометрию (черепица, ткань): её задняя грань лежит в
         // сантиметрах за передней, и PCF-соседи на рельефе ловят чужие задние грани - крыши
         // затеняют сами себя. Сдвиг по нормали уводит точку из этой зоны независимо от глубины.
-        float texelWorld = cascadeWorld / 4096.0;
+        float texelWorld = cascadeWorld / SUN_SHADOW_TEXELS;
         float3 samplePos = worldPos + N * texelWorld * 1.5;
 
         float4 lightClip = mul(float4(samplePos, 1.0), lightData.CascadeMatrix[c]);
         float3 lightNdc = lightClip.xyz / max(lightClip.w, 1e-6);
         float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 0.5 - lightNdc.y * 0.5);
 
-        if (any(shadowUv < 0.0) || any(shadowUv > 1.0) || lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
+        if (lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
         {
-            // Точка вне этого каскада - пробуем следующий, крупнее.
+            // Точка вне глубинного диапазона этого каскада - пробуем следующий, крупнее.
+            continue;
+        }
+
+        // Расстояние до края карты за вычетом отступа. Отрицательное - точка в кайме, где фильтр
+        // вылез бы за карту: каскад не годится, идём на следующий.
+        float edge = min(min(shadowUv.x, 1.0 - shadowUv.x),
+                         min(shadowUv.y, 1.0 - shadowUv.y)) - margin;
+        if (edge <= 0.0)
+        {
+            continue;
+        }
+
+        // Вес этого каскада: единица в глубине, плавно к нулю в полосе перехода у кромки. Остаток
+        // веса доберёт следующий каскад - там та же точка лежит глубоко внутри.
+        float w = (c == lastValid) ? 1.0 : saturate(edge / SUN_CASCADE_BLEND_UV);
+        float take = min(w, 1.0 - acc);
+        if (take <= 0.0)
+        {
             continue;
         }
 
@@ -299,7 +382,6 @@ float SampleWorldLightShadow(float3 worldPos, float3 N)
         // каскадов одинаковый (см. BuildLightData), так что константа работает на любом уровне.
         float referenceDepth = lightNdc.z - 0.0004;
 
-        const float texel = 1.0 / 4096.0;
         float sum = 0.0;
         [unroll]
         for (int y = -1; y <= 1; y++)
@@ -312,10 +394,19 @@ float SampleWorldLightShadow(float3 worldPos, float3 N)
             }
         }
 
-        return sum / 9.0;
+        if (firstCascade < 0.0)
+        {
+            firstCascade = (float)c;
+        }
+
+        shadow += (sum / 9.0) * take;
+        acc += take;
     }
 
-    return 1.0;
+    // Недобранный вес - освещён: за пределами всех каскадов тени нет. Раньше здесь стоял ранний
+    // выход с 1.0, и «за пределами» наступало разом; теперь край последнего каскада уходит в свет
+    // тем же плавным весом, что и стыки между каскадами.
+    return shadow + (1.0 - acc);
 }
 #endif
 
@@ -505,45 +596,89 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #undef PROBE_GI_COUNTS
 #undef PROBE_GI_BRICKS
 
-// Плавный вес объёма: ноль у грани бокса (и снаружи), единица в двух шагах сетки внутрь. Лечит
-// сразу две видимые беды стыков (см. скриншоты с «переходами»):
+// Плавный вес объёма: ноль у грани бокса (и снаружи), единица - не ближе КИРПИЧА от грани. Прямой
+// аналог margin теневых каскадов (Shadows.hlsl, GetDistanceToCascadeMargin): выборка не берёт
+// каскад у самого края, а в полосе перед ним уходит на следующий, более крупный объём.
+//
+// Лечит сразу три видимые беды стыков:
 //   1) тело выборки КЛАМПИТ точку к боксу - без веса пиксель ВНЕ мелкого каскада не проваливался
 //      на крупный, а получал растянутые крайние кирпичи мелкого;
-//   2) даже честная граница переключала разрешение поля жёстко, швом.
+//   2) даже честная граница переключала разрешение поля жёстко, швом;
 // Отступ 0.5 шага держит выборку подальше от кламп-зоны самой грани.
+//
+// Ширина - два шага сетки, а не кирпич. Кирпич (три шага) здесь стоял недолго и по другому поводу:
+// им гасилась рябь только что въехавших кирпичей, которые прокрутка приводит с краю. Но платить за
+// это геометрией неправильно - полоса в кирпич съедала у каскада 13 ячеек по оси больше половины
+// полного веса, то есть ровно ту плотность, ради которой каскад и заведён. Свежестью и надо гасить
+// свежесть: теперь въехавший кирпич проявляется сам, по своему окну (см. ProbeGiSampleBody,
+// confidence), где бы он ни лежал, а этой полосе остаётся её собственная работа - стык объёмов.
+#define PROBE_CASCADE_MARGIN_CELLS 2.0
+
 float ProbeCascadeWeight(float3 worldPos, float4 origin, float4 cell, float4 counts)
 {
     float3 f = (worldPos - origin.xyz) / cell.xyz;
     float3 hi = counts.xyz - 1.0;
     float d = min(min(f.x, hi.x - f.x), min(min(f.y, hi.y - f.y), min(f.z, hi.z - f.z)));
-    return saturate((d - 0.5) / 1.5);
+    return saturate((d - 0.5) / (PROBE_CASCADE_MARGIN_CELLS - 0.5));
 }
 
 // Каскадная выборка: база - гарантия покрытия, мелкие объёмы подмешиваются ПОВЕРХ с весом своего
 // бокса. Плата за плавный стык - в зоне каскада выборок больше одной (до трёх в самом мелком);
 // это ровно те места, ради которых каскады и заведены, так что цена по адресу.
+// probeCoverage - НАСКОЛЬКО результату можно верить как замене константного ambient, 0..1.
+// Заведён из-за свежих кирпичей. Прокрутка каскада приводит их непрерывно, пока летит камера, и в
+// местах, где базовый объём дыряв (он разрежённый - кирпичи есть только у геометрии), свежий кирпич
+// оказывается ЕДИНСТВЕННЫМ источником. Смешивать его по уверенности с нулём, как делалось раньше,
+// значит проявлять освещение из черноты: на резкое движение камеры перед ней шли тёмные
+// прямоугольники размером с кирпич. Смешивать в полную силу - другая крайность, дававшая яркие
+// вспышки. Правильно - смешивать с тем, что стоит под полем: с константным ambient, а он считается
+// в Main. Поэтому наружу отдаётся ВЕС, а сам размен делает вызывающий.
 float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out float sunFraction,
-                     out float3 probeMarker)
+                     out float3 probeMarker, out float probeCoverage)
 {
-    float3 result = SampleProbeGiC0(worldPos, N, skyVisibility, sunFraction, probeMarker);
+    probeCoverage = 1.0;
+    // Уверенность базового объёма не читается: он не ездит, его кирпичи не бывают свежими, и
+    // гасить последний рубеж покрытия всё равно нечем - под ним только константный ambient.
+    float conf0;
+    float3 result = SampleProbeGiC0(worldPos, N, skyVisibility, sunFraction, probeMarker, conf0);
 
     if (ProbeGridOrigin1.w > 0.5)
     {
         float w = ProbeCascadeWeight(worldPos, ProbeGridOrigin1, ProbeGridCell1, ProbeGridCounts1);
         if (w > 0.0)
         {
-            float sky1, sun1;
+            float sky1, sun1, conf1;
             float3 marker1;
-            float3 mid = SampleProbeGiC1(worldPos, N, sky1, sun1, marker1);
-            if (mid.x >= 0.0)
+            float3 mid = SampleProbeGiC1(worldPos, N, sky1, sun1, marker1, conf1);
+
+            // Вес каскада гасится уверенностью кирпича: только что въехавший проявляется за свои
+            // раунды, а не вспыхивает готовым (см. ProbeGiSampleBody).
+            w *= conf1;
+            if (mid.x >= 0.0 && w > 0.0)
             {
-                // Базе нечем крыть (дыра без кирпича) - мелкий объём целиком, без фейда в мусор.
+                // Базе нечем крыть (дыра без кирпича - базовый объём разрежённый, кирпичи есть
+                // только у геометрии). Тогда подмешивать не к чему, и вес каскада по БОКСУ здесь
+                // ни при чём: гасить единственный источник за отсутствие второго бессмысленно.
+                //
+                // Но уверенность кирпича остаётся в силе, и раньше её тут теряли: строка ставила
+                // w = 1.0 поверх уже домноженного на conf1 веса. Свежий кирпич, только что
+                // привезённый прокруткой, показывался в ПОЛНУЮ СИЛУ с полем от одного-двух вееров -
+                // те самые прямоугольные вспышки размером с кирпич на резкое движение камеры, с
+                // резкой границей по слою, который прокрутка привезла. Ровно против этого
+                // confidence и заведён (см. ProbeGiBakeSession.BrickConfidence), а здесь он
+                // отменялся.
+                // Базе нечем крыть - значение берём ЦЕЛИКОМ, а неуверенность отдаём наружу весом.
+                // Именно значение, а не его долю: поле свежего кирпича шумно, но по величине это
+                // уже освещение, а не ноль, и тянуть его к нулю - выдумывать темноту, которой нет.
                 if (result.x < 0.0)
                 {
-                    w = 1.0;
+                    probeCoverage = conf1;
+                    result = mid;
                 }
-
-                result = lerp(max(result, 0.0), mid, w);
+                else
+                {
+                    result = lerp(max(result, 0.0), mid, w);
+                }
                 skyVisibility = lerp(skyVisibility, sky1, w);
                 sunFraction = lerp(sunFraction, sun1, w);
                 if (w > 0.5)
@@ -559,17 +694,23 @@ float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out flo
         float w = ProbeCascadeWeight(worldPos, ProbeGridOrigin2, ProbeGridCell2, ProbeGridCounts2);
         if (w > 0.0)
         {
-            float sky2, sun2;
+            float sky2, sun2, conf2;
             float3 marker2;
-            float3 fine = SampleProbeGiC2(worldPos, N, sky2, sun2, marker2);
-            if (fine.x >= 0.0)
+            float3 fine = SampleProbeGiC2(worldPos, N, sky2, sun2, marker2, conf2);
+            w *= conf2;
+            if (fine.x >= 0.0 && w > 0.0)
             {
+                // То же, что у каскада выше: дыра в предыдущих объёмах снимает вес по боксу, но не
+                // уверенность кирпича.
                 if (result.x < 0.0)
                 {
-                    w = 1.0;
+                    probeCoverage = conf2;
+                    result = fine;
                 }
-
-                result = lerp(max(result, 0.0), fine, w);
+                else
+                {
+                    result = lerp(max(result, 0.0), fine, w);
+                }
                 skyVisibility = lerp(skyVisibility, sky2, w);
                 sunFraction = lerp(sunFraction, sun2, w);
                 if (w > 0.5)
@@ -801,9 +942,17 @@ PSOutput Main(in PSInput input)
                 // применяют нормал-мапу с перевёрнутым Y - рельеф инвертируется.
                 float3 B = cross(N, T) * input.tangent.w;
 
-                float3 mapped = _NormalTex.Sample(_NormalTex_sampler, uv).xyz * 2.0 - 1.0;
-                mapped.xy *= PbrNormalScale;
-                N = normalize(mapped.x * T + mapped.y * B + mapped.z * N);
+                // Z ВОССТАНАВЛИВАЕТСЯ из XY, а не читается из текстуры. Запечённые карты нормалей
+                // ассет-пайплайна лежат в BC5 (см. TextureImportSettings.AutoFor), а он хранит ровно
+                // два канала - третий приходит из сэмплера нулём. Для тангенциальной нормали это не
+                // потеря: она всегда смотрит наружу поверхности, то есть z однозначно выводится из
+                // длины. Незапечённым RGBA8-картам и плоскому 1x1-филлеру (128,128,255 -> xy≈0,
+                // z≈1) реконструкция даёт то же самое, что дало бы чтение .z, поэтому ветвление по
+                // формату не нужно.
+                float2 mappedXY = _NormalTex.Sample(_NormalTex_sampler, uv).xy * 2.0 - 1.0;
+                float mappedZ = sqrt(saturate(1.0 - dot(mappedXY, mappedXY)));
+                mappedXY *= PbrNormalScale;
+                N = normalize(mappedXY.x * T + mappedXY.y * B + mappedZ * N);
             }
         }
 #endif
@@ -827,6 +976,10 @@ PSOutput Main(in PSInput input)
         float keyIntensity;
         bool hasWorldLight = false;
 
+        // Индекс каскада солнца, выбранного этим пикселем (-1 - каскад не выбран). Только для
+        // отладочного канала 26.
+        float dbgSunCascade = -1.0;
+
 #if FEATURE_SHADOWS
         hasWorldLight = (PbrFeatureFlags & FeatureShadows)
             && dot(lightData.LightDirection.xyz, lightData.LightDirection.xyz) > 1e-4;
@@ -836,7 +989,7 @@ PSOutput Main(in PSInput input)
             // Конвенция ОСНОВНОГО пайплайна (см. CullingAndRenderSystem): LightData.LightDirection
             // указывает НА солнце - SimpleCullingAndRenderSystem теперь пишет так же.
             keyDir = normalize(lightData.LightDirection.xyz);
-            keyShadow = SampleWorldLightShadow(input.worldPos, N);
+            keyShadow = SampleWorldLightShadow(input.worldPos, N, dbgSunCascade);
 
             // Мировой ключ слабее камерного (3.5 тюнился под риг без IBL-солнца): источник, из
             // которого он выведен, УЖЕ светит через энвайронмент-отражения - полная двойная
@@ -941,30 +1094,54 @@ PSOutput Main(in PSInput input)
         // окклюдера в кадре" от "слайс вообще пустой/чужой" - индекс тут решает спор (см. канал 12).
         float dbgShadowSlice = -1;
         float dbgShadowBase = -1; // ВРЕМЕННЫЙ: punctual.ShadowParams.x ДО добавления смещения грани куба.
+        float3 punctualLightPosDbg = 0; // ВРЕМЕННЫЙ: позиция света, которой соответствует dbgPunctual/dbgShadowSlice.
         float dbgClusterRawCount = -1; // ВРЕМЕННЫЙ: ClusterCounts[clusterIdx] сырьём, до клампа CLUSTER_MAX_LIGHTS.
+        // ВРЕМЕННЫЙ для каналов 22..24: x - глубина ПРИЁМНИКА (этой поверхности) в системе координат
+        // света, y - глубина ОККЛЮДЕРА, лежащая в слайсе по тому же UV, z - far слайса (масштаб
+        // рампы). Обе в МИРОВЫХ единицах вдоль оси слайса. -1 = сэмплинг тени сюда не дошёл.
+        float3 dbgShadowDepth = -1;
+        float dbgShadowBiasWorld = 0; // ВРЕМЕННЫЙ: мировой байас этого пикселя - масштаб канала 24.
+        float dbgShadowClipW = -1e9; // ВРЕМЕННЫЙ: shadowClip.w ДО guard'а, для канала 25.
+        float3 dbgSliceAxis = 1e9;    // ВРЕМЕННЫЙ: ось грани из СТОЛБЦА матрицы слайса, для канала 26.
+        float3 dbgSliceAxisRow = 1e9; // ВРЕМЕННЫЙ: то же из СТРОКИ, для канала 27.
+        // ВРЕМЕННЫЙ: координаты фроксела этого пикселя (x/y - тайл экрана, z - экспоненциальный срез
+        // глубины) для канала 20. -1 = сетка не определена (ClusterParams.zw пустые - превью-конвейер).
+        float3 dbgClusterCell = -1;
 
         // ----- Clustered punctual-света (point/spot) -------------------------------------------
         // Пиксель находит свой фроксел-кластер (тайл экрана + экспоненциальный срез по view-z,
         // обязано зеркалить прямое отображение в LightClusterCS.hlsl) и шейдит только света его
-        // кластера. ClusterParams.y == 0 - punctual-светов у камеры нет, ветка мёртвая.
+        // кластера. ClusterParams.y == 0 - punctual-светов у камеры нет, шейдинг мёртвый, но САМО
+        // отображение пиксель->фроксел считается всё равно: канал 20 обязан показывать сетку и на
+        // сцене без единого punctual-света (иначе "кластеры не работают" неотличимо от "светов нет").
         uint punctualCount = (uint)lightData.ClusterParams.y;
-        if (punctualCount > 0)
+        float clusterZNear = lightData.ClusterParams.z;
+        float clusterZFar = lightData.ClusterParams.w;
+        bool clusterGridValid = clusterZFar > clusterZNear && clusterZNear > 0.0;
+
+        uint tileX = 0, tileY = 0, tileZ = 0;
+        // Условие однородно по кадру во второй половине (PreviewChannel - константа кбуфера), так что
+        // без светов на сцене обычный проход не платит за отладочный mul вовсе.
+        if (clusterGridValid && (punctualCount > 0 || PreviewChannel == 20 || PreviewChannel == 21))
         {
             float clusterViewZ = mul(float4(input.worldPos, 1.0), viewData.view).z;
-            float clusterZNear = lightData.ClusterParams.z;
-            float clusterZFar = lightData.ClusterParams.w;
 
             float2 clusterUv = input.pos.xy / viewData.viewport.zw;
-            uint tileX = min((uint)(clusterUv.x * CLUSTER_GRID_X), CLUSTER_GRID_X - 1);
-            uint tileY = min((uint)(clusterUv.y * CLUSTER_GRID_Y), CLUSTER_GRID_Y - 1);
+            tileX = min((uint)(clusterUv.x * CLUSTER_GRID_X), CLUSTER_GRID_X - 1);
+            tileY = min((uint)(clusterUv.y * CLUSTER_GRID_Y), CLUSTER_GRID_Y - 1);
             float clusterSlice = log2(max(clusterViewZ, clusterZNear) / clusterZNear)
                                / log2(clusterZFar / clusterZNear) * CLUSTER_GRID_Z;
-            uint tileZ = (uint)clamp(clusterSlice, 0.0, CLUSTER_GRID_Z - 1.0);
+            tileZ = (uint)clamp(clusterSlice, 0.0, CLUSTER_GRID_Z - 1.0);
+            dbgClusterCell = float3(tileX, tileY, tileZ);
+        }
 
+        if (punctualCount > 0 && clusterGridValid)
+        {
             uint clusterIdx = ClusterFlatIndex(uint3(tileX, tileY, tileZ));
             uint clusterLightCount = min(ClusterCounts[clusterIdx], CLUSTER_MAX_LIGHTS);
             // ВРЕМЕННЫЙ: сколько записей реально в ClusterCounts у этого пикселя ДО клампа - если
-            // >1 при единственном свете в сцене, кластеризация дублирует/мусорит индексы.
+            // >1 при единственном свете в сцене, кластеризация дублирует/мусорит индексы, а
+            // >CLUSTER_MAX_LIGHTS значит, что кластер переполнен и хвост светов молча потерян.
             dbgClusterRawCount = (float)ClusterCounts[clusterIdx];
 
             for (uint li = 0; li < clusterLightCount; li++)
@@ -998,6 +1175,7 @@ PSOutput Main(in PSInput input)
                 {
                     uint shadowSlice = (uint)punctual.ShadowParams.x;
                     dbgShadowBase = punctual.ShadowParams.x;
+                    punctualLightPosDbg = punctual.PositionRange.xyz;
                     if (punctual.DirectionType.w < 0.5)
                     {
                         float3 toFrag = -toLight;
@@ -1021,10 +1199,29 @@ PSOutput Main(in PSInput input)
                     float shadowTanHalfFov = punctual.DirectionType.w > 0.5
                         ? punctual.SpotAngles.z / max(punctual.SpotAngles.x, 1e-4)
                         : 1.0;
-                    float shadowTexelWorld = 2.0 * shadowTanHalfFov * punctualDist / 1024.0;
+                    float shadowTexelWorld = 2.0 * shadowTanHalfFov * punctualDist / PUNCTUAL_SHADOW_MAP_SIZE;
                     float3 shadowSamplePos = input.worldPos + N * shadowTexelWorld * 1.5;
 
-                    float4 shadowClip = mul(float4(shadowSamplePos, 1.0), PunctualShadowMatrices[shadowSlice]);
+                    float4x4 shadowMatrix = LoadPunctualShadowMatrix(shadowSlice);
+                    float4 shadowClip = mul(float4(shadowSamplePos, 1.0), shadowMatrix);
+                    // ВРЕМЕННЫЙ замер для канала 25 - w ДО guard'а ниже. Отдельно от dbgShadowDepth.x
+                    // (тот пишется уже ВНУТРИ guard'а и про отказавшие пиксели молчит), а вопрос
+                    // именно в них: w = проекция вектора свет->фрагмент на ось выбранной грани, и по
+                    // построению выбора грани она обязана быть положительной. Отрицательная w - это
+                    // либо матрица не той грани, либо позиция света в матрице не та, что в шейдинге.
+                    dbgShadowClipW = shadowClip.w;
+                    dbgShadowDepth.z = punctual.PositionRange.w; // far слайса - масштаб рампы канала 25
+                    // ВРЕМЕННЫЙ для канала 26: w-столбец матрицы слайса, как её видит ШЕЙДЕР. Это
+                    // ось грани в мире (у корректной матрицы обязана совпасть с FaceDirs[грань]).
+                    // Сверяется с дампом PunctualShadowScheduler (sliceAxis) - расхождение CPU/GPU
+                    // означает, что до шейдера доезжает не та матрица, а не что выбор грани врёт.
+                    dbgSliceAxis = float3(shadowMatrix._m03, shadowMatrix._m13, shadowMatrix._m23);
+                    // Та же ось, но из СТРОКИ - канал 27. Держится регресс-тестом раскладки: у
+                    // правильно собранной матрицы ось грани лежит в СТОЛБЦЕ, поэтому канал 26 обязан
+                    // совпадать с выбранной гранью (канал 19), а канал 27 - НЕТ. Если они поменяются
+                    // местами, значит раскладка строк снова разъехалась (см. комментарий у
+                    // LoadPunctualShadowMatrix) - на обоих бэкендах это видно одним прогоном.
+                    dbgSliceAxisRow = float3(shadowMatrix._m30, shadowMatrix._m31, shadowMatrix._m32);
                     if (shadowClip.w > 1e-4)
                     {
                         float3 shadowNdc = shadowClip.xyz / shadowClip.w;
@@ -1041,20 +1238,82 @@ PSOutput Main(in PSInput input)
                             // так что та же NDC-константа на разной глубине z стоит РАЗНОЕ число метров -
                             // близко к свету это мало, а у границы дальности разгоняется до целого
                             // метра просадки тени под объект (peter-panning). Вместо этого bias задаётся
-                            // в МИРОВЫХ единицах (склон по углу к свету + пол, как у каскадов) и
+                            // в МИРОВЫХ единицах (в масштабе текселя слайса, см. ниже) и
                             // переводится в NDC локальной производной d(ndc)/dz = n*f/((f-n)*z^2) в точке
                             // приёмника (z = shadowClip.w - view-space глубина вдоль оси света).
+                            // near берётся ГОТОВЫМ из ShadowParams.z (PunctualShadowScheduler.
+                            // SliceNearPlane - то же число, что ушло в проекцию слайса). Своей копии
+                            // формулы здесь больше нет: прошлая - max(0.05, range*0.001) - не знала
+                            // про потолок 0.25, добавленный на стороне планировщика, и на дальнобойной
+                            // лампе (Range 20000) считала near = 20 вместо 0.25, завышая производную
+                            // d(ndc)/dz и с ней депф-байас на два порядка.
                             float shadowFar = punctual.PositionRange.w;
-                            float shadowNear = max(0.05, shadowFar * 0.001);
+                            float shadowNear = max(punctual.ShadowParams.z, 1e-4);
                             float shadowZ = max(shadowClip.w, shadowNear);
-                            float shadowWorldBias = max(0.05 * (1.0 - dot(N, punctualL)), 0.005);
+                            // Мировая величина байаса задаётся В ТЕКСЕЛЯХ СЛАЙСА, а не константой в
+                            // метрах. Прежняя пара (склон 0.05*(1-N.L) с полом 0.005) не знала о
+                            // разрешении и дальности: у перспективного слайса тексель растёт линейно с
+                            // дистанцией (shadowTexelWorld выше), и на замеренном кадре - лампа far=6.4
+                            // на высоте 5.15 над полом - тексель на полу выходит ~0.010 мировых единиц,
+                            // то есть ВДВОЕ больше, чем весь байас в этой точке (N.L=1 -> пол 0.005).
+                            // Байас меньше кванта растра акне не давит по определению, а под косыми
+                            // углами перепад глубины ВНУТРИ одного текселя ещё и умножается на tan угла
+                            // падения - отсюда слагаемое с тангенсом (кламп 4.0 держит скользящие углы
+                            // от ухода байаса в бесконечность, дальше работает peter-panning).
+                            float shadowNdotL = saturate(dot(N, punctualL));
+                            float shadowTanTheta = sqrt(saturate(1.0 - shadowNdotL * shadowNdotL))
+                                / max(shadowNdotL, 0.15);
+                            float shadowWorldBias = shadowTexelWorld * (1.0 + 2.0 * min(shadowTanTheta, 4.0));
                             float shadowNdcPerWorld = shadowNear * shadowFar
                                 / max((shadowFar - shadowNear) * shadowZ * shadowZ, 1e-6);
                             float shadowBias = shadowWorldBias * shadowNdcPerWorld;
 
-                            float shadowLit = PunctualShadowMaps.SampleCmpLevelZero(
-                                PunctualShadowMaps_sampler,
-                                float3(shadowUv, shadowSlice), shadowNdc.z - shadowBias);
+                            // PCF 3x3 - как у каскадов солнца (см. SampleWorldLightShadow): одиночный
+                            // тап давал ступенчатую кромку в тексель шириной, и остаточное акне нечем
+                            // было размазать. Тапы у кромки грани куба выходят за её квадрат не дальше
+                            // одного текселя из 1024, а грани рисуются с перехлёстом 2% (~20 текселей,
+                            // см. PunctualShadowScheduler) - за чужую грань выборка не уезжает, и
+                            // адресация сэмплера всё равно Clamp.
+                            const float punctualTexel = 1.0 / PUNCTUAL_SHADOW_MAP_SIZE;
+                            float shadowSum = 0.0;
+                            [unroll]
+                            for (int sy = -1; sy <= 1; sy++)
+                            {
+                                [unroll]
+                                for (int sx = -1; sx <= 1; sx++)
+                                {
+                                    shadowSum += PunctualShadowMaps.SampleCmpLevelZero(
+                                        PunctualShadowMaps_sampler,
+                                        float3(shadowUv + float2(sx, sy) * punctualTexel, shadowSlice),
+                                        shadowNdc.z - shadowBias);
+                                }
+                            }
+
+                            // ВРЕМЕННЫЙ замер для каналов 22..24 - ДВЕ глубины в системе координат
+                            // света, обе в МИРОВЫХ единицах вдоль оси слайса:
+                            //   x - глубина ПРИЁМНИКА (этой поверхности), она же shadowClip.w;
+                            //   y - глубина ОККЛЮДЕРА, реально лежащая в слайсе по тому же UV.
+                            // Вторая берётся Load'ом (точечный тап центрального тексела): у текстуры
+                            // сравнивающий сэмплер, обычный Sample с ним невалиден, а Load сэмплера не
+                            // требует вовсе. Обратное преобразование перспективной NDC-глубины в
+                            // view-z - ровно инверсия проекции слайса (PunctualShadowScheduler.AddSlice,
+                            // CreatePerspectiveFieldOfViewLeftHanded): ndc = f/(f-n) - n*f/((f-n)*z)
+                            // => z = n*f / (f - ndc*(f-n)). Именно поэтому сравнивать надо ЗДЕСЬ, в
+                            // метрах: в NDC обе глубины у дальней плоскости слипаются в неразличимые
+                            // тысячные доли и по картинке о зазоре приёмник/окклюдер сказать нечего.
+                            uint2 dbgShadowTexel = (uint2)clamp(shadowUv * PUNCTUAL_SHADOW_MAP_SIZE,
+                                0.0, PUNCTUAL_SHADOW_MAP_SIZE - 1.0);
+                            float dbgOccluderNdc = PunctualShadowMaps.Load(
+                                int4(dbgShadowTexel, shadowSlice, 0)).r;
+                            float dbgOccluderZ = shadowNear * shadowFar
+                                / max(shadowFar - dbgOccluderNdc * (shadowFar - shadowNear), 1e-6);
+                            dbgShadowDepth = float3(shadowClip.w, dbgOccluderZ, shadowFar);
+                            // Мировой байас этого пикселя - масштаб для канала 24: разница
+                            // приёмник/окклюдер осмысленна только В СРАВНЕНИИ с ним (меньше байаса -
+                            // пиксель считается освещённым, больше - уходит в тень).
+                            dbgShadowBiasWorld = shadowWorldBias;
+
+                            float shadowLit = shadowSum / 9.0;
                             dbgPunctual.w = shadowLit;
                             punctualAtten *= lerp(1.0, shadowLit, saturate(punctual.ShadowParams.y));
                         }
@@ -1106,12 +1365,14 @@ PSOutput Main(in PSInput input)
         float probeSunFraction = 0.0;
         // Отметка ближайшей пробы для канала 10 (расстановка проб); вне его не используется.
         float3 probeMarker = float3(1e6, 0.0, 0.0);
+        // Доля, в которой поле проб заменяет константный ambient - см. SampleProbeGi.
+        float probeCoverage = 1.0;
         bool probeGi = ProbeGridOrigin.w > 0.5;
         float3 probeIrradiance = 0.0;
         if (probeGi)
         {
             probeIrradiance = SampleProbeGi(input.worldPos, N, skyVisibility, probeSunFraction,
-                                            probeMarker);
+                                            probeMarker, probeCoverage);
             probeGi = probeIrradiance.x >= 0.0;
         }
 
@@ -1136,9 +1397,17 @@ PSOutput Main(in PSInput input)
         float skyDamp = lerp(skyFloor, 1.0, keyShadow);
         float probeShadow = lerp(skyDamp, sunDamp, probeSunFraction);
         float probeBoost = ProbeGiParams.w > 0.01 ? ProbeGiParams.w : 1.0;
+        // Запасной ambient считается ВСЕГДА: он нужен не только там, где поля нет совсем, но и
+        // там, где оно есть, да не в полную силу - свежий кирпич проявляется из него, а не из
+        // черноты (см. probeCoverage в SampleProbeGi). Лишний SampleEnvironment на пиксель - цена
+        // за то, что перед летящей камерой больше не идут прямоугольники размером с кирпич.
+        float3 envAmbient =
+            SampleEnvironment(N, 1.0) * ambientLevel * albedo * (1.0 - metallic) * occlusion * envShadow;
         float3 ambient = probeGi
-            ? probeIrradiance * probeBoost * albedo * (1.0 - metallic) * occlusion * probeShadow
-            : SampleEnvironment(N, 1.0) * ambientLevel * albedo * (1.0 - metallic) * occlusion * envShadow;
+            ? lerp(envAmbient,
+                   probeIrradiance * probeBoost * albedo * (1.0 - metallic) * occlusion * probeShadow,
+                   saturate(probeCoverage))
+            : envAmbient;
 
         // KHR_materials_transmission via a real refraction pass (see ForwardPass): _SceneColor
         // holds the opaque scene as drawn this frame, and each channel samples it along its own
@@ -1312,8 +1581,18 @@ PSOutput Main(in PSInput input)
                 dbgPunctual.w < -4.5 ? float3(1, 0, 1)   // -5 (default/no light path) сюда не попадает - оставлено на всякий
                 : dbgPunctual.w < -3.5 ? float3(1, 0.5, 0) // -4: UV в допуске, ndc.z >= 1.0 (за дальней плоскостью)
                 : dbgPunctual.w < -2.5 ? float3(0, 1, 1)   // -3: UV вне [0,1] (точка вне квадрата слайса)
-                : dbgPunctual.w < -1.5 ? float3(1, 0, 1)   // -1: ветка не выполнилась вовсе
-                : dbgPunctual.www;                          // сэмплировано: 0 (тень) .. 1 (свет)
+                // -1: ветка не выполнилась вовсе. Порог именно -0.5, а НЕ -1.5: дефолт dbgPunctual.w
+                // равен -1 и условию "< -1.5" не удовлетворял никогда, так что случай "света сюда не
+                // дошло" молча проваливался в серую ветку и рисовался чёрным - неотличимо от глухой
+                // тени. Значение -2 пишется только транзитом (перед сэмплером) и тут же затирается
+                // его результатом, так что магента не появлялась вообще ни при каких условиях.
+                : dbgPunctual.w < -0.5 ? float3(1, 0, 1)
+                // Сэмплировано: тень .. свет, но поднято с 0 до 0.15 - ЧИСТО ЧЁРНЫЙ обязан остаться
+                // только у фона. Пиксельный шейдер на пикселях без геометрии не запускается вовсе, и
+                // они держат цвет очистки таргета; при отображении тени нулём небо за силуэтом стены
+                // и затенённая стена были В КАНАЛЕ НЕОТЛИЧИМЫ, из-за чего "тень залила весь кадр"
+                // читалось там, где полкадра просто фон.
+                : lerp(0.15, 1.0, saturate(dbgPunctual.w)).xxx;
             output.color = float4(dbgColor, 1.0);
             return output;
         }
@@ -1348,12 +1627,347 @@ PSOutput Main(in PSInput input)
         }
         // ВРЕМЕННЫЙ отладочный канал 14 - сырое ClusterCounts[clusterIdx] (до клампа) этого пикселя,
         // та же кодировка *16/255. Магента = punctualCount == 0 (ветка кластеров вообще не вошла).
+        // Кодировка ЦВЕТОМ, а не серым *16/255, как было: на 8 битах один свет давал 16/255 - на глаз
+        // неотличимо от нуля, и «в кластере нет светов» читалось там, где свет ровно один (ровно эта
+        // ловушка съела прогон пробника: канал показывал сплошной чёрный при работающей
+        // кластеризации). Теперь ноль отделён от единицы качественно, а не количественно:
+        //   чёрный  - 0 светов (кластер пуст);
+        //   синий -> циан -> зелёный -> жёлтый -> красный - 1..CLUSTER_MAX_LIGHTS по возрастанию;
+        //   белый   - счётчик БОЛЬШЕ CLUSTER_MAX_LIGHTS: кластер переполнен, хвост светов потерян;
+        //   магента - ветка кластеров не выполнялась (у камеры нет punctual-светов).
         if (PreviewChannel == 14)
         {
-            float3 dbgColor = dbgClusterRawCount < -0.5
-                ? float3(1, 0, 1)
-                : saturate(dbgClusterRawCount * 16.0 / 255.0).xxx;
+            if (dbgClusterRawCount < -0.5)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+            if (dbgClusterRawCount < 0.5)
+            {
+                output.color = float4(0, 0, 0, 1);
+                return output;
+            }
+            if (dbgClusterRawCount > CLUSTER_MAX_LIGHTS + 0.5)
+            {
+                output.color = float4(1, 1, 1, 1);
+                return output;
+            }
+
+            float dbgCountT = saturate((dbgClusterRawCount - 1.0) / (CLUSTER_MAX_LIGHTS - 1.0));
+            float3 dbgColor =
+                  dbgCountT < 0.25 ? lerp(float3(0, 0, 1), float3(0, 1, 1), dbgCountT / 0.25)
+                : dbgCountT < 0.50 ? lerp(float3(0, 1, 1), float3(0, 1, 0), (dbgCountT - 0.25) / 0.25)
+                : dbgCountT < 0.75 ? lerp(float3(0, 1, 0), float3(1, 1, 0), (dbgCountT - 0.50) / 0.25)
+                : lerp(float3(1, 1, 0), float3(1, 0, 0), (dbgCountT - 0.75) / 0.25);
             output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // ВРЕМЕННЫЙ отладочный канал 15 - величина выхода shadowUv за [0,1] для пикселей канала 11
+        // с кодом -3 (циан, UV вне диапазона): dbgPunctual.xy несёт СЫРОЙ shadowUv независимо от
+        // guard'а (см. запись dbgPunctual выше), так что маргинальный перехлёст (чуть больше 1) и
+        // грубо неверный слайс (UV в разы за пределами) различимы численно, а не только визуально.
+        // excess = максимум по x/y расстояния от [0,1] (0 - внутри, растёт с выходом за границу),
+        // закодирован r=g=b = saturate(excess / 2.0) - excess=2.0 бьёт в белый потолок; для пикселей
+        // ветки, что НЕ дали -3 (не циан), пишем чёрный.
+        if (PreviewChannel == 15)
+        {
+            float excessX = max(-dbgPunctual.x, dbgPunctual.x - 1.0);
+            float excessY = max(-dbgPunctual.y, dbgPunctual.y - 1.0);
+            float excess = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5 ? max(excessX, excessY) : 0.0;
+            output.color = float4(saturate(excess / 2.0).xxx, 1.0);
+            return output;
+        }
+
+        // ВРЕМЕННЫЙ отладочный канал 16 - dbgShadowSlice (та же кодировка *16/255, что канал 12), но
+        // ТОЛЬКО для пикселей, у которых канал 11 дал циан (dbgPunctual.w == -3, UV вне [0,1]) -
+        // остальные чёрные. Отвечает "какой слайс выбран именно у циан-пикселей" напрямую, без
+        // визуального сравнения двух отдельных картинок.
+        if (PreviewChannel == 16)
+        {
+            bool isCyan = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5;
+            float3 dbgColor = !isCyan ? float3(0, 0, 0)
+                : dbgShadowSlice < -0.5 ? float3(1, 0, 1)
+                : saturate(dbgShadowSlice * 16.0 / 255.0).xxx;
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // ВРЕМЕННЫЙ отладочный канал 17 - сырой shadowUv.xy циан-пикселей канала 11, закодирован как
+        // (uv/8 + 0.5) чтобы уместить диапазон примерно [-4, 4] в 8 бит (excess до 2.0 наблюдался,
+        // берём запас). r=x, g=y, b=0. Чёрный (0,0,0 ТОЧНО) - не циан-пиксель (excess=0 у циан
+        // пикселя тоже даёт крошечное ненулевое значение из-за +0.5, так что чёрный однозначен).
+        if (PreviewChannel == 17)
+        {
+            bool isCyan = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5;
+            float3 dbgColor = isCyan
+                ? float3(saturate(dbgPunctual.x / 8.0 + 0.5), saturate(dbgPunctual.y / 8.0 + 0.5), 0.0)
+                : float3(0, 0, 0);
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // ВРЕМЕННЫЙ отладочный канал 18 - toFrag (worldPos - light) циан-пикселей канала 11, r/g/b =
+        // (toFrag.xyz/16 + 0.5): нужен, чтобы вручную пересчитать на CPU, какую грань ДОЛЖНА была
+        // выбрать доминирующая ось для ЭТОЙ ТОЧКИ, и сравнить с тем, что реально выбрал шейдер
+        // (канал 16/dbgShadowSlice) - расхождение укажет, врёт ли выбор грани или сама проекция.
+        if (PreviewChannel == 18)
+        {
+            bool isCyan = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5;
+            float3 toFragDbg = input.worldPos - punctualLightPosDbg;
+            float3 dbgColor = isCyan ? saturate(toFragDbg / 16.0 + 0.5) : float3(0, 0, 0);
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // ВРЕМЕННЫЙ отладочный канал 19 - ВЫБРАННАЯ ГРАНЬ КУБА своим цветом, для ВСЕХ пикселей, куда
+        // свет со слайсом вообще дотянулся (не только для циан). Каналы 12/16 кодируют слайс серым
+        // (*16/255), и на глаз соседние грани там неразличимы - приходилось сравнивать по пипетке.
+        // Здесь грань = dbgShadowSlice - dbgShadowBase, и у каждой свой цвет:
+        //   +X красный / -X тёмно-красный, +Y зелёный / -Y тёмно-зелёный, +Z синий / -Z тёмно-синий.
+        // Белый - грань вне 0..5 (у спота смещение не добавляется, так что там всегда «+X»/красный:
+        // для спота это норма, у него один слайс). Магента - ветка не дошла до выбора слайса.
+        //
+        // Зачем: раскладка граней на плоскости ПРЕДСКАЗУЕМА аналитически. Пол под точечным светом
+        // виден гранью -Y ровно там, где вертикаль до пола больше горизонтального выноса, то есть
+        // пока высота лампы над полом > Range/sqrt(2); дальше кольцом идут ±X/±Z, и границы между
+        // ними - прямые под 45 градусов от проекции лампы. Если картинка канала расходится с этим
+        // рисунком (одна грань на весь кадр, или граница не там), выбор грани врёт; если совпадает -
+        // врёт не он, и дальше смотреть надо в саму проекцию.
+        if (PreviewChannel == 19)
+        {
+            float dbgFace = dbgShadowSlice - dbgShadowBase;
+            float3 dbgColor =
+                  dbgShadowSlice < -0.5 ? float3(1, 0, 1)
+                : dbgFace < 0.5 ? float3(1.0, 0.0, 0.0)
+                : dbgFace < 1.5 ? float3(0.4, 0.0, 0.0)
+                : dbgFace < 2.5 ? float3(0.0, 1.0, 0.0)
+                : dbgFace < 3.5 ? float3(0.0, 0.4, 0.0)
+                : dbgFace < 4.5 ? float3(0.0, 0.0, 1.0)
+                : dbgFace < 5.5 ? float3(0.0, 0.0, 0.4)
+                : float3(1, 1, 1);
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // Канал 20 - СРЕЗ ГЛУБИНЫ фроксел-сетки (dbgClusterCell.z) своим цветом: прямой аналог
+        // "Display depth Slices" из статьи aortiz (Clustered Shading), по которой сделан
+        // LightClusterCS. Отвечает на вопрос, который каналы 11..19 не задают вовсе: правильно ли
+        // пиксель находит СВОЙ кластер. Каналы теней (11..19) диагностируют совсем другую половину -
+        // сэмплинг PunctualShadowMaps, и по ним о кластеризации нельзя сказать ничего.
+        //
+        // Как ЧИТАТЬ картинку (в этом вся ценность канала - ожидаемый вид известен аналитически):
+        //   - Полосы обязаны идти по ГЛУБИНЕ, а не по экрану: на плоском полу, уходящем от камеры,
+        //     это полосы поперёк направления взгляда, сгущающиеся вдаль (срезы экспоненциальные);
+        //     на стене, перпендикулярной взгляду, - ОДИН ровный цвет на всю стену.
+        //   - Цвет обязан МЕНЯТЬСЯ при движении камеры вперёд/назад и НЕ меняться при повороте
+        //     камеры вокруг своей оси.
+        //   - Весь кадр одного цвета = срезы вырождены (ClusterParams.zw пустые/равные, см. магенту)
+        //     или view-z считается неверно; полосы ВЕРТИКАЛЬНЫЕ/ГОРИЗОНТАЛЬНЫЕ по экрану вместо
+        //     глубинных = в срез утёк экранный x/y.
+        // Палитра - 8 цветов по кругу (срез % 8), яркость ступенькой по номеру восьмёрки
+        // (0..7 тусклее, 8..15 средние, 16..23 яркие), так что соседние срезы всегда контрастны, а
+        // абсолютный номер среза читается по яркости. Магента - сетка не определена (ClusterParams
+        // .zw пустые: превью-конвейеры, где кластеризация не гоняется вовсе).
+        if (PreviewChannel == 20)
+        {
+            if (dbgClusterCell.z < -0.5)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+
+            uint dbgSlice = (uint)dbgClusterCell.z;
+            uint dbgHue = dbgSlice % 8;
+            float3 dbgPalette =
+                  dbgHue == 0 ? float3(1, 0, 0)
+                : dbgHue == 1 ? float3(0, 1, 0)
+                : dbgHue == 2 ? float3(0, 0, 1)
+                : dbgHue == 3 ? float3(1, 1, 0)
+                : dbgHue == 4 ? float3(0, 1, 1)
+                : dbgHue == 5 ? float3(1, 0, 1)
+                : dbgHue == 6 ? float3(1, 0.5, 0)
+                : float3(1, 1, 1);
+            float dbgBand = 0.35 + 0.325 * (float)(dbgSlice / 8);
+            output.color = float4(dbgPalette * dbgBand, 1.0);
+            return output;
+        }
+
+        // Канал 21 - ТАЙЛ фроксел-сетки по экрану (dbgClusterCell.xy) шахматкой: контроль второй
+        // половины отображения пиксель->кластер. Ожидаемый вид известен точно: ровная сетка
+        // CLUSTER_GRID_X x CLUSTER_GRID_Y (16x8) клеток НА ВЕСЬ кадр. Если клеток видно меньше и они
+        // сжаты в угол - input.pos.xy и viewData.viewport.zw живут в разных разрешениях (рендер-скейл
+        // апскейлера, см. GraphicsPipelineSimple.LatchRenderResolution); если сетка съезжает при
+        // ресайзе окна - viewport камеры отстаёт от таргета. Красный канал - номер тайла по X,
+        // зелёный - по Y (плавная градация), синий - шахматка (x+y) % 2 для видимости границ.
+        if (PreviewChannel == 21)
+        {
+            if (dbgClusterCell.z < -0.5)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+
+            float dbgChecker = fmod(dbgClusterCell.x + dbgClusterCell.y, 2.0) < 0.5 ? 0.15 : 0.85;
+            output.color = float4((dbgClusterCell.x + 0.5) / CLUSTER_GRID_X,
+                                  (dbgClusterCell.y + 0.5) / CLUSTER_GRID_Y, dbgChecker, 1.0);
+            return output;
+        }
+
+        // Каналы 22..24 - ПРОЕЦИРУЕМАЯ ГЛУБИНА СВЕТА НА ПОВЕРХНОСТЬ, то есть обе глубины, которые
+        // сравнивает теневой сэмплер, в МИРОВЫХ единицах вдоль оси слайса (см. dbgShadowDepth):
+        //   22 - глубина ПРИЁМНИКА: как далеко от света лежит ЭТА поверхность;
+        //   23 - глубина ОККЛЮДЕРА: что записано в слайсе по тому же UV, то есть до чего свет
+        //        реально "дострелил" в этом направлении;
+        //   24 - их знаковая разница в масштабе применённого байаса - собственно вердикт сэмплера.
+        // Зачем в метрах, а не в NDC: проекция слайса перспективная, у дальней плоскости NDC-глубины
+        // приёмника и окклюдера слипаются в неразличимые тысячные, и по NDC-картинке о зазоре между
+        // ними сказать нечего. Рампа общая у 22 и 23 (нормировка на far слайса), поэтому их можно
+        // сравнивать переключением туда-сюда: там, где поверхность НЕ в тени, картинки обязаны
+        // СОВПАДАТЬ (свет видит ровно её); расхождение = либо перед ней есть окклюдер (законная
+        // тень), либо сэмплится ЧУЖОЙ слайс (тогда расхождение сплошное и бессистемное).
+        // Рампа: чёрный (у света) -> синий -> циан -> зелёный -> жёлтый -> красный (far слайса).
+        // Магента - сэмплинг тени сюда не дошёл (нет слайса, точка вне радиуса/вне квадрата слайса).
+        if (PreviewChannel == 22 || PreviewChannel == 23)
+        {
+            if (dbgShadowDepth.x < 0.0)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+
+            float dbgDepth = PreviewChannel == 22 ? dbgShadowDepth.x : dbgShadowDepth.y;
+            float dbgT = saturate(dbgDepth / max(dbgShadowDepth.z, 1e-4));
+            // Шеститочечная рампа кусочными lerp-ами (пять равных отрезков по 0.2, стыки НЕПРЕРЫВНЫ:
+            // конец каждого отрезка - начало следующего): у линейной серой шкалы дальняя половина
+            // диапазона неразличима на глаз, а весь смысл канала - именно в сравнении двух картинок.
+            float3 dbgColor =
+                  dbgT < 0.2 ? lerp(float3(0, 0, 0), float3(0, 0, 1), dbgT / 0.2)
+                : dbgT < 0.4 ? lerp(float3(0, 0, 1), float3(0, 1, 1), (dbgT - 0.2) / 0.2)
+                : dbgT < 0.6 ? lerp(float3(0, 1, 1), float3(0, 1, 0), (dbgT - 0.4) / 0.2)
+                : dbgT < 0.8 ? lerp(float3(0, 1, 0), float3(1, 1, 0), (dbgT - 0.6) / 0.2)
+                : lerp(float3(1, 1, 0), float3(1, 0, 0), (dbgT - 0.8) / 0.2);
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // Канал 24 - зазор (приёмник - окклюдер) В ЕДИНИЦАХ ПРИМЕНЁННОГО МИРОВОГО БАЙАСА. Именно
+        // байас, а не метры: акне и peter-panning - это всегда вопрос "зазор больше или меньше
+        // байаса", и абсолютная величина в метрах на него не отвечает (у перспективного слайса
+        // тексель, а с ним и байас, растёт с дистанцией - см. shadowTexelWorld).
+        //   зелёный - зазор в пределах байаса: поверхность сама себе окклюдер, пиксель освещён (норма);
+        //   красный - зазор БОЛЬШЕ байаса: перед поверхностью реальный окклюдер, пиксель в тени;
+        //   синий   - зазор ОТРИЦАТЕЛЬНЫЙ (приёмник ближе к свету, чем всё записанное в слайсе):
+        //             в норме это только там, куда каст не рисовался, сплошная синева = слайс пустой
+        //             или сэмплится чужой.
+        // Яркость - |зазор|/байас с потолком 4: тонкая красная кайма вдоль контактов при зелёном
+        // фоне и есть здоровая картинка, широкая красная полоса от объекта = байас велик
+        // (peter-panning), рваная красная сыпь по освещённой плоскости = байас мал (акне).
+        if (PreviewChannel == 24)
+        {
+            if (dbgShadowDepth.x < 0.0)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+
+            float dbgGap = dbgShadowDepth.x - dbgShadowDepth.y;
+            float dbgGapInBias = dbgGap / max(dbgShadowBiasWorld, 1e-6);
+            float dbgMag = saturate(abs(dbgGapInBias) / 4.0);
+            float3 dbgColor = dbgGapInBias < -1.0 ? float3(0, 0, 1)
+                : dbgGapInBias <= 1.0 ? float3(0, 1, 0)
+                : float3(1, 0, 0);
+            output.color = float4(dbgColor * lerp(0.25, 1.0, dbgMag), 1.0);
+            return output;
+        }
+
+        // Канал 25 - ЗНАК shadowClip.w у пикселей, ДОШЕДШИХ до проекции в слайс (см. dbgShadowClipW).
+        // Отвечает на вопрос, который каналы 11..24 обходят стороной: они все живут ЗА guard'ом
+        // shadowClip.w > 1e-4 и про отброшенные им пиксели молчат - в канале 11 такой пиксель
+        // неотличим от «света сюда не дошло» (и то, и другое магента).
+        //   магента - до проекции не дошли (света нет в кластере / вне радиуса / нет слайса);
+        //   СИНИЙ   - w <= 0: точка ПОЗАДИ ближней плоскости выбранной грани. По построению выбора
+        //             грани (доминирующая ось вектора свет->фрагмент) этого быть не может вовсе:
+        //             w и есть проекция того самого вектора на ось той самой грани. Синева здесь -
+        //             прямая улика, что матрица слайса не соответствует выбранной грани;
+        //   зелёный->жёлтый->красный - w от 0 до far слайса (нормальный случай).
+        if (PreviewChannel == 25)
+        {
+            if (dbgShadowClipW < -1e8)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+            if (dbgShadowClipW <= 1e-4)
+            {
+                output.color = float4(0, 0, 1, 1);
+                return output;
+            }
+
+            float dbgWt = saturate(dbgShadowClipW / max(dbgShadowDepth.z, 1e-4));
+            output.color = float4(dbgWt < 0.5
+                ? lerp(float3(0, 1, 0), float3(1, 1, 0), dbgWt / 0.5)
+                : lerp(float3(1, 1, 0), float3(1, 0, 0), (dbgWt - 0.5) / 0.5), 1.0);
+            return output;
+        }
+
+        // Канал 26 - ОСЬ ГРАНИ ИЗ МАТРИЦЫ СЛАЙСА глазами шейдера (w-столбец viewProj), закодированная
+        // цветом ровно как грани в канале 19: +X красный / -X тёмно-красный, +Y зелёный / -Y тёмно-
+        // зелёный, +Z синий / -Z тёмно-синий. Белый - ось не единичная и не осевая (единичная матрица
+        // даёт (0,0,0), нулевая тоже - обе сюда). Магента - до чтения матрицы не дошли.
+        // Смысл: канал 19 показывает, какую грань шейдер ВЫБРАЛ, а этот - какая грань лежит в
+        // матрице, которую он по этому выбору ПРОЧИТАЛ. Совпадают - виновата не индексация; расходятся
+        // (или белое) - до шейдера доезжает не тот набор матриц, и дальше искать надо в заливке
+        // буфера, а не в HLSL.
+        if (PreviewChannel == 26 || PreviewChannel == 27)
+        {
+            if (dbgSliceAxis.x > 1e8)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+
+            float3 a = PreviewChannel == 26 ? dbgSliceAxis : dbgSliceAxisRow;
+            float3 dbgColor =
+                  a.x > 0.9 ? float3(1.0, 0.0, 0.0)
+                : a.x < -0.9 ? float3(0.4, 0.0, 0.0)
+                : a.y > 0.9 ? float3(0.0, 1.0, 0.0)
+                : a.y < -0.9 ? float3(0.0, 0.4, 0.0)
+                : a.z > 0.9 ? float3(0.0, 0.0, 1.0)
+                : a.z < -0.9 ? float3(0.0, 0.0, 0.4)
+                : float3(1, 1, 1);
+            output.color = float4(dbgColor, 1.0);
+            return output;
+        }
+
+        // Канал 28 - ТЕНЬ СОЛНЦА и КАСКАД, которым она взята, одной картинкой. Существует потому,
+        // что на кадре пятно тени, пятно акне и пятно от смены каскада выглядят одинаково - тёмное
+        // пятно на стене, - а лечатся тремя разными вещами. Тон отвечает «каким каскадом», яркость -
+        // «сколько тени»:
+        //   магента       - мирового света нет (тени выключены / LightDirection пустой);
+        //   ЧЁРНЫЙ        - каскад не выбран ни один, точка объявлена освещённой. На геометрии,
+        //                   которая обязана быть в объёме каскадов, это и есть просвет;
+        //   красный   (0) - каскад 0, зелёный (1), синий (2), жёлтый (3);
+        //   яркость тона  - множитель тени: полный тон = свет, чёрный = полная тень.
+        // Как читать: тень от реального окклюдера повторяет силуэт и НЕ меняет тон на своей границе;
+        // смена каскада - это смена ТОНА, и если тьма начинается ровно на ней, виноват каскад, а не
+        // окклюдер; акне - мелкая рябь ВНУТРИ одного тона, повторяющая сетку текселей карты.
+        if (PreviewChannel == 28)
+        {
+            if (!hasWorldLight)
+            {
+                output.color = float4(1, 0, 1, 1);
+                return output;
+            }
+
+            float3 cascadeTint =
+                  dbgSunCascade < -0.5 ? float3(0, 0, 0)
+                : dbgSunCascade < 0.5 ? float3(1, 0, 0)
+                : dbgSunCascade < 1.5 ? float3(0, 1, 0)
+                : dbgSunCascade < 2.5 ? float3(0, 0, 1)
+                : float3(1, 1, 0);
+
+            output.color = float4(cascadeTint * saturate(keyShadow), 1.0);
             return output;
         }
 

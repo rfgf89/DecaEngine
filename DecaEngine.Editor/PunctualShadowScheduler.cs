@@ -55,6 +55,13 @@ public static unsafe class PunctualShadowScheduler
     private static readonly bool FrustumCullCasters =
         Environment.GetEnvironmentVariable("DECA_PUNCTUAL_CULL") != "0";
 
+    /// <summary>Тот же тумблер, что у <see cref="LightCulling.DumpPunctualLight"/> - две половины
+    /// одной диагностики печатаются вместе или не печатаются вовсе.</summary>
+    private static readonly bool DumpPunctual =
+        Environment.GetEnvironmentVariable("DECA_PUNCTUAL_DUMP") == "1";
+
+    private static readonly Dictionary<int, string> LastSchedulerDump = new();
+
     /// <summary>Заполняет слайсы теней кадра в <paramref name="target"/> (cull/light-данные для
     /// записи shadow map + матрицы для сэмплинга) и раскладку "id сущности света - первый слайс" в
     /// <paramref name="assignments"/> (её читает LightCulling.TryBuildPunctualLight, собирая
@@ -103,20 +110,7 @@ public static unsafe class PunctualShadowScheduler
             // относительно каcтующей геометрии.
             LightCulling.GetWorldPositionRotation(entity, out var position, out var rotation);
             float range = light.Range;
-            // near обязан остаться СТРОГО меньше far (= range): CreatePerspectiveFieldOfViewLeftHanded
-            // кидает ArgumentOutOfRangeException при near >= far. Для Range <= 0.05 (за пределами
-            // разумного, но встречается - декой-свет, тестовая сцена) near = max(0.05, range*0.001)
-            // раньше давал near == far == range и ронял ВЕСЬ кадр (сборка слайсов идёт до отрисовки,
-            // так что одна такая лампа в сцене убивала все тени, включая чужие). Зажимаем near снизу
-            // так, чтобы всегда оставался зазор.
-            // ...и СВЕРХУ ограничен абсолютной величиной, а не только долей range. Слагаемое
-            // range*0.001 задумано как рост точности глубины вместе с дальностью, но без потолка
-            // оно рубит саму тень: при Range = 20000 near становится 20 единиц, и КАЖДЫЙ кастер
-            // ближе 20 единиц к лампе отсекается ближней плоскостью, не попадая в карту вовсе -
-            // здание вокруг источника перестаёт отбрасывать тень, свет идёт сквозь стены. Потолок
-            // 0.25 достигается только на range >= 250; до range = 50 формула, как и раньше, даёт
-            // ровно 0.05, так что обычные лампы ведут себя без изменений.
-            float near = MathF.Min(Math.Clamp(range * 0.001f, 0.05f, 0.25f), range * 0.5f);
+            float near = SliceNearPlane(range);
 
             if (light.Type == LightType.Spot)
             {
@@ -141,6 +135,37 @@ public static unsafe class PunctualShadowScheduler
             }
 
             assignments[entity.Id] = nextSlice;
+
+            // См. LightCulling.DumpPunctualLight - вторая половина той же диагностики. Планировщик и
+            // сборщик пула читают ОДИН И ТОТ ЖЕ LightComponent, но решения принимают разные (здесь -
+            // сколько слайсов и с какой проекцией, там - тип для шейдера), и разойтись им нельзя:
+            // шесть граней куба при DirType.w = 1 в шейдере означают, что пять из них не будут
+            // прочитаны никогда. Печатаем тип ЗДЕСЬ, чтобы сравнение было прямым.
+            if (DumpPunctual)
+            {
+                // w-столбец viewProj слайса - это ось грани в мире плюс -dot(eye, ось): именно он
+                // даёт shadowClip.w в шейдере, то есть глубину приёмника вдоль оси грани. Печатается
+                // потому, что единичная/нулевая матрица в буфере НЕОТЛИЧИМА от рабочей по всем
+                // прочим дампам, а в шейдере выглядит как "точка позади ближней плоскости" (w <= 0)
+                // или "UV далеко за квадратом слайса" - то есть как ошибка выбора грани, которой нет.
+                // Ожидание: у грани f ось обязана совпасть с FaceDirs[f].
+                var axes = new System.Text.StringBuilder();
+                for (int face = 0; face < sliceCount; face++)
+                {
+                    var m = *UnsafeArray.GetPtr<Matrix4x4>(target.punctualShadowMatrices, nextSlice + face);
+                    axes.Append($" [{nextSlice + face}]=({m.M14:F3},{m.M24:F3},{m.M34:F3}|{m.M44:F3})");
+                }
+
+                var line = $"[punctual] entity={entity.Id} scheduler type={light.Type} " +
+                    $"slices={sliceCount} base={nextSlice} pos=({position.X:F4},{position.Y:F4},{position.Z:F4}) " +
+                    $"range={range:F4} near={near:F4} sliceAxis:{axes}";
+                if (!LastSchedulerDump.TryGetValue(entity.Id, out var prev) || prev != line)
+                {
+                    LastSchedulerDump[entity.Id] = line;
+                    Console.WriteLine(line);
+                }
+            }
+
             nextSlice += sliceCount;
         }
 
@@ -164,6 +189,29 @@ public static unsafe class PunctualShadowScheduler
             UnsafeArray.Set(target.punctualShadowMatrices, slice, Matrix4x4.Identity);
         }
     }
+
+    /// <summary>Ближняя плоскость теневого слайса света с дальностью <paramref name="range"/> (far
+    /// слайса = range). ЕДИНСТВЕННЫЙ источник этого числа: его берёт и <see cref="AddSlice"/>,
+    /// строя проекцию слайса, и <see cref="LightCulling.TryBuildPunctualLight"/>, кладя его в
+    /// PunctualLight.ShadowParams.z для шейдера. Раньше шейдер выводил near сам, повторяя формулу
+    /// в HLSL, и та уже разошлась: потолок 0.25 добавили здесь, а в UnlitInstancedPS осталось
+    /// max(0.05, range*0.001), так что на Range = 20000 шейдер считал near = 20 вместо 0.25 и
+    /// ошибался в производной d(ndc)/dz (а значит и в депф-байасе тени) в восемьдесят раз.
+    ///
+    /// near обязан остаться СТРОГО меньше far: CreatePerspectiveFieldOfViewLeftHanded кидает
+    /// ArgumentOutOfRangeException при near >= far. Для Range &lt;= 0.05 (за пределами разумного, но
+    /// встречается - декой-свет, тестовая сцена) прежнее max(0.05, range*0.001) давало near == far
+    /// и роняло ВЕСЬ кадр (сборка слайсов идёт до отрисовки, так что одна такая лампа убивала все
+    /// тени, включая чужие) - отсюда множитель range*0.5 снизу.
+    ///
+    /// Сверху near ограничен абсолютной величиной, а не только долей range: слагаемое range*0.001
+    /// задумано как рост точности глубины вместе с дальностью, но без потолка оно рубит саму тень -
+    /// при Range = 20000 near становится 20 единиц, и КАЖДЫЙ кастер ближе 20 единиц к лампе
+    /// отсекается ближней плоскостью, не попадая в карту вовсе (здание вокруг источника перестаёт
+    /// отбрасывать тень, свет идёт сквозь стены). Потолок 0.25 достигается только на range >= 250;
+    /// до range = 50 формула даёт ровно 0.05, так что обычные лампы ведут себя без изменений.</summary>
+    public static float SliceNearPlane(float range) =>
+        MathF.Min(Math.Clamp(range * 0.001f, 0.05f, 0.25f), range * 0.5f);
 
     private static void AddSlice(ref RenderCamerasData target, Vector3 eye, Vector3 lookAt, Vector3 up,
         float fov, float near, float far, int drawCount)

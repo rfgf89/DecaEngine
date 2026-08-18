@@ -199,7 +199,10 @@ public class EditorManager : TimeLoopCore
 		var autoLoadModel = Environment.GetEnvironmentVariable("DECA_AUTOLOAD_MODEL");
 		if (!string.IsNullOrEmpty(autoLoadModel))
 		{
-			_modelPreviewViewport.LoadModel(autoLoadModel);
+			// Через Inspector, а не прямым LoadModel: превью держит модель, только пока Inspector в
+			// режиме Model (см. переключение в OnUpdate), иначе автозагруженная модель тут же
+			// отдавалась бы обратно первым же кадром.
+			inspectorWindow.ShowModel(autoLoadModel);
 		}
 		_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.SceneView, () => new SceneViewWindow("Scene View", inspectorWindow, _prefabSceneViewport, _imGuiManager.ImGuiRender));
 		new SceneViewWindow("Scene View", inspectorWindow, _prefabSceneViewport, _imGuiManager.ImGuiRender).Show();
@@ -286,6 +289,14 @@ public class EditorManager : TimeLoopCore
 			// догрузившаяся в этом кадре модель успела зарегистрироваться (ModelStore.ModelReady - см.
 			// ModelStreamer/ModelIconBaker) до их Update.
 			_modelStore.Tick(deltaTime);
+
+			// Модель редактора загружена РОВНО В ОДНОМ месте: показывает Inspector превью модели -
+			// её держит _modelPreviewViewport, иначе (дерево префаба/ничего не открыто) - сцена
+			// префаба. Второй вьюпорт отдаёт свои модели с GPU: раньше оба держали резидентными свои
+			// копии материалов/инстансов одной и той же модели и оба писали полный кадр.
+			bool modelPreviewMode = _inspectorWindow.IsModelPreviewMode;
+			_modelPreviewViewport.SetActive(modelPreviewMode);
+			_prefabSceneViewport.SetActive(!modelPreviewMode);
 
 			_modelPreviewViewport.Update(deltaTime, time);
 			_prefabSceneViewport.Update(deltaTime, time, _inspectorWindow.Root, _inspectorWindow.PrefabPath,

@@ -87,6 +87,10 @@ public static class LightClusters
 	/// писал без глобальной компакции атомиками (каждый кластер владеет своим отрезком).</summary>
 	public const int MaxLightsPerCluster = 32;
 
+	/// <summary>Размер группы компьюта кластеризации (LightClusterCS.hlsl: numthreads и размер
+	/// groupshared-батча светов) - им же считается число групп в диспатче.</summary>
+	public const int CullGroupSize = 64;
+
 	/// <summary>Ёмкость общего пула видимых punctual-светов кадра (сумма по всем камерам).</summary>
 	public const int MaxLights = 256;
 
@@ -124,7 +128,8 @@ public struct PunctualLight
 
 	/// <summary>Тень света: x - индекс ПЕРВОГО слайса в texture array теней punctual-светов
 	/// (спот - один слайс, точечный - шесть граней куба подряд; -1 = тени нет), y - сила тени
-	/// (ShadowStrength, 0..1), z/w - пад. Матрицы слайсов - в структурном буфере
+	/// (ShadowStrength, 0..1), z - ближняя плоскость слайса (PunctualShadowScheduler.SliceNearPlane;
+	/// far слайса = PositionRange.w), w - пад. Матрицы слайсов - в структурном буфере
 	/// PunctualShadowMatrices по тому же индексу.</summary>
 	public Vector4 ShadowParams;
 }

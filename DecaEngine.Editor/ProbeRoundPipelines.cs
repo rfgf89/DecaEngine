@@ -1,4 +1,4 @@
-using DecaEngine;
+﻿using DecaEngine;
 using Diligent;
 
 namespace DecaEngine.Editor;
@@ -22,6 +22,9 @@ public sealed class ProbeRoundPipelines : IDisposable
 	/// <summary>Обновление кэша поверхностей (entry point mainSurface).</summary>
 	public IPipelineState Surface { get; }
 
+	/// <summary>Свёртка изменчивости проб в число на объём (entry point mainVariability).</summary>
+	public IPipelineState Variability { get; }
+
 	/// <summary>Во что обошлась компиляция, мс - для диагностики.</summary>
 	public long CompileMs { get; }
 
@@ -40,11 +43,22 @@ public sealed class ProbeRoundPipelines : IDisposable
 		Round = CreatePso(device, factory, "ProbeRoundCS", "main", "ProbeRound", hardware);
 		Surface = CreatePso(device, factory, "ProbeSurfaceCacheCS", "mainSurface", "ProbeSurfaceCache", hardware);
 
+		// Свёртка изменчивости трассировкой не пользуется, поэтому компилируется БЕЗ кейворда
+		// аппаратного пути (hardware: false) - и заодно штатным компилятором, без SM 6.5 и DXC.
+		// Имя PSO своё и с вариантом трассировки не пересекается: дисковый кэш D3D12 ключуется по
+		// имени, и одинаковые имена у разных вариантов травят кэш чужим кодом.
+		Variability = CreatePso(device, factory, "ProbeVariabilityCS", "mainVariability",
+			"ProbeVariability", hardware: false, fileName: "ProbeVariabilityCS.hlsl");
+
 		CompileMs = sw.ElapsedMilliseconds;
 	}
 
+	/// <param name="fileName">Файл шейдера. Отдельно от <paramref name="shaderName"/>: раунд проб и
+	/// проход кэша поверхностей - это два входа в ОДНОМ файле, а свёртка изменчивости живёт в
+	/// своём.</param>
 	private static IPipelineState CreatePso(IRenderDevice device, IShaderSourceInputStreamFactory factory,
-		string shaderName, string entryPoint, string psoName, bool hardware)
+		string shaderName, string entryPoint, string psoName, bool hardware,
+		string fileName = "ProbeRoundCS.hlsl")
 	{
 		// Путь трассировки выбирается КЕЙВОРДОМ, а не ветвлением в рантайме: выключенный вариант не
 		// существует в скомпилированном коде вовсе - ни обхода BVH, ни его буферов (см. SceneTrace.hlsl).
@@ -63,7 +77,7 @@ public sealed class ProbeRoundPipelines : IDisposable
 				UseCombinedTextureSamplers = false,
 			},
 			EntryPoint = entryPoint,
-			FilePath = "ProbeRoundCS.hlsl",
+			FilePath = fileName,
 			Macros = macros,
 			// Inline-трассировка (RayQuery) появилась в шейдерной модели 6.5, а её понимает только
 			// DXC - штатный FXC не знает даже идентификатора RaytracingAccelerationStructure.
@@ -98,6 +112,7 @@ public sealed class ProbeRoundPipelines : IDisposable
 
 	public void Dispose()
 	{
+		Variability.Dispose();
 		Surface.Dispose();
 		Round.Dispose();
 	}

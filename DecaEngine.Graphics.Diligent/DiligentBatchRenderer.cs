@@ -216,8 +216,15 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				access = HandleAccess.Compute | HandleAccess.Pixel,
 			});
 
-		_punctualShadowMatricesBuffer = (DiligentBufferHandle)_api.CreateBuffer<Matrix4x4>(
-			LightClusters.MaxShadowSlices,
+		// Шаг элемента - Vector4, а НЕ Matrix4x4: пиксельный шейдер читает слайс как четыре
+		// row-major строки (UnlitInstancedPS.hlsl::LoadPunctualShadowMatrix). Матрицу в элементе
+		// структурного буфера держать нельзя - её majorness там не подчиняется PackMatrixRowMajor и
+		// отличается у D3D12 и Vulkan, из-за чего тени punctual-светов не работали на D3D12 вообще.
+		// Содержимое буфера при этом не меняется: заливка идёт тем же UpdateBuffer<Matrix4x4> по
+		// массиву RenderCamerasData.punctualShadowMatrices, байты те же, меняется только объявленный
+		// шаг вью.
+		_punctualShadowMatricesBuffer = (DiligentBufferHandle)_api.CreateBuffer<Vector4>(
+			LightClusters.MaxShadowSlices * 4,
 			new BufferInfo
 			{
 				name = "Punctual Shadow Matrices Buffer",
@@ -578,6 +585,10 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			alphaCutoff, baseColor.Stream);
 	}
 
+	/// <summary>См. <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
+	public void SetMaterialShadowCasting(int materialId, bool casts) =>
+		_shadowRenderer.SetMaterialShadowCasting(materialId, casts);
+
 	/// <summary>См. <see cref="IBatchRenderer.TransitionShadowMapsForRead"/>. DepthRead, а не
 	/// ShaderResource - см. комментарий в ShadowRenderer.ExecuteDrawShadows.</summary>
 	public void TransitionShadowMapsForRead(ICommandBuffer cmd)
@@ -857,7 +868,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		cmd.SetPipelineState(_lightClusterMaterial);
 		cmd.CommitShaderResources(_lightClusterMaterial);
-		cmd.DispatchCompute((uint)((LightClusters.ClusterCount + 63) / 64));
+		cmd.DispatchCompute((uint)((LightClusters.ClusterCount + LightClusters.CullGroupSize - 1) / LightClusters.CullGroupSize));
 	}
 
 	// --- IBatchRenderer explicit implementations (boxed CullResult behind the ICullResult marker) ---

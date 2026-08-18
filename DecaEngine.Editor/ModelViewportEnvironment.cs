@@ -825,6 +825,13 @@ namespace DecaEngine.Editor
 				_mainCullingSystem = new CullingAndRenderSystem(ResourceManager, graphicsApi, Pipeline);
 				Root = new SystemRoot()
 				{
+					// Before GpuInstanceBufferSystem/culling: it produces WorldMatrix/WorldTransformDirtyTag
+					// for hierarchy children (same ordering as EditorManager's real SystemRoot). Without
+					// it, a light/entity nested under a parent with its own transform (Super > MegaEntity
+					// > ...) never gets its WorldMatrix composed here, so LightCulling.GetWorldPositionRotation
+					// silently falls back to raw local Position/Rotation - the exact gap that let the
+					// nested-light punctual shadow defect go untested by every probe harness scenario.
+					new DecaEngine.Core.Entities.TransformSystem(),
 					new GpuInstanceBufferSystem(),
 					_mainCullingSystem
 				};
@@ -834,6 +841,8 @@ namespace DecaEngine.Editor
 				_cullingSystem = new SimpleCullingAndRenderSystem(ResourceManager, Pipeline, ShadowSettings);
 				Root = new SystemRoot()
 				{
+					// See the TransformSystem comment in the branch above - same reasoning applies here.
+					new DecaEngine.Core.Entities.TransformSystem(),
 					new GpuInstanceBufferSystem(),
 					_cullingSystem
 				};
@@ -988,18 +997,40 @@ namespace DecaEngine.Editor
 
 				// Альфа-тест при записи тени - только для РЕАЛЬНО дырявой геометрии (листва). Критерий
 				// дословно тот же, что у probe-GI при отборе треугольников в BVH (см. ProbeGi.cs), и
-				// по той же причине: смотреть на glTF alphaMode нельзя - экспортеры сплошь метят
-				// MASK/BLEND камень и ткань с альфой ~1, и по режиму под альфа-тест уехала бы вся
-				// сцена. Средняя альфа отделяет крону (много прозрачного) от них.
+				// по той же причине: одной пометки MASK недостаточно - экспортеры сплошь метят ею
+				// камень и ткань с альфой ~1, и по режиму под альфа-тест уехала бы вся сцена. Средняя
+				// альфа отделяет крону (много прозрачного) от них. А вот BLEND - случай отдельный,
+				// см. ниже.
 				//
 				// Цена ошибки здесь не косметическая: каждый такой материал добавляет дроу-колл в
 				// КАЖДЫЙ теневой каскад (см. ShadowRenderer.ExecuteDrawShadows).
-				if (modelLoader.MaterialPbr.TryGetValue(kvp.Key, out var maskPbr) &&
-					maskPbr.AlphaCutoff > 0f && maskPbr.HasBaseColorTexture && maskPbr.AverageAlpha < 0.6f &&
-					modelLoader.MaterialBaseColor.TryGetValue(kvp.Key, out var maskBaseColor))
+				if (modelLoader.MaterialPbr.TryGetValue(kvp.Key, out var maskPbr))
 				{
-					batchRenderer.SetMaterialAlphaTestedShadow(materialIdMap[kvp.Key].materialId, maskBaseColor,
-						maskPbr.AlphaCutoff);
+					// МЯГКАЯ накладка - не кастер вовсе, ни сплошным квадом, ни по альфе. Это декали
+					// грязи и потёков: они лежат в миллиметрах от стены, которую украшают, и их тень
+					// падает на эту же стену, дублируя их собственный рисунок крупными тёмными
+					// кляксами. Альфа-тест тут не лечит ничего - он лишь меняет форму кляксы со
+					// сплошного квада на форму текстуры, ровно это и было видно на скриншотах.
+					//
+					// Отбор НЕ по одному alphaMode: этот ассет метит BLEND-ом и декали, и крону
+					// (dirt_decal и LeafSpring - все BLEND), так что по режиму вместе с кляксами
+					// уехала бы и тень дерева. Различает их бинарность альфы: у вырезки она почти
+					// везде 0 или 1 (бинарная тень осмысленна), у мягкой размазки размазана по
+					// диапазону (бинарной тени у неё быть не может в принципе).
+					//
+					// Неизвестная бинарность (-1: пикселей не было, кеш ещё не запечён) считается
+					// вырезкой - то есть измерение способно тень только УБРАТЬ, но не появиться из
+					// ниоткуда; на промахе кеша поведение остаётся прежним.
+					if (maskPbr.AlphaMode == MaterialAlphaMode.Blend && maskPbr.SoftAlphaFraction > 0.25f)
+					{
+						batchRenderer.SetMaterialShadowCasting(materialIdMap[kvp.Key].materialId, false);
+					}
+					else if (maskPbr.AlphaCutoff > 0f && maskPbr.HasBaseColorTexture && maskPbr.AverageAlpha < 0.6f &&
+						modelLoader.MaterialBaseColor.TryGetValue(kvp.Key, out var maskBaseColor))
+					{
+						batchRenderer.SetMaterialAlphaTestedShadow(materialIdMap[kvp.Key].materialId, maskBaseColor,
+							maskPbr.AlphaCutoff);
+					}
 				}
 			}
 
