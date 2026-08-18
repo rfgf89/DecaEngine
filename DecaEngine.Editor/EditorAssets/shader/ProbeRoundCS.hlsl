@@ -36,8 +36,8 @@ cbuffer ProbeRoundParams
     // геометрия врёт на движущейся сцене, отскок идёт из поля). w = сон проб: 0 - выключен,
     // иначе 1 + (номер веера & 3) - фаза раунда для пробуждения спящих (см. mainProbe).
     float4 ProbeRelocation;
-    // x = предел релокации СВЕЖЕЙ пробы (слот пула только что заселён прокруткой объёма, см.
-    // ProbeGiBakeSession.BrickFresh): у неё своё окно, не общесеточное.
+    // x = предел релокации СВЕЖЕЙ пробы (её плоскость только что въехала прокруткой объёма, см.
+    // ProbeGiBakeSession.ProbeFresh): у неё своё окно, не общесеточное.
     float4 ProbeScroll;
 };
 
@@ -46,29 +46,9 @@ cbuffer ProbeRoundParams
 // силуэта, и сверка с CPU-эталоном перестала бы что-либо значить.
 StructuredBuffer<float4> _ProbeRayDirections;
 
-// xyz = угол кирпича в координатах виртуальной сетки, w = состояние слота (см.
-// ProbeRoundGpu.BrickWord): биты 0-3 - уровень подразделения (шаг проб внутри кирпича равен
-// Cell * 2^level, см. ProbeGiBaker.BrickLevel), 256 - холодный раунд, 512 - слот пуст,
-// 1024 - слоту разрешена релокация.
-StructuredBuffer<int4> _ProbeBrickOrigin;
-
-#define PROBE_BRICK_LEVEL_MASK 15
-#define PROBE_BRICK_COLD       256
-#define PROBE_BRICK_EMPTY      512
-#define PROBE_BRICK_RELOCATE   1024
-
-// Остаток окна свежести кирпича (см. ProbeRoundGpu.BrickWord): столько раундов ему ещё жить
-// "молодым". Отсчёт идёт ВНИЗ от ProbeGiBaker.RelocationRounds.
-#define PROBE_BRICK_FRESH_SHIFT 11
-#define PROBE_BRICK_FRESH_MASK  7
-
 // Длина окна свежести - зеркало ProbeGiBaker.RelocationRounds. Разъехаться им нельзя: по этому
 // числу считается номер раунда свежей пробы, а значит и вес её бегущего среднего.
 #define PROBE_FRESH_WINDOW 5
-
-// Карта индирекции по ячейкам САМОЙ МЕЛКОЙ сетки кирпичей: x = индекс кирпича в пуле (-1 = пусто),
-// y = его уровень. Крупный кирпич прописан во все свои ячейки, поэтому чтение одно на сбор.
-StructuredBuffer<int2> _ProbeBrickIndex;
 
 // Поле проб, четыре float4 на пробу (раскладка атласов):
 //   [0] rgb = SH L0,  a = видимость неба
@@ -89,24 +69,76 @@ RWStructuredBuffer<int4> _ProbeCounters;
 // Окто-карта глубин, PROBE_VIS_RES² на пробу: x = сумма дистанций, y = сумма квадратов, z = счётчик.
 RWStructuredBuffer<float4> _ProbeVisibility;
 
-#define PROBE_BRICK_PROBES 4
-#define PROBE_BRICK_CELLS  3
-
-// xyz = размер виртуальной сетки проб, w - резерв.
+// xyz = размер ПЛОТНОЙ сетки проб, w = насыщенность отскока.
 // (второй кбуфер, чтобы не ломать раскладку первого)
 cbuffer ProbeGridParams
 {
     float4 ProbeGridCounts;
-    // xyz = размер сетки кирпичей.
-    float4 ProbeBrickCounts;
+    // xyz = тороидальное смещение сетки в пробах: узел c лежит по индексу (c + scroll) mod counts.
+    float4 ProbeGridScroll;
+    // xyz = ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ.
+    // -1 = по этой оси не двигались; очень большое значение (ProbeGiBakeSession.ClearWholeAxis) =
+    // чистить ось целиком: камеру телепортировали дальше размера объёма, беречь нечего.
+    float4 ProbeGridClear;
+    // xyz = сколько плоскостей подряд въехало по каждой оси, начиная с ProbeGridClear.
+    float4 ProbeGridClearSpan;
     // xyz = размер вокселя кэша поверхностей, w = число живых вокселей (0 = кэш выключен).
     float4 SurfaceVoxel;
     // xyz = размер воксельной сетки кэша.
     float4 SurfaceCounts;
     // x = поворот энвайронмента (радианы), y = множитель яркости неба, z = сторона окто-карты
-    // видимости (ручка «Visibility res», см. ProbeGiBakeResult.VisRes), w = кирпичей в ряду пула.
+    // видимости (ручка «Visibility res», см. ProbeGiBakeResult.VisRes), w - резерв.
     float4 ProbeSkyParams;
 };
+
+// Координаты узла сетки по индексу ХРАНЕНИЯ пробы и обратно - зеркало ProbeGiBaker.StorageIndex /
+// Wrap. Слагаемое counts перед остатком обязательно: смещение бывает отрицательным, а % в HLSL
+// (как и в C#) даёт отрицательный остаток от отрицательного делимого.
+int3 ProbeStorageCoords(uint probe)
+{
+    int cx = (int)ProbeGridCounts.x;
+    int cy = (int)ProbeGridCounts.y;
+    return int3((int)probe % cx, (int)probe / cx % cy, (int)probe / (cx * cy));
+}
+
+int3 ProbeWrap(int3 coords, int3 scroll, int3 counts)
+{
+    return ((coords + scroll) % counts + counts) % counts;
+}
+
+// Въехала ли эта плоскость последней прокруткой - её поле принадлежит месту, откуда объём уехал, и
+// накопители надо не смешивать, а обнулить (эталон RTXGI: DDGIClearScrolledPlane).
+bool ProbeScrolledIn(int3 storage)
+{
+    bool cleared = false;
+    [unroll]
+    for (int axis = 0; axis < 3; axis++)
+    {
+        int plane = (int)ProbeGridClear[axis];
+        if (plane < 0)
+        {
+            continue;
+        }
+
+        int count = (int)ProbeGridCounts[axis];
+        if (plane >= count)
+        {
+            // Вся ось - телепорт дальше размера объёма.
+            cleared = true;
+            continue;
+        }
+
+        // Плоскостей могло въехать несколько подряд; диапазон заворачивается по периоду сетки.
+        int span = min((int)ProbeGridClearSpan[axis], count);
+        int delta = (storage[axis] - plane % count + count) % count;
+        if (delta < span)
+        {
+            cleared = true;
+        }
+    }
+
+    return cleared;
+}
 
 // Сторона окто-карты видимости. Приходит кбуфером, а не дефайном: это ручка окна Graphics, и
 // раскладка буфера глубин (VisRes² на пробу) задаётся на CPU тем же значением - разойтись им
@@ -167,19 +199,12 @@ RWStructuredBuffer<float4> _ProbeOffsets;
 // ProbeVariabilityCS.hlsl) и служит признаком «объём сошёлся, трассировку можно остановить вовсе».
 RWStructuredBuffer<float2> _ProbeVariability;
 
-// Тексель пробы в пуле - зеркало ProbeGiBaker.ProbeTexel.
-uint2 ProbeAtlasTexel(uint slot)
+// Тексель пробы в атласе - зеркало ProbeGiBaker.ProbeTexel. Ширина атласа равна оси X сетки,
+// поэтому индекс хранения раскладывается в тексель делением с остатком, и это вся адресация.
+uint2 ProbeAtlasTexel(uint probe)
 {
-    const uint perBrick = PROBE_BRICK_PROBES * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES;
-    uint brick = slot / perBrick;
-    uint local = slot - brick * perBrick;
-    uint poolColumns = max((uint)ProbeSkyParams.w, 1u);
-
-    return uint2(
-        (brick % poolColumns) * PROBE_BRICK_PROBES + local % PROBE_BRICK_PROBES,
-        (brick / poolColumns) * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES
-            + (local / (PROBE_BRICK_PROBES * PROBE_BRICK_PROBES)) * PROBE_BRICK_PROBES
-            + (local / PROBE_BRICK_PROBES % PROBE_BRICK_PROBES));
+    uint width = max((uint)ProbeGridCounts.x, 1u);
+    return uint2(probe % width, probe / width);
 }
 
 // Индекс вокселя, накрывающего точку, или -1. Зеркало SurfaceCache.Lookup.
@@ -256,27 +281,12 @@ float3 ProbeGatherIrradiance(float3 pos, float3 normal, out float sunFracOut)
     float3 cell = ProbeGridCell.xyz;
     float3 f = clamp((pos - origin) / cell, 0.0, ProbeGridCounts.xyz - 1.0);
 
-    int3 fineBrick = min((int3)(f / PROBE_BRICK_CELLS), (int3)ProbeBrickCounts.xyz - 1);
-    int cellIndex = (fineBrick.z * (int)ProbeBrickCounts.y + fineBrick.y) * (int)ProbeBrickCounts.x
-                  + fineBrick.x;
-    int2 indirection = _ProbeBrickIndex[cellIndex];
-    if (indirection.x < 0)
-    {
-        // Кирпича нет - вокруг пустота, поля здесь не запечено.
-        return 0.0;
-    }
-
-    int brick = indirection.x;
-    int step = 1 << indirection.y;
-    float3 brickOrigin = (float3)_ProbeBrickOrigin[brick].xyz;
-
-    // Локальные координаты считаются в ШАГЕ ПРОБ кирпича, а не в мелких ячейках: у крупного
-    // кирпича пробы стоят через 2^level ячеек.
-    float3 lf = (f - brickOrigin) / (float)step;
-    int3 l = clamp((int3)floor(lf), 0, PROBE_BRICK_CELLS - 1);
-    float3 t = saturate(lf - (float3)l);
-
-    uint slotBase = (uint)brick * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES;
+    // Базовый узел ячейки - просто пол координат сетки: у плотной сетки проба есть в каждом узле,
+    // искать её больше негде и не через что. Индирекции здесь не осталось вовсе.
+    int3 counts = (int3)ProbeGridCounts.xyz;
+    int3 scroll = (int3)ProbeGridScroll.xyz;
+    int3 l = clamp((int3)floor(f), 0, counts - 2);
+    float3 t = saturate(f - (float3)l);
 
     float3 sh0 = 0.0, shX = 0.0, shY = 0.0, shZ = 0.0;
     float fracSum = 0.0;
@@ -287,8 +297,8 @@ float3 ProbeGatherIrradiance(float3 pos, float3 normal, out float sunFracOut)
     {
         int3 o = int3(corner & 1, (corner >> 1) & 1, corner >> 2);
         int3 lp = l + o;
-        uint index = slotBase
-            + (uint)((lp.z * PROBE_BRICK_PROBES + lp.y) * PROBE_BRICK_PROBES + lp.x);
+        int3 sp = ProbeWrap(lp, scroll, counts);
+        uint index = (uint)((sp.z * counts.y + sp.y) * counts.x + sp.x);
 
         float4 field1 = _ProbeFieldRead[index * 4 + 1];
         float w = (o.x ? t.x : 1.0 - t.x) * (o.y ? t.y : 1.0 - t.y) * (o.z ? t.z : 1.0 - t.z)
@@ -298,8 +308,7 @@ float3 ProbeGatherIrradiance(float3 pos, float3 normal, out float sunFracOut)
         // могла быть отодвинута из стены. Чтение буфера, который этот же диспатч пишет, здесь
         // безобидно - в худшем случае сосед отдаст смещение прошлого раунда, а разница между ними
         // заведомо меньше отступа, на который влияет вес.
-        float3 probePos = origin + (brickOrigin + (float3)lp * (float)step) * cell
-                        + _ProbeOffsets[index].xyz;
+        float3 probePos = origin + (float3)lp * cell + _ProbeOffsets[index].xyz;
         float3 toProbe = probePos - pos;
         float toProbeLen = length(toProbe);
         float wrap = (dot(toProbe / max(toProbeLen, 1e-4), normal) + 1.0) * 0.5;
@@ -386,30 +395,25 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // арифметика вокруг беззнаковая, смешивать типы в условиях циклов ни к чему.
     uint visRes = (uint)ProbeVisRes();
 
-    const uint perBrick = PROBE_BRICK_PROBES * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES;
-    uint brick = probe / perBrick;
-    uint local = probe - brick * perBrick;
+    // Пустых слотов у плотной сетки нет по построению - проба есть в каждом узле, и ранний выход
+    // «слот пуст» вместе с запасом пула отсюда ушёл.
+    int3 counts = (int3)ProbeGridCounts.xyz;
+    int3 scroll = (int3)ProbeGridScroll.xyz;
+    int3 storage = ProbeStorageCoords(probe);
 
-    int4 brickOrigin = _ProbeBrickOrigin[brick];
-    int brickWord = brickOrigin.w;
+    // Координаты УЗЛА - обратный сдвиг прокрутки: узел c лежит по индексу (c + scroll) mod counts,
+    // значит c = (storage - scroll) mod counts.
+    int3 cell = ProbeWrap(storage, -scroll, counts);
 
-    // Пустой слот пула - запас под прокрутку объёма (см. ProbeGiBaker.ScrollHeadroom). Проб в нём
-    // нет: ни индирекция на него не смотрит, ни лучей он не стоит.
-    if ((brickWord & PROBE_BRICK_EMPTY) != 0)
-    {
-        return;
-    }
-
-    // ХОЛОДНЫЙ раунд: слот только что отобран у другого кирпича (объём прокрутился), и всё, что в
-    // нём накоплено, описывает ЧУЖОЕ место. Поле принимается целиком, накопители обнуляются -
-    // смешивать новую пробу со старой было бы не «плавным переходом», а размазыванием освещения
-    // одного угла сцены по другому.
-    bool cold = (brickWord & PROBE_BRICK_COLD) != 0;
-    int step = 1 << (brickWord & PROBE_BRICK_LEVEL_MASK);
-    int3 cell = brickOrigin.xyz + int3(
-        (int)(local % PROBE_BRICK_PROBES) * step,
-        (int)(local / PROBE_BRICK_PROBES % PROBE_BRICK_PROBES) * step,
-        (int)(local / (PROBE_BRICK_PROBES * PROBE_BRICK_PROBES)) * step);
+    // ХОЛОДНЫЙ раунд: эта плоскость только что въехала прокруткой, и всё, что накоплено в её
+    // текселях, описывает ЧУЖОЕ место - то, откуда объём уехал. Поле принимается целиком,
+    // накопители обнуляются: смешивать новую пробу со старой было бы не «плавным переходом», а
+    // размазыванием освещения одного угла сцены по другому.
+    //
+    // Раньше это состояние приезжало таблицей на слот пула, а снималось отдельным прогревающим
+    // диспатчем (WarmColdBricks). Теперь оно выводится из трёх чисел кбуфера прямо здесь, в том же
+    // диспатче, что и обычная работа, - отдельного прохода и отдельной синхронизации больше нет.
+    bool cold = ProbeScrolledIn(storage);
 
     // СОН ПРОБ (Majercik 2021 §6, упрощённая машина состояний): проба, чьё поле давно спокойно
     // (счётчик calm в _ProbeCounters.w), обновляется раз в 4 раунда - фаза по номеру пробы против
@@ -439,6 +443,17 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // не сошлась бы: сдвинувшись наружу, проба продолжала бы считать себя замурованной.
     float4 offsetSlot = _ProbeOffsets[probe];
     float3 probeOffset = cold ? (float3)0.0 : offsetSlot.xyz;
+
+    // ОКНО РЕЛОКАЦИИ СВЕЖЕЙ ПРОБЫ живёт несколько раундов, а не один, и счётчик этих раундов
+    // хранится в МОДУЛЕ .w слота смещений: |w| = 1 + сколько раундов ещё осталось.
+    //
+    // Место выбрано не от бедности. Само .w занято классификацией (см. probeActive), но она читается
+    // ТОЛЬКО по знаку - и здесь, и в пиксельном шейдере, который из этого атласа берёт одни rgb.
+    // Модуль, таким образом, свободен, и счётчик влезает в уже существующий ресурс: заводить под
+    // него отдельный буфер значило бы вернуть таблицу на пробу, которую эта переделка как раз и
+    // сняла. Одного раунда мало по существу: релокация сходится итеративно (Majercik 2021 §5), а
+    // въехавшая проба - это ровно случай инициализации, ей нужно всё окно.
+    int freshLeft = cold ? PROBE_FRESH_WINDOW - 1 : max((int)abs(offsetSlot.w) - 1, 0);
     float3 probePos = ProbeGridOrigin.xyz + (float3)cell * ProbeGridCell.xyz + probeOffset;
 
     int rays = (int)ProbeSunDirection.w;
@@ -574,7 +589,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
         // Смещение релокации - тоже наследство прежнего жильца, и его надо снять ЗДЕСЬ, а не в
         // блоке релокации внизу: тот работает только при открытом окне, а с закрытым проба так и
         // осталась бы отодвинутой от своего узла в сторону чужой стены.
-        _ProbeOffsets[probe] = float4(0.0, 0.0, 0.0, 1.0);
+        // Модуль .w несёт остаток окна релокации (см. freshLeft): въехавшей пробе оно открыто целиком.
+        _ProbeOffsets[probe] = float4(0.0, 0.0, 0.0, (float)(1 + freshLeft));
     }
     else if (geometryDecay < 1.0)
     {
@@ -660,10 +676,10 @@ void main(uint3 threadId : SV_DispatchThreadID)
                 // если оно ближе, чем луч вышел бы из собственного вокселя пробы. У эталона это
                 // выписано через нормали и скалярные произведения трёх плоскостей, но сводится к
                 // выходу луча из коробки полуразмером в шаг сетки: по каждой оси граница на
-                // расстоянии spacing/|dir|, берётся ближайшая. Шаг - СВОЙ у кирпича (крупный
-                // кирпич ставит пробы через 2^level ячеек), иначе пробы разрежённых кирпичей
-                // гасились бы поголовно.
-                float3 spacing = ProbeGridCell.xyz * (float)step;
+                // расстоянии spacing/|dir|, берётся ближайшая. Шаг у плотной сетки один на весь
+                // объём - множителя по уровню подразделения, под который это подстраивалось, больше
+                // нет.
+                float3 spacing = ProbeGridCell.xyz;
                 float3 planeT = spacing / max(abs(dir), 1e-6);
                 if (hit.t <= min(planeT.x, min(planeT.y, planeT.z)))
                 {
@@ -840,7 +856,10 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // валидное содержимое, а не устаревшее.
     if (!probeActive)
     {
-        _ProbeOffsets[probe] = float4(probeOffset, nearGeometry ? 1.0 : -1.0);
+        // Счётчик свежести тикает и на этой ветке: замороженная проба обязана дожить своё окно, а не
+        // застрять в нём навсегда (см. freshLeft).
+        _ProbeOffsets[probe] = float4(probeOffset,
+            (nearGeometry ? 1.0 : -1.0) * (float)(1 + max(freshLeft - 1, 0)));
 
         // В общую изменчивость такая проба входит нулём с ПОЛНЫМ весом, а не нулевым: она
         // действительно неизменна - её ровно за устоявшееся поле и заморозили. Исключи мы её из
@@ -858,10 +877,10 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // копиться дальше, как ни в чём не бывало, - хотя описывает ровно ту же старую точку.
     //
     // На прокрутке это и вылезает. Свежему слоту релокация открыта всё окно свежести
-    // (PROBE_BRICK_RELOCATE), то есть кирпич, приведённый прокруткой, первые раунды ЕЗДИТ. Его поле
+    // (freshLeft > 0), то есть проба, приведённая прокруткой, первые раунды ЕЗДИТ. Её поле
     // в это время - смесь замеров из разных точек пространства, и чем дольше копится, тем сильнее
-    // размазано. Проявляется кирпич уже с этой смесью: перед летящей камерой, где прокрутка идёт
-    // непрерывно, получаются блоки, которые "сквозят" - показывают освещение соседнего места.
+    // размазано. Перед летящей камерой, где прокрутка идёт непрерывно, это читается как полоса,
+    // которая "сквозит" - показывает освещение соседнего места.
     // (Проверено от обратного: попытка УСРЕДНИТЬ оценки по окну свежести сделала картину заметно
     // хуже - она усиливала ровно это смешение. См. комментарий ниже, там разбор.)
     //
@@ -882,8 +901,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // вместе с её разбросом, значит надо копить среднее за те раунды, пока он всё равно скрыт.
     // Арифметически верно, а на деле стало ХУЖЕ - блоки перед летящей камерой поплыли сильнее.
     //
-    // Причина в том, что окно свежести - это ТО ЖЕ САМОЕ окно, в котором слоту открыта релокация
-    // (BrickFresh > 0 поднимает PROBE_BRICK_RELOCATE, см. ProbeRoundGpu.BrickWord). Всё это время
+    // Причина в том, что окно свежести - это ТО ЖЕ САМОЕ окно, в котором пробе открыта релокация
+    // (freshLeft > 0, счётчик лежит в модуле .w слота смещений). Всё это время
     // проба ездит, и усреднять её оценки значит смешивать замеры из РАЗНЫХ ТОЧЕК пространства -
     // тем сильнее, чем больше раундов в среднее положить.
     //
@@ -1053,10 +1072,10 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // Релокация: проба, стоящая внутри стены или колонны, отодвигается наружу. Это главное лекарство
     // густой сетки - чем мельче ячейка, тем больше проб оказывается замуровано, а такая проба и
     // мигает (её лучи мечутся между задними гранями и небом за краем), и течёт светом сквозь стену.
-    // У свежего слота (заселён прокруткой) окно релокации СВОЁ: общесеточное открывать на каждый
-    // сдвиг камеры нельзя - Majercik 2021 §5 двигает пробы только на инициализации, а для новых
-    // проб этот сдвиг инициализацией и является.
-    float relocLimit = (brickWord & PROBE_BRICK_RELOCATE) != 0
+    // У СВЕЖЕЙ пробы (её плоскость въехала прокруткой) окно релокации СВОЁ: общесеточное открывать
+    // на каждый сдвиг камеры нельзя - Majercik 2021 §5 двигает пробы только на инициализации, а для
+    // новых проб этот сдвиг инициализацией и является.
+    float relocLimit = freshLeft > 0
         ? max(ProbeRelocation.x, ProbeScroll.x)
         : ProbeRelocation.x;
     bool relocated = false;
@@ -1147,7 +1166,10 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // ветки - и когда релокация выключена, и когда проба не переезжала: иначе проба с закрытым
     // окном релокации никогда бы своё состояние не обновила. В запечке (fixedRays == 0)
     // классификации нет, состояние всегда активное.
-    float probeState = (fixedRays == 0 || nearGeometry) ? 1.0 : -1.0;
+    // Модуль несёт остаток окна релокации свежей пробы (см. freshLeft выше) - раунд его тикает,
+    // а знак, который единственный кто-либо читает, остаётся прежним.
+    int freshNext = max(freshLeft - 1, 0);
+    float probeState = ((fixedRays == 0 || nearGeometry) ? 1.0 : -1.0) * (float)(1 + freshNext);
     _ProbeOffsets[probe] = float4(probeOffset, probeState);
 
     // Те же значения сразу в атласы - материалы читают их без участия CPU.

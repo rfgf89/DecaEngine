@@ -35,7 +35,7 @@ public sealed class ProbeRoundGpu : IDisposable
 		public Vector4 Chunk;         // x - первый элемент порции, y - за последним, z - потолок луча,
 		                              // w - предел изменения пробы за раунд
 		public Vector4 Relocation;    // x - предел релокации пробы в мировых единицах
-		public Vector4 Scroll;        // x - предел релокации СВЕЖЕЙ пробы (см. ProbeGiBakeSession.BrickFresh)
+		public Vector4 Scroll;        // x - предел релокации СВЕЖЕЙ пробы (см. ProbeGiBakeSession.ProbeFresh)
 	}
 
 	[StructLayout(LayoutKind.Sequential)]

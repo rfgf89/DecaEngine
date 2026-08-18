@@ -18,25 +18,21 @@ cbuffer ProbeDebugParams
     float4 DebugGridOrigin;
     // xyz = шаг сетки проб, w = число проб.
     float4 DebugGridCell;
-    // x = кирпичей в ряду пула атласов (раскладка texel-а пробы), yzw = цветовая метка ОБЪЁМА:
-    // каскады подкрашиваются, чтобы их шарики отличались от базовых (они мельче и стоят среди них).
-    float4 DebugPool;
+    // xyz = размер сетки проб.
+    float4 DebugGridCounts;
+    // xyz = тороидальное смещение сетки в пробах.
+    float4 DebugGridScroll;
+    // xyz = цветовая метка ОБЪЁМА: каскады подкрашиваются, чтобы их шарики отличались от базовых
+    // (они мельче и стоят среди них).
+    float4 DebugTint;
 };
 
-// Углы кирпичей - тот же буфер, что у compute-раунда (см. ProbeRoundGpu.BrickWord): xyz = угол в
-// координатах виртуальной сетки, w = состояние слота (биты 0-3 - уровень подразделения, 512 - слот
-// пуст).
-StructuredBuffer<int4> _ProbeBrickOrigin;
-
-#define PROBE_BRICK_LEVEL_MASK 15
-#define PROBE_BRICK_EMPTY      512
+// Буфера углов кирпичей здесь больше нет: у плотной сетки координаты узла ЕСТЬ номер шарика.
 
 // Атласы проб: смещение релокации, поле L0 (цвет) и валидность (альфа Sh1).
 Texture2D _ProbeOffset;
 Texture2D _ProbeSh0;
 Texture2D _ProbeSh1;
-
-#define PROBE_BRICK_PROBES 4
 
 struct PSInput
 {
@@ -46,7 +42,7 @@ struct PSInput
     float4 color    : COLOR0;
     // Длина смещения релокации в долях радиуса - PS подкрашивает переехавшие пробы.
     float  offsetLen : TEXCOORD0;
-    // Цветовая метка объёма (см. DebugPool.yzw).
+    // Цветовая метка объёма (см. DebugTint).
     float3 tint      : TEXCOORD1;
 };
 
@@ -64,19 +60,11 @@ static const float3 OctaVerts[24] =
     float3(0, -1, 0), float3(1, 0, 0), float3(0, 0, -1),
 };
 
-// Тексель пробы в пуле - зеркало ProbeGiBaker.ProbeTexel / ProbeAtlasTexel в ProbeRoundCS.hlsl.
-int2 DebugProbeTexel(uint slot)
+// Тексель пробы - зеркало ProbeGiBaker.ProbeTexel / ProbeAtlasTexel в ProbeRoundCS.hlsl.
+int2 DebugProbeTexel(uint probe)
 {
-    const uint perBrick = PROBE_BRICK_PROBES * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES;
-    uint brick = slot / perBrick;
-    uint local = slot - brick * perBrick;
-    uint poolColumns = max((uint)DebugPool.x, 1u);
-
-    return int2(
-        (brick % poolColumns) * PROBE_BRICK_PROBES + local % PROBE_BRICK_PROBES,
-        (brick / poolColumns) * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES
-            + (local / (PROBE_BRICK_PROBES * PROBE_BRICK_PROBES)) * PROBE_BRICK_PROBES
-            + (local / PROBE_BRICK_PROBES % PROBE_BRICK_PROBES));
+    uint width = max((uint)DebugGridCounts.x, 1u);
+    return int2(probe % width, probe / width);
 }
 
 PSInput Main(uint vid : SV_VertexID)
@@ -84,25 +72,20 @@ PSInput Main(uint vid : SV_VertexID)
     uint probe = vid / 24;
     uint corner = vid - probe * 24;
 
-    // Мировая позиция узла - зеркало mainProbe в ProbeRoundCS.hlsl.
-    const uint perBrick = PROBE_BRICK_PROBES * PROBE_BRICK_PROBES * PROBE_BRICK_PROBES;
-    uint brick = probe / perBrick;
-    uint local = probe - brick * perBrick;
-    int4 brickOrigin = _ProbeBrickOrigin[brick];
-    int step = 1 << (brickOrigin.w & PROBE_BRICK_LEVEL_MASK);
-    int3 cell = brickOrigin.xyz + int3(
-        (int)(local % PROBE_BRICK_PROBES) * step,
-        (int)(local / PROBE_BRICK_PROBES % PROBE_BRICK_PROBES) * step,
-        (int)(local / (PROBE_BRICK_PROBES * PROBE_BRICK_PROBES)) * step);
+    // Мировая позиция узла - зеркало mainProbe в ProbeRoundCS.hlsl: номер шарика есть индекс
+    // ХРАНЕНИЯ, а координаты узла получаются обратным сдвигом прокрутки.
+    int3 counts = (int3)DebugGridCounts.xyz;
+    int3 scroll = (int3)DebugGridScroll.xyz;
+    int3 storage = int3((int)probe % counts.x, (int)probe / counts.x % counts.y,
+                        (int)probe / (counts.x * counts.y));
+    int3 cell = ((storage - scroll) % counts + counts) % counts;
 
     int3 texel = int3(DebugProbeTexel(probe), 0);
     float3 offset = _ProbeOffset.Load(texel).rgb;
     float3 probePos = DebugGridOrigin.xyz + (float3)cell * DebugGridCell.xyz + offset;
 
-    // Пустой слот пула (запас под прокрутку объёма, см. ProbeGiBaker.ScrollHeadroom) - схлопываем
-    // шарик в точку: пробы там нет, а рисовать её у угла объёма значило бы показывать кучу
-    // фантомов, которых в поле не существует.
-    float radius = (brickOrigin.w & PROBE_BRICK_EMPTY) != 0 ? 0.0 : DebugGridOrigin.w;
+    // Схлопывать шарик больше не за что: пустых слотов у плотной сетки нет, проба есть в каждом узле.
+    float radius = DebugGridOrigin.w;
     float3 n = normalize(OctaVerts[corner]);
 
     PSInput result;
@@ -110,6 +93,6 @@ PSInput Main(uint vid : SV_VertexID)
     result.normal = n;
     result.color = float4(_ProbeSh0.Load(texel).rgb, _ProbeSh1.Load(texel).a);
     result.offsetLen = length(offset) / max(radius, 1e-4);
-    result.tint = DebugPool.yzw;
+    result.tint = DebugTint.xyz;
     return result;
 }

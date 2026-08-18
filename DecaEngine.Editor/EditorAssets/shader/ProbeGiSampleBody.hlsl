@@ -4,11 +4,11 @@
 //
 // Ожидает макросы:
 //   PROBE_GI_FN       - имя генерируемой функции
-//   PROBE_GI_SH0..SH3, PROBE_GI_VIS, PROBE_GI_OFFSET, PROBE_GI_IND - текстуры атласов объёма
-//   PROBE_GI_ORIGIN / PROBE_GI_CELL / PROBE_GI_COUNTS / PROBE_GI_BRICKS - float4 его сетки
+//   PROBE_GI_SH0..SH3, PROBE_GI_VIS, PROBE_GI_OFFSET - текстуры атласов объёма
+//   PROBE_GI_ORIGIN / PROBE_GI_CELL / PROBE_GI_COUNTS / PROBE_GI_SCROLL - float4 его сетки
 //
-// Использует OctEncode, NonLinearIrradianceL1, viewData и PROBE_BRICK_* - они объявлены до
-// первого включения. Возвращает (-1,-1,-1), если точка вне кирпичей объёма или весам не из чего
+// Использует OctEncode, NonLinearIrradianceL1 и viewData - они объявлены до
+// первого включения. Возвращает (-1,-1,-1), если точка вне объёма или весам не из чего
 // собраться - вызывающий падает на следующий, более крупный каскад (см. SampleProbeGiCascaded).
 //
 // sunFraction - доля солнечного света (баунс + переотскоки) в поле, альфа Sh2: экранная тень
@@ -16,10 +16,9 @@
 // probeMarker - для отладочного вида расстановки проб: x = расстояние до ближайшей из восьми проб
 // ячейки в долях шага, y = её смещение релокацией (в долях шага), z = её валидность.
 //
-// confidence - НАСКОЛЬКО кирпичу можно верить, 0..1. Прокрутка объёма приводит кирпичи с краю, и
-// поле у них собрано парой раундов: показывать их сразу в полную силу - это рябь по въехавшей
-// полосе на каждое движение камеры. Вызывающий домножает на неё вес каскада, и кирпич проявляется
-// за своё окно свежести (см. ProbeGiBakeSession.WriteIndirection).
+// confidence - вес доверия объёму, 0..1; вызывающий домножает на него вес каскада. У плотной
+// сетки всегда 1 (см. тело функции): величина осталась в сигнатуре, потому что механизм плавного
+// проявления может понадобиться снова, а звать её неоткуда, если её нет.
 float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float sunFraction,
                    out float3 probeMarker, out float confidence)
 {
@@ -28,8 +27,7 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
     probeMarker = float3(1e6, 0.0, 0.0);
     confidence = 0.0;
 
-    float3 counts = PROBE_GI_COUNTS.xyz;
-    float3 brickCounts = PROBE_GI_BRICKS.xyz;
+    float3 counts3 = PROBE_GI_COUNTS.xyz;
 
     // Смещение точки сэмпла по нормали И ПО ВЗГЛЯДУ - self-shadow bias, формула (2) Majercik 2021
     // (§4.1): (n*0.2 + wo*0.8) * (0.75 * минимальный шаг проб) * ручка. Дисперсия оценки видимости
@@ -64,88 +62,26 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
 
     // Вне объёма - к следующему каскаду. Кламп, как у одиночной сетки, здесь не годится: он
     // прилепил бы точку к граничной ячейке, и мелкий каскад «растянулся» бы на всю сцену.
-    if (any(f < 0.0) || any(f > counts - 1.0))
+    if (any(f < 0.0) || any(f > counts3 - 1.0))
     {
         return float3(-1.0, -1.0, -1.0);
     }
 
-    // Кирпич, накрывающий точку - ищется в САМОЙ МЕЛКОЙ сетке кирпичей, куда крупный прописан во
-    // все свои ячейки. Граничные пробы соседних кирпичей дублируются, поэтому все восемь углов
-    // лежат в найденном кирпиче - индирекция читается один раз, а не по разу на угол.
-    int3 brickCoord = min((int3)(f / PROBE_BRICK_CELLS), (int3)brickCounts - 1);
-    int brickCountY = (int)brickCounts.y;
-    float4 indirection = PROBE_GI_IND.Load(int3(
-        brickCoord.x, brickCoord.z * brickCountY + brickCoord.y, 0));
-    // b - не флаг, а УВЕРЕННОСТЬ: ноль = кирпича нет (в этом объёме тут пусто либо он ещё не
-    // прогрет), больше нуля = во сколько раз ему верить. Вызывающий пробует следующий каскад, а за
-    // последним откатится на константный ambient.
-    if (indirection.b <= 0.0)
-    {
-        return float3(-1.0, -1.0, -1.0);
-    }
-
-    // УВЕРЕННОСТЬ - ТРИЛИНЕЙНО ПО СОСЕДНИМ КИРПИЧАМ, а не значением своего.
+    // Базовый узел ячейки - пол координат сетки. Индирекции, уверенности кирпича и уровней
+    // подразделения здесь больше нет: у плотной сетки проба есть в каждом узле, адрес считается
+    // арифметикой, и промахнуться мимо «незанятого места» больше негде.
     //
-    // Точечное чтение здесь было источником прямоугольных блоков на резкое движение камеры, и
-    // виновата не сама уверенность, а её кусочная постоянность. Прокрутка приводит кирпичи слоями,
-    // у слоя своя свежесть, и на стыке с прогретой серединой уверенность прыгает СТУПЕНЬКОЙ.
-    // Вызывающий домножает на неё вес каскада, то есть скачком меняется ПРОПОРЦИЯ между базовым и
-    // мелким объёмом, а поля у них разного разрешения и отличаются заметно (замерено смоуком
-    // прокрутки: свежие кирпичи ярче прогретых на 16-20%). Разрыв ложится ровно по границам
-    // кирпичей - отсюда прямоугольники размером с кирпич и с идеально прямыми краями.
-    //
-    // Лечится растягиванием ступеньки на ширину кирпича: уверенность берётся трилинейно по восьми
-    // соседям в сетке кирпичей. Отсутствующий сосед (за краем сетки или пустой) даёт ноль - и это
-    // не костыль, а то же самое смягчение на границе занятой области.
-    //
-    // Восемь лишних выборок стоят пренебрежимо мало и берутся ОДИН раз на каскад, а не на каждый из
-    // восьми углов: карта индирекции крошечная (кирпичей тысячи) и целиком лежит в кэше. Замер
-    // цены выборок в этом шейдере - в комментарии к билинейке карты видимости ниже.
-    {
-        float3 fb = f / PROBE_BRICK_CELLS - 0.5;
-        int3 b0 = (int3)floor(fb);
-        float3 bt = saturate(fb - (float3)b0);
+    // Уверенность осталась в сигнатуре ради вызывающего (он домножает на неё вес каскада), но
+    // всегда единица. Она лечила ступеньку на границе кирпича: прокрутка приводила кирпичи слоями,
+    // у слоя была своя свежесть, и на стыке с прогретой серединой вес каскада прыгал разрывом
+    // размером с кирпич. Границ кирпичей не осталось - не осталось и разрыва.
+    confidence = 1.0;
 
-        float confSum = 0.0;
-        [unroll]
-        for (int bc = 0; bc < 8; bc++)
-        {
-            int3 bo = int3(bc & 1, (bc >> 1) & 1, bc >> 2);
-            int3 bn = b0 + bo;
-            float bw = (bo.x ? bt.x : 1.0 - bt.x)
-                     * (bo.y ? bt.y : 1.0 - bt.y)
-                     * (bo.z ? bt.z : 1.0 - bt.z);
-
-            // За краем сетки кирпичей соседа нет - считаем его пустым (уверенность 0), иначе кламп
-            // растиражировал бы крайний кирпич наружу и вернул бы ступеньку на границе объёма.
-            if (bw <= 0.0 || any(bn < 0) || any(bn >= (int3)brickCounts))
-            {
-                continue;
-            }
-
-            confSum += bw * PROBE_GI_IND.Load(int3(
-                bn.x, bn.z * brickCountY + bn.y, 0)).b;
-        }
-
-        confidence = confSum;
-    }
-
-    // Индекс кирпича упакован по байтам, в альфе - уровень подразделения (см.
-    // ProbeGiBakeResult.Indirection); разворачиваем его в координаты блока в пуле.
-    int brick = (int)round(indirection.r * 255.0) + (int)round(indirection.g * 255.0) * 256;
-    int level = (int)round(indirection.a * 255.0);
-    int step = 1 << level;
-    int poolColumns = max((int)PROBE_GI_BRICKS.w, 1);
-    int2 brickTexel = int2(brick % poolColumns, brick / poolColumns)
-                    * int2(PROBE_BRICK_PROBES, PROBE_BRICK_PROBES * PROBE_BRICK_PROBES);
-
-    // Угол кирпича: координаты выравниваются вниз по его размеру (крупный кирпич покрывает 2^level
-    // мелких), а локальные координаты считаются в ЕГО шаге проб.
-    float3 brickOrigin = (float3)((brickCoord / step) * step * PROBE_BRICK_CELLS);
-    float3 lf = (f - brickOrigin) / step;
-    int3 localCell = clamp((int3)floor(lf), 0, PROBE_BRICK_CELLS - 1);
-    float3 t = saturate(lf - (float3)localCell);
-    float3 probeStep = PROBE_GI_CELL.xyz * step;
+    int3 counts = (int3)counts3;
+    int3 scroll = (int3)PROBE_GI_SCROLL.xyz;
+    int3 localCell = clamp((int3)floor(f), 0, counts - 2);
+    float3 t = saturate(f - (float3)localCell);
+    float3 probeStep = PROBE_GI_CELL.xyz;
 
     float4 sum0 = 0.0;
     float3 sumX = 0.0, sumY = 0.0, sumZ = 0.0;
@@ -157,11 +93,12 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
     {
         int3 offset = int3(corner & 1, (corner >> 1) & 1, corner >> 2);
 
-        // Тексель угла внутри блока кирпича: локальная проба (0..BrickProbes-1) по каждой оси,
-        // z-слайсы столбиком - зеркало ProbeGiBaker.ProbeTexel.
+        // Узел -> тексель: тороидальный заворот прокруткой, затем плоскости столбиком. Зеркало
+        // ProbeGiBaker.Wrap / ProbeTexel. Слагаемое counts перед остатком обязательно - % от
+        // отрицательного делимого в HLSL отрицателен.
         int3 lp = localCell + offset;
-        int3 texel = int3(brickTexel.x + lp.x,
-                          brickTexel.y + lp.z * PROBE_BRICK_PROBES + lp.y, 0);
+        int3 sp = ((lp + scroll) % counts + counts) % counts;
+        int3 texel = int3(sp.x, sp.z * counts.y + sp.y, 0);
 
         // Валидность в альфе Sh1 читается первой - невалидный угол не тянет остальные Load-ы.
         // ТРИЛИНЕЙНЫЙ вес считается отдельно и умножается ПОСЛЕ подавления малых весов - как в
@@ -181,9 +118,7 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
         // оставляет боковым пробам частичный вес (иначе плоская стена теряла бы половину
         // интерполяции и полосила по ячейкам).
         float3 probeOffsetWorld = PROBE_GI_OFFSET.Load(texel).rgb;
-        float3 probeWorld = PROBE_GI_ORIGIN.xyz
-                          + brickOrigin * PROBE_GI_CELL.xyz + (float3)lp * probeStep
-                          + probeOffsetWorld;
+        float3 probeWorld = PROBE_GI_ORIGIN.xyz + (float3)lp * probeStep + probeOffsetWorld;
         float3 toProbe = probeWorld - samplePos;
         float toProbeLen = length(toProbe);
 

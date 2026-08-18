@@ -966,7 +966,6 @@ namespace DecaEngine.Editor
 					kvp.Value.SetTexture("_ProbeSh3", environmentMap);
 					kvp.Value.SetTexture("_ProbeVis", environmentMap);
 					kvp.Value.SetTexture("_ProbeOffset", environmentMap);
-					kvp.Value.SetTexture("_ProbeIndirection", environmentMap);
 
 					// Каскады: слоты объявлены безусловно, как и базовые - без плейсхолдера
 					// дескрипторы невалидны (VUID-08114), даже когда каскадов нет и мёртвая ветка
@@ -979,7 +978,6 @@ namespace DecaEngine.Editor
 						kvp.Value.SetTexture($"_ProbeSh3{suffix}", environmentMap);
 						kvp.Value.SetTexture($"_ProbeVis{suffix}", environmentMap);
 						kvp.Value.SetTexture($"_ProbeOffset{suffix}", environmentMap);
-						kvp.Value.SetTexture($"_ProbeIndirection{suffix}", environmentMap);
 					}
 				}
 

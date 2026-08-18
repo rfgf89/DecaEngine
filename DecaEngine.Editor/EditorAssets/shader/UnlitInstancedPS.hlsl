@@ -59,9 +59,9 @@ Texture2D    _EnvMap;
 SamplerState _EnvMap_sampler;
 
 // Probe-GI (DDGI-лайт, см. DecaEngine.Editor.ProbeGiBaker): атласы SH L1 irradiance-проб,
-// запечённых CPU-трассировкой. Сетка РАЗРЕЖЕННАЯ - пробы существуют только в кирпичах рядом с
-// геометрией, а атлас хранит пул таких кирпичей (кирпич - блок 4 в ширину и 4*4 в высоту,
-// z-слайсы столбиком). Тексель пробы ищется через _ProbeIndirection, см. ProbeTexel/SampleProbeGi.
+// запечённых CPU-трассировкой. Сетка ПЛОТНАЯ - проба есть в каждом узле, а тексель считается из
+// её координат арифметикой: ширина атласа равна оси X сетки, плоскости Z уложены столбиком
+// (см. ProbeGiBakeResult.ShWidth и ProbeGiSampleBody.hlsl).
 // Sh0: rgb = L0, a = sky visibility; Sh1: rgb = L1x, a = валидность пробы (0 = в стене);
 // Sh2/Sh3: rgb = L1y/L1z. Читаются через Load - сэмплер не нужен, трилинейность ручная
 // (SampleProbeGi). Привязаны только в превью с пробами (ProbeGridOrigin.w = 0 иначе - как _EnvMap,
@@ -79,10 +79,6 @@ Texture2D _ProbeVis;
 // об этом обязаны ОБА потребителя: и трилинейный вес, и тест Чебышёва меряют расстояние до пробы.
 // В запечке атлас нулевой - релокация работает только в реальном времени.
 Texture2D _ProbeOffset;
-// Карта индирекции RGBA8 размером с сетку КИРПИЧЕЙ, тексель (bx, bz*BrickCountY+by): r/g -
-// младший/старший байт индекса кирпича в пуле, b > 0 - кирпич существует. Читается один раз на
-// сэмпл: все восемь углов трилинейной ячейки по построению лежат в одном кирпиче.
-Texture2D _ProbeIndirection;
 
 // КАСКАДЫ (см. SampleProbeGi): те же комплекты атласов для одного-двух дополнительных, более
 // МЕЛКИХ объёмов вокруг точки интереса - _C1 вдвое плотнее базового, _C2 вчетверо. Выборка идёт от
@@ -94,14 +90,12 @@ Texture2D _ProbeSh2_C1;
 Texture2D _ProbeSh3_C1;
 Texture2D _ProbeVis_C1;
 Texture2D _ProbeOffset_C1;
-Texture2D _ProbeIndirection_C1;
 Texture2D _ProbeSh0_C2;
 Texture2D _ProbeSh1_C2;
 Texture2D _ProbeSh2_C2;
 Texture2D _ProbeSh3_C2;
 Texture2D _ProbeVis_C2;
 Texture2D _ProbeOffset_C2;
-Texture2D _ProbeIndirection_C2;
 
 // Contains data about the camera/view (e.g., camera position).
 cbuffer View
@@ -223,11 +217,12 @@ cbuffer PreviewSettings
     // xyz = шаг сетки в мировых единицах, w = normal-бейас точки сэмпла (доля ячейки) - от
     // утечек света сквозь тонкие стены (аналог DDGI normal bias).
     float4 ProbeGridCell;
-    // xyz = число проб по осям ВИРТУАЛЬНОЙ сетки (float для простоты cbuffer-паковки) - в ней
-    // ищется ячейка по мировой позиции; реально выделены только пробы живых кирпичей.
+    // xyz = число проб по осям сетки (float для простоты cbuffer-паковки), w = доля взгляда в
+    // направлении сдвига сэмпла (ручка View bias).
     float4 ProbeGridCounts;
-    // xyz = размер сетки кирпичей, w = сколько кирпичей в ряду пула (см. ProbeGiTextures.GridBricks).
-    float4 ProbeGridBricks;
+    // xyz = тороидальное смещение сетки в пробах: узел c лежит в текселе (c + scroll) mod counts
+    // (см. ProbeGiTextures.GridScroll).
+    float4 ProbeGridScroll;
     // Ручки probe-GI из окна Graphics (см. GraphicsSettingsWindow / EditorSettings): x = флор
     // глушения солнечной доли эмбиента тенью ключа (дефолт 0.3), y = флор глушения env-спекуляра
     // видимостью неба (0.2), z = интенсивность солнца (0 = zero-init, берём дефолт 2.0),
@@ -242,11 +237,11 @@ cbuffer PreviewSettings
     float4 ProbeGridOrigin1;
     float4 ProbeGridCell1;
     float4 ProbeGridCounts1;
-    float4 ProbeGridBricks1;
+    float4 ProbeGridScroll1;
     float4 ProbeGridOrigin2;
     float4 ProbeGridCell2;
     float4 ProbeGridCounts2;
-    float4 ProbeGridBricks2;
+    float4 ProbeGridScroll2;
 
     // Режим кривой тонмапа (см. Tonemap.hlsl). Действует только в LDR-режиме: в HDR-конвейере
     // кривую применяет TonemapPS в самом конце, а здесь кадр остаётся линейным.
@@ -431,10 +426,6 @@ float3 SampleEnvironment(float3 dir, float roughness)
 // Возвращает E/PI - готовый ламбертов множитель альбедо; skyVisibility - доля неба, видимая
 // точкой (глушит env-спекуляр в закрытых местах). Отрицательный x = валидных проб рядом нет,
 // вызывающий откатывается на константный ambient.
-// Геометрия кирпича разреженной сетки - обязана совпадать с ProbeGiBaker.BrickProbes/BrickCells.
-#define PROBE_BRICK_PROBES 4
-#define PROBE_BRICK_CELLS  3
-
 // Сторона окто-карты видимости на пробу. Приходит кбуфером (ProbeGiParams2.y - ручка «Visibility
 // res», см. ProbeGiBakeResult.VisRes): раскладка атласа задаётся ей же на CPU, и разойтись им
 // нельзя. 0 (zero-init кбуфера вне превью) трактуется как дефолтные 8.
@@ -525,11 +516,10 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #define PROBE_GI_SH3     _ProbeSh3
 #define PROBE_GI_VIS     _ProbeVis
 #define PROBE_GI_OFFSET  _ProbeOffset
-#define PROBE_GI_IND     _ProbeIndirection
 #define PROBE_GI_ORIGIN  ProbeGridOrigin
 #define PROBE_GI_CELL    ProbeGridCell
 #define PROBE_GI_COUNTS  ProbeGridCounts
-#define PROBE_GI_BRICKS  ProbeGridBricks
+#define PROBE_GI_SCROLL  ProbeGridScroll
 #include "ProbeGiSampleBody.hlsl"
 #undef PROBE_GI_FN
 #undef PROBE_GI_SH0
@@ -538,11 +528,10 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #undef PROBE_GI_SH3
 #undef PROBE_GI_VIS
 #undef PROBE_GI_OFFSET
-#undef PROBE_GI_IND
 #undef PROBE_GI_ORIGIN
 #undef PROBE_GI_CELL
 #undef PROBE_GI_COUNTS
-#undef PROBE_GI_BRICKS
+#undef PROBE_GI_SCROLL
 
 #define PROBE_GI_FN      SampleProbeGiC1
 #define PROBE_GI_SH0     _ProbeSh0_C1
@@ -551,11 +540,10 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #define PROBE_GI_SH3     _ProbeSh3_C1
 #define PROBE_GI_VIS     _ProbeVis_C1
 #define PROBE_GI_OFFSET  _ProbeOffset_C1
-#define PROBE_GI_IND     _ProbeIndirection_C1
 #define PROBE_GI_ORIGIN  ProbeGridOrigin1
 #define PROBE_GI_CELL    ProbeGridCell1
 #define PROBE_GI_COUNTS  ProbeGridCounts1
-#define PROBE_GI_BRICKS  ProbeGridBricks1
+#define PROBE_GI_SCROLL  ProbeGridScroll1
 #include "ProbeGiSampleBody.hlsl"
 #undef PROBE_GI_FN
 #undef PROBE_GI_SH0
@@ -564,11 +552,10 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #undef PROBE_GI_SH3
 #undef PROBE_GI_VIS
 #undef PROBE_GI_OFFSET
-#undef PROBE_GI_IND
 #undef PROBE_GI_ORIGIN
 #undef PROBE_GI_CELL
 #undef PROBE_GI_COUNTS
-#undef PROBE_GI_BRICKS
+#undef PROBE_GI_SCROLL
 
 #define PROBE_GI_FN      SampleProbeGiC2
 #define PROBE_GI_SH0     _ProbeSh0_C2
@@ -577,11 +564,10 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #define PROBE_GI_SH3     _ProbeSh3_C2
 #define PROBE_GI_VIS     _ProbeVis_C2
 #define PROBE_GI_OFFSET  _ProbeOffset_C2
-#define PROBE_GI_IND     _ProbeIndirection_C2
 #define PROBE_GI_ORIGIN  ProbeGridOrigin2
 #define PROBE_GI_CELL    ProbeGridCell2
 #define PROBE_GI_COUNTS  ProbeGridCounts2
-#define PROBE_GI_BRICKS  ProbeGridBricks2
+#define PROBE_GI_SCROLL  ProbeGridScroll2
 #include "ProbeGiSampleBody.hlsl"
 #undef PROBE_GI_FN
 #undef PROBE_GI_SH0
@@ -590,11 +576,10 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #undef PROBE_GI_SH3
 #undef PROBE_GI_VIS
 #undef PROBE_GI_OFFSET
-#undef PROBE_GI_IND
 #undef PROBE_GI_ORIGIN
 #undef PROBE_GI_CELL
 #undef PROBE_GI_COUNTS
-#undef PROBE_GI_BRICKS
+#undef PROBE_GI_SCROLL
 
 // Плавный вес объёма: ноль у грани бокса (и снаружи), единица - не ближе КИРПИЧА от грани. Прямой
 // аналог margin теневых каскадов (Shadows.hlsl, GetDistanceToCascadeMargin): выборка не берёт
@@ -660,13 +645,12 @@ float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out flo
                 // только у геометрии). Тогда подмешивать не к чему, и вес каскада по БОКСУ здесь
                 // ни при чём: гасить единственный источник за отсутствие второго бессмысленно.
                 //
-                // Но уверенность кирпича остаётся в силе, и раньше её тут теряли: строка ставила
-                // w = 1.0 поверх уже домноженного на conf1 веса. Свежий кирпич, только что
-                // привезённый прокруткой, показывался в ПОЛНУЮ СИЛУ с полем от одного-двух вееров -
-                // те самые прямоугольные вспышки размером с кирпич на резкое движение камеры, с
-                // резкой границей по слою, который прокрутка привезла. Ровно против этого
-                // confidence и заведён (см. ProbeGiBakeSession.BrickConfidence), а здесь он
-                // отменялся.
+                // Уверенность объёма при этом остаётся в силе и НЕ затирается единицей - строка
+                // когда-то ставила w = 1.0 поверх уже домноженного на conf1 веса, и свежий кирпич
+                // вспыхивал в полную силу с полем от одного-двух вееров. У плотной сетки conf1
+                // всегда 1 (см. ProbeGiSampleBody), так что сегодня это ничего не меняет; порядок
+                // сохранён нарочно - механизм плавного проявления может понадобиться снова, и
+                // возвращать его придётся ровно сюда.
                 // Базе нечем крыть - значение берём ЦЕЛИКОМ, а неуверенность отдаём наружу весом.
                 // Именно значение, а не его долю: поле свежего кирпича шумно, но по величине это
                 // уже освещение, а не ноль, и тянуть его к нулю - выдумывать темноту, которой нет.

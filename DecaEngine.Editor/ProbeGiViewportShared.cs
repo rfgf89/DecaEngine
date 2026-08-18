@@ -190,7 +190,6 @@ internal static class ProbeGiViewportShared
 			material.SetTexture($"_ProbeSh3{suffix}", placeholder);
 			material.SetTexture($"_ProbeVis{suffix}", placeholder);
 			material.SetTexture($"_ProbeOffset{suffix}", placeholder);
-			material.SetTexture($"_ProbeIndirection{suffix}", placeholder);
 		}
 	}
 
