@@ -1,7 +1,7 @@
 using System.Numerics;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Animation;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 

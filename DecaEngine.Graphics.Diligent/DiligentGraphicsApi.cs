@@ -2,7 +2,6 @@ using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
@@ -11,10 +10,10 @@ using StbImageSharp;
 // Прямая работа с нативным контекстом - состояния здесь Diligent-овские, не из ICommandBuffer.
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
-using TextureInfo = DecaEngine.Graphics.Core.TextureInfo;
+using TextureInfo = DecaEngine.Graphics.TextureInfo;
 using Version = Diligent.Version;
 
-namespace DecaEngine
+namespace DecaEngine.Graphics.Diligent
 {
 	public class DiligentGraphicsApi : IGraphicsApi
 	{
@@ -145,7 +144,7 @@ namespace DecaEngine
 			ImmediateContext.SetRenderTargets(new[] { rtv }, dsv, ResourceStateTransitionMode.Transition);
 			ImmediateContext.ClearRenderTarget(rtv, color, ResourceStateTransitionMode.Transition);
 			if (dsv != null)
-				ImmediateContext.ClearDepthStencil(dsv, ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
+				ImmediateContext.ClearDepthStencil(dsv, global::Diligent.ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
 		}
 
 
@@ -418,13 +417,13 @@ namespace DecaEngine
 				new StateTransitionDesc()
 				{
 					Resource = nativeTexture,
-					OldState = ResourceState.Unknown,
-					NewState = ResourceState.ShaderResource,
+					OldState = global::Diligent.ResourceState.Unknown,
+					NewState = global::Diligent.ResourceState.ShaderResource,
 					Flags = StateTransitionFlags.UpdateState
 				}
 			]);
 
-			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			var textureInfo = new DecaEngine.Graphics.TextureInfo
 			{
 				name = data.Name,
 				width = (uint)width,
@@ -497,13 +496,13 @@ namespace DecaEngine
 					new StateTransitionDesc()
 					{
 						Resource = nativeTexture,
-						OldState = ResourceState.Unknown,
-						NewState = ResourceState.ShaderResource,
+						OldState = global::Diligent.ResourceState.Unknown,
+						NewState = global::Diligent.ResourceState.ShaderResource,
 						Flags = StateTransitionFlags.UpdateState
 					}
 				]);
 
-				var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+				var textureInfo = new DecaEngine.Graphics.TextureInfo
 				{
 					name = name,
 					width = (uint)width,
@@ -615,13 +614,13 @@ namespace DecaEngine
 				new StateTransitionDesc()
 				{
 					Resource = nativeTexture,
-					OldState = ResourceState.Unknown,
-					NewState = ResourceState.ShaderResource,
+					OldState = global::Diligent.ResourceState.Unknown,
+					NewState = global::Diligent.ResourceState.ShaderResource,
 					Flags = StateTransitionFlags.UpdateState
 				}
 			]);
 
-			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			var textureInfo = new DecaEngine.Graphics.TextureInfo
 			{
 				name = data.Name,
 				width = (uint)width,
@@ -688,13 +687,13 @@ namespace DecaEngine
 				new StateTransitionDesc()
 				{
 					Resource = nativeTexture,
-					OldState = ResourceState.Unknown,
-					NewState = ResourceState.ShaderResource,
+					OldState = global::Diligent.ResourceState.Unknown,
+					NewState = global::Diligent.ResourceState.ShaderResource,
 					Flags = StateTransitionFlags.UpdateState
 				}
 			]);
 
-			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			var textureInfo = new DecaEngine.Graphics.TextureInfo
 			{
 				name = name,
 				width = (uint)width,
@@ -744,13 +743,13 @@ namespace DecaEngine
 				new StateTransitionDesc()
 				{
 					Resource = nativeTexture,
-					OldState = ResourceState.Unknown,
-					NewState = ResourceState.ShaderResource,
+					OldState = global::Diligent.ResourceState.Unknown,
+					NewState = global::Diligent.ResourceState.ShaderResource,
 					Flags = StateTransitionFlags.UpdateState
 				}
 			]);
 
-			var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+			var textureInfo = new DecaEngine.Graphics.TextureInfo
 			{
 				name = name,
 				width = (uint)width,
@@ -813,8 +812,8 @@ namespace DecaEngine
 				new StateTransitionDesc()
 				{
 					Resource = gpuTexture.Texture,
-					OldState = ResourceState.CopyDest,
-					NewState = ResourceState.ShaderResource,
+					OldState = global::Diligent.ResourceState.CopyDest,
+					NewState = global::Diligent.ResourceState.ShaderResource,
 					Flags = StateTransitionFlags.UpdateState
 				}
 			]);
@@ -944,8 +943,8 @@ namespace DecaEngine
 					BufferCount = 2,
 					Usage = SwapChainUsageFlags.RenderTarget,
 					IsPrimary = true,
-					ColorBufferFormat = Diligent.TextureFormat.RGBA8_UNorm,
-					DepthBufferFormat = Diligent.TextureFormat.D32_Float
+					ColorBufferFormat = global::Diligent.TextureFormat.RGBA8_UNorm,
+					DepthBufferFormat = global::Diligent.TextureFormat.D32_Float
 				};
 
 				OnSwapChainInfo?.Invoke();
@@ -1017,8 +1016,8 @@ namespace DecaEngine
 					BufferCount = 2,
 					Usage = SwapChainUsageFlags.RenderTarget,
 					IsPrimary = true,
-					ColorBufferFormat = Diligent.TextureFormat.RGBA8_UNorm,
-					DepthBufferFormat = Diligent.TextureFormat.D32_Float
+					ColorBufferFormat = global::Diligent.TextureFormat.RGBA8_UNorm,
+					DepthBufferFormat = global::Diligent.TextureFormat.D32_Float
 				};
 
 				OnSwapChainInfo?.Invoke();
@@ -1090,8 +1089,8 @@ namespace DecaEngine
 					BufferCount = 3, // Use triple buffering for Vulkan
 					Usage = SwapChainUsageFlags.RenderTarget,
 					IsPrimary = true,
-					ColorBufferFormat = Diligent.TextureFormat.RGBA8_UNorm,
-					DepthBufferFormat = Diligent.TextureFormat.D32_Float
+					ColorBufferFormat = global::Diligent.TextureFormat.RGBA8_UNorm,
+					DepthBufferFormat = global::Diligent.TextureFormat.D32_Float
 				};
 
 				OnSwapChainInfo?.Invoke();

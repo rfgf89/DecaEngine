@@ -2,7 +2,6 @@
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 

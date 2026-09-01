@@ -6,7 +6,6 @@ using System.Threading.Tasks;
 using SharpGLTF.Schema2;
 using DecaEngine.Core;
 using DecaEngine.Graphics.Assets;
-using DecaEngine.Graphics.Core;
 using System.Runtime.InteropServices;
 using Diligent;
 using MeshOptimizer;
@@ -1427,12 +1426,12 @@ public class ModelLoader
 		// PbrHas*Texture - динамическое), поэтому непривязанный дескриптор - это undefined
 		// behavior на Vulkan (validation VUID-vkCmdDrawIndexedIndirect-None-08114), а не
 		// безобидный «нулевой» сэмпл. Один общий на модель, создаётся лениво.
-		Core.Texture fallbackTexture = null;
+		Texture fallbackTexture = null;
 		ISamplerObject fallbackSampler = null;
 
 		// Отдельный филлер для _NormalTex: белый пиксель распаковался бы в наклонённую нормаль
 		// (1,1,1)->(1,1,1), а "плоский" (128,128,255) -> (0,0,1) оставляет геометрическую.
-		Core.Texture flatNormalTexture = null;
+		Texture flatNormalTexture = null;
 
 		// Создаёт (лениво) оба 1x1-филлера, не привязывая их ни к какому слоту: стриминг ставит их
 		// сам, со СВОИМ (авторским) сэмплером - см. BindPreparedTexture.
@@ -1440,7 +1439,7 @@ public class ModelLoader
 		{
 			if (fallbackTexture == null)
 			{
-				fallbackTexture = new Core.Texture("Model Fallback White", new CpuTextureData
+				fallbackTexture = new Texture("Model Fallback White", new CpuTextureData
 				{
 					Name = "Model Fallback White",
 					DecodedPixels = new byte[] { 255, 255, 255, 255 },
@@ -1460,7 +1459,7 @@ public class ModelLoader
 
 			if (flatNormalTexture == null)
 			{
-				flatNormalTexture = new Core.Texture("Model Fallback Flat Normal", new CpuTextureData
+				flatNormalTexture = new Texture("Model Fallback Flat Normal", new CpuTextureData
 				{
 					Name = "Model Fallback Flat Normal",
 					DecodedPixels = new byte[] { 128, 128, 255, 255 },
@@ -1476,7 +1475,7 @@ public class ModelLoader
 		{
 			if (fallbackTexture == null)
 			{
-				fallbackTexture = new Core.Texture("Model Fallback White", new CpuTextureData
+				fallbackTexture = new Texture("Model Fallback White", new CpuTextureData
 				{
 					Name = "Model Fallback White",
 					DecodedPixels = new byte[] { 255, 255, 255, 255 },
@@ -1508,7 +1507,7 @@ public class ModelLoader
 
 			if (flatNormalTexture == null)
 			{
-				flatNormalTexture = new Core.Texture("Model Fallback Flat Normal", new CpuTextureData
+				flatNormalTexture = new Texture("Model Fallback Flat Normal", new CpuTextureData
 				{
 					Name = "Model Fallback Flat Normal",
 					DecodedPixels = new byte[] { 128, 128, 255, 255 },
@@ -1654,7 +1653,7 @@ public class ModelLoader
 			// Тот же замер, что и у обычного пути: именно по нему видно, что кеш действительно
 			// убирает время из финализации, а не переносит его в другое место.
 			var swBaked = System.Diagnostics.Stopwatch.StartNew();
-			var texture = new Core.Texture(slot, payload.ToCpuTextureData(slot));
+			var texture = new Texture(slot, payload.ToCpuTextureData(slot));
 			texture.Upload(graphicsApi, true);
 			result._textureMs += swBaked.ElapsedMilliseconds;
 			result._textureCount++;
@@ -1831,7 +1830,7 @@ public class ModelLoader
 					DecodedHeight = preparedTexture.Height,
 				};
 
-				var texture = new Core.Texture(cpuData.Name, cpuData);
+				var texture = new Texture(cpuData.Name, cpuData);
 
 				// Замер отдельно от остальной финализации: она оказалась 80% времени загрузки и при этом
 				// почти не зависит от ОБЪЁМА текстур - значит цена не в байтах, а в вызовах, и надо

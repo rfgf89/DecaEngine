@@ -6,7 +6,6 @@ using DecaEngine.Core.Diagnostics;
 using DecaEngine.Core.Assets;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.ProbeGi;
 using Engine.ImGui.Core;

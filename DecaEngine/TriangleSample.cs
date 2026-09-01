@@ -7,6 +7,7 @@ using Diligent;
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
 using ValueType = Diligent.ValueType;
+using DecaEngine.Graphics;
 
 namespace DiligentEngineNET.Samples;
 

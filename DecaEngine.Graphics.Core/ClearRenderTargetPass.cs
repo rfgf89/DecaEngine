@@ -1,8 +1,7 @@
 using System.Numerics;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Graphics;
 
 public class ClearRenderTargetPass : RenderGraphPass<ClearRenderTargetPass.PassData>
 {

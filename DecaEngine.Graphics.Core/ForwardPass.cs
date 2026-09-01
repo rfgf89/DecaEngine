@@ -1,9 +1,9 @@
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using UnsafeCollections.Collections.Unsafe;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>
 /// Render-graph pass that clears/binds the back buffer and culls + draws every camera view.

@@ -1,8 +1,8 @@
 ﻿using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the final HDR -&gt; display conversion: exposure from
 /// <see cref="EyeAdaptationPassResources"/>, the PBR Neutral curve and the manual sRGB encode

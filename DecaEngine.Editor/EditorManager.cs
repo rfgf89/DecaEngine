@@ -2,7 +2,6 @@
 using System.Diagnostics;
 using System.Numerics;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 using DecaEngine.Editor.ECS;

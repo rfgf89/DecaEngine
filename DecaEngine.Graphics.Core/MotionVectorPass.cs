@@ -1,9 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the screen-space motion vector buffer: один фуллскрин-материал,
 /// который читает глубину кадра и пишет в свой RG16F-таргет смещение каждого пикселя к его положению

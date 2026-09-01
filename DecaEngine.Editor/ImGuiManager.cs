@@ -2,11 +2,11 @@ using System;
 using System.Diagnostics;
 using System.Numerics;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 using Engine.ImGui.Core;
 using Hexa.NET.ImGui;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor
 {

@@ -3,9 +3,9 @@ using System.Text;
 using System.Text.Json;
 using DecaEngine.Core;
 using DecaEngine.Core.Diagnostics;
-using DecaEngine.Graphics.Core;
 using Hexa.NET.ImGui;
 using StbImageSharp;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 

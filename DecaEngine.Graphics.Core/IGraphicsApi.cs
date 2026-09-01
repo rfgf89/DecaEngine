@@ -1,11 +1,11 @@
 ﻿using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 using UnsafeCollections.Collections.Native;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 public enum TextureAddress
 {

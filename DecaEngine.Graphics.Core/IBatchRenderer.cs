@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using DecaEngine.Graphics.Diligent;
 using UnsafeCollections.Collections.Unsafe;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>
 /// Opaque handle to the result of a compute-culling dispatch (<see cref="IBatchRenderer.ExecuteComputeCulling"/>).

@@ -3,12 +3,11 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
-using ClearDepthStencilFlags = DecaEngine.Core.ClearDepthStencilFlags;
-using ResourceState = DecaEngine.Core.ResourceState;
-using SetVertexBuffersFlags = DecaEngine.Core.SetVertexBuffersFlags;
+using ClearDepthStencilFlags = DecaEngine.Graphics.ClearDepthStencilFlags;
+using ResourceState = DecaEngine.Graphics.ResourceState;
+using SetVertexBuffersFlags = DecaEngine.Graphics.SetVertexBuffersFlags;
 using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent

@@ -1,6 +1,5 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
-using DecaEngine.Graphics.Core;
 using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Graphics.Diligent;

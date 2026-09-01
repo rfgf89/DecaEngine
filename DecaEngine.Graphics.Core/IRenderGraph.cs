@@ -1,7 +1,8 @@
 ﻿using System.Runtime.CompilerServices;
-using DecaEngine.Graphics.Core;
 
-namespace DecaEngine.Core;
+using DecaEngine.Core;
+
+namespace DecaEngine.Graphics;
 
 public abstract unsafe class RenderGraphPass<T>() : IRenderGraphPass
 {

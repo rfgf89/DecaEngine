@@ -2,7 +2,6 @@ using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Graphics.Diligent;
 

@@ -10,6 +10,7 @@ using ResourceState = Diligent.ResourceState;
 using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using StbImageSharp;
 using ValueType = Diligent.ValueType;
+using DecaEngine.Graphics;
 
 namespace DiligentEngineNET.Samples;
 

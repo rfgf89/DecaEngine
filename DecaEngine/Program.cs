@@ -7,6 +7,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
+using DecaEngine.Graphics;
 
 // Sample List
 var samplesMap = new Dictionary<string, Func<GraphicsBackend, Application>>()

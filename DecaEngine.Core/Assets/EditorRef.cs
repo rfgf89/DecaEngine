@@ -35,7 +35,7 @@ namespace DecaEngine.Core.Assets
 
 		/// <summary>
 		/// Splits the path into the (factoryPath, fileName) pair expected by
-		/// <see cref="DecaEngine.Graphics.Core.IGraphicsApi.CreateShader(string, string, string, DecaEngine.Graphics.Core.ShaderObjectType)"/>,
+		/// <see cref="DecaEngine.Graphics.IGraphicsApi.CreateShader(string, string, string, DecaEngine.Graphics.ShaderObjectType)"/>,
 		/// e.g. "shader/UnlitInstancedVS.hlsl" -&gt; ("EditorAssets/shader", "UnlitInstancedVS.hlsl").
 		/// </summary>
 		public readonly (string factoryPath, string fileName) ToShaderFactoryParts()

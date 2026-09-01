@@ -1,9 +1,9 @@
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 public class GraphicsPipeline : IGraphicsPipeline
 {

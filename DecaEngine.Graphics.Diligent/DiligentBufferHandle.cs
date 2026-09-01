@@ -1,7 +1,7 @@
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 
-namespace DecaEngine;
+namespace DecaEngine.Graphics.Diligent;
 
 public class DiligentBufferHandle : IBufferHandle
 {
@@ -108,7 +108,7 @@ public class DiligentBufferHandle : IBufferHandle
 			BindFlags = bindFlags,
 			Usage = usage,
 			CPUAccessFlags = cpuAccessFlags,
-			Mode = needsShaderView ? Diligent.BufferMode.Structured : Diligent.BufferMode.Undefined,
+			Mode = needsShaderView ? global::Diligent.BufferMode.Structured : global::Diligent.BufferMode.Undefined,
 		};
 
 		_buffer = _device.CreateBuffer(desc);

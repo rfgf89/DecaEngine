@@ -1,6 +1,5 @@
-using DecaEngine.Graphics.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 public enum PrimitiveTopologyType
 {

@@ -1,7 +1,6 @@
 using BCnEncoder.Encoder;
 using BCnEncoder.Shared;
 using CommunityToolkit.HighPerformance;
-using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Graphics.Assets;
 

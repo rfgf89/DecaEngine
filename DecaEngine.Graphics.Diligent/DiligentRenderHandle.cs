@@ -1,10 +1,9 @@
 using System.Numerics;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 
-namespace DecaEngine;
+namespace DecaEngine.Graphics.Diligent;
 
 // IGpuTexture - чтобы хэндл можно было передавать в backend-независимые перегрузки ICommandBuffer
 // (SetRenderTarget/ClearRenderTarget) вместо сырого Diligent-ITextureView.
@@ -62,9 +61,9 @@ public class DiligentRenderHandle : IRenderHandle, IGpuTexture
 	private void CreateTexture()
 	{
 		var dilFormat = DiligentResourceFormats.ToNativeFormat(_info.format);
-		if (dilFormat == Diligent.TextureFormat.Unknown)
+		if (dilFormat == global::Diligent.TextureFormat.Unknown)
 		{
-			dilFormat = Diligent.TextureFormat.RGBA8_UNorm;
+			dilFormat = global::Diligent.TextureFormat.RGBA8_UNorm;
 		}
 
 		var desc = new TextureDesc

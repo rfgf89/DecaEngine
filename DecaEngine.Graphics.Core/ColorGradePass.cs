@@ -1,9 +1,9 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the final colour grading + vignette pass (см.
 /// ColorGradePS.hlsl): one fullscreen material plus its own display-space copy of the frame.

@@ -1,4 +1,4 @@
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>
 /// Per-pass debug statistics collected while executing a <see cref="IRenderGraph"/>.

@@ -1,5 +1,6 @@
 ﻿using DecaEngine;
 using Diligent;
+using DecaEngine.Graphics.Diligent;
 
 namespace DecaEngine.Graphics.ProbeGi;
 

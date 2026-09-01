@@ -1,7 +1,7 @@
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Diligent;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>
 /// Покадровое расписание перерисовки теневых каскадов, разделяемое между системой сборки видов

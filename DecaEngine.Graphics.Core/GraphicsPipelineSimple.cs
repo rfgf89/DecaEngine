@@ -1,9 +1,9 @@
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Набор фич конвейера превью, которые можно менять НА ЖИВОМ конвейере - см.
 /// <see cref="GraphicsPipelineSimple.SetFeatures"/>. Всё, что здесь перечислено, переключается без

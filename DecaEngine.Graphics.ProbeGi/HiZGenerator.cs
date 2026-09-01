@@ -106,8 +106,8 @@ public class HiZGenerator : IDisposable
 
         context.TransitionResourceStates([new StateTransitionDesc {
             Resource = hizTexture,
-            OldState = ResourceState.Unknown,
-            NewState = ResourceState.UnorderedAccess,
+            OldState = global::Diligent.ResourceState.Unknown,
+            NewState = global::Diligent.ResourceState.UnorderedAccess,
             FirstMipLevel = 0,
             MipLevelsCount = 1
         }]);
@@ -122,8 +122,8 @@ public class HiZGenerator : IDisposable
 
         context.TransitionResourceStates([new StateTransitionDesc {
             Resource = hizTexture,
-            OldState = ResourceState.UnorderedAccess,
-            NewState = ResourceState.UnorderedAccess,
+            OldState = global::Diligent.ResourceState.UnorderedAccess,
+            NewState = global::Diligent.ResourceState.UnorderedAccess,
             FirstMipLevel = 0,
             MipLevelsCount = 1,
             TransitionType = StateTransitionType.Immediate
@@ -139,15 +139,15 @@ public class HiZGenerator : IDisposable
             context.TransitionResourceStates([
                 new StateTransitionDesc {
                     Resource = hizTexture,
-                    OldState = ResourceState.UnorderedAccess,
-                    NewState = ResourceState.ShaderResource,
+                    OldState = global::Diligent.ResourceState.UnorderedAccess,
+                    NewState = global::Diligent.ResourceState.ShaderResource,
                     FirstMipLevel = mip - 1,
                     MipLevelsCount = 1
                 },
                 new StateTransitionDesc {
                     Resource = hizTexture,
-                    OldState = ResourceState.Unknown, // CORRECTED: Use Unknown to discard previous mip content
-                    NewState = ResourceState.UnorderedAccess,
+                    OldState = global::Diligent.ResourceState.Unknown, // CORRECTED: Use Unknown to discard previous mip content
+                    NewState = global::Diligent.ResourceState.UnorderedAccess,
                     FirstMipLevel = mip,
                     MipLevelsCount = 1
                 }
@@ -166,8 +166,8 @@ public class HiZGenerator : IDisposable
 
             context.TransitionResourceStates([new StateTransitionDesc {
                 Resource = hizTexture,
-                OldState = ResourceState.UnorderedAccess,
-                NewState = ResourceState.UnorderedAccess,
+                OldState = global::Diligent.ResourceState.UnorderedAccess,
+                NewState = global::Diligent.ResourceState.UnorderedAccess,
                 FirstMipLevel = mip,
                 MipLevelsCount = 1,
                 TransitionType = StateTransitionType.Immediate
@@ -176,8 +176,8 @@ public class HiZGenerator : IDisposable
 
         context.TransitionResourceStates([new StateTransitionDesc {
             Resource = hizTexture,
-            OldState = ResourceState.Unknown,
-            NewState = ResourceState.ShaderResource,
+            OldState = global::Diligent.ResourceState.Unknown,
+            NewState = global::Diligent.ResourceState.ShaderResource,
             FirstMipLevel = 0,
             MipLevelsCount = _mipLevels
         }]);

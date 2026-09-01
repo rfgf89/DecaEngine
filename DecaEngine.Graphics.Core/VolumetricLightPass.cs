@@ -1,9 +1,9 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the volumetric-light post-process: one fullscreen material
 /// that raymarches the view ray through a participating medium, sampling the cascaded shadow map at

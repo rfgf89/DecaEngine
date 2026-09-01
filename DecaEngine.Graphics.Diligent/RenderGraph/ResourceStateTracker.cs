@@ -13,11 +13,11 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         // regardless of key overlap, so all mutation goes through this lock.
         private readonly object _lock = new();
 
-        private readonly Dictionary<IDeviceObject, ResourceState> _resourceStates = new();
+        private readonly Dictionary<IDeviceObject, global::Diligent.ResourceState> _resourceStates = new();
         private readonly List<StateTransitionDesc> _pendingTransitions = new();
         private readonly Dictionary<int, StateTransitionDesc[]> _arrayCache = new();
 
-        public void AddTransition(IDeviceObject resource, ResourceState newState)
+        public void AddTransition(IDeviceObject resource, global::Diligent.ResourceState newState)
         {
             if (resource == null) return;
 
@@ -26,7 +26,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                 if (_resourceStates.TryGetValue(resource, out var currentState))
                 {
                     // Allow UAV-to-UAV transition as it acts as a UAV barrier in Diligent
-                    if (currentState == newState && newState != ResourceState.UnorderedAccess) return;
+                    if (currentState == newState && newState != global::Diligent.ResourceState.UnorderedAccess) return;
 
                     _pendingTransitions.Add(new StateTransitionDesc
                     {
@@ -41,7 +41,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                     _pendingTransitions.Add(new StateTransitionDesc
                     {
                         Resource = resource,
-                        OldState = ResourceState.Unknown,
+                        OldState = global::Diligent.ResourceState.Unknown,
                         NewState = newState,
                         Flags = StateTransitionFlags.UpdateState
                     });
@@ -50,7 +50,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             }
         }
 
-        public void SetState(IDeviceObject resource, ResourceState state)
+        public void SetState(IDeviceObject resource, global::Diligent.ResourceState state)
         {
             if (resource == null) return;
             lock (_lock)

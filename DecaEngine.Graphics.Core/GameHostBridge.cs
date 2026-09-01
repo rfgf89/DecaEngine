@@ -1,7 +1,7 @@
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 public static class GameHostBridge
 {

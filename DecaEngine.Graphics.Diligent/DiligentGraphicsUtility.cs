@@ -283,7 +283,7 @@ public static unsafe class DiligentGraphicsUtility
 			{
 				Resource = sourceBuffer,
 				OldState = originalState,
-				NewState = ResourceState.CopySource,
+				NewState = global::Diligent.ResourceState.CopySource,
 				Flags = StateTransitionFlags.UpdateState
 			}
 		});
@@ -296,7 +296,7 @@ public static unsafe class DiligentGraphicsUtility
 			new StateTransitionDesc
 			{
 				Resource = sourceBuffer,
-				OldState = ResourceState.CopySource,
+				OldState = global::Diligent.ResourceState.CopySource,
 				NewState = originalState,
 				Flags = StateTransitionFlags.UpdateState
 			}

@@ -1,9 +1,9 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the atmospheric fog post-process: one fullscreen material
 /// that reads scene depth plus a copy of the frame and writes the frame back with exponential

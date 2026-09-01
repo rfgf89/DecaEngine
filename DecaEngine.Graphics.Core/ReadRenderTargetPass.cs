@@ -1,7 +1,6 @@
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Graphics;
 
 /// <summary>
 /// Minimal demo/debug pass: declares a read dependency on a texture pinned by an earlier pass

@@ -2,9 +2,9 @@ using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Ресурсы отладочной визуализации буфера векторов движения (см. MotionVectorDebugPS.hlsl).
 /// Живут ровно столько же, сколько <see cref="MotionVectorPassResources"/>, и создаются вместе с ними:

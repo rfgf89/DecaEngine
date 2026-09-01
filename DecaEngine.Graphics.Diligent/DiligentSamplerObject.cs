@@ -1,7 +1,7 @@
 using DecaEngine.Core;
 using Diligent;
 
-namespace DecaEngine;
+namespace DecaEngine.Graphics.Diligent;
 
 public class DiligentSamplerObject : ISamplerObject
 {

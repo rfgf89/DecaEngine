@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Animation;
-using DecaEngine.Graphics.Core;
 using MeshOptimizer;
 using UnsafeCollections.Collections.Unsafe;
 

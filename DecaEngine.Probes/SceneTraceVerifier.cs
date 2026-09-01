@@ -1,9 +1,9 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.ProbeGi;
 using Diligent;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Probes;
 

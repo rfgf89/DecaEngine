@@ -5,7 +5,6 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;

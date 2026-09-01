@@ -5,13 +5,12 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
-using ResourceState = DecaEngine.Core.ResourceState;
-using SetVertexBuffersFlags = DecaEngine.Core.SetVertexBuffersFlags;
+using ResourceState = DecaEngine.Graphics.ResourceState;
+using SetVertexBuffersFlags = DecaEngine.Graphics.SetVertexBuffersFlags;
 using TextureAddressMode = Diligent.TextureAddressMode;
 using ValueType = Diligent.ValueType;
 

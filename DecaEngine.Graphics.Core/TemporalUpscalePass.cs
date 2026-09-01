@@ -2,9 +2,9 @@ using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Ресурсы встроенного темпорального апскейлера (TAAU, см. TemporalUpscalePS.hlsl) -
 /// первый бэкенд слота апскейлера конвейера. Владеет display-размерными <see cref="OutputTarget"/>

@@ -1,6 +1,6 @@
 using DecaEngine.Core;
 
-namespace DecaEngine.Graphics.Core
+namespace DecaEngine.Graphics
 {
     /// <summary>
     /// High-level texture class that manages both CPU and GPU resources.

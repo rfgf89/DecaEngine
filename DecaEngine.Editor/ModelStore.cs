@@ -6,7 +6,6 @@ using DecaEngine.Core;
 using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Assets;
-using DecaEngine.Graphics.Core;
 using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Editor.ECS

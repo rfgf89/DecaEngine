@@ -1,10 +1,10 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using Diligent;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for stochastic screen-space reflections (см. SsrTracePS.hlsl /
 /// SsrResolvePS.hlsl / SsrCompositePS.hlsl): трейс-таргет (rgb хита + confidence), пара

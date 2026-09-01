@@ -1,9 +1,9 @@
 using System.Numerics;
-using DecaEngine.Graphics.Core;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 public interface ICommandBuffer
 {

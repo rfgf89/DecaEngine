@@ -4,6 +4,7 @@ using DecaEngine.Core;
 using DecaEngine.Core.Assets;
 using Engine.ImGui.Core;
 using Hexa.NET.ImGui;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 

@@ -1,4 +1,6 @@
-namespace DecaEngine.Core;
+using DecaEngine.Core;
+
+namespace DecaEngine.Graphics;
 
 /// <summary>
 /// Подтип Pipeline State, описываемый <see cref="IStateObject"/>.

@@ -1,8 +1,8 @@
 ﻿using System.Collections.Generic;
-using DecaEngine.Graphics.Core;
 using Diligent;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 public interface ISamplerObject : IReleaseObject { }
 

@@ -1,9 +1,9 @@
 using System;
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Бэкенд слота апскейлера, живущий В НАТИВНОЙ библиотеке (FSR через ffx-api, позже DLSS).
 /// Реализация лежит в графическом бэкенде (см. FsrUpscalerBackend в DecaEngine.Graphics.Diligent) и

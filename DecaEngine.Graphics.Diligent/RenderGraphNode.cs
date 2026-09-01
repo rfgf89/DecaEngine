@@ -484,7 +484,7 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 	/// container. Must be called after <see cref="SetupPass"/> has run for all passes (i.e. after
 	/// <see cref="DecaEngine.Graphics.Diligent.DiligentRenderGraph.Compile"/>).
 	/// </summary>
-	public IEnumerable<DecaEngine.Core.ResourceDebugInfo> ExportLifetimes(bool isBuffer)
+	public IEnumerable<DecaEngine.Graphics.ResourceDebugInfo> ExportLifetimes(bool isBuffer)
 	{
 		foreach (var desc in RenderTargetsDesc)
 		{
@@ -496,7 +496,7 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 			foreach (var view in ReadViewsDesc) { if (getViewDescName(view) == name) refCount++; }
 			foreach (var view in WriteViewsDesc) { if (getViewDescName(view) == name) refCount++; }
 
-			yield return new DecaEngine.Core.ResourceDebugInfo
+			yield return new DecaEngine.Graphics.ResourceDebugInfo
 			{
 				Name = name,
 				IsBuffer = isBuffer,

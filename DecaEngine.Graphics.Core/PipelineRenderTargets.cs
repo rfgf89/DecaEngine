@@ -1,6 +1,7 @@
-using DecaEngine.Graphics.Core;
 
-namespace DecaEngine.Core;
+using DecaEngine.Core;
+
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the off-screen color/depth/scene-copy targets a <see cref="GraphicsPipelineSimple"/>
 /// renders into - the off-screen equivalent of a swap chain's back buffer, created once by the

@@ -2,7 +2,7 @@
 using DecaEngine.Core;
 using UnsafeCollections.Collections.Unsafe;
 
-namespace DecaEngine.Graphics.Core;
+namespace DecaEngine.Graphics;
 
 public struct LodLevel
 {

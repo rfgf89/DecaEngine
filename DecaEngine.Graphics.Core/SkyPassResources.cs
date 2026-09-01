@@ -1,8 +1,8 @@
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the procedural sky background (fullscreen equirect-sample
 /// material). Created once by <see cref="GraphicsPipelineSimple"/> when a sky background is enabled -

@@ -1,7 +1,7 @@
 using System;
-using CoreClearDepthStencilFlags = DecaEngine.Core.ClearDepthStencilFlags;
-using CoreResourceState = DecaEngine.Core.ResourceState;
-using CoreSetVertexBuffersFlags = DecaEngine.Core.SetVertexBuffersFlags;
+using CoreClearDepthStencilFlags = DecaEngine.Graphics.ClearDepthStencilFlags;
+using CoreResourceState = DecaEngine.Graphics.ResourceState;
+using CoreSetVertexBuffersFlags = DecaEngine.Graphics.SetVertexBuffersFlags;
 using NativeClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using NativeResourceState = Diligent.ResourceState;
 using NativeSetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
@@ -16,7 +16,7 @@ internal static class DiligentEnumMapping
 	/// <summary>Выставляется в DiligentGraphicsApi.Initialize. Нужен маппингу DepthRead: смысл
 	/// этого состояния в движке - "депт-текстура читается шейдером как SRV", но нативное
 	/// представление зависит от бэкенда (см. ниже).</summary>
-	internal static DecaEngine.Core.GraphicsBackend Backend;
+	internal static DecaEngine.Graphics.GraphicsBackend Backend;
 
 	// DepthRead:
 	//  - Vulkan: одиночный DEPTH_READ - SRV депта биндится с лейаутом
@@ -31,7 +31,7 @@ internal static class DiligentEnumMapping
 		CoreResourceState.Unknown => NativeResourceState.Unknown,
 		CoreResourceState.RenderTarget => NativeResourceState.RenderTarget,
 		CoreResourceState.DepthWrite => NativeResourceState.DepthWrite,
-		CoreResourceState.DepthRead => Backend == DecaEngine.Core.GraphicsBackend.Vulkan
+		CoreResourceState.DepthRead => Backend == DecaEngine.Graphics.GraphicsBackend.Vulkan
 			? NativeResourceState.DepthRead
 			: NativeResourceState.DepthRead | NativeResourceState.ShaderResource,
 		CoreResourceState.ShaderResource => NativeResourceState.ShaderResource,

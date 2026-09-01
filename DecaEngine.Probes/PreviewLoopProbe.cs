@@ -4,6 +4,7 @@ using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 using DecaEngine.Editor;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Probes;
 

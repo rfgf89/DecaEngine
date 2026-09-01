@@ -1,9 +1,9 @@
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Core.Diagnostics;
-using DecaEngine.Graphics.Core;
 using StbImageSharp;
 using DecaEngine.Animation;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 

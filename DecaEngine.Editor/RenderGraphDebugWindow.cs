@@ -2,6 +2,7 @@
 using System.Numerics;
 using DecaEngine.Core;
 using Hexa.NET.ImGui;
+using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 

@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Graphics.ProbeGi;
 

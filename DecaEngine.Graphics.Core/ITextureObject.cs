@@ -2,7 +2,7 @@ using System;
 using DecaEngine.Core;
 using SharpGLTF.Schema2; // For Image
 
-namespace DecaEngine.Graphics.Core
+namespace DecaEngine.Graphics
 {
 	public struct TextureInfo
 	{

@@ -1,4 +1,4 @@
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Реестр ЖИВЫХ конвейеров (<see cref="IGraphicsPipeline"/>). Каждый конвейер регистрируется
 /// в нём САМ, в своём конструкторе - поэтому окну отладки рендер-графа

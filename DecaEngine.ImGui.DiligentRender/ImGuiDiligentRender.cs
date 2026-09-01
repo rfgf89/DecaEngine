@@ -1,9 +1,7 @@
 ﻿using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using DecaEngine;
 using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 using Hexa.NET.ImGui;
@@ -11,6 +9,7 @@ using Hexa.NET.ImGui;
 using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using TextureFormat = Diligent.TextureFormat;
 using ValueType = Diligent.ValueType;
+using DecaEngine.Graphics;
 
 public class ImGuiDiligentRender : ImGuiRender
 {

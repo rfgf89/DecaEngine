@@ -7,6 +7,7 @@ using DiligentEngineNET.Samples.Utils;
 using Hexa.NET.ImGui;
 using SDL;
 using Version = Diligent.Version;
+using DecaEngine.Graphics;
 
 namespace DecaEngine;
 

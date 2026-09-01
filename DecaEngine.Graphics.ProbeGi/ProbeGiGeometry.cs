@@ -1,7 +1,6 @@
 ﻿using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
@@ -161,7 +160,7 @@ public sealed class ProbeInstancedGeometry
 	/// <summary>Потолок числа уникальных текстур хитов - размер массива Texture2D в шейдере
 	/// (bindless-режим) и слоёв атласа, сшит с SsrPassResources.MaxHitTextures. Не влезшие
 	/// материалы честно падают на потриугольное альбедо (TextureIndex = -1).</summary>
-	public const int MaxHitTextures = DecaEngine.Core.SsrPassResources.MaxHitTextures;
+	public const int MaxHitTextures = DecaEngine.Graphics.SsrPassResources.MaxHitTextures;
 
 	public int TriangleCount => Triangles.Length;
 }

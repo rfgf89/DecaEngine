@@ -1,5 +1,4 @@
 ﻿using DecaEngine.Core;
-using DecaEngine.Graphics.Core;
 using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;

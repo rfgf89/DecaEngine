@@ -1,10 +1,10 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for auto-exposure ("eye adaptation"): the log-luminance reduction
 /// chain over the HDR frame plus the 1x1 ping-pong pair holding the temporally smoothed luminance

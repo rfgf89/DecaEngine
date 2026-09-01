@@ -1,8 +1,8 @@
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Техника экранной амбиентной окклюзии AO-пасса превью. Выбирает пиксельный шейдер в
 /// <see cref="SsaoPassResources"/> (SsaoCommon.hlsl против GtaoCommon.hlsl) - весь остальной

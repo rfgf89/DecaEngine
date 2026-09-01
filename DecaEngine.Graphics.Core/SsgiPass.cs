@@ -1,8 +1,8 @@
 using System.Numerics;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Core;
+using DecaEngine.Core;
 
-namespace DecaEngine.Core;
+namespace DecaEngine.Graphics;
 
 /// <summary>Owns the GPU resources for the SSGI (screen-space global illumination) post-process:
 /// the GI render target plus the two fullscreen materials (depth + scene copy -&gt; one-bounce
