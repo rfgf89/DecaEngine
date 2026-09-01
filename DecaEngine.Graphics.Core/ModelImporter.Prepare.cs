@@ -15,11 +15,11 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>CPU-фаза: разбор glTF в PreparedModel - меши, LOD-ы, скелет, клипы, материалы. Часть <see cref="ModelLoader"/> - файл на фазу; состояние,
-/// точки входа загрузки и Release живут в основном файле.</summary>
-public partial class ModelLoader
+/// <summary>CPU-фаза: разбор glTF в PreparedModel - меши, LOD-ы, скелет, клипы, материалы. Часть <see cref="ModelImporter"/> - CPU-стороны импорта; ФАЗА потребления (GPU-финализация) и
+/// точки входа загрузки живут в <see cref="ModelLoader"/>.</summary>
+public static partial class ModelImporter
 {
-	private static PreparedModel PrepareModel(string modelPath, ModelLoadOptions options,
+	internal static PreparedModel PrepareModel(string modelPath, ModelLoadOptions options,
 		IProgress<float> progress, CancellationToken cancellationToken)
 	{
 		// Ассет-пайплайн. При ПОПАДАНИИ всё, что ниже, не выполняется вовсе: ни разбора glTF, ни
@@ -505,11 +505,11 @@ public partial class ModelLoader
 				// материалу, так что отдельный материал на топологию не требует его переделки.
 				int topology = primitive.DrawPrimitiveType switch
 				{
-					PrimitiveType.TRIANGLES => MeshTopologyTriangles,
-					PrimitiveType.LINES => MeshTopologyLineList,
-					PrimitiveType.LINE_STRIP => MeshTopologyLineStrip,
-					PrimitiveType.LINE_LOOP => MeshTopologyLineStrip,
-					PrimitiveType.POINTS => MeshTopologyPoints,
+					PrimitiveType.TRIANGLES => ModelLoader.MeshTopologyTriangles,
+					PrimitiveType.LINES => ModelLoader.MeshTopologyLineList,
+					PrimitiveType.LINE_STRIP => ModelLoader.MeshTopologyLineStrip,
+					PrimitiveType.LINE_LOOP => ModelLoader.MeshTopologyLineStrip,
+					PrimitiveType.POINTS => ModelLoader.MeshTopologyPoints,
 					_ => -1,
 				};
 				if (topology < 0)
@@ -617,7 +617,7 @@ public partial class ModelLoader
 			var sourceIndices = work.SourceIndices;
 			var sourceSkin = work.SourceSkin;
 
-			if (work.Topology == MeshTopologyTriangles)
+			if (work.Topology == ModelLoader.MeshTopologyTriangles)
 			{
 				for (int t = 0; t + 2 < sourceIndices.Length; t += 3)
 				{
@@ -677,7 +677,7 @@ public partial class ModelLoader
 			var finalSkin = sourceSkin;
 			LodLevel[] lodLevels = null;
 
-			if (work.Topology == MeshTopologyTriangles)
+			if (work.Topology == ModelLoader.MeshTopologyTriangles)
 			{
 				// Must run before Optimize/GenerateLods reorder/remap vertices - it needs the
 				// pristine per-triangle winding to compute per-triangle tangents, but the resulting
@@ -811,9 +811,9 @@ public partial class ModelLoader
 					// Не-треугольная топология: инстанс ссылается на материал-клон с подходящим PSO
 					// (создаётся в BuildFromPrepared по этому реестру).
 					int topology = prepared.Meshes[meshId].Topology;
-					if (topology != MeshTopologyTriangles)
+					if (topology != ModelLoader.MeshTopologyTriangles)
 					{
-						int synthKey = MakeTopologyMaterialKey(topology, materialId);
+						int synthKey = ModelLoader.MakeTopologyMaterialKey(topology, materialId);
 						prepared.TopologyMaterialClones[synthKey] = (materialId, topology);
 						materialId = synthKey;
 					}
@@ -833,4 +833,9 @@ public partial class ModelLoader
 		return prepared;
 	}
 
+
+	/// <summary>Подготовка МИМО кеша - вход для фоновой печки (см. <see cref="AssetBakeQueue"/>).
+	/// Рекурсии не даёт сам вызывающий: он снимает CacheDirectory в переданных опциях.</summary>
+	internal static PreparedModel PrepareForBake(string modelPath, ModelLoadOptions options,
+		CancellationToken cancellationToken) => PrepareModel(modelPath, options, null, cancellationToken);
 }

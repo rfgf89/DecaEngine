@@ -443,7 +443,7 @@ public partial class ModelLoader
 		return any ? (min, max) : (Vector3.Zero, Vector3.Zero);
 	}
 
-	private static TextureAddress ToAddressMode(TextureWrapMode wrapMode)
+	internal static TextureAddress ToAddressMode(TextureWrapMode wrapMode)
 	{
 		return wrapMode switch
 		{
@@ -454,7 +454,7 @@ public partial class ModelLoader
 		};
 	}
 
-	private static TextureFilter ToFilter(TextureMipMapFilter minFilter, TextureInterpolationFilter magFilter)
+	internal static TextureFilter ToFilter(TextureMipMapFilter minFilter, TextureInterpolationFilter magFilter)
 	{
 		if (magFilter == TextureInterpolationFilter.LINEAR)
 		{
@@ -491,7 +491,7 @@ public partial class ModelLoader
 	/// </summary>
 	public const string DefaultModelPath = "EditorAssets/models/result.gltf";
 
-	private ModelLoader()
+	internal ModelLoader()
 	{
 	}
 
@@ -539,9 +539,160 @@ public partial class ModelLoader
 		return request.FinalizeOnMainThread();
 	}
 
-	/// <summary>Подготовка МИМО кеша - вход для фоновой печки (см. <see cref="AssetBakeQueue"/>).
-	/// Рекурсии не даёт сам вызывающий: он снимает CacheDirectory в переданных опциях.</summary>
-	internal static PreparedModel PrepareForBake(string modelPath, ModelLoadOptions options,
-		CancellationToken cancellationToken) => PrepareModel(modelPath, options, null, cancellationToken);
+	/// <summary>
+	/// Handle to an in-flight background <see cref="ModelLoader"/> load (see <see cref="BeginLoadAsync"/>).
+	/// Poll <see cref="PrepareTask"/>/<see cref="Progress"/> from the render loop and, once the task
+	/// completes successfully, call <see cref="FinalizeOnMainThread"/> on the graphics thread to create
+	/// the actual GPU resources and obtain the ready <see cref="ModelLoader"/>.
+	/// </summary>
+	public sealed class ModelLoadRequest
+	{
+		private readonly IGraphicsApi _graphicsApi;
+		private readonly ModelLoadOptions _options;
+		private readonly ProgressTracker _progressTracker = new();
 
+		public string ModelPath { get; }
+		public Task PrepareTask { get; }
+		public float Progress => _progressTracker.Value;
+
+		private PreparedModel _prepared;
+
+		// Состояние пошаговой финализации (см. FinalizeChunk): наполовину построенный ModelLoader и
+		// текущая позиция итератора BuildFromPreparedIncremental. Живёт между кадрами.
+		private ModelLoader _finalizing;
+		private long _finalizeMs;
+		private IEnumerator<long> _finalizeSteps;
+
+		internal ModelLoadRequest(IGraphicsApi graphicsApi, string modelPath, ModelLoadOptions options,
+			IProgress<float> externalProgress, CancellationToken cancellationToken)
+		{
+			_graphicsApi = graphicsApi;
+			_options = options;
+			ModelPath = modelPath;
+
+			var combinedProgress = new Progress<float>(p =>
+			{
+				_progressTracker.Value = p;
+				externalProgress?.Report(p);
+			});
+
+			PrepareTask = Task.Run(() =>
+			{
+				_prepared = ModelImporter.PrepareModel(modelPath, options, combinedProgress, cancellationToken);
+				// Прогрев шейдер-вариантов ЗДЕСЬ, в фоне - иначе они компилируются лениво из
+				// SetShader во время финализации, синхронно на GPU-потоке (см. PrecompileShaderVariants).
+				PrecompileShaderVariants(graphicsApi, options, _prepared, cancellationToken);
+			}, cancellationToken);
+		}
+
+		/// <summary>Дефолтный байтовый бюджет одного вызова <see cref="FinalizeChunk"/>. Подобран под
+		/// дефолтный dynamicHeapSize Diligent-а: страницы upload-хипа возвращаются в пул только на
+		/// FinishFrame (Present), поэтому бюджет кадра и определяет пиковый расход host-visible
+		/// памяти при загрузке (у Sponza одним махом выходило 2.5+ GB и «Space in dynamic heap is
+		/// almost exhausted» с принудительным idle GPU).</summary>
+		public const long DefaultFinalizeBudgetBytes = 96L << 20;
+
+		/// <summary>
+		/// Creates the GPU resources (shaders/materials/textures/meshes) for a completed background load
+		/// and returns the ready <see cref="ModelLoader"/>. Must be called on the thread that owns the
+		/// <see cref="IGraphicsApi"/> passed to <see cref="BeginLoadAsync"/> (i.e. the main/render
+		/// thread), only after <see cref="PrepareTask"/> has completed successfully. Заливает ВСЮ
+		/// модель одним вызовом - в интерактивном рендер-лупе предпочитайте покадровый
+		/// <see cref="FinalizeChunk"/>, иначе upload-хип раздувается на весь размер модели.
+		/// </summary>
+		public ModelLoader FinalizeOnMainThread() => FinalizeChunk(long.MaxValue, long.MaxValue);
+
+		/// <summary>
+		/// Покадровая версия <see cref="FinalizeOnMainThread"/>: создаёт GPU-ресурсы, пока суммарная
+		/// оценка залитых байт не превысит <paramref name="budgetBytes"/>, и возвращает null - «зайди
+		/// на следующем кадре» (между вызовами обязан пройти Present, освобождающий страницы
+		/// upload-хипа). Когда всё создано - возвращает готовый <see cref="ModelLoader"/>. Те же
+		/// требования, что у FinalizeOnMainThread: главный поток, PrepareTask завершился успешно.
+		/// Внимание: бросить запрос между вызовами (не дойдя до результата) - значит утечь уже
+		/// созданными GPU-ресурсами: у ModelLoader нет Release, недостроенный экземпляр никому не
+		/// возвращается.
+		/// </summary>
+		public ModelLoader FinalizeChunk(long budgetBytes = DefaultFinalizeBudgetBytes,
+			long budgetMs = FinalizeBudgetMs)
+		{
+			if (!PrepareTask.IsCompletedSuccessfully)
+			{
+				throw new InvalidOperationException(
+					"FinalizeChunk called before the background load finished successfully.");
+			}
+
+			if (_prepared == null)
+			{
+				throw new InvalidOperationException("FinalizeChunk called after finalization already completed.");
+			}
+
+			if (_finalizeSteps == null)
+			{
+				_finalizing = new ModelLoader();
+				_finalizeSteps = BuildFromPreparedIncremental(_graphicsApi, _options, _prepared, _finalizing);
+			}
+
+			// Финализация размазана по кадрам, поэтому её время копится по кусочкам - иначе цифра
+			// показывала бы длину последнего чанка, а не стоимость фазы.
+			var swFinalize = System.Diagnostics.Stopwatch.StartNew();
+
+			long uploadedBytes = 0;
+			while (uploadedBytes < budgetBytes)
+			{
+				if (!_finalizeSteps.MoveNext())
+				{
+					var ready = _finalizing;
+					_finalizeMs += swFinalize.ElapsedMilliseconds;
+					ready.Timings = new LoadTimings(_prepared.MsParse, _prepared.MsDecode,
+						_prepared.MsMaterials, _prepared.MsMeshes, _finalizeMs,
+						_prepared.DecodedImages, _prepared.DecodedBytes,
+						ready._shaderVariants, ready._shaderMs, ready._textureCount, ready._textureMs,
+						ready._meshCount, ready._meshMs, ready._samplerCount, ready._samplerMs, ready._materialCount, ready._materialMs, ready._matCreateMs, ready._matShaderMs);
+
+					_finalizeSteps.Dispose();
+					_finalizeSteps = null;
+					_finalizing = null;
+					_prepared = null;
+
+					// Кэш PSO - на диск ровно здесь: загрузка только что создала все конвейеры модели,
+					// а следующий запуск иначе скомпилирует их заново (см. IGraphicsApi.SavePipelineCache).
+					_graphicsApi.SavePipelineCache();
+					return ready;
+				}
+
+				uploadedBytes += _finalizeSteps.Current;
+
+				// Бюджет ВРЕМЕНИ, а не только байт. Байтовый бюджет считает ЗАЛИВКУ, а самое дорогое
+				// в финализации байт не заливает вовсе: компиляция вариантов пиксельного шейдера
+				// (секунда на вариант) и создание материалов. В режиме стриминга текстур оценка
+				// материала - жалкие 4 КБ, так что все 50+ материалов Sponza со всеми компиляциями
+				// проходили за ОДИН вызов, то есть за один кадр: окно редактора висело "Not
+				// Responding" на всё время загрузки.
+				if (swFinalize.ElapsedMilliseconds >= budgetMs)
+				{
+					break;
+				}
+			}
+
+			_finalizeMs += swFinalize.ElapsedMilliseconds;
+
+			return null;
+		}
+
+		/// <summary>Сколько миллисекунд одному вызову <see cref="FinalizeChunk"/> позволено занимать
+		/// поток рендера. Один шаг итератора прервать нельзя (компиляция шейдера идёт целиком), так
+		/// что реальный кадр может выйти длиннее - но следующий шаг уже уедет в следующий кадр, и UI
+		/// остаётся живым.</summary>
+		public const long FinalizeBudgetMs = 8;
+
+		private sealed class ProgressTracker
+		{
+			private float _value;
+			public float Value
+			{
+				get => Volatile.Read(ref _value);
+				set => Volatile.Write(ref _value, value);
+			}
+		}
+	}
 }

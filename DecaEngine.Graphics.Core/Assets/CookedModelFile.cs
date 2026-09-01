@@ -7,7 +7,7 @@ using DecaEngine.Animation;
 namespace DecaEngine.Graphics.Assets;
 
 /// <summary>
-/// Контейнер запечённой модели: результат ФОНОВОЙ фазы загрузки (<c>ModelLoader.PrepareModel</c>)
+/// Контейнер запечённой модели: результат ФОНОВОЙ фазы загрузки (<c>ModelImporter.PrepareModel</c>)
 /// целиком, сериализованный на диск. Хранит уже подготовленную геометрию - переведённую в
 /// левостороннюю систему, с посчитанными нормалями и тангентами, прогнанную через meshopt и с
 /// готовыми LOD-уровнями, - плюс материалы со ссылками на .dtex-текстуры и список инстансов.
@@ -82,8 +82,8 @@ public static class CookedModelFile
 				WriteTopologyClones(writer, prepared);
 
 				// Потриугольные атрибуты материала - ОБЯЗАТЕЛЬНО здесь: считать их можно только
-				// пока живы пиксели текстур (см. ModelLoader.EnsureTriangleAttributes).
-				ModelLoader.EnsureTriangleAttributes(prepared);
+				// пока живы пиксели текстур (см. ModelImporter.EnsureTriangleAttributes).
+				ModelImporter.EnsureTriangleAttributes(prepared);
 				WriteTriangleAttributes(writer, prepared);
 
 				WriteSkeleton(writer, prepared);
@@ -243,7 +243,7 @@ public static class CookedModelFile
 			// Среднее base color считается по ПИКСЕЛЯМ, которых в cooked-модели нет, - значит оно
 			// обязано лежать в файле. Ensure здесь, а не на вызывающей стороне: на этом шаге пиксели
 			// ещё живы (печка держит PreparedModel целиком), а после чтения из кеша их уже не будет.
-			ModelLoader.EnsureAverageBaseColor(material);
+			ModelImporter.EnsureAverageBaseColor(material);
 			WriteVector4(writer, material.AverageBaseColorRgba.Value);
 
 			// Бинарность альфы - тоже по пикселям и тоже обязана лежать в файле (см.

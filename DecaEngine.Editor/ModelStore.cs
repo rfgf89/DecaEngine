@@ -167,7 +167,7 @@ namespace DecaEngine.Editor.ECS
 		private readonly List<Entry> _evictScratch = new();
 
 		/// <summary>Фоновый декод ОДНОЙ текстуры сразу всей лестницей качества (см.
-		/// <see cref="ModelLoader.DecodeEncodedImageLadder"/>): файл читается и декодируется ровно один
+		/// <see cref="ModelImporter.DecodeEncodedImageLadder"/>): файл читается и декодируется ровно один
 		/// раз за всю жизнь текстуры, а не по разу на ступень.</summary>
 		private sealed class TextureUpgradeJob
 		{
@@ -658,7 +658,7 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>Забирает результаты завершившихся фоновых декодов. Декод отдаёт СРАЗУ ВСЮ лестницу
-		/// качества (см. <see cref="ModelLoader.DecodeEncodedImageLadder"/>), поэтому здесь остаётся
+		/// качества (см. <see cref="ModelImporter.DecodeEncodedImageLadder"/>), поэтому здесь остаётся
 		/// только переложить готовые ступени в очередь заливки - это перекладывание ссылок, бюджета тика
 		/// оно не тратит (его тратит <see cref="UploadPendingLevels"/>).</summary>
 		private void CollectTextureDecodes()
@@ -1029,7 +1029,7 @@ namespace DecaEngine.Editor.ECS
 			// ступень "64px" стоит ровно столько же, сколько полная, и лестница из отдельных декодов
 			// означала бы N полных разжатий одного файла (это и делало появление модели МЕДЛЕННЕЕ, чем
 			// загрузка сразу в целевом качестве). Все ступени снимаются с одной цепочки даунскейлов и
-			// заливаются по одной - см. ModelLoader.DecodeEncodedImageLadder и UploadPendingLevels.
+			// заливаются по одной - см. ModelImporter.DecodeEncodedImageLadder и UploadPendingLevels.
 			var source = bestStream;
 			var stepFactor = Math.Max(2, TextureStepFactor);
 			_textureJobs.Add(new TextureUpgradeJob
@@ -1055,7 +1055,7 @@ namespace DecaEngine.Editor.ECS
 				return new List<ModelLoader.StreamedTextureLevel>();
 			}
 
-			var decoded = ModelLoader.DecodeEncodedImageLadder(encoded, targetSize, firstSize, stepFactor);
+			var decoded = ModelImporter.DecodeEncodedImageLadder(encoded, targetSize, firstSize, stepFactor);
 			var levels = new List<ModelLoader.StreamedTextureLevel>(decoded.Count);
 
 			foreach (var (pixels, width, height) in decoded)

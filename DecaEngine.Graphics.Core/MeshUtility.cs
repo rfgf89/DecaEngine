@@ -210,7 +210,7 @@ public static class MeshUtility
 
 	// --- Pure CPU-array variants below, operating on plain managed arrays instead of an already-created
 	// IMeshObject's native buffers. Used by ModelLoader's background load pipeline (see
-	// ModelLoader.PrepareModel) so mesh optimization/LOD generation - all pure CPU meshoptimizer work -
+	// ModelImporter.PrepareModel) so mesh optimization/LOD generation - all pure CPU meshoptimizer work -
 	// can run off the main/GPU thread, before any GPU resource is created for the mesh. ---
 
 	/// <summary>

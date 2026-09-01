@@ -167,7 +167,7 @@ public static class AssetBakeQueue
 		// не ушла в кеш рекурсивно.
 		var bakeOptions = job.Options with { StreamTextures = false, CacheDirectory = null };
 
-		var prepared = ModelLoader.PrepareForBake(job.ModelPath, bakeOptions, token);
+		var prepared = ModelImporter.PrepareForBake(job.ModelPath, bakeOptions, token);
 		token.ThrowIfCancellationRequested();
 
 		ModelAssetBaker.BakeTextures(prepared, cache, job.Options, token);

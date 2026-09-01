@@ -15,16 +15,16 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Потриугольные атрибуты для probe GI: альбедо из текстур, тайлы, упаковка единичных векторов. Часть <see cref="ModelLoader"/> - файл на фазу; состояние,
-/// точки входа загрузки и Release живут в основном файле.</summary>
-public partial class ModelLoader
+/// <summary>Потриугольные атрибуты для probe GI: альбедо из текстур, тайлы, упаковка единичных векторов. Часть <see cref="ModelImporter"/> - CPU-стороны импорта; ФАЗА потребления (GPU-финализация) и
+/// точки входа загрузки живут в <see cref="ModelLoader"/>.</summary>
+public static partial class ModelImporter
 {
 	/// <summary>Линейное альбедо КАЖДОГО треугольника меша: base color текстуры в центроиде UV
 	/// (точечная выборка с заворотом) x линейный фактор. Ключ - meshId; меши без текстуры/UV или
 	/// без CPU-пикселей (стриминг, cooked-модель) пропускаются - потребитель падает на средний
 	/// цвет материала (<see cref="MaterialPbrFactors.AverageBaseColor"/>). Стоимость - единицы
 	/// миллисекунд на Sponza (одна выборка на треугольник) на фоне декода текстур.</summary>
-	private static void ComputeTriangleAlbedoFromTextures(ModelLoader result, PreparedModel prepared)
+	internal static void ComputeTriangleAlbedoFromTextures(ModelLoader result, PreparedModel prepared)
 	{
 		var materialByLogical = new Dictionary<int, PreparedMaterial>();
 		foreach (var pm in prepared.Materials)
@@ -288,14 +288,14 @@ public partial class ModelLoader
 	private static byte EncodeUnitSrgb(float linear) =>
 		EncodeUnit(MathF.Pow(Math.Clamp(linear, 0f, 1f), 1f / 2.2f));
 
-	/// <summary>Бокс-даунсемпл base color текстуры в плитку <see cref="AlbedoTileSize"/>² (см.
+	/// <summary>Бокс-даунсемпл base color текстуры в плитку <see cref="ModelLoader.AlbedoTileSize"/>² (см.
 	/// <see cref="MaterialAlbedoTile"/>). Усреднение в линейном пространстве, но по РАЗРЕЖЕННОЙ
 	/// сетке (до 4x4 сэмплов на тексель плитки, как stride у ComputeAverageBaseColor): полный
 	/// проход по 2К-текстуре стоил бы сотни миллионов выборок на модель, а плитке 128² больше
 	/// точности и не нужно.</summary>
 	private static byte[] BuildAlbedoTile(PreparedTexture texture)
 	{
-		const int size = AlbedoTileSize;
+		const int size = ModelLoader.AlbedoTileSize;
 
 		// sRGB -> linear через таблицу: pow на каждый сэмпл - главная цена всего прохода.
 		Span<float> toLinear = stackalloc float[256];

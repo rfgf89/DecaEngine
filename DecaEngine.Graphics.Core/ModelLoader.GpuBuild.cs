@@ -617,7 +617,7 @@ public partial class ModelLoader
 		// синтетический ключ, см. MakeTopologyMaterialKey), т.к. materialScales собран по инстансам.
 		MaterialPbrFactors BuildFactors(PreparedMaterial pm, int scaleKey)
 		{
-			var averageBaseColor = ComputeAverageBaseColor(pm);
+			var averageBaseColor = ModelImporter.ComputeAverageBaseColor(pm);
 			return new MaterialPbrFactors
 			{
 			BaseColorFactor = pm.BaseColorFactor,
@@ -771,7 +771,7 @@ public partial class ModelLoader
 		// Потриугольное альбедо из текстур - пока CPU-пиксели base color ещё живы (после
 		// финализации они освобождаются). Потребитель - probe-GI бейкер: цвет отскока и
 		// RT-отражений в разрешении треугольников вместо одного среднего на материал.
-		ComputeTriangleAlbedoFromTextures(result, prepared);
+		ModelImporter.ComputeTriangleAlbedoFromTextures(result, prepared);
 	}
 
 }

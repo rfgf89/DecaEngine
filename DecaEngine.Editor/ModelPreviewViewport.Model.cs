@@ -223,7 +223,7 @@ namespace DecaEngine.Editor
 
 		/// <summary>
 		/// Cancels and releases the in-flight background load, if any - the background Task.Run in
-		/// ModelLoader.PrepareModel checks the token between phases, so this actually stops it from
+		/// ModelImporter.PrepareModel checks the token between phases, so this actually stops it from
 		/// continuing to burn CPU decoding textures for a model/sub-mesh selection the user has already
 		/// moved on from, instead of just forgetting the reference and letting it run to completion
 		/// unobserved.
