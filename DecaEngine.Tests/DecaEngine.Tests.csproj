@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<IsPackable>false</IsPackable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="coverlet.collector" Version="6.0.4" />
+		<PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+		<PackageReference Include="xunit" Version="2.9.3" />
+		<PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+		<ProjectReference Include="..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
+
+		<!--
+			Ссылка на ИСПОЛНЯЕМЫЙ проект редактора, потому что ProbeGiBaker живёт в нём - вместе с
+			окнами ImGui, MSBuild-локатором и загрузкой нативных библиотек. Ради чистой математики
+			веера лучей сюда приезжает весь редактор.
+
+			Это не удобство сборки тестов, а симптом: probe GI - код рантайма, а не редактора.
+			Ссылка уйдёт, когда ProbeGi переедет в свой модуль.
+		-->
+		<ProjectReference Include="..\DecaEngine.Editor\DecaEngine.Editor.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Using Include="Xunit" />
+	</ItemGroup>
+
+</Project>
