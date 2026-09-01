@@ -1,0 +1,6 @@
+﻿[shim] agility: SetSDKVersion(619, ".\D3D12\") hr=0x00000000
+[full] model: EditorAssets/models/Sponza.gltf, frames: 300, backend: D3D12
+[full] done: 300 frames, HasModel=True, LoadError=, finalized=37, texturesReady=50, visible=50, streamingComplete=78
+[full] final texture quality: min=4 max=1024, still streaming 0/69
+[full] store state: entries=1, streams=69, ceiling=1024, withSource=0, atZero=0, atTarget=68, decodeJobs=0, queuedLevels=0, pendingLevelMB=0, textureMB=362/1024, stalled=False
+[full] log x1: Model preview: FULL reload for 'EditorAssets/models/Sponza.gltf' subMesh=-1 (resident was

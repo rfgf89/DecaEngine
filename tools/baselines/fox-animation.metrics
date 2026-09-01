@@ -1,0 +1,58 @@
+﻿[shim] agility: SetSDKVersion(619, ".\D3D12\") hr=0x00000000
+[probe] backend: D3D12
+[probe] meshes=1 materials=2 instances=1
+[probe] alpha-tested shadows: 0 materials, не кастеры: 0
+[probe] entities created: 1 (subMesh=-1)
+[probe] animreport: клип 'GetUp_FromBack', 2,333 с, выборок 60, костей 25
+[probe] animreport [GetUp_FromBack]: замыкание цикла - худший разрыв 55,108 (35,7% размаха) на 'b_LeftHand_011', движение за шаг 1,943 ЦИКЛ НЕ ЗАМКНУТ
+[probe] animreport [GetUp_FromBack]: таз - вертикальный размах 31,599 (y 9,2..40,8)
+[probe] animreport [GetUp_FromBack]: опора L - ход 44,742, опора 37/60 кадров, скольжение 41,252 (92,2% хода)
+[probe] animreport [GetUp_FromBack]: опора R - ход 47,416, опора 34/60 кадров, скольжение 25,354 (53,5% хода)
+[probe] animreport [GetUp_FromBack]: кисть L - ход 60,352, опора 38/60 кадров, скольжение 84,967 (140,8% хода)
+[probe] animreport [GetUp_FromBack]: кисть R - ход 60,574, опора 31/60 кадров, скольжение 51,79 (85,5% хода)
+[probe] animreport [GetUp_FromBack]: фаза ног - сдвиг 0 периода (синхронно - прыжок/галоп/иноходь)
+[probe] animreport: клип 'GetUp_FromBelly', 1,375 с, выборок 60, костей 25
+[probe] animreport [GetUp_FromBelly]: замыкание цикла - худший разрыв 32,266 (22,5% размаха) на 'b_Head_05', движение за шаг 0,645 ЦИКЛ НЕ ЗАМКНУТ
+[probe] animreport [GetUp_FromBelly]: таз - вертикальный размах 31,721 (y 9,2..40,92)
+[probe] animreport [GetUp_FromBelly]: опора L - ход 3,361, опора 4/60 кадров, скольжение 3,502 (104,2% хода)
+[probe] animreport [GetUp_FromBelly]: опора R - ход 3,36, опора 4/60 кадров, скольжение 3,499 (104,1% хода)
+[probe] animreport [GetUp_FromBelly]: кисть L - ход 16,694, опора 2/60 кадров, скольжение 6,751 (40,4% хода)
+[probe] animreport [GetUp_FromBelly]: кисть R - ход 16,666, опора 2/60 кадров, скольжение 6,718 (40,3% хода)
+[probe] animreport [GetUp_FromBelly]: фаза ног - сдвиг 0 периода (синхронно - прыжок/галоп/иноходь)
+[probe] animreport: клип 'Run', 1,125 с, выборок 60, костей 25
+[probe] animreport [Run]: замыкание цикла - худший разрыв 10,007 (6,2% размаха) на 'b_LeftHand_011', движение за шаг 1,223 ЦИКЛ НЕ ЗАМКНУТ
+[probe] animreport [Run]: таз - вертикальный размах 10,722 (y 33,63..44,35)
+[probe] animreport [Run]: опора L - ход 34,951, опора 12/60 кадров, скольжение 41,404 (118,5% хода)
+[probe] animreport [Run]: опора R - ход 38,453, опора 17/60 кадров, скольжение 54,866 (142,7% хода)
+[probe] animreport [Run]: кисть L - ход 26,84, опора 21/60 кадров, скольжение 49,859 (185,8% хода)
+[probe] animreport [Run]: кисть R - ход 26,836, опора 12/60 кадров, скольжение 60,802 (226,6% хода)
+[probe] animreport [Run]: фаза ног - сдвиг 0,07 периода (синхронно - прыжок/галоп/иноходь)
+[probe] animreport: клип 'Survey', 3,417 с, выборок 60, костей 25
+[probe] animreport [Survey]: замыкание цикла - худший разрыв 0,647 (0,5% размаха) на 'b_Tail03_014', движение за шаг 0,104 OK
+[probe] animreport [Survey]: таз - вертикальный размах 1,705 (y 40,25..41,96)
+[probe] animreport [Survey]: опора L - ход 0,001, опора 15/60 кадров, скольжение 0 (29% хода)
+[probe] animreport [Survey]: опора R - ход 0,001, опора 19/60 кадров, скольжение 0,001 (48,6% хода)
+[probe] animreport [Survey]: кисть L - ход 0,003, опора 0/60 кадров, скольжение 0 (0% хода) БЕЗ ОПОРЫ
+[probe] animreport [Survey]: кисть R - ход 0,003, опора 0/60 кадров, скольжение 0 (0% хода) БЕЗ ОПОРЫ
+[probe] animreport [Survey]: фаза ног - сдвиг 0 периода (синхронно - прыжок/галоп/иноходь)
+[probe] animreport: клип 'Walk', 0,708 с, выборок 60, костей 25
+[probe] animreport [Walk]: замыкание цикла - худший разрыв 1,941 (1,4% размаха) на 'b_RightFoot02_022', движение за шаг 0,601 OK
+[probe] animreport [Walk]: таз - вертикальный размах 2,033 (y 40,05..42,08)
+[probe] animreport [Walk]: опора L - ход 11,425, опора 19/60 кадров, скольжение 28,384 (248,4% хода)
+[probe] animreport [Walk]: опора R - ход 10,993, опора 31/60 кадров, скольжение 37,843 (344,2% хода)
+[probe] animreport [Walk]: кисть L - ход 11,474, опора 24/60 кадров, скольжение 29,754 (259,3% хода)
+[probe] animreport [Walk]: кисть R - ход 13,54, опора 34/60 кадров, скольжение 41,81 (308,8% хода)
+[probe] animreport [Walk]: фаза ног - сдвиг 0,27 периода (синхронно - прыжок/галоп/иноходь)
+[probe] skinning: 1 персонажей через компоненты, клип нет (bind-поза), t=0s
+[probe] bounds: min=<-79,419914  -42,42504  -68,936676> max=<79,419914  116,41479  89,90315> size=<158,83983  158,83983  158,83983>
+[probe] eye=<-238,32623  191,06735  358,84372> target=<0  36,994873  10,483238> distance=449,32477
+[probe] surface cache: 9934 voxels over 438976 cells (2,3% filled), voxel 2,17
+[probe] probe-gi field: skyVis avg=0,929 max=1,000, validity avg=0,989, sunFrac avg=0,008 max=0,258
+[probe] lighting: pixels=262144 lum avg=131,2 min=32 max=242 chroma avg=16,2 max=190
+[probe] lighting_flat: pixels=262144 lum avg=131,1 min=32 max=238 chroma avg=15,9 max=177
+[probe] debug_ambient: pixels=262144 lum avg=138,4 min=2 max=210 chroma avg=12,9 max=91
+[probe] debug_direct: pixels=262144 lum avg=138,3 min=0 max=210 chroma avg=12,6 max=93
+[probe] debug_envspec: pixels=262144 lum avg=137,5 min=1 max=210 chroma avg=11,3 max=15
+[probe] debug_probes: pixels=262144 lum avg=142,0 min=103 max=210 chroma avg=15,8 max=250
+[probe] highlight: pixels=262144 lum avg=141,3 min=28 max=255 chroma avg=11,4 max=15
+[probe] channel_normal: pixels=262144 lum avg=140,7 min=46 max=212 chroma avg=14,9 max=184

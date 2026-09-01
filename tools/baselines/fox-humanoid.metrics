@@ -1,0 +1,54 @@
+﻿[shim] agility: SetSDKVersion(619, ".\D3D12\") hr=0x00000000
+[probe] backend: D3D12
+[probe] meshes=1 materials=2 instances=1
+[probe] alpha-tested shadows: 0 materials, не кастеры: 0
+[probe] entities created: 1 (subMesh=-1)
+[probe] humanoid [Mixamo]: слотов угадано 21/21, проблем валидации 0 OK
+[probe] humanoid [Mixamo]: T-поза - руки 0°/0°, ноги 0°/0° OK
+[probe] humanoid [Mixamo]: round-trip позы - костей 31/31, потеряно 0, худшее расхождение 0 OK
+[probe] humanoid [Unreal]: слотов угадано 21/21, проблем валидации 0 OK
+[probe] humanoid [Unreal]: T-поза - руки 0°/0°, ноги 0°/0° OK
+[probe] humanoid [Unreal]: round-trip позы - костей 31/31, потеряно 0, худшее расхождение 0 OK
+[probe] humanoid [Blender]: слотов угадано 21/21, проблем валидации 0 OK
+[probe] humanoid [Blender]: T-поза - руки 0°/0°, ноги 0°/0° OK
+[probe] humanoid [Blender]: round-trip позы - костей 31/31, потеряно 0, худшее расхождение 0 OK
+[probe] humanoid [без имён]: слотов угадано 21/21, проблем валидации 0 OK
+[probe] humanoid [без имён]: T-поза - руки 0°/0°, ноги 0°/0° OK
+[probe] humanoid [без имён]: round-trip позы - костей 31/31, потеряно 0, худшее расхождение 0 OK
+[probe] humanoid [укороченный]: слотов угадано 17/17, проблем валидации 0 OK
+[probe] humanoid [укороченный]: T-поза - руки 0°/0°, ноги 0°/0° OK
+[probe] humanoid [укороченный]: round-trip позы - костей 17/17, потеряно 0, худшее расхождение 0 OK
+[probe] humanoid [модель]: Таз                * b_Hip_01
+[probe] humanoid [модель]: Позвоночник        * b_Spine01_02
+[probe] humanoid [модель]: Грудь                b_Spine02_03
+[probe] humanoid [модель]: Шея                  b_Neck_04
+[probe] humanoid [модель]: Голова             * b_Head_05
+[probe] humanoid [модель]: Плечо L            * b_LeftUpperArm_09
+[probe] humanoid [модель]: Предплечье L       * b_LeftForeArm_010
+[probe] humanoid [модель]: Кисть L            * b_LeftHand_011
+[probe] humanoid [модель]: Плечо R            * b_RightUpperArm_06
+[probe] humanoid [модель]: Предплечье R       * b_RightForeArm_07
+[probe] humanoid [модель]: Кисть R            * b_RightHand_08
+[probe] humanoid [модель]: Бедро L            * b_LeftLeg01_015
+[probe] humanoid [модель]: Голень L           * b_LeftLeg02_016
+[probe] humanoid [модель]: Стопа L            * b_LeftFoot01_017
+[probe] humanoid [модель]: Носок L              b_LeftFoot02_018
+[probe] humanoid [модель]: Бедро R            * b_RightLeg01_019
+[probe] humanoid [модель]: Голень R           * b_RightLeg02_020
+[probe] humanoid [модель]: Стопа R            * b_RightFoot01_021
+[probe] humanoid [модель]: Носок R              b_RightFoot02_022
+[probe] humanoid [модель]: проблем 0
+[probe] humanoid: round-trip аватара - расхождений 0 OK
+[probe] skinning: 1 персонажей через компоненты, клип нет (bind-поза), t=0s
+[probe] bounds: min=<-79,419914  -42,42504  -68,936676> max=<79,419914  116,41479  89,90315> size=<158,83983  158,83983  158,83983>
+[probe] eye=<-238,32623  191,06735  358,84372> target=<0  36,994873  10,483238> distance=449,32477
+[probe] surface cache: 9934 voxels over 438976 cells (2,3% filled), voxel 2,17
+[probe] probe-gi field: skyVis avg=0,929 max=1,000, validity avg=0,989, sunFrac avg=0,008 max=0,258
+[probe] lighting: pixels=262144 lum avg=131,2 min=32 max=242 chroma avg=16,2 max=190
+[probe] lighting_flat: pixels=262144 lum avg=131,1 min=32 max=238 chroma avg=15,9 max=177
+[probe] debug_ambient: pixels=262144 lum avg=138,4 min=2 max=210 chroma avg=12,9 max=91
+[probe] debug_direct: pixels=262144 lum avg=138,3 min=0 max=210 chroma avg=12,6 max=93
+[probe] debug_envspec: pixels=262144 lum avg=137,5 min=1 max=210 chroma avg=11,3 max=15
+[probe] debug_probes: pixels=262144 lum avg=142,0 min=103 max=210 chroma avg=15,8 max=250
+[probe] highlight: pixels=262144 lum avg=141,3 min=28 max=255 chroma avg=11,4 max=15
+[probe] channel_normal: pixels=262144 lum avg=140,7 min=46 max=212 chroma avg=14,9 max=184

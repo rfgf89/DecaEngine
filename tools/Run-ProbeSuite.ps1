@@ -54,7 +54,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 # тихо гоняет вчерашний код. Только bin\x64.
 $BinDir = Join-Path $RepoRoot 'DecaEngine.Editor\bin\x64\Debug\net10.0'
 $Exe = Join-Path $BinDir 'DecaEngine.Editor.exe'
-$BaselineDir = Join-Path $PSScriptRoot 'probe-baseline'
+# Не "probe-baseline": .gitignore выбрасывает probe-*/ на любом уровне (там ~150 каталогов
+# с выводом проб), и эталоны молча не попадали бы в коммит.
+$BaselineDir = Join-Path $PSScriptRoot 'baselines'
 $OutRoot = Join-Path $RepoRoot '_probeout\suite'
 
 # Пробы ищут EditorAssets рядом с exe, поэтому пути к моделям - относительные от bin.
