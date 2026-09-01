@@ -1,7 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Graphics;
 
 [StructLayout(LayoutKind.Explicit, Size = 48)]
 public struct DrawData

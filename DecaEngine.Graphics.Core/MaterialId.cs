@@ -1,4 +1,4 @@
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Graphics;
 
 public struct MaterialId(int materialId)
 {

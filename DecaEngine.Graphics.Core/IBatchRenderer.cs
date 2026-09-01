@@ -33,6 +33,14 @@ public interface IBatchRenderer
 	/// <summary>True when cached indirect draw commands / GPU buffers need to be rebuilt.</summary>
 	bool IsDirty { get; }
 
+	/// <summary>Инстанс-данные изменились по содержимому (мировые матрицы, DrawData) без смены
+	/// состава - буферы перезальются, команды не перестраиваются.</summary>
+	void MarkInstancesContentDirty();
+
+	/// <summary>Пиновка живого подмножества инстансов (см. <see cref="BatchSubset"/>): рендерер
+	/// читает массивы напрямую из него при каждой заливке.</summary>
+	void PinInstances(BatchSubset subset);
+
 	/// <summary>Number of shadow-map cascades supported by the shadow renderer.</summary>
 	int ShadowCascadeCount { get; }
 

@@ -30,8 +30,10 @@ namespace DecaEngine.Graphics.Diligent
 		/// (например asset-browser icon baker: shadows=false, ShadowPass в граф не входит).</summary>
 		private IRenderTarget _shadowMapPlaceholder;
 
-		public const int MaxCascades = 4;
-		public const int ShadowMapSize = 4096;
+		// Числа раскладки живут в ShadowLayout (Graphics.Core): их читает и сборщик каскадов в
+		// сцене, а сюда они входят как псевдонимы, чтобы бэкенд не менялся.
+		public const int MaxCascades = ShadowLayout.MaxCascades;
+		public const int ShadowMapSize = ShadowLayout.ShadowMapSize;
 
 		/// <summary>Поле каймы у ортокаскада, в текселях shadow map: орто-матрица описывается не
 		/// вокруг сферы каскада, а вокруг сферы ПЛЮС эта кайма (см. UpdateCascades /
@@ -46,7 +48,7 @@ namespace DecaEngine.Graphics.Diligent
 		///
 		/// Восемь = 3 (отступ шейдера) + 1 (тап PCF) + 1.5 (normal-offset) + 1 (снап центра к сетке
 		/// текселей двигает саму сферу) с запасом. Цена - 0.4% линейного разрешения каскада.</summary>
-		public const float CascadeMarginTexels = 8f;
+		public const float CascadeMarginTexels = ShadowLayout.CascadeMarginTexels;
 
 		/// <summary>Реальный каскадный массив, если уже заведён (был хотя бы один каскадный дроу),
 		/// иначе временная заглушка - геттер безопасен ДО первого кадра теней: его дергает КАЖДЫЙ

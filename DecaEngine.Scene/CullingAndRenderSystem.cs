@@ -2,7 +2,6 @@ using System;
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using UnsafeCollections.Collections.Unsafe;
@@ -82,7 +81,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         // Граница ИНДЕКСА занятых слотов, а не их количество - слоты выдаются из стека свободных и
         // разрежены, см. RenderResourceManager.DrawInstanceCount.
         int drawCount = _resourceManager.DrawInstanceCount;
-        int shadowViewCount = lights.Count > 0 ? ShadowRenderer.MaxCascades : 0;
+        int shadowViewCount = lights.Count > 0 ? ShadowLayout.MaxCascades : 0;
 
         if (!_renderCamerasData.IsCreated || _renderCamerasData.Capacity != cameraCount || _directionalLightCascadeData.Capacity != Math.Max(1, shadowViewCount))
         {
@@ -135,7 +134,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 fixed (CameraComponent* ptr = &cascadedShadow.Cascade0)
                 {
                     // Each cascade needs its own LightData with its own matrix
-                    for (int i = 0; i < ShadowRenderer.MaxCascades; i++)
+                    for (int i = 0; i < ShadowLayout.MaxCascades; i++)
                     {
                         var viewData = (ptr + i)->CreateViewData();
                         var cullData = (ptr + i)->CreateCullData();
@@ -299,7 +298,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             return ShadowCascadeSchedule.AllCascades;
         }
 
-        // Раскладка ниже рассчитана на четыре каскада (ShadowRenderer.MaxCascades).
+        // Раскладка ниже рассчитана на четыре каскада (ShadowLayout.MaxCascades).
         int mask = 0b0011;
         if ((_cascadeFrameIndex & 1u) == 0u) mask |= 0b0100;
         if ((_cascadeFrameIndex & 3u) == 1u) mask |= 0b1000;
@@ -333,7 +332,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         // аллоцировал на каждый каскад каждый кадр.
         Span<Vector3> cornersViewSpace = stackalloc Vector3[8];
 
-        for (int i = 0; i < ShadowRenderer.MaxCascades; i++)
+        for (int i = 0; i < ShadowLayout.MaxCascades; i++)
         {
             if ((updateMask & (1 << i)) == 0)
             {
@@ -381,14 +380,14 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 radius = Math.Max(radius, Vector3.Distance(cornersViewSpace[j], center));
             }
 
-            // Кайма ВОКРУГ сферы каскада - см. ShadowRenderer.CascadeMarginTexels. Орто-матрица
+            // Кайма ВОКРУГ сферы каскада - см. ShadowLayout.CascadeMarginTexels. Орто-матрица
             // ниже строится по этому радиусу, то есть сфера ложится в карту не впритык, а с
             // отступом от края: тот самый отступ, который шейдер требует пройти внутрь, прежде чем
             // взять каскад, - иначе он отъедался у объёма изнутри и по границам каскадов шли
             // просветы. Снап тоже по НОВОМУ размеру текселя, иначе сетка снапа разъедется с картой.
-            radius /= 1f - 2f * ShadowRenderer.CascadeMarginTexels / ShadowRenderer.ShadowMapSize;
+            radius /= 1f - 2f * ShadowLayout.CascadeMarginTexels / ShadowLayout.ShadowMapSize;
 
-            float worldUnitsPerTexel = (radius * 2.0f) / ShadowRenderer.ShadowMapSize;
+            float worldUnitsPerTexel = (radius * 2.0f) / ShadowLayout.ShadowMapSize;
             Matrix4x4 tempLightView = Matrix4x4.CreateLookAt(Vector3.Zero, lightDirection, lightUp);
             Vector3 lightSpaceCenter = Vector3.Transform(center, tempLightView);
             lightSpaceCenter.X = MathF.Floor(lightSpaceCenter.X / worldUnitsPerTexel) * worldUnitsPerTexel;
@@ -419,7 +418,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             (&cascadeSizes.X)[i] = radius * 2.0f;
             (&cascadeNearPlanes.X)[i] = znear;
 
-            var camData = new CameraData(radius * 2.0f, radius * 2.0f, znear, zfar, new Vector4(0, 0, ShadowRenderer.ShadowMapSize, ShadowRenderer.ShadowMapSize));
+            var camData = new CameraData(radius * 2.0f, radius * 2.0f, znear, zfar, new Vector4(0, 0, ShadowLayout.ShadowMapSize, ShadowLayout.ShadowMapSize));
 
             fixed (CameraComponent* ptr = &cascadedShadow.Cascade0)
             {

@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core.Entities;
-using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using DecaEngine.Graphics;
 

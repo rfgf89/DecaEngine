@@ -1,5 +1,5 @@
 using System.Numerics;
-using DecaEngine.Graphics.Diligent;
+using DecaEngine.Graphics;
 using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
@@ -8,7 +8,7 @@ namespace DecaEngine.Scene;
 
 public class RenderResourceManager
 {
-	private readonly DiligentBatchRenderer _batchRenderer;
+	private readonly IBatchRenderer _batchRenderer;
 	private readonly NativeStack<int> _freeSlots;
 	private readonly EntityStore _store;
 	private int[] _batchCounts;
@@ -39,7 +39,7 @@ public class RenderResourceManager
 	public int DrawInstanceCount => _slotHighWaterMark;
 
 	public RenderResourceManager(int totalInstances, int totalBatch, EntityStore store,
-		DiligentBatchRenderer batchRenderer)
+		IBatchRenderer batchRenderer)
 	{
 		_store = store;
 		_batchRenderer = batchRenderer;

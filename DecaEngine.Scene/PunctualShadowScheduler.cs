@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
-using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Unsafe;
 

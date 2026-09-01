@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Graphics;
 
 [StructLayout(LayoutKind.Sequential)]
 public struct IndirectInstance
