@@ -2,6 +2,7 @@
 using System.Text.Json.Serialization;
 using DecaEngine.Core;
 using DecaEngine.Core.Assets;
+using DecaEngine.Graphics.ProbeGi;
 
 namespace DecaEngine.Editor;
 

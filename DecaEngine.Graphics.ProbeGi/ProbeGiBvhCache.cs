@@ -4,7 +4,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using DecaEngine.Core.Diagnostics;
 
-namespace DecaEngine.Editor
+namespace DecaEngine.Graphics.ProbeGi
 {
 	/// <summary>
 	/// Дисковый кеш BVH проб: файл &lt;модель&gt;.bhv.bin рядом с самой моделью. Сборка BVH - чистый

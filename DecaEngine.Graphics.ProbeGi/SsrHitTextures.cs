@@ -5,7 +5,7 @@ using DecaEngine.Core;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 /// <summary>
 /// Набор base color текстур сцены для текстурного альбедо RT-хитов SSR (см.

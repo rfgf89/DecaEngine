@@ -3,6 +3,7 @@ using DecaEngine.Core;
 using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
+using DecaEngine.Graphics.ProbeGi;
 
 namespace DecaEngine.Editor;
 

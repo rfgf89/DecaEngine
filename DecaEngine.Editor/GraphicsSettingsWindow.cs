@@ -3,6 +3,7 @@ using DecaEngine.Core;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Graphics.ProbeGi;
 using Engine.ImGui.Core;
 using Friflo.Engine.ECS;
 using Hexa.NET.ImGui;

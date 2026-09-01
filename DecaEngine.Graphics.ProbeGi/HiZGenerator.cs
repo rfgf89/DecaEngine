@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 public class HiZGenerator : IDisposable
 {

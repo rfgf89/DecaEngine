@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using DecaEngine;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Graphics.ProbeGi;
 using Diligent;
 
 namespace DecaEngine.Editor;
@@ -269,7 +270,7 @@ public static class SceneTraceVerifier
 		double cpuSum = 0, gpuSum = 0, magnitudeSum = 0;
 		for (int p = 0; p < session.ProbeCount; p++)
 		{
-			var cpu = session.L0R[p];
+			var cpu = session.IrradianceRead[p];
 			var got = gpuField[p * 4];
 			var gotRgb = new Vector3(got.X, got.Y, got.Z);
 

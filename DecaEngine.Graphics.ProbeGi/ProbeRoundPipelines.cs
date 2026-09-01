@@ -1,7 +1,7 @@
 ﻿using DecaEngine;
 using Diligent;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 /// <summary>
 /// Скомпилированные конвейеры GPU-раунда probe-GI. Вынесены из <see cref="ProbeRoundGpu"/> и живут
@@ -83,7 +83,9 @@ public sealed class ProbeRoundPipelines : IDisposable
 			// DXC - штатный FXC не знает даже идентификатора RaytracingAccelerationStructure.
 			// Программному пути всё это не нужно, поэтому переключаем компилятор только под аппаратный.
 			ShaderCompiler = hardware ? ShaderCompiler.Dxc : ShaderCompiler.Default,
-			HLSLVersion = hardware ? new Diligent.Version(6, 5) : default,
+			// global:: обязателен: изнутри DecaEngine.Graphics.ProbeGi имя Diligent сначала
+			// разрешается в соседний DecaEngine.Graphics.Diligent и заслоняет SDK.
+			HLSLVersion = hardware ? new global::Diligent.Version(6, 5) : default,
 			ShaderSourceStreamFactory = factory,
 		}, out _);
 

@@ -111,10 +111,17 @@ $Scenarios = @(
 		Desc = 'Оба рендер-графа в реальном порядке EditorManager + переключение фич на лету'
 		Args = @('--full-loop', $Sponza, '300', '<BACKEND>')
 		Env  = @{ DECA_LOOP_TOGGLE = '1' }
-		# Свой допуск: итоговая строка сценария несёт номера кадров, на которых модель
-		# дозагрузилась, а они зависят от фоновых потоков и гуляют на кадр-другой из ~40-80.
-		# Главное в ней всё равно текст - HasModel=True и пустой LoadError, - а он сверяется точно.
-		Tolerance = 0.1
+		<#
+			Итоговая строка сценария несёт номера кадров, на которых модель дозагрузилась. Это
+			замер скорости МАШИНЫ, а не поведения движка: между тёплыми прогонами они гуляют на
+			кадр, а на первом прогоне после пересборки - сразу на пять (холодные JIT и кэш
+			шейдеров сдвигают всю асинхронную загрузку). Расширять допуск, пока не позеленеет,
+			значит просто перестать что-либо проверять - поэтому эти поля выброшены поимённо.
+
+			Проверяемое утверждение остаётся: модель загрузилась, без ошибки, за 300 кадров, и
+			стриминг ДОШЁЛ до конца (соседняя строка `still streaming 0/69`).
+		#>
+		IgnoreFields = @('finalized', 'texturesReady', 'visible', 'streamingComplete')
 	}
 )
 
@@ -172,9 +179,17 @@ function Get-Metrics {
 	значит ломать сверку каждый раз, когда в пробу добавили поле.
 #>
 function Compare-MetricLine {
-	param([string]$Expected, [string]$Actual, [double]$Tolerance)
+	param([string]$Expected, [string]$Actual, [double]$Tolerance, [string[]]$IgnoreFields)
 
 	$numberPattern = '-?\d+(?:[.,]\d+)?'
+
+	# Значения перечисленных полей затираются в ОБЕИХ строках, поэтому из сверки уходит только
+	# число, а само наличие поля по-прежнему проверяется формой строки.
+	foreach ($field in $IgnoreFields) {
+		$mask = "$([regex]::Escape($field))=$numberPattern"
+		$Expected = [regex]::Replace($Expected, $mask, "$field=~")
+		$Actual = [regex]::Replace($Actual, $mask, "$field=~")
+	}
 	$expectedShape = [regex]::Replace($Expected, $numberPattern, '#')
 	$actualShape = [regex]::Replace($Actual, $numberPattern, '#')
 
@@ -330,10 +345,12 @@ foreach ($case in $selected) {
 	}
 
 	$caseTolerance = if ($case.ContainsKey('Tolerance')) { [double]$case.Tolerance } else { $Tolerance }
+	$caseIgnored = if ($case.ContainsKey('IgnoreFields')) { [string[]]$case.IgnoreFields } else { @() }
 
 	$common = [Math]::Min($expected.Count, $metrics.Count)
 	for ($i = 0; $i -lt $common; $i++) {
-		$problem = Compare-MetricLine -Expected $expected[$i] -Actual $metrics[$i] -Tolerance $caseTolerance
+		$problem = Compare-MetricLine -Expected $expected[$i] -Actual $metrics[$i] `
+			-Tolerance $caseTolerance -IgnoreFields $caseIgnored
 		if ($problem) {
 			$diffs += "  эталон: $($expected[$i])"
 			$diffs += "  стало : $($metrics[$i])"

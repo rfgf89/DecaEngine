@@ -4,7 +4,7 @@ using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 /// <summary>
 /// Дебаг-вид probe-GI: шарик-октаэдр на каждую пробу в её ФАКТИЧЕСКОЙ позиции - узел сетки плюс

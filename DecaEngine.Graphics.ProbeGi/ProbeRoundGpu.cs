@@ -1,13 +1,12 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
-using DecaEngine;
 using DecaEngine.Core;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 /// <summary>
 /// Раунд обновления probe-GI на GPU (см. ProbeRoundCS.hlsl) - перенос
@@ -781,8 +780,10 @@ public sealed class ProbeRoundGpu : IDisposable
 				transitions[i] = new StateTransitionDesc
 				{
 					Resource = _atlasTextures[i],
-					OldState = Diligent.ResourceState.UnorderedAccess,
-					NewState = Diligent.ResourceState.ShaderResource,
+					// global:: обязателен: изнутри DecaEngine.Graphics.ProbeGi имя Diligent сначала
+					// разрешается в соседний DecaEngine.Graphics.Diligent и заслоняет SDK.
+					OldState = global::Diligent.ResourceState.UnorderedAccess,
+					NewState = global::Diligent.ResourceState.ShaderResource,
 					Flags = StateTransitionFlags.UpdateState,
 				};
 			}

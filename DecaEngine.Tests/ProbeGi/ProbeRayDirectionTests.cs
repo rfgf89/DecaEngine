@@ -1,5 +1,5 @@
 using System.Numerics;
-using DecaEngine.Editor;
+using DecaEngine.Graphics.ProbeGi;
 
 namespace DecaEngine.Tests.ProbeGi;
 

@@ -4,6 +4,7 @@ using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Graphics.ProbeGi;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 

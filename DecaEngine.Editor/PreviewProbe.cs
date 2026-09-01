@@ -6,6 +6,7 @@ using Friflo.Engine.ECS;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Graphics.ProbeGi;
 using DecaEngine.Sdl;
 using Friflo.Engine.ECS.Systems;
 

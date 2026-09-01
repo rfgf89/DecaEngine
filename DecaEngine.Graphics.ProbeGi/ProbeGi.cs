@@ -6,7 +6,7 @@ using DecaEngine.Graphics.Diligent;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 /// <summary>
 /// DDGI-лайт для превью: сетка irradiance-проб (SH L1) + sky visibility, запечённая CPU-трассировкой
@@ -319,7 +319,7 @@ public sealed class ProbeGiBakeSession
 
 	/// <summary>Печь нечего (пустой BVH) - раунды крутить бессмысленно даже в реальном времени.
 	/// Ставится <see cref="ProbeGiBaker.RunRound"/>.</summary>
-	internal bool NoGeometry;
+	public bool NoGeometry { get; internal set; }
 
 	/// <summary>Альфа экспоненциального среднего в реальном времени - живая ручка (см.
 	/// <see cref="ProbeGiBakeOptions.RealtimeBlend"/>).</summary>
@@ -350,11 +350,11 @@ public sealed class ProbeGiBakeSession
 
 	/// <summary>Лучей за ТЕКУЩИЙ раунд - зависит от режима: запечка копит качество раундами и может
 	/// позволить себе редкий веер, реальное время платит за него мерцанием.</summary>
-	internal int RaysPerRound => Realtime ? RealtimeRaysPerRound : _bakeRaysPerRound;
+	public int RaysPerRound => Realtime ? RealtimeRaysPerRound : _bakeRaysPerRound;
 
 	/// <summary>Сколько первых лучей веера - ФИКСИРОВАННЫЕ (см.
 	/// <see cref="ProbeGiBaker.FixedRayCount"/>).</summary>
-	internal int FixedRays => ProbeGiBaker.FixedRayCount(RaysPerRound, Realtime);
+	public int FixedRays => ProbeGiBaker.FixedRayCount(RaysPerRound, Realtime);
 
 	/// <summary>Потолок яркости луча в реальном времени - живая ручка (см.
 	/// <see cref="ProbeGiBakeOptions.RealtimeMaxRayLuminance"/>).</summary>
@@ -481,7 +481,7 @@ public sealed class ProbeGiBakeSession
 	/// <summary>Сквозной номер раунда за всю жизнь сессии (в отличие от <see cref="Round"/> не
 	/// откатывается) - им поворачивается веер Фибоначчи, чтобы раунды после смены света не
 	/// повторяли уже отстрелянные направления.</summary>
-	internal int Sequence;
+	public int Sequence { get; internal set; }
 
 	// Поле проб в двойном буфере: раунд читает прошлое поле (мультибаунс собирается по соседним
 	// пробам в точках попаданий) и пишет новое, после чего буферы меняются местами. Прежний бейк
@@ -489,6 +489,14 @@ public sealed class ProbeGiBakeSession
 	// раунда трассировки.
 	internal Vector3[] L0R, L1XR, L1YR, L1ZR, L0W, L1XW, L1YW, L1ZW;
 	internal float[] ValidityR, ValidityW, SunFracR, SunFracW;
+
+	/// <summary>Постоянная составляющая поля проб (L0) на ЧТЕНИЕ - то, что сейчас видят сэмплеры.
+	///
+	/// Отдаётся span'ом, а не самим массивом: снаружи это нужно ровно затем, чтобы сверить поле с
+	/// GPU-путём (см. сверочный прогон в пробах), и восемь буферов пинг-понга наружу выставлять
+	/// незачем - перепутать R и W со стороны потребителя значит сравнить поле с самим собой из
+	/// прошлого раунда и не заметить расхождения.</summary>
+	public ReadOnlySpan<Vector3> IrradianceRead => L0R;
 
 	/// <summary>Видимость неба: чистая геометрия, читается только владеющей пробой - одинарный
 	/// буфер (в отличие от валидности, которую читает сбор по соседям).</summary>
@@ -505,7 +513,7 @@ public sealed class ProbeGiBakeSession
 
 	/// <summary>Буферы атласов переиспользуются: снимок берётся каждый раунд, а это десятки
 	/// мегабайт - пересоздавать их незачем (см. ProbeGiBaker.Snapshot).</summary>
-	internal readonly ProbeGiBakeResult Result;
+	public readonly ProbeGiBakeResult Result;
 
 	/// <summary>Кэш радианса на поверхностях - источник отскока для лучей бейка (см.
 	/// <see cref="SurfaceCache"/>). null, пока первый раунд его не построил, и навсегда, если кэш
@@ -2099,7 +2107,7 @@ public sealed class ProbeGiBaker
 	/// Против ХВОСТА распределения альфа работает много лучше числа лучей: учетверение лучей при
 	/// 0.15 убирает дыхание сцены, но отдельные пробы продолжают дёргаться, потому что их разброс
 	/// делает не шум оценки, а смена того, во что попадает веер.</summary>
-	internal const float RealtimeBlend = 0.04f;
+	public const float RealtimeBlend = 0.04f;
 
 	/// <summary>Длина окна релокации в раундах - ПЯТЬ, как в Majercik 2021 (§5: «cap the number of
 	/// iterations at five to prevent probes from moving back and forth (infinitely) through tangent

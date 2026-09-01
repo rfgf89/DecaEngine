@@ -1,9 +1,8 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
-using DecaEngine;
 using Diligent;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Graphics.ProbeGi;
 
 /// <summary>
 /// Аппаратные структуры ускорения под трассировку probe-GI: BLAS на МЕШ в объектном пространстве
