@@ -4,7 +4,7 @@ using System.Numerics;
 using DecaEngine.Graphics;
 using DecaEngine.Animation;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Численный отчёт по анимационному клипу (DECA_PROBE_ANIMREPORT=1).

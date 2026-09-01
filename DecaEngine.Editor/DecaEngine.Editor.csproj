@@ -16,6 +16,7 @@
       <ProjectReference Include="..\DecaEngine.Graphics.Diligent\DecaEngine.Graphics.Diligent.csproj" />
       <ProjectReference Include="..\DecaEngine.ImGui.DiligentRender\DecaEngine.ImGui.DiligentRender.csproj" />
       <ProjectReference Include="..\DecaEngine.Physics.Bepu\DecaEngine.Physics.Bepu.csproj" />
+      <ProjectReference Include="..\DecaEngine.Probes\DecaEngine.Probes.csproj" />
     </ItemGroup>
 
     <ItemGroup>

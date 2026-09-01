@@ -1,12 +1,11 @@
 ﻿using System.Numerics;
 using System.Runtime.InteropServices;
-using DecaEngine;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.ProbeGi;
 using Diligent;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Сверка GPU-трассировки (см. SceneTrace.hlsl) с CPU-эталоном из <see cref="ProbeGiBaker"/>. Один

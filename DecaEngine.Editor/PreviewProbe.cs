@@ -11,6 +11,7 @@ using DecaEngine.Sdl;
 using Friflo.Engine.ECS.Systems;
 using DecaEngine.Scene;
 using DecaEngine.Animation;
+using DecaEngine.Probes;
 
 namespace DecaEngine.Editor;
 

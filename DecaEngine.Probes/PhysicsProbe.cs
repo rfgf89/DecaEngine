@@ -4,7 +4,7 @@ using BepuPhysics;
 using DecaEngine.Physics;
 using DecaEngine.Scene;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Автономная проверка физического мира (DECA_PROBE_PHYSICS=1, печатается из PreviewProbe).

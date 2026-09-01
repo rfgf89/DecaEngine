@@ -5,7 +5,7 @@ using DecaEngine.Graphics;
 using DecaEngine.Animation;
 using DecaEngine.Core;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Проверка автоматической разметки аватара (DECA_PROBE_HUMANOID=1).

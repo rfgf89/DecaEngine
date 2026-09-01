@@ -6,7 +6,7 @@ using DecaEngine.Graphics;
 using DecaEngine.Animation;
 using DecaEngine.Core;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Проверка процедурного слоя (DECA_PROBE_PROC=1): spring bones, foot IK, aim IK. Настраивается по

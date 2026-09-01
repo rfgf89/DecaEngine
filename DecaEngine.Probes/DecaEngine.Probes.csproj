@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!--
+		Headless-пробники: численные отчёты, которыми проверяется движок без GUI и без глаз.
+		Их вывод - эталоны в tools/baselines, а сверяет их tools/Run-ProbeSuite.ps1.
+
+		Сюда переехали те пробники, которым от редактора не нужно НИЧЕГО: физика, процедурная
+		анимация, гуманоидная разметка, рэгдолл, отчёт по анимации и сверка CPU/GPU-обхода probe GI.
+		Лёжа в DecaEngine.Editor, они имели доступ ко всем его внутренностям - и то, что они им не
+		пользовались, ничем не было закреплено. Теперь закреплено компилятором.
+
+		Оставшиеся семь (PreviewProbe, ScenePhysicsProbe, FullLoopProbe и другие) держатся за
+		вьюпорты редактора и переедут, когда сам редактор станет библиотекой, а exe - тонким.
+	-->
+	<ItemGroup>
+		<ProjectReference Include="..\DecaEngine.Animation\DecaEngine.Animation.csproj" />
+		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+		<ProjectReference Include="..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
+		<ProjectReference Include="..\DecaEngine.Graphics.Diligent\DecaEngine.Graphics.Diligent.csproj" />
+		<ProjectReference Include="..\DecaEngine.Graphics.ProbeGi\DecaEngine.Graphics.ProbeGi.csproj" />
+		<ProjectReference Include="..\DecaEngine.Physics.Bepu\DecaEngine.Physics.Bepu.csproj" />
+		<ProjectReference Include="..\DecaEngine.Scene\DecaEngine.Scene.csproj" />
+	</ItemGroup>
+
+</Project>

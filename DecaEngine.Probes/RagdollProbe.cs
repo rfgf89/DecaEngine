@@ -6,7 +6,7 @@ using DecaEngine.Graphics;
 using DecaEngine.Physics;
 using DecaEngine.Animation;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Проверка рэгдолла на реальном риге. Три вопроса, и все три - «молчаливые»: кинематический
