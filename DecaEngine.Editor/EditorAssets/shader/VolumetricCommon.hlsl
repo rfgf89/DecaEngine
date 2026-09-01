@@ -36,6 +36,27 @@ Texture2D    _AdaptTex;
 Texture2DArray         ShadowMaps;
 SamplerComparisonState ShadowMaps_sampler;
 
+// Punctual-света и их тени: среда рассеивает и свет ламп (см. петлю в Main), иначе спот в дымке
+// «сухой» - геометрию освещает, а конуса в воздухе нет. Пул, матрицы и выбор грани куба зеркалят
+// UnlitInstancedPS (кластерная петля); привязка - BindShadowResources, который для фуллскрин-
+// пассов кладёт и карты, и оба буфера. Кластерная сетка здесь НЕ используется: она экранная
+// по фрустуму поверхностей, а точка марша ей не принадлежит - светов сегмента камеры единицы,
+// линейный проход дешевле ошибки адресации.
+StructuredBuffer<PunctualLight> PunctualLights;
+StructuredBuffer<float4> PunctualShadowMatrices;
+Texture2DArray         PunctualShadowMaps;
+SamplerComparisonState PunctualShadowMaps_sampler;
+
+// viewProj слайса как row-major матрица - зеркало UnlitInstancedPS.LoadPunctualShadowMatrix
+// (кбуферная передача матриц из структурного буфера транспонируется по-разному у бэкендов,
+// см. разбор там же).
+float4x4 LoadPunctualShadowMatrix(uint slice)
+{
+    uint row = slice * 4;
+    return float4x4(PunctualShadowMatrices[row + 0], PunctualShadowMatrices[row + 1],
+                    PunctualShadowMatrices[row + 2], PunctualShadowMatrices[row + 3]);
+}
+
 cbuffer View
 {
     ViewData viewData;
@@ -126,7 +147,11 @@ cbuffer VolumetricConstants
     float volExposureRelative;
     // Тот же key value, что уходит в авто-экспозицию и тонемап (TonemapConstants.x).
     float volExposureKey;
-    float volPad1, volPad2;
+    // Множитель рассеяния punctual-светов (0 = среда ламп не видит). В отличие от volSunIntensity
+    // это не цвет источника, а ручка ДОЛИ: сами света приходят из пула в сценовых линейных
+    // единицах и экспозиционным множителем НЕ домножаются (см. сборку result в Main).
+    float volPunctualIntensity;
+    float volPad2;
 }
 
 // CameraData near/fov в ModelViewportEnvironment - тот же реверсивный-Z и тот же фиксированный
@@ -241,6 +266,58 @@ float VolumetricShadow(float3 worldPos)
     return 1.0;
 }
 
+// Сторона слайса punctual-теней - обязана совпадать с LightClusters.ShadowMapSize (1024, не 4096
+// солнечных каскадов).
+static const float VolPunctualShadowMapSize = 1024.0;
+
+// Тень punctual-света в точке объёма - зеркало кластерной петли UnlitInstancedPS (выбор грани
+// куба по доминирующей оси, мировой байас с переводом локальной производной d(ndc)/dz), с теми же
+// двумя вольностями, что у VolumetricShadow: без normal-offset (у точки среды нет нормали, байас
+// втрое крупнее поверхностного) и одна выборка вместо PCF - ступеньку съедает джиттер шага.
+// toFrag - вектор СВЕТ -> точка (для выбора грани куба).
+float VolumetricPunctualShadow(PunctualLight l, float3 samplePos, float3 toFrag)
+{
+    if (l.ShadowParams.x < 0.0)
+    {
+        return 1.0;
+    }
+
+    uint slice = (uint)l.ShadowParams.x;
+    if (l.DirectionType.w < 0.5)
+    {
+        float3 absDir = abs(toFrag);
+        if (absDir.x >= absDir.y && absDir.x >= absDir.z)
+            slice += toFrag.x > 0.0 ? 0 : 1;
+        else if (absDir.y >= absDir.z)
+            slice += toFrag.y > 0.0 ? 2 : 3;
+        else
+            slice += toFrag.z > 0.0 ? 4 : 5;
+    }
+
+    float4x4 shadowMatrix = LoadPunctualShadowMatrix(slice);
+    float4 clip = mul(float4(samplePos, 1.0), shadowMatrix);
+    if (clip.w <= 1e-4)
+    {
+        return 1.0;
+    }
+
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0) || ndc.z >= 1.0)
+    {
+        return 1.0;
+    }
+
+    float near = max(l.ShadowParams.z, 1e-4);
+    float far = l.PositionRange.w;
+    float z = max(clip.w, near);
+    float tanHalf = l.DirectionType.w > 0.5 ? l.SpotAngles.z / max(l.SpotAngles.x, 1e-4) : 1.0;
+    float texelWorld = 2.0 * tanHalf * z / VolPunctualShadowMapSize;
+    float bias = texelWorld * 3.0 * near * far / max((far - near) * z * z, 1e-6);
+    return PunctualShadowMaps.SampleCmpLevelZero(PunctualShadowMaps_sampler,
+        float3(uv, (float)slice), ndc.z - bias);
+}
+
 // Interleaved gradient noise - псевдослучайное смещение первого шага, разное у соседних пикселей.
 // Без него марш выдаёт КОЛЬЦА: у всех пикселей шаги попадают на одни и те же дистанции, и граница
 // шага становится видимой дугой поперёк кадра. Джиттер меняет эту дугу на мелкое зерно, которое
@@ -303,7 +380,17 @@ PSOutput Main(in VSOutput input)
     float3 camPos = viewData.CameraWorldPos;
     float jitter = VolumetricDither(input.pos.xy);
 
+    // Сегмент punctual-светов этой камеры в общем пуле (см. LightData.ClusterParams). Фазовая
+    // функция ламп считается НА ШАГЕ: в отличие от солнца направление на свет меняется вдоль луча,
+    // и при рассеянии вперёд конус спота, глядящий на камеру, вспыхивает - как фара в тумане.
+    uint punctualOffset = (uint)lightData.ClusterParams.x;
+    uint punctualCount = volPunctualIntensity > 0.0 ? (uint)lightData.ClusterParams.y : 0u;
+    float anisotropy = clamp(volAnisotropy, -0.95, 0.95);
+
     float3 scattered = float3(0.0, 0.0, 0.0);
+    // Рассеяние ламп копится ОТДЕЛЬНО: света пула лежат в сценовых линейных единицах, как сам
+    // кадр, и экспозиционного домножения (в отличие от художественных цветов солнца/неба) не ждут.
+    float3 scatteredScene = float3(0.0, 0.0, 0.0);
     float transmittance = 1.0;
 
     for (int i = 0; i < steps; i++)
@@ -326,6 +413,54 @@ PSOutput Main(in VSOutput input)
             + ambientRadiance * lerp(saturate(volAmbientShadowFloor), 1.0, shadow))
             * density * volScatter;
 
+        // Рассеяние punctual-светов - формулы затухания и конуса зеркалят кластерный шейдинг
+        // UnlitInstancedPS, тень - VolumetricPunctualShadow выше.
+        float3 punctualRadiance = float3(0.0, 0.0, 0.0);
+        [loop]
+        for (uint li = 0; li < punctualCount; li++)
+        {
+            PunctualLight l = PunctualLights[punctualOffset + li];
+            float3 toLight = l.PositionRange.xyz - samplePos;
+            float distSq = dot(toLight, toLight);
+            float range = l.PositionRange.w;
+            if (distSq > range * range)
+            {
+                continue;
+            }
+
+            float dist = sqrt(max(distSq, 1e-6));
+            float3 dirToLight = toLight / dist;
+
+            // Пол знаменателя КРУПНЕЕ поверхностного (+0.25 против +1e-2): шаг марша, легший
+            // вплотную к лампе, с чистым 1/d^2 даёт одинокий пиксель-фаервол, который джиттер
+            // превращает в мерцающее зерно вокруг источника.
+            float distRatio2 = distSq / (range * range);
+            float distFactor = saturate(1.0 - distRatio2 * distRatio2);
+            float atten = distFactor * distFactor / (distSq + 0.25);
+
+            if (l.DirectionType.w > 0.5)
+            {
+                float cd = dot(-dirToLight, l.DirectionType.xyz);
+                float spotFactor = saturate((cd - l.SpotAngles.x) * l.SpotAngles.y);
+                atten *= spotFactor * spotFactor;
+            }
+
+            if (atten <= 1e-6)
+            {
+                continue;
+            }
+
+            float punctualShadow = VolumetricPunctualShadow(l, samplePos, -toLight);
+            punctualShadow = lerp(1.0, punctualShadow,
+                saturate(volShadowStrength) * saturate(l.ShadowParams.y));
+
+            float punctualPhase = VolumetricPhase(dot(viewDir, dirToLight), anisotropy);
+            punctualRadiance += l.ColorIntensity.rgb * l.ColorIntensity.w
+                * (atten * punctualPhase) * punctualShadow;
+        }
+
+        float3 inScatterScene = punctualRadiance * volPunctualIntensity * density * volScatter;
+
         // Аналитическое интегрирование рассеяния ПО ОТРЕЗКУ, а не «в точке × длину шага»:
         //
         //   S(x) = S0 * exp(-sigma * x)  =>  integral[0..dx] = S0 * (1 - exp(-sigma*dx)) / sigma
@@ -336,7 +471,9 @@ PSOutput Main(in VSOutput input)
         // границ.
         float sigma = max(density * volExtinction, 1e-6);
         float stepTransmittance = exp(-sigma * stepLength);
-        scattered += transmittance * inScatter * (1.0 - stepTransmittance) / sigma;
+        float segment = transmittance * (1.0 - stepTransmittance) / sigma;
+        scattered += inScatter * segment;
+        scatteredScene += inScatterScene * segment;
 
         transmittance *= stepTransmittance;
 
@@ -353,9 +490,10 @@ PSOutput Main(in VSOutput input)
     float minTransmittance = 1.0 - saturate(volMaxOpacity);
     transmittance = max(transmittance, minTransmittance);
 
-    // Экспозиционный множитель - ТОЛЬКО на рассеянный свет: он задан в отображаемых единицах, а
-    // кадр под ним уже живёт в абсолютных линейных (см. VolumetricExposureScale).
-    float3 result = scene.rgb * transmittance + scattered * VolumetricExposureScale();
+    // Экспозиционный множитель - ТОЛЬКО на солнечно-небесное рассеяние: его цвета заданы в
+    // отображаемых единицах. Рассеяние ламп (scatteredScene) уже в сценовых линейных, как кадр.
+    float3 result = scene.rgb * transmittance + scattered * VolumetricExposureScale()
+        + scatteredScene;
 
     // Альфа берётся ОТ СЦЕНЫ: пасс рисует поверх кадра, и своя альфа выбила бы прозрачный фон
     // бейкера иконок (та же причина, что в FogCommon.hlsl).

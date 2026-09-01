@@ -66,6 +66,35 @@ public class EditorSettings
 	/// создаётся вместе с превью-вьюпортом).</summary>
 	public string PreviewEnvironmentHdr { get; set; } = "";
 
+	// --- Физика сцены и отладка анимации (см. AnimationPhysicsDebugWindow) ---
+
+	/// <summary>Разрешена ли физика в сцене префаба вообще. Сам мир всё равно заводится ЛЕНИВО -
+	/// только под персонажа с foot IK/рэгдоллом или под включённый дебаг физики (см.
+	/// PrefabSceneViewport.ScenePhysicsWanted); этот тумблер - способ выключить её насовсем, когда
+	/// сцена тяжёлая, а физика в ней не нужна.</summary>
+	public bool ScenePhysicsEnabled { get; set; } = true;
+
+	/// <summary>Ускорение свободного падения по Y в единицах мира. Настраивается, потому что масштаб
+	/// моделей в движке произволен: у метрового персонажа -9.81 - это метры в секунду за секунду, а
+	/// у модели с габаритом в сотни единиц то же число выглядит как падение на Луне.</summary>
+	public float SceneGravity { get; set; } = -9.81f;
+
+	/// <summary>Пауза симуляции - НЕ нулевой шаг: пауза останавливает мир целиком, чтобы можно было
+	/// разглядеть позу тела, которое только что провалилось сквозь пол.</summary>
+	public bool ScenePhysicsPaused { get; set; } = false;
+
+	/// <summary>Замедление/ускорение времени симуляции. Рэгдолл, разлетающийся за три кадра, на 0.1
+	/// разбирается по кадрам.</summary>
+	public float ScenePhysicsTimeScale { get; set; } = 1f;
+
+	/// <summary>Множитель яркости дебаг-линий. Линии рисуются в HDR-таргет ДО тонемапа, экспозиция
+	/// которого заранее неизвестна, - см. DebugLineOverlay.Intensity.</summary>
+	public float DebugLineIntensity { get; set; } = 4f;
+
+	public AnimationDebugOptions AnimationDebug { get; set; } = new();
+
+	public PhysicsDebugOptions PhysicsDebug { get; set; } = new();
+
 	// --- Preview Graphics (см. SettingsWindow.DrawGraphicsSection) ---
 
 	/// <summary>Нормал-мапы в Lighting-превью (live-тумблер, бит PreviewFeatureFlags.NormalMaps).</summary>
@@ -106,7 +135,7 @@ public class EditorSettings
 	/// DLSS/FSR, TAA). Сам кадр не меняет: пасс лишь заполняет свой RG16F-буфер, и пока его никто не
 	/// читает, галка стоит одного фуллскрин-дроу. Фича живого конвейера, заводится по SetFeatures.
 	///
-	/// Молча не работает при MSAA больше 1: векторы читают одно-сэмпловый депт, а он при
+	/// (историческая оговорка про MSAA снята: мультисемплинга в конвейере больше нет, а он при
 	/// мультисемплинге остаётся неразрешённым (см. PipelineFeatures.MotionVectors). Окно Graphics
 	/// показывает это через ModelViewportEnvironment.MotionVectorsAvailable.</summary>
 	public bool PreviewMotionVectors { get; set; } = false;
@@ -333,6 +362,22 @@ public class EditorSettings
 	/// наравне с залитым солнцем двором.</summary>
 	public float VolumetricAmbientShadowFloor { get; set; } = VolumetricLightPassResources.DefaultAmbientShadowFloor;
 
+	/// <summary>Множитель рассеяния punctual-светов средой (конусы спотов/ореолы ламп в дымке).
+	/// 0 - среда видит только солнце и небо, 1 - физическая доля света ламп.</summary>
+	public float VolumetricPunctualScatter { get; set; } = 1f;
+
+	/// <summary>Видимый угловой ДИАМЕТР диска солнца, градусы - ширина полутени PCSS (см.
+	/// LightComponent.SunAngularSize; сюда пишется солнце-сущность Scene View, см.
+	/// PrefabSceneViewport.SyncSunEntity). Реальное солнце ~0.53, дефолт чуть крупнее - мягкость
+	/// видна и на коротких тенях.</summary>
+	public float SunAngularSize { get; set; } = 1f;
+
+	/// <summary>Режим фильтрации теней (солнце И punctual-света) - значения ШЕЙДЕРНЫЕ
+	/// (SHADOW_MODE_* в UnlitInstancedPS.hlsl): 0 = PCSS (дефолт, ноль обязан оставаться PCSS -
+	/// сцены вне превью кбуфер не заполняют), 1 = Hard (1 тап), 2 = PCF 3x3, 3 = PCSS HQ
+	/// (32 тапа). Порядок в комбо окна - по возрастанию цены, см. GraphicsSettingsWindow.</summary>
+	public int ShadowFilterMode { get; set; } = 0;
+
 	/// <summary>Потолок стороны текстуры при загрузке модели (см. ModelLoadOptions.MaxTextureSize).
 	///
 	/// Прямо определяет ПИКОВУЮ память загрузки, и не по чуть-чуть: загрузчик декодирует ВСЕ
@@ -347,7 +392,36 @@ public class EditorSettings
 	/// текстурах, поэтому применяется перечитыванием модели (кнопкой в окне Graphics).</summary>
 	public int PreviewMaxTextureSize { get; set; } = 2048;
 
-	/// <summary>MSAA превью (1/2/4/8). Ручка ПЕРЕЗАГРУЗКИ: число сэмплов запечено в PSO всей
+	/// <summary>
+	/// Стриминг моделей сцены по расстоянию до камеры (см. <see cref="ModelStreamer"/>). Выключение
+	/// НЕ отключает загрузку - оно делает все модели сцены постоянно резидентными: радиус уходит в
+	/// бесконечность, и никто ничего не отпускает.
+	///
+	/// Ручка нужна не только для вкуса. Стриминг заводит и снимает регистрации мешей/материалов/
+	/// батчей ПО ХОДУ кадров, и это единственный путь в редакторе, где набор батчей меняется вне
+	/// первого кадра. Возможность его выключить разделяет «проблема в сцене» и «проблема в
+	/// стриминге» одним тумблером, без пересборки.
+	/// </summary>
+	public bool SceneStreaming { get; set; } = true;
+
+	/// <summary>
+	/// GPU-скиннинг скиннед-моделей сцены. Выключение НЕ убирает модель - она рисуется в bind-позе
+	/// обычным статическим путём: не заводятся ни отдельные инстансы в мега-буфере вершин, ни батчи
+	/// под них, ни compute-проход.
+	///
+	/// Ручка ИНСТАНЦИРОВАНИЯ: скиннед-инстансы регистрируются в момент появления модели в сцене,
+	/// поэтому переключение действует на следующие инстанцирования - уже показанную модель нужно
+	/// переоткрыть (или заново открыть префаб).
+	/// </summary>
+	public bool SceneSkinning { get; set; } = true;
+
+	/// <summary>Радиус стриминга в мировых единицах при включённом <see cref="SceneStreaming"/>:
+	/// дальше него модель отпускается, ближе - берётся. Гистерезис выгрузки добавляет к нему запас
+	/// (см. <see cref="ModelStreamer.StreamOutHysteresis"/>), чтобы модель не мигала на границе.</summary>
+	public float SceneStreamingRadius { get; set; } = 200f;
+
+	/// <summary>УСТАРЕЛО: MSAA выпилен из конвейера, поле осталось только чтобы старые json-настройки
+	/// не падали при чтении. Значение игнорируется. Ручка была ПЕРЕЗАГРУЗКИ: число сэмплов пеклось в PSO всей
 	/// геометрии, поэтому применяется пересозданием окружения (кнопкой в окне Graphics).</summary>
 	public int PreviewMsaaSamples { get; set; } = 4;
 
@@ -416,6 +490,59 @@ public class EditorSettings
 	/// <summary>Отладочный вид SSGI: композит выводит один только bounce вместо кадра с ним.
 	/// Live, аналог <see cref="AoDebugView"/>.</summary>
 	public bool SsgiDebugView { get; set; } = false;
+
+	// --- SSR (стохастические экранные отражения, см. SsrPass.cs / GraphicsSettingsWindow) ---
+
+	/// <summary>Экранные отражения (SSR-пасс): стохастический GGX-луч на пиксель по тонкому
+	/// G-buffer-у + темпоральная аккумуляция; результат ЗАМЕНЯЕТ env-спекуляр. Live-фича конвейера
+	/// (сам G-buffer пишется всегда); тянет за собой буфер векторов движения.</summary>
+	public bool PreviewSsr { get; set; } = false;
+
+	/// <summary>RT-фолбэк отражений: лучи, промахнувшиеся мимо экрана, добираются inline RayQuery
+	/// по TLAS сцены (нужны inline-трассировка устройства И включённый аппаратный probe GI - его
+	/// accel и питает лучи). Смена пересобирает материалы SSR, но не окружение.</summary>
+	public bool SsrRayTraced { get; set; } = false;
+
+	/// <summary>Текстурное альбедо внеэкранных RT-хитов (только с <see cref="SsrRayTraced"/>):
+	/// 0 - выкл (потриугольное усреднённое альбедо), 1 - атлас даунсемпленных плиток 128²
+	/// (дёшево), 2 - «bindless»-массив полноразмерных base color текстур (честнее и дороже;
+	/// без поддержки индексации массивов на девайсе тихо падает до атласа). Смена пересобирает
+	/// материалы SSR, как <see cref="SsrRayTraced"/>.</summary>
+	public int SsrHitTextures { get; set; } = 0;
+
+	/// <summary>Множитель заменяющего отражения (1 - энергетически честно). Live (кбуфер SsrConstants).</summary>
+	public float SsrIntensity { get; set; } = SsrPassResources.DefaultIntensity;
+
+	/// <summary>Потолок perceptual roughness: выше отражения плавно гаснут. Live.</summary>
+	public float SsrMaxRoughness { get; set; } = SsrPassResources.DefaultMaxRoughness;
+
+	/// <summary>Толщина поверхности при проверке пересечения луча с глубиной, мировые единицы. Live.</summary>
+	public float SsrThickness { get; set; } = SsrPassResources.DefaultThickness;
+
+	/// <summary>Дальность луча отражения, мировые единицы. Live.</summary>
+	public float SsrMaxDistance { get; set; } = SsrPassResources.DefaultMaxDistance;
+
+	/// <summary>Вес истории темпоральной аккумуляции (0..0.97): больше - глаже и инертнее. Live.</summary>
+	public float SsrHistoryWeight { get; set; } = SsrPassResources.DefaultHistoryWeight;
+
+	/// <summary>Качество резолва отражений (1..4): сколько чужих лучей переиспользует пиксель
+	/// (x2 тапов, вес BRDF/PDF - см. SsrResolvePS). Live.</summary>
+	public int SsrRaysPerPixel { get; set; } = SsrPassResources.DefaultRaysPerPixel;
+
+	/// <summary>Отладочный вид SSR: 0 - кадр, 1 - только отражения, 2 - confidence, 3 - нормали
+	/// G-buffer-а, 4 - альбедо RT-хитов. Live, аналог <see cref="SsgiDebugView"/>.</summary>
+	public int SsrDebugView { get; set; } = 0;
+
+	/// <summary>ВСЕГО отскоков RT-луча отражений (1..4): 1 - только первичный луч, 2+ -
+	/// зеркальные продолжения с металлических хитов («зеркало в зеркале»). Только с
+	/// <see cref="SsrRayTraced"/>; live (кбуфер SsrConstants).</summary>
+	public int SsrRtBounces { get; set; } = SsrPassResources.DefaultRtBounces;
+
+	/// <summary>Режим трассировки отражений (только с <see cref="SsrRayTraced"/>): 0 - экранный
+	/// марш, затем RT для промахнувшихся лучей; 1 - сразу RT (марш пропускается целиком). Во
+	/// втором режиме экранные ДАННЫЕ по-прежнему используются - радианс в точке хита берётся с
+	/// экрана репроекцией; уходят артефакты самого марша. Live (кбуфер SsrConstants).</summary>
+	public int SsrTraceMode { get; set; } = 0;
 
 	// --- Авто-экспозиция (см. EyeAdaptationPass.cs / TonemapPass.cs / GraphicsSettingsWindow) ---
 
@@ -603,9 +730,9 @@ public class EditorSettings
 	/// <see cref="ProbeGiBakeOptions.RealtimeVariabilityThreshold"/>). Live.</summary>
 	public float ProbeGiVariabilityThreshold { get; set; } = 0.08f;
 
-	/// <summary>Число объёмов probe-GI (1-3): 1 = одна сетка на всю сцену (как раньше), выше -
-	/// дополнительные вдвое/вчетверо более мелкие каскады вокруг центра сцены тем же бюджетом
-	/// проб (см. SampleProbeGi). Только GPU + реальное время. Ребейк.</summary>
+	/// <summary>МЁРТВАЯ ручка, оставлена только чтобы старые settings.json читались без ошибок:
+	/// каскады probe-GI сняты вместе с прокруткой (артефакты въезжающих плоскостей), объём один и
+	/// статический, бюджет проб отдан ему целиком (см. ProbeGiViewportShared.BuildOptions).</summary>
 	public int ProbeGiCascades { get; set; } = 1;
 
 	/// <summary>Релокация проб: насколько проба вправе отойти от узла сетки, в долях шага сетки
@@ -614,6 +741,22 @@ public class EditorSettings
 	public float ProbeGiRealtimeRelocation { get; set; } = 0.45f;
 
 
+	/// <summary>
+	/// Настройки сериализуются ВМЕСТЕ С ПОЛЯМИ.
+	///
+	/// Почти всё здесь - свойства, но <see cref="AnimationDebug"/> и <see cref="PhysicsDebug"/> -
+	/// структуры из публичных ПОЛЕЙ, а System.Text.Json поля по умолчанию не трогает вовсе. Без
+	/// этого флага обе уезжали в файл пустым объектом (проверено: в живом editor_settings.json
+	/// лежало `"AnimationDebug": {}`), то есть каждая галочка дебага молча терялась при перезапуске
+	/// редактора - причём выглядело это как «настройки не сохраняются иногда», ведь всё остальное
+	/// сохранялось исправно.
+	/// </summary>
+	private static readonly JsonSerializerOptions SerializerOptions = new()
+	{
+		WriteIndented = true,
+		IncludeFields = true,
+	};
+
 	public static EditorSettings Load()
 	{
 		try
@@ -621,7 +764,7 @@ public class EditorSettings
 			if (File.Exists(FilePath))
 			{
 				var json = File.ReadAllText(FilePath);
-				var loaded = JsonSerializer.Deserialize<EditorSettings>(json);
+				var loaded = JsonSerializer.Deserialize<EditorSettings>(json, SerializerOptions);
 				if (loaded is not null)
 				{
 					loaded.UiScalePercent = ClampToAllowedScale(loaded.UiScalePercent);
@@ -647,7 +790,7 @@ public class EditorSettings
 				Directory.CreateDirectory(directory);
 			}
 
-			var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+			var json = JsonSerializer.Serialize(this, SerializerOptions);
 			File.WriteAllText(FilePath, json);
 		}
 		catch

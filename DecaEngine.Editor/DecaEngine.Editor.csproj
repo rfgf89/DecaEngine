@@ -16,6 +16,7 @@
       <ProjectReference Include="..\DecaEngine.ImGui.Core\DecaEngine.ImGui.Core.csproj" />
       <ProjectReference Include="..\DecaEngine.Input.Sdl3\DecaEngine.Input.Sdl3.csproj" />
       <ProjectReference Include="..\DecaEngine\DecaEngine.csproj" />
+      <ProjectReference Include="..\DecaEngine.Physics.Bepu\DecaEngine.Physics.Bepu.csproj" />
     </ItemGroup>
 
     <ItemGroup>

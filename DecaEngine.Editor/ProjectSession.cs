@@ -62,79 +62,167 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>????????? ?????? ?? ?????????? ???? ? .sln (?????????? ?????, ???????? ?? MenuBarWindow).</summary>
-		public void LoadProject(string slnPath)
+		/// <summary>
+		/// Платформа, под которую собирается проект пользователя. Не настройка, а СЛЕДСТВИЕ: сборка
+		/// проекта грузится В ЭТОТ ЖЕ процесс, значит обязана совпадать с ним по разрядности. Плюс
+		/// движок тянет DiligentEngine, который на AnyCPU отказывается собираться вовсе - без явной
+		/// платформы открытие проекта заканчивалось сообщением «не удалось собрать проект».
+		/// </summary>
+		public static string EditorPlatform =>
+			System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
+			{
+				System.Runtime.InteropServices.Architecture.X86 => "x86",
+				System.Runtime.InteropServices.Architecture.Arm64 => "ARM64",
+				_ => "x64",
+			};
+
+		/// <summary>Что подготовка нашла: пути проекта и собранная сборка, которую остаётся
+		/// загрузить.</summary>
+		private readonly record struct LoadedPaths(string SlnPath, string CsprojPath, string DllPath);
+
+		private Task<LoadedPaths>? _loadTask;
+
+		/// <summary>
+		/// Начинает открытие проекта. Тяжёлая часть - разбор csproj и ПОЛНАЯ СБОРКА проекта (он
+		/// тянет за собой два десятка проектов движка, на холодную это минуты) - уходит в фон;
+		/// завершается открытие в <see cref="PollLoad"/>, в потоке UI.
+		///
+		/// Раньше всё это шло синхронно из обработчика меню: редактор переставал рисовать кадры на
+		/// всё время сборки, и открытие проекта было неотличимо от зависания.
+		/// </summary>
+		public void BeginLoadProject(string slnPath)
 		{
+			if (_loadTask is not null)
+			{
+				return;
+			}
+
+			// Остановка прежнего приложения - здесь, в UI-потоке: она трогает состояние редактора.
 			if (_assemblyApp is not null && _assemblyApp.State != AssemblyAppState.NotLoaded)
 			{
 				_assemblyApp.Quit();
 			}
 
 			IsBusy = true;
-			StatusMessage = "???????? ???????...";
+			StatusMessage = "Открытие проекта: сборка...";
+
+			_loadTask = Task.Run(() => PrepareProject(slnPath));
+		}
+
+		/// <summary>
+		/// Доводит начатое открытие до конца, если подготовка закончилась. Звать каждый кадр.
+		/// Возвращает true, если в этот раз открытие завершилось (успешно или нет).
+		///
+		/// Загрузка сборки, публикация путей и событие <see cref="ProjectChanged"/> живут ЗДЕСЬ, а не
+		/// в фоне: на них завязаны окна редактора, и трогать их из чужого потока нельзя.
+		/// </summary>
+		public bool PollLoad()
+		{
+			if (_loadTask is not { IsCompleted: true })
+			{
+				return false;
+			}
+
+			var task = _loadTask;
+			_loadTask = null;
 
 			try
 			{
-				var slnDir = Path.GetDirectoryName(slnPath)!;
-				var slnName = Path.GetFileNameWithoutExtension(slnPath);
-
-				var csprojPath = Path.Combine(slnDir, slnName, $"{slnName}.csproj");
-
-				if (!File.Exists(csprojPath))
+				if (task.IsFaulted)
 				{
-					csprojPath = Path.Combine(slnDir, $"{slnName}.csproj");
-					if (!File.Exists(csprojPath))
-					{
-						csprojPath = Directory.GetFiles(slnDir, "*.csproj", SearchOption.AllDirectories)
-							.FirstOrDefault(p => !Path.GetFileNameWithoutExtension(p).EndsWith(".Assembly", StringComparison.OrdinalIgnoreCase))
-							?? throw new FileNotFoundException("?? ?????? .csproj ??????? ????? ? .sln", slnPath);
-					}
+					var error = task.Exception?.GetBaseException();
+					StatusMessage = $"Ошибка открытия проекта: {error?.Message}";
+					EditorConsoleLog.Add(LogLevel.Error, error?.ToString() ?? "Project load failed");
+					return true;
 				}
 
-				var assemblyProjectName = $"{slnName}.Assembly";
-				var assemblyCsprojPath = Path.Combine(slnDir, assemblyProjectName, $"{assemblyProjectName}.csproj");
-				var runnableCsprojPath = File.Exists(assemblyCsprojPath) ? assemblyCsprojPath : csprojPath;
+				var paths = task.Result;
 
-				EditorBuilder.AttachEngineReferences(csprojPath);
-				if (runnableCsprojPath != csprojPath)
+				if (string.IsNullOrEmpty(paths.DllPath))
 				{
-					EditorBuilder.AttachEngineReferences(runnableCsprojPath);
-				}
-
-				var outputs = CsprojOutputResolver.GetBuildOutputs(runnableCsprojPath, buildIfMissing: true);
-				var assemblyName = Path.GetFileNameWithoutExtension(runnableCsprojPath);
-				var dllPath = outputs.FirstOrDefault(p =>
-					string.Equals(Path.GetFileNameWithoutExtension(p), assemblyName, StringComparison.OrdinalIgnoreCase) &&
-					Path.GetExtension(p).Equals(".dll", StringComparison.OrdinalIgnoreCase));
-
-				if (dllPath is null)
-				{
-					StatusMessage = "?? ??????? ??????? ?????? (??. ????? ???????)";
-					return;
+					StatusMessage = "Не удалось собрать проект (см. окно Console)";
+					return true;
 				}
 
 				_assemblyApp = new AssemblyApp();
 				_assemblyApp.ThreadStarted += threadId => EditorConsoleLog.SetProjectThreadId(threadId);
 				_assemblyApp.ThreadStopped += () => EditorConsoleLog.SetProjectThreadId(null);
-				_assemblyApp.LoadFromPath(dllPath);
+				_assemblyApp.LoadFromPath(paths.DllPath);
 
-				_projectSlnPath = slnPath;
-				_projectCsprojPath = csprojPath;
+				_projectSlnPath = paths.SlnPath;
+				_projectCsprojPath = paths.CsprojPath;
 
 				// Asset pipeline cache lives inside the opened project (see AssetCache.DefaultRoot):
 				// every ModelLoadOptions built from here on picks it up by default, so baked textures
 				// and cooked models follow the project rather than the editor install.
 				AssetCache.SetProjectRoot(ProjectDirectory);
 
-				StatusMessage = "?????? ????????, ????? ? ???????";
+				StatusMessage = "Проект открыт, готов к запуску";
 			}
 			catch (Exception ex)
 			{
-				StatusMessage = $"?????? ???????? ???????: {ex.Message}";
+				StatusMessage = $"Ошибка открытия проекта: {ex.Message}";
+				EditorConsoleLog.Add(LogLevel.Error, ex.ToString());
 			}
 			finally
 			{
 				IsBusy = false;
 				ProjectChanged?.Invoke();
+			}
+
+			return true;
+		}
+
+		/// <summary>Фоновая часть открытия: только файлы и процессы, ничего от редактора. Именно
+		/// поэтому её можно унести с UI-потока целиком.</summary>
+		private static LoadedPaths PrepareProject(string slnPath)
+		{
+			var slnDir = Path.GetDirectoryName(slnPath)!;
+			var slnName = Path.GetFileNameWithoutExtension(slnPath);
+
+			var csprojPath = Path.Combine(slnDir, slnName, $"{slnName}.csproj");
+
+			if (!File.Exists(csprojPath))
+			{
+				csprojPath = Path.Combine(slnDir, $"{slnName}.csproj");
+				if (!File.Exists(csprojPath))
+				{
+					csprojPath = Directory.GetFiles(slnDir, "*.csproj", SearchOption.AllDirectories)
+						.FirstOrDefault(p => !Path.GetFileNameWithoutExtension(p).EndsWith(".Assembly", StringComparison.OrdinalIgnoreCase))
+						?? throw new FileNotFoundException("Не найден .csproj игрового проекта рядом с .sln", slnPath);
+				}
+			}
+
+			var assemblyProjectName = $"{slnName}.Assembly";
+			var assemblyCsprojPath = Path.Combine(slnDir, assemblyProjectName, $"{assemblyProjectName}.csproj");
+			var runnableCsprojPath = File.Exists(assemblyCsprojPath) ? assemblyCsprojPath : csprojPath;
+
+			EditorBuilder.AttachEngineReferences(csprojPath);
+			if (runnableCsprojPath != csprojPath)
+			{
+				EditorBuilder.AttachEngineReferences(runnableCsprojPath);
+			}
+
+			var outputs = CsprojOutputResolver.GetBuildOutputs(runnableCsprojPath,
+				buildIfMissing: true, platform: EditorPlatform);
+			var assemblyName = Path.GetFileNameWithoutExtension(runnableCsprojPath);
+			var dllPath = outputs.FirstOrDefault(p =>
+				string.Equals(Path.GetFileNameWithoutExtension(p), assemblyName, StringComparison.OrdinalIgnoreCase) &&
+				Path.GetExtension(p).Equals(".dll", StringComparison.OrdinalIgnoreCase));
+
+			return new LoadedPaths(slnPath, csprojPath, dllPath ?? string.Empty);
+		}
+
+		/// <summary>Синхронное открытие - для кода без кадрового цикла (командная строка, проверки).
+		/// В редакторе пользоваться им НЕЛЬЗЯ: он снова заморозит кадры на всё время сборки.</summary>
+		public void LoadProject(string slnPath)
+		{
+			BeginLoadProject(slnPath);
+
+			_loadTask?.Wait();
+
+			while (!PollLoad() && _loadTask is not null)
+			{
 			}
 		}
 

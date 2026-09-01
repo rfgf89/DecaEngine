@@ -60,12 +60,6 @@ public static class PreviewProbe
 		Console.WriteLine($"[probe] features: {(PreviewFeatureFlags)ProbeFeatureFlags}");
 
 		// DECA_PROBE_HDR=<путь к .hdr> - IBL из файла вместо процедурного неба.
-		// DECA_PROBE_MSAA=1 - выключить MSAA (по умолчанию 4x, как в редакторе).
-		uint msaa = uint.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_MSAA"), out var parsedMsaa)
-			? Math.Max(1u, parsedMsaa)
-			: 4u;
-		Console.WriteLine($"[probe] msaa: {msaa}x");
-
 		// DECA_PROBE_SSAO=0 - выключить SSAO-пасс (по умолчанию включён, как в редакторе).
 		bool ssao = Environment.GetEnvironmentVariable("DECA_PROBE_SSAO") != "0";
 		// DECA_PROBE_AO=GTAO - техника GTAO вместо классического SSAO (см. AmbientOcclusionMode).
@@ -96,7 +90,7 @@ public static class PreviewProbe
 		var env = new ModelViewportEnvironment(api, 512, 512, "Probe Color", "Probe Depth", sharedResources,
 			skyBackground: true,
 			environmentHdrPath: Environment.GetEnvironmentVariable("DECA_PROBE_HDR"),
-			msaaSamples: msaa, ssao: ssao, shadows: shadows, aoMode: aoMode, ssgi: ssgi,
+			ssao: ssao, shadows: shadows, aoMode: aoMode, ssgi: ssgi,
 			eyeAdaptation: eyeAdaptation, mainCascades: mainCascades,
 			// DECA_PROBE_FOG=1 - атмосферный туман в гарнессе (см. FogPass): выключен по умолчанию,
 			// чтобы не сдвигать сравнительную метрику яркости ([probe] lighting: lum avg).
@@ -505,9 +499,13 @@ public static class PreviewProbe
 		var meshIdMap = new Dictionary<int, MeshId>();
 		var materialIdMap = new Dictionary<int, MaterialId>();
 		var batchCache = new Dictionary<(int, int), BatchId>();
+
+		// Скин-стримы мешей (меш -> начало в общем буфере скиннинга). Пустая карта у статической
+		// модели - штатно: CreateInstanceEntity просто не найдёт в ней меш и заведёт обычный инстанс.
+		var skinBaseMap = new Dictionary<int, int>();
 		ModelViewportGeometry.RegisterModelResources(env.BatchRenderer, model, meshIdMap, materialIdMap,
 			sharedResources.EnvMapSampler, env.SceneCopyTarget, env.EnvironmentMap,
-			sceneCopySampler: sharedResources.SceneColorSampler);
+			sceneCopySampler: sharedResources.SceneColorSampler, skinBaseMap: skinBaseMap);
 
 		// Сколько материалов пишут тень с альфа-тестом (листва). Ноль на сцене с деревом означает,
 		// что критерий отбора её не признал, - и тогда никакие god rays сквозь крону не пойдут по
@@ -531,6 +529,12 @@ public static class PreviewProbe
 			}
 		}
 
+		// Участки палитры скиннед-инстансов. Собираются здесь, а привязываются к ОДНОЙ сущности
+		// после цикла: коллбэк срабатывает ВНУТРИ CreateInstanceEntity, когда сущности ещё нет, а
+		// поза у всех мешей персонажа общая - это один скелет (см. AnimationDriver).
+		var skinnedPalettes = new List<int>();
+		Entity? animatedEntity = null;
+
 		int created = 0;
 		foreach (var instance in model.instances)
 		{
@@ -539,15 +543,197 @@ public static class PreviewProbe
 				continue;
 			}
 
+			int palettesBefore = skinnedPalettes.Count;
 			var entity = ModelViewportGeometry.CreateInstanceEntity(env.Store, env.ResourceManager,
 				env.BatchRenderer, meshIdMap, materialIdMap, batchCache,
-				instance.meshId, instance.materialId, instance.transform);
+				instance.meshId, instance.materialId, instance.transform,
+				model, skinBaseMap, skinnedPalettes.Add);
 			if (entity != null)
 			{
 				created++;
+				if (skinnedPalettes.Count > palettesBefore)
+				{
+					animatedEntity ??= entity;
+				}
 			}
 		}
 		Console.WriteLine($"[probe] entities created: {created} (subMesh={subMesh})");
+
+		// Анимация идёт ЧЕРЕЗ КОМПОНЕНТЫ и AnimationDriver - тем же путём, что и Scene View (см.
+		// PrefabSceneViewport.UpdateAnimation). Прямой вызов семплера был бы короче, но проверял бы
+		// не тот путь, который ломается в редакторе, и расхождение между ними приезжало бы уже туда.
+		//   DECA_PROBE_ANIMCLIP=<индекс>  - клип модели (без него персонаж стоит в bind-позе)
+		//   DECA_PROBE_ANIMTIME=<сек>     - время в клипе
+		//   DECA_PROBE_ANIMFRAMES=<n>     - прогон n кадров по 1/60 с с полным конвейером
+		// Автономные проверки анимационного стека. Обе НЕ трогают ни кадр, ни сцену пробника - они
+		// строят собственные миры и позы, - поэтому и стоят здесь, до отрисовки: их вывод должен
+		// быть виден даже если кадр дальше упадёт.
+		//   DECA_PROBE_PHYSICS=1 - физический мир (см. PhysicsProbe): гравитация, контакт с полом,
+		//                          райкасты, меш-коллайдер.
+		//   DECA_PROBE_PROC=1    - процедурный слой (см. ProceduralProbe): spring bones, foot IK,
+		//                          aim IK и рэгдолл на реальном риге модели.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_PHYSICS") == "1")
+		{
+			PhysicsProbe.Run();
+		}
+
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_PROC") == "1")
+		{
+			ProceduralProbe.Run(model);
+		}
+
+		//   DECA_PROBE_HUMANOID=1 - автоматическая разметка аватара (см. HumanoidProbe).
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_HUMANOID") == "1")
+		{
+			HumanoidProbe.Run(model);
+		}
+
+		//   DECA_PROBE_ANIMREPORT=1 - численный отчёт по клипам модели (см. AnimationReportProbe):
+		//   замыкание цикла, скольжение опоры, фаза ног. Инструмент для правки анимации без глаз.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_ANIMREPORT") == "1")
+		{
+			AnimationReportProbe.ModelPathHint = modelPath;
+			AnimationReportProbe.Run(model);
+		}
+
+		//   DECA_PROBE_GAMEPLAY=1 - геймплейные скрипты сцены (см. GameplayProbe): движение по кругу.
+		//   Модель ему не нужна вовсе - он гоняет систему по собственному EntityStore, - но стоит
+		//   здесь по той же причине, что и физика: у пробника одна точка входа.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_GAMEPLAY") == "1")
+		{
+			GameplayProbe.Run();
+		}
+
+		//   DECA_PROBE_SCENE=1 - НАСТОЯЩАЯ демо-сцена с физикой, без окна (см. ScenePhysicsProbe):
+		//   префаб, его иерархия и геометрия площадки, прочитанная тем же импортёром. Здесь ему
+		//   нужен api - в отличие от прочих автономных проверок, статика строится из реальных
+		//   мешей, а их читает ModelLoader.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_SCENE") == "1")
+		{
+			ScenePhysicsProbe.Run(api, env.BatchRenderer.Skinning);
+		}
+
+		//   DECA_PROBE_CHARACTER=1 - полный персонаж на плоскости со стеной (см. CharacterPlaneProbe):
+		//   матрица состояний с метрикой «лапа в корпусе». Модель нужна ЖИВАЯ - это воспроизведение
+		//   конкретного персонажа, а не абстрактной системы.
+		if (Environment.GetEnvironmentVariable("DECA_PROBE_CHARACTER") == "1")
+		{
+			CharacterPlaneProbe.Run(env.BatchRenderer.Skinning, model, modelPath);
+		}
+
+		var animationDriver = new AnimationDriver(env.BatchRenderer.Skinning);
+		if (animatedEntity != null)
+		{
+			foreach (int palette in skinnedPalettes)
+			{
+				animationDriver.AddInstance(animatedEntity.Value.Id, model, palette);
+			}
+
+			string clipName = int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_ANIMCLIP"),
+					out int clipIndex)
+				&& clipIndex >= 0 && clipIndex < model.Animations.Count
+					? model.Animations[clipIndex].Name
+					: string.Empty;
+
+			float animTime = float.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_ANIMTIME"),
+				System.Globalization.NumberStyles.Float,
+				System.Globalization.CultureInfo.InvariantCulture, out var parsedAnimTime)
+				? parsedAnimTime
+				: 0f;
+
+			// Playing = false: время задано напрямую, и Advance сдвинул бы его с ожидаемого значения,
+			// сделав кадр невоспроизводимым.
+			animatedEntity.Value.AddComponent(new Animator
+			{
+				ClipName = clipName,
+				Time = animTime,
+				Playing = false,
+				Loop = true,
+				Speed = 1f,
+			});
+
+			// Единичный трансформ: пробник ставит персонажа в начало координат, и пространство модели
+			// совпадает с мировым (физики у пробника нет, так что переводить между ними некому и
+			// незачем).
+			animationDriver.Update(animatedEntity.Value, Matrix4x4.Identity, 0f);
+			env.BatchRenderer.ExecuteSkinning();
+
+			Console.WriteLine($"[probe] skinning: {animationDriver.CharacterCount} персонажей через компоненты, " +
+				$"клип {(clipName.Length > 0 ? clipName : "нет (bind-поза)")}, t={animTime:0.###}s");
+
+			// DECA_PROBE_DEBUGDRAW=1 - дебаг-вид скелета в кадр (см. DebugDraw/DebugLineOverlay).
+			// Проверка ровно того, что нельзя проверить числами: собрались ли шейдеры линий, дошли
+			// ли вершины до GPU и попал ли дроу в кадр. Ответ - в probe_lighting.png: кадр с линиями
+			// ОБЯЗАН отличаться от кадра без них.
+			if (Environment.GetEnvironmentVariable("DECA_PROBE_DEBUGDRAW") == "1")
+			{
+				var debugDraw = new DebugDraw { Enabled = true };
+
+				animationDriver.Debug = debugDraw;
+				animationDriver.DebugOptions = new AnimationDebugOptions
+				{
+					Skeleton = true,
+					JointAxes = true,
+					OnTop = true,
+				};
+
+				// Ещё один шаг с нулевым временем: поза уже посчитана, здесь нужна только её отрисовка.
+				debugDraw.Clear();
+				animationDriver.Update(animatedEntity.Value, Matrix4x4.Identity, 0f);
+
+				var debugOverlay = new DebugLineOverlay(env.DilApi, api, env.BatchRenderer,
+					env.Pipeline.Targets?.RenderColorFormat ?? TextureObjectFormat.R8G8B8A8UNorm);
+
+				debugOverlay.Upload(debugDraw);
+				env.Pipeline.DebugOverlay = debugOverlay.Draw;
+				env.Pipeline.InvalidateGraph();
+
+				Console.WriteLine($"[probe] debug draw: {debugDraw.TotalCount} вершин " +
+					$"({debugDraw.DepthTestedCount} с депт-тестом, {debugDraw.OnTopCount} поверх), " +
+					$"ёмкость {debugOverlay.DepthTestedCapacity}/{debugOverlay.OnTopCapacity}" +
+					(debugDraw.Overflowed ? ", УПЁРЛИСЬ В ПОТОЛОК" : ""));
+			}
+
+			// ПРОГОН анимации с полным проходом конвейера на каждом кадре. Одиночный снимок, который
+			// пробник делает по умолчанию, не проверяет ровно то, что ломается в редакторе:
+			// покадровое обновление палитры, диспетчеризацию скиннинга рядом с уже записанными
+			// командами и рост буферов батч-рендерера по ходу. Здесь всё это прогоняется по-настоящему.
+			if (int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_ANIMFRAMES"), out int animFrames) &&
+				animFrames > 0)
+			{
+				Console.WriteLine($"[probe] anim-loop: {animFrames} кадров по 1/60 с");
+
+				var animEntity = animatedEntity.Value;
+				ref var loopAnimator = ref animEntity.GetComponent<Animator>();
+				loopAnimator.Playing = true;
+
+				float loopTime = 0f;
+				for (int frame = 0; frame < animFrames; frame++)
+				{
+					// Скиннинг - строго ДО Root.Update: внутри него команды кадра уже ЗАПИСЫВАЮТСЯ, а
+					// скиннинг на пути роста пересоздаёт мега-буфер вершин, и вызов после записи
+					// освобождал бы буфер под уже записанными командами (см. PrefabSceneViewport).
+					animationDriver.Update(animEntity, Matrix4x4.Identity, 1f / 60f);
+					env.BatchRenderer.ExecuteSkinning();
+
+					loopTime += 1f / 60f;
+					env.SetEyeAdaptationDeltaTime(1f / 60f);
+					env.Root.Update(new UpdateTick(1f / 60f, loopTime));
+					env.Pipeline.Execute();
+
+					if (frame % 15 == 0)
+					{
+						Console.WriteLine($"[probe] anim-loop: кадр {frame}, " +
+							$"t={animEntity.GetComponent<Animator>().Time:0.###}s, " +
+							$"{env.BatchRenderer.DiagCounters}");
+					}
+				}
+
+				env.DilApi.ImmediateContext.Flush();
+				env.DilApi.ImmediateContext.WaitForIdle();
+				Console.WriteLine($"[probe] anim-loop: прошло {animFrames} кадров без падения");
+			}
+		}
 
 		// DECA_PROBE_MODEL2=<путь> - завести ВТОРУЮ модель ОДНОВРЕМЕННО с первой (не вместо, как
 		// DECA_PROBE_RELOAD выше) в заданном мировом TRS, зеркало обнаруженной у пользователя сцены:
@@ -810,8 +996,6 @@ public static class PreviewProbe
 
 			env.DepthTarget.Resize(sceneSize);
 			env.SceneCopyTarget.Resize(sceneSize);
-			env.MsaaColorTarget?.Resize(sceneSize);
-			env.MsaaDepthTarget?.Resize(sceneSize);
 			env.AoTarget?.Resize(sceneSize);
 			env.GiTarget?.Resize(sceneSize);
 			env.HdrColorTarget?.Resize(sceneSize);
@@ -1330,92 +1514,17 @@ public static class PreviewProbe
 					_gpuBakerLongRun = baker;
 					Console.WriteLine("[probe] probe-gi rounds: GPU (compute)");
 
-					// DECA_PROBE_CASCADES=<n> (2..3) - мелкие каскады, как во вьюпорте: бокс в 2^i
-					// раз меньше вокруг центра той же плотностью, атласы в слоты _C1/_C2. Раунды
-					// докручиваются до сходимости здесь же - смоуку нужен готовый результат в кадре.
-					if (int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_CASCADES"),
-							out var cascadeCount) && cascadeCount > 1)
-					{
-						// DECA_PROBE_SCROLL=<n> - смоук ПРОКРУТКИ каскада (см.
-						// ProbeGiBakeSession.Scroll): единственный headless-способ проверить её
-						// целиком - раздачу слотов пула, перезаливку карт кирпичей и холодный раунд
-						// въехавших проб - до запуска редактора.
-						int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_SCROLL"),
-							out var scrollSteps);
-
-						var cascadeCenter = (fullMin + fullMax) * 0.5f;
-						var cascadeHalf = (fullMax - fullMin) * 0.5f;
-						for (int c = 1; c < Math.Min(cascadeCount, 3); c++)
-						{
-							var half = cascadeHalf / (1 << c);
-
-							// Область прокрутки - те же границы, что даёт вьюпорт (см.
-							// ProbeGiViewportShared.CreateCascade): по ней меряется ёмкость пула.
-							// Смоук обязан идти тем же путём, иначе он не проверяет сизинг вовсе -
-							// а ровно на нём и разваливался каскад в редакторе.
-							bakeOptions.ScrollOriginRange = scrollSteps > 0
-								? (fullMin, fullMax - half * 2f)
-								: null;
-							var cascadeOptions = bakeOptions;
-
-							var cascadeSession = baker.BeginBake(cascadeCenter - half,
-								cascadeCenter + half,
-								Vector3.Normalize(-env.ShadowSettings.LightDirection),
-								new Vector3(1f, 0.98f, 0.92f) * 2f,
-								env.ShadowSettings.EnvYawRadians, env.EnvironmentRadiance,
-								cascadeOptions, scrollable: scrollSteps > 0);
-							baker.EnsureSurfaceCache(cascadeSession);
-
-							var cascadeAtlases = new ProbeGiTextures(api, cascadeSession.Result,
-								$"_probeGiCliC{c}", gpuWritable: true);
-							cascadeAtlases.Bind(model, $"_C{c}");
-							CascadeTextures.Add(cascadeAtlases);
-
-							var cascadeGpu = new ProbeRoundGpu(env.DilApi, gpuPipelines!,
-								cascadeSession, baker, cascadeAtlases, env.EnvironmentMap,
-								env.ShadowSettings.EnvYawRadians, gpuAccel);
-							while (!cascadeSession.NoGeometry
-								&& cascadeSession.Round < cascadeSession.TargetRounds)
-							{
-								if (cascadeGpu.RunRound(cascadeSession, baker,
-										ProbeGiBaker.RoundRayDirections(cascadeSession),
-										ProbeGiBaker.RoundBlendWeight(cascadeSession)))
-								{
-									cascadeSession.AdvanceRound();
-								}
-							}
-
-							env.DilApi.ImmediateContext.Flush();
-							env.DilApi.ImmediateContext.WaitForIdle();
-							// Разрежённость КАСКАДА - число, решающее, во что обойдётся перевод каскадов
-							// на плотную тороидальную сетку по образцу RTXGI-DDGI. У базового объёма
-							// она заведомо выгоднее (он накрывает всю сцену с её пустотами), а
-							// решение принимается по каскаду: коробка у него маленькая и почти вся в
-							// геометрии, там плотная сетка должна быть почти бесплатной.
-							long cascadeDense = (long)cascadeSession.CountX * cascadeSession.CountY
-								* cascadeSession.CountZ;
-							Console.WriteLine($"[probe] cascade {c}: " +
-								$"{cascadeSession.CountX}x{cascadeSession.CountY}x{cascadeSession.CountZ} " +
-								$"virtual grid, {cascadeSession.ProbeCount} probes, cell " +
-								$"{cascadeSession.Cell.X:F2}; dense would be {cascadeDense} " +
-								$"(x{(double)cascadeDense / Math.Max(cascadeSession.ProbeCount, 1):F2})");
-
-							ScrollCascadeSmoke(env, baker, cascadeSession, cascadeGpu, c,
-								half, scrollSteps);
-
-							// Раунд держит привязки на атласы - жить им до конца прогона, Dispose
-							// только раунду.
-							cascadeGpu.Dispose();
-						}
-					}
-
+					// Каскадов и прокрутки больше нет (сняты вместе со всеми артефактами въезжающих
+					// плоскостей): probe-GI - один статический объём на всю сцену, бюджет проб отдан
+					// ему целиком (см. ProbeGiViewportShared.BuildOptions). Смоук каскадов и
+					// ScrollCascadeSmoke, стоявшие здесь, проверяли ровно снятый механизм.
 					// DECA_PROBE_DEBUGOVERLAY=1 - смоук дебаг-вида проб (см. ProbeDebugOverlay):
 					// компиляция его шейдеров и PSO плюс отрисовка в кадры прогона. Единственный
 					// headless-способ поймать ошибку шейдера/раскладки до запуска редактора.
 					if (Environment.GetEnvironmentVariable("DECA_PROBE_DEBUGOVERLAY") == "1")
 					{
 						var overlay = new ProbeDebugOverlay(env.DilApi, api, env.BatchRenderer,
-							session, ProbeTextures!, env.MsaaSamples,
+							session, ProbeTextures!,
 							env.Pipeline.Targets?.RenderColorFormat
 								?? TextureObjectFormat.R8G8B8A8UNorm);
 						env.Pipeline.InlineOverlay = overlay.Draw;
@@ -2485,7 +2594,7 @@ public static class PreviewProbe
 		// ModelPreviewViewport.ResizeTargets, кроме ImGui-биндинга - его в headless нет): в редакторе
 		// связка AO + ресайз окна превью намертво вешает GPU. Здесь тот же сценарий воспроизводится
 		// без UI, так что его можно гонять под D3D12 debug layer / Vulkan validation и в связке с
-		// DECA_PROBE_SSAO/DECA_PROBE_AO/DECA_PROBE_MSAA для локализации.
+		// DECA_PROBE_SSAO/DECA_PROBE_AO для локализации.
 		if (Environment.GetEnvironmentVariable("DECA_PROBE_RESIZE") == "1")
 		{
 			var newSize = new Vector2(768, 640);
@@ -2497,8 +2606,6 @@ public static class PreviewProbe
 			env.ColorTarget.Resize(newSize);
 			env.DepthTarget.Resize(newSize);
 			env.SceneCopyTarget.Resize(newSize);
-			env.MsaaColorTarget?.Resize(newSize);
-			env.MsaaDepthTarget?.Resize(newSize);
 			env.AoTarget?.Resize(newSize);
 			env.GiTarget?.Resize(newSize);
 			env.HdrColorTarget?.Resize(newSize);
@@ -2597,198 +2704,6 @@ public static class PreviewProbe
 	/// параметры сетки в кбуфер каждого материала (см. ModelPreviewViewport.PollProbeBake).</summary>
 	private static ProbeGiTextures? ProbeTextures;
 
-	/// <summary>Атласы мелких каскадов (DECA_PROBE_CASCADES, зеркало
-	/// ModelPreviewViewport._probeCascades) - индекс 0 уходит в слоты _C1, 1 - в _C2.</summary>
-	private static readonly List<ProbeGiTextures> CascadeTextures = new();
-
-	/// <summary>Смоук ПРОКРУТКИ каскада (DECA_PROBE_SCROLL): гоняет объём шагами вдоль X, как это
-	/// делает камера во вьюпорте, и печатает то, ради чего прокрутка и написана, - сколько слотов
-	/// пула УДЕРЖАЛО своё поле против того, сколько заселено заново, и во что обошёлся сам сдвиг.
-	///
-	/// Это не декорация: в редакторе прокрутка живёт в кадре движения камеры, воспроизвести её
-	/// руками дорого, а сломать легко - раздача слотов, выравнивание якорей слитых кирпичей и
-	/// холодный раунд въехавших проб связаны между собой и молча деградируют в «поле мигает»
-	/// вместо честного отказа.</summary>
-	private static void ScrollCascadeSmoke(ModelViewportEnvironment env, ProbeGiBaker baker,
-		ProbeGiBakeSession session, ProbeRoundGpu gpu, int cascade, Vector3 half, int steps)
-	{
-		if (steps <= 0)
-		{
-			return;
-		}
-
-		// Шаг - четверть бокса по X: ровно тот порог, на котором вьюпорт решает, что объёму пора
-		// ехать (см. ProbeGiViewportShared.NeedsRecenter).
-		var step = new Vector3(half.X * 0.5f, 0f, 0f);
-		for (int s = 0; s < steps; s++)
-		{
-			var before = session.Origin;
-			ProbeGiViewportShared.ScrollVolume(session, ProbeGiViewportShared.VolumeCenter(session) + step);
-
-			// Заявка исполняется на границе раунда, а не в момент подачи (см.
-			// ProbeGiBakeSession.RequestScroll), поэтому переезд меряется вместе с первой порцией
-			// раунда - это и есть та работа, которую в редакторе видит кадр движения камеры.
-			var sw = System.Diagnostics.Stopwatch.StartNew();
-			bool roundDone = gpu.RunRound(session, baker,
-				ProbeGiBaker.RoundRayDirections(session),
-				ProbeGiBaker.RoundBlendWeight(session));
-			long scrollMs = sw.ElapsedMilliseconds;
-			if (session.Origin == before)
-			{
-				Console.WriteLine($"[probe] cascade {cascade} scroll {s}: refused (step below quantum)");
-				continue;
-			}
-
-			// Какие пробы этот переезд привёз - снимок ДО того, как раунд дотикает окно свежести
-			// (AdvanceRound ниже). Прокрутка пометила их в ProbeFresh, а въехавшие плоскости
-			// обнулены внутри самого раунда (см. GridClear в ProbeRoundCS.hlsl).
-			var freshSlots = new bool[session.ProbeCount];
-			int fresh = 0;
-			for (int p = 0; p < session.ProbeCount; p++)
-			{
-				if (session.ProbeFresh[p] != 0)
-				{
-					freshSlots[p] = true;
-					fresh++;
-				}
-			}
-
-			// Дожимаем раунд въехавших проб. Первая его порция уже выпущена выше вместе с переездом.
-			while (!roundDone)
-			{
-				roundDone = gpu.RunRound(session, baker,
-					ProbeGiBaker.RoundRayDirections(session),
-					ProbeGiBaker.RoundBlendWeight(session));
-			}
-
-			session.AdvanceRound();
-			env.DilApi.ImmediateContext.Flush();
-			env.DilApi.ImmediateContext.WaitForIdle();
-
-			// Главная проверка прокрутки: раунд обязан ЗАПОЛНИТЬ въехавшие пробы, а не оставить в них
-			// ни ноль (тогда во въехавшей полосе дырка), ни поле места, откуда объём уехал (тогда там
-			// вспыхнет освещение чужого угла сцены - тексель-то тот же самый). Сравниваем среднюю
-			// яркость свежих проб с удержавшими своё поле: у здоровой прокрутки это один порядок.
-			//
-			// Для тороидальной раскладки проверка СТРОЖЕ, чем была для пула: там свежий кирпич
-			// получал новый слот и мог отличаться от соседей законно, здесь свежая проба лежит
-			// ровно в том же текселе, где лежало старое поле, и «чужая яркость» означает, что
-			// обнуление плоскости не сработало.
-			var field = gpu.ReadField();
-			double keptLum = 0, freshLum = 0;
-			int keptProbes = 0, freshProbes = 0, freshZero = 0;
-			for (int p = 0; p < session.ProbeCount; p++)
-			{
-				var sh0 = field[p * 4];
-				double lum = 0.2126 * sh0.X + 0.7152 * sh0.Y + 0.0722 * sh0.Z;
-				if (freshSlots[p])
-				{
-					freshLum += lum;
-					freshProbes++;
-					if (lum <= 0.0)
-					{
-						freshZero++;
-					}
-				}
-				else
-				{
-					keptLum += lum;
-					keptProbes++;
-				}
-			}
-
-			Console.WriteLine($"[probe] cascade {cascade} scroll {s}: {scrollMs} ms, " +
-				$"{fresh}/{session.ProbeCount} fresh probes, scroll " +
-				$"({session.ScrollX},{session.ScrollY},{session.ScrollZ}), " +
-				$"origin x {session.Origin.X:F2}; field lum kept " +
-				$"{(keptProbes > 0 ? keptLum / keptProbes : 0):F3}, fresh " +
-				$"{(freshProbes > 0 ? freshLum / freshProbes : 0):F3} " +
-				$"({freshZero}/{freshProbes} still empty)");
-
-			// ОТСТОЙ ПОСЛЕ ПРОКРУТКИ - проверка, что въехавшая плоскость чистится ОДИН раз, а не
-			// каждый раунд. Шаги выше её не ловят: там каждый шаг снова скроллит, пометка чистки
-			// успевает перезаписаться, и повторное обнуление неотличимо от штатного. А в редакторе
-			// между прокрутками идут десятки раундов, и пометка, которую забыли снять, обнуляет
-			// накопители снова и снова: проба в такой плоскости не сходится НИКОГДА. Выглядит это
-			// как мигающие полосы с повторяющимся узором (плоскость - полоса, период тороидального
-			// заворота - повтор), и ровно так этот баг и приехал из редактора.
-			//
-			// Мера - РАЗБРОС МЕЖДУ СОСЕДНИМИ РАУНДАМИ, а не яркость. Яркость тут ничего не скажет, и
-			// это проверено от обратного: с забытым снятием пометки среднее по свежим пробам растёт
-			// ровно так же. Причина в том, что холодная проба принимает поле ЦЕЛИКОМ (вес раунда 1),
-			// то есть переобнуляемая плоскость не темнеет - она каждый раунд получает НОВУЮ оценку
-			// по одному вееру лучей. Не тускнеет, а дёргается; именно это и видно как мигание.
-			//
-			// Сошедшаяся проба между спокойными раундами меняется на проценты (бегущее среднее с
-			// малым весом), переобнуляемая - на десятки процентов, потому что усреднения у неё нет
-			// вовсе.
-			if (s == steps - 1)
-			{
-				for (int extra = 0; extra < 3; extra++)
-				{
-					bool quiet = false;
-					while (!quiet)
-					{
-						quiet = gpu.RunRound(session, baker,
-							ProbeGiBaker.RoundRayDirections(session),
-							ProbeGiBaker.RoundBlendWeight(session));
-					}
-
-					session.AdvanceRound();
-				}
-
-				env.DilApi.ImmediateContext.Flush();
-				env.DilApi.ImmediateContext.WaitForIdle();
-				var beforeQuiet = (Vector4[])gpu.ReadField().Clone();
-
-				bool lastQuiet = false;
-				while (!lastQuiet)
-				{
-					lastQuiet = gpu.RunRound(session, baker,
-						ProbeGiBaker.RoundRayDirections(session),
-						ProbeGiBaker.RoundBlendWeight(session));
-				}
-
-				session.AdvanceRound();
-				env.DilApi.ImmediateContext.Flush();
-				env.DilApi.ImmediateContext.WaitForIdle();
-				var afterQuiet = gpu.ReadField();
-
-				double deltaSum = 0;
-				int deltaProbes = 0, jumpy = 0;
-				for (int p = 0; p < session.ProbeCount; p++)
-				{
-					if (!freshSlots[p])
-					{
-						continue;
-					}
-
-					var a = beforeQuiet[p * 4];
-					var b = afterQuiet[p * 4];
-					double lumA = 0.2126 * a.X + 0.7152 * a.Y + 0.0722 * a.Z;
-					double lumB = 0.2126 * b.X + 0.7152 * b.Y + 0.0722 * b.Z;
-					if (lumA <= 1e-4)
-					{
-						continue;
-					}
-
-					double rel = Math.Abs(lumB - lumA) / lumA;
-					deltaSum += rel;
-					deltaProbes++;
-					if (rel > 0.1)
-					{
-						jumpy++;
-					}
-				}
-
-				double meanDelta = deltaProbes > 0 ? deltaSum / deltaProbes : 0;
-				Console.WriteLine($"[probe] cascade {cascade} settle: fresh probes change " +
-					$"{meanDelta * 100:F1}% between two quiet rounds, " +
-					$"{jumpy}/{deltaProbes} above 10% " +
-					$"(десятки процентов = плоскость чистится каждый раунд)");
-			}
-		}
-	}
 
 	// GPU-путь для длинного прогона (DECA_PROBE_FRAMES): раунд на кадр, как в редакторе.
 	private static ProbeRoundGpu? _gpuRoundLongRun;
@@ -2821,31 +2736,16 @@ public static class PreviewProbe
 				: 0,
 		};
 
+		// Сетка пушится ТЕМ ЖЕ помощником, что и во вьюпортах: раньше CLI заполнял эти поля
+		// собственным кодом, и поле, добавленное только в одном из двух мест, молча приезжало сюда
+		// нулём - гарнесс рендерил без probe-GI, не сказав об этом ни слова.
+		// Каскадные поля (ProbeGridOrigin1/2) остаются нулями: каскады сняты вместе с прокруткой.
 		if (ProbeTextures != null)
 		{
-			data.ProbeGridOrigin = ProbeTextures.GridOrigin;
-			data.ProbeGridCell = ProbeTextures.GridCell;
-			data.ProbeGridCounts = ProbeTextures.GridCounts;
-			data.ProbeGridScroll = ProbeTextures.GridScroll;
-		}
-
-		// Каскады (DECA_PROBE_CASCADES > 1) - как во вьюпорте: нули = каскада нет.
-		if (CascadeTextures.Count > 0)
-		{
-			var t = CascadeTextures[0];
-			data.ProbeGridOrigin1 = t.GridOrigin;
-			data.ProbeGridCell1 = t.GridCell;
-			data.ProbeGridCounts1 = t.GridCounts;
-			data.ProbeGridScroll1 = t.GridScroll;
-		}
-
-		if (CascadeTextures.Count > 1)
-		{
-			var t = CascadeTextures[1];
-			data.ProbeGridOrigin2 = t.GridOrigin;
-			data.ProbeGridCell2 = t.GridCell;
-			data.ProbeGridCounts2 = t.GridCounts;
-			data.ProbeGridScroll2 = t.GridScroll;
+			ProbeGiViewportShared.PushGrid(ref data, ProbeTextures,
+				// Дефолты EditorSettings.ProbeGiNormalBias/ProbeGiViewBias - гарнесс обязан считать
+				// тем же смещением сэмпла, что и редактор, иначе метрика яркости несравнима.
+				normalBias: 0.3f, viewBias: 1f);
 		}
 
 		// Дефолты ручек probe-GI/солнца - те же, что в EditorSettings (см. кбуфер ProbeGiParams);

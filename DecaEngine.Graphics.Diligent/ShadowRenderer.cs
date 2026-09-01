@@ -612,9 +612,21 @@ namespace DecaEngine.Graphics.Diligent
 		/// против следа текселя в ~10 мм. У ортокаскада глубина размазана по всему [0,1], экспонента в
 		/// среднем много меньше, и его 2000 единиц весят несопоставимо больше. Тысяча даёт ~3 см на
 		/// пяти метрах - ниже порога заметного peter-panning и выше кванта растра.</summary>
-		private GraphicsStateInfo GetPunctualBaseState() => GetBaseState(1000, 2f);
+		/// <summary>У punctual-слайсов ближний клип ВКЛЮЧЁН, в отличие от каскадов. У орто-каскада
+		/// глаз оттянут от сцены на радиус, и кастер перед ближней плоскостью - легитимный окклюдер,
+		/// его надо клампить, а не резать (см. depthClipDisable ниже). У ПЕРСПЕКТИВНОЙ грани
+		/// точечного света "перед ближней плоскостью" означает "вплотную к лампе или за ней":
+		/// треугольник, пересекающий плоскость глаза грани (w=0), при отключённом клипе
+		/// растеризуется размазанной проекцией с глубиной, прижатой к near, и закрашивает огромный
+		/// кусок карты грани - ВЕСЬ конус этой грани уходит в тень, на приёмниках это круглая "дыра"
+		/// в свете, чей радиус не зависит от Range (репро: вертикальная панель в 0.3 от лампы,
+		/// пересекающая её высоту). Кастер честно ближе near (0.05..0.25, см.
+		/// PunctualShadowScheduler.SliceNearPlane) при включённом клипе тени не пишет - и не должен:
+		/// он практически внутри светильника.</summary>
+		private GraphicsStateInfo GetPunctualBaseState() => GetBaseState(1000, 2f, depthClipDisable: false);
 
-		private GraphicsStateInfo GetBaseState(int depthBias, float slopeScaledDepthBias)
+		private GraphicsStateInfo GetBaseState(int depthBias, float slopeScaledDepthBias,
+			bool depthClipDisable = true)
 		{
 			return new GraphicsStateInfo
 			{
@@ -638,7 +650,8 @@ namespace DecaEngine.Graphics.Diligent
 					// РАДИУСА, а до реальных окклюдеров расстояние своё у сцены, поэтому первому,
 					// самому мелкому каскаду ближняя плоскость режет кастеров раньше всех - в его
 					// тени появляются дыры, которых у крупных каскадов на том же месте нет.
-					DepthClipDisable = true,
+					// У punctual-слайсов клип ВКЛЮЧЁН - см. GetPunctualBaseState.
+					DepthClipDisable = depthClipDisable,
 				},
 				DepthStencilState = new DepthStencilStateInfo
 				{

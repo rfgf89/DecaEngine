@@ -129,8 +129,9 @@ public struct PunctualLight
 	/// <summary>Тень света: x - индекс ПЕРВОГО слайса в texture array теней punctual-светов
 	/// (спот - один слайс, точечный - шесть граней куба подряд; -1 = тени нет), y - сила тени
 	/// (ShadowStrength, 0..1), z - ближняя плоскость слайса (PunctualShadowScheduler.SliceNearPlane;
-	/// far слайса = PositionRange.w), w - пад. Матрицы слайсов - в структурном буфере
-	/// PunctualShadowMatrices по тому же индексу.</summary>
+	/// far слайса = PositionRange.w), w - мировой радиус светящегося тела для ширины полутени PCSS
+	/// (0 = дефолт в шейдере, см. LightComponent.SourceRadius). Матрицы слайсов - в структурном
+	/// буфере PunctualShadowMatrices по тому же индексу.</summary>
 	public Vector4 ShadowParams;
 }
 

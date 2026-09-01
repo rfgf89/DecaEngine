@@ -2,10 +2,15 @@ using DecaEngine.Graphics.Core;
 
 namespace DecaEngine.Core;
 
-/// <summary>Owns the off-screen color/depth/scene-copy(/MSAA) targets a <see cref="GraphicsPipelineSimple"/>
+/// <summary>Owns the off-screen color/depth/scene-copy targets a <see cref="GraphicsPipelineSimple"/>
 /// renders into - the off-screen equivalent of a swap chain's back buffer, created once by the
 /// pipeline (see <see cref="SsaoPassResources"/>, <see cref="SkyPassResources"/> for the same pattern
-/// applied to individual passes).</summary>
+/// applied to individual passes).
+///
+/// MSAA выпилен из конвейера целиком (вместе с мультисемпловой парой таргетов, резолвами и
+/// *Msaa*-вариантами шейдеров пост-обработки): сглаживание - забота темпоральных техник
+/// (TAAU/FSR/DLSS, см. TemporalUpscalePass), которые с мультисемплом были взаимоисключающи, а
+/// каждый экранный пасс таскал под него второй вариант шейдера.</summary>
 public sealed class PipelineRenderTargets : IReleaseObject
 {
 	public IRenderTarget ColorTarget { get; }
@@ -30,18 +35,23 @@ public sealed class PipelineRenderTargets : IReleaseObject
 	/// для transmissive-материалов (см. ForwardPass / UnlitInstancedPS.hlsl).</summary>
 	public IRenderTarget SceneCopyTarget { get; }
 
-	/// <summary>Мультисемпловая пара таргетов, non-null только когда конструктору передан
-	/// <c>msaaSamples</c> &gt; 1 - геометрия рисуется в них и резолвится в <see cref="ColorTarget"/>
-	/// (см. ForwardPass).</summary>
-	public IRenderTarget? MsaaColorTarget { get; }
-	public IRenderTarget? MsaaDepthTarget { get; }
+	/// <summary>Тонкий G-buffer отражений (SSR, см. SsrPass), non-null в HDR-режиме. Пишется вторым и
+	/// третьим MRT-слотами opaque-дроу (см. ForwardPass / FEATURE_REFLECTION_GBUFFER в
+	/// UnlitInstancedPS.hlsl): нормаль шейдинга (мир, xyz) + perceptual roughness (w).</summary>
+	public IRenderTarget? NormalRoughnessTarget { get; }
+
+	/// <summary>Вторая половина G-buffer-а отражений: полный множитель, на который в env-спекуляре
+	/// умножается префильтрованное окружение (Fr * specularWeight * occlusion * envOcclusion, rgb) -
+	/// им SSR энергетически корректно ЗАМЕНЯЕТ окружение своим результатом, а не складывается поверх.
+	/// w = 1 у пикселей, прошедших lit-путь (маска для композита).</summary>
+	public IRenderTarget? EnvFactorTarget { get; }
 
 	/// <param name="hdr">Включает HDR-конвейер: добавляется линейный <see cref="HdrColorTarget"/>, а
-	/// scene-copy и MSAA-цвет создаются в том же RGBA16F (копия/резолв формат не конвертируют, а
-	/// рефракция обязана читать линейную сцену). Нужен для авто-экспозиции - см.
+	/// scene-copy создаётся в том же RGBA16F (копия формат не конвертирует, а рефракция обязана
+	/// читать линейную сцену). Нужен для авто-экспозиции - см.
 	/// <see cref="EyeAdaptationPassResources"/>.</param>
 	public PipelineRenderTargets(IGraphicsApi api, string colorTargetName, string depthTargetName,
-		uint width, uint height, uint msaaSamples, bool hdr = false)
+		uint width, uint height, bool hdr = false)
 	{
 		RenderColorFormat = hdr ? TextureObjectFormat.R16G16B16A16Float : TextureObjectFormat.R8G8B8A8UNorm;
 
@@ -85,24 +95,26 @@ public sealed class PipelineRenderTargets : IReleaseObject
 			});
 		}
 
-		if (msaaSamples > 1)
+		// G-buffer отражений - в HDR-режиме безусловно (вместе с MSAA ушла и его условность):
+		// форматы MRT пекутся в PSO всей геометрии (см. DiligentBatchRenderer.GetBaseState), и
+		// условность здесь означала бы пересоздание окружения на тумблер отражений - ровно то,
+		// от чего ушёл безусловный hdr (см. комментарий GraphicsPipelineSimple).
+		if (hdr)
 		{
-			MsaaColorTarget = api.CreateRenderTarget(new TextureInfo
+			NormalRoughnessTarget = api.CreateRenderTarget(new TextureInfo
 			{
-				name = colorTargetName + " MSAA",
+				name = colorTargetName + " NormalRough",
 				width = width,
 				height = height,
-				format = RenderColorFormat,
-				sampleCount = msaaSamples,
+				format = TextureObjectFormat.R16G16B16A16Float,
 			});
 
-			MsaaDepthTarget = api.CreateRenderTarget(new TextureInfo
+			EnvFactorTarget = api.CreateRenderTarget(new TextureInfo
 			{
-				name = depthTargetName + " MSAA",
+				name = colorTargetName + " EnvFactor",
 				width = width,
 				height = height,
-				format = TextureObjectFormat.D32Float,
-				sampleCount = msaaSamples,
+				format = TextureObjectFormat.R16G16B16A16Float,
 			});
 		}
 	}
@@ -113,7 +125,7 @@ public sealed class PipelineRenderTargets : IReleaseObject
 		DepthTarget.Release();
 		SceneCopyTarget.Release();
 		HdrColorTarget?.Release();
-		MsaaColorTarget?.Release();
-		MsaaDepthTarget?.Release();
+		NormalRoughnessTarget?.Release();
+		EnvFactorTarget?.Release();
 	}
 }

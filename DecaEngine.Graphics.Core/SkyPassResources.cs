@@ -17,7 +17,7 @@ public sealed class SkyPassResources : IReleaseObject
 	/// <see cref="ForwardPass"/> - в HDR-режиме превью это RGBA16F, и PSO обязан совпадать с
 	/// привязанным таргетом (см. <see cref="PipelineRenderTargets.RenderColorFormat"/>).</param>
 	public SkyPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, IGpuTexture environmentMap,
-		uint msaaSamples, TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
+		TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
 	{
 		var skyVs = graphicsApi.CreateShader("Sky Background VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var skyPs = graphicsApi.CreateShader("Sky Background PS", "EditorAssets/shader", "SkyBackgroundPS.hlsl", ShaderObjectType.Pixel);
@@ -33,7 +33,6 @@ public sealed class SkyPassResources : IReleaseObject
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
 			DepthStencilState = new DepthStencilStateInfo { DepthEnable = false },
 			InputLayout = [],
-			SampleCount = msaaSamples,
 		}));
 
 		batchRenderer.BindViewConstants(_material);

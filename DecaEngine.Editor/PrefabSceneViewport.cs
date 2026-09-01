@@ -174,6 +174,11 @@ namespace DecaEngine.Editor
 		/// стриминга от камеры.</summary>
 		private sealed class RenderedModel
 		{
+			/// <summary>Сущность ПРЕФАБА, которой принадлежит запись (ключ <see cref="_rendered"/>).
+			/// Продублирован в саму запись, потому что она передаётся вглубь инстанцирования, где
+			/// ключа словаря уже нет, а компоненты анимации висят именно на этой сущности.</summary>
+			public int EntityId;
+
 			public string AssetPath = "";
 			public string? ResolvedPath;
 			public ModelStreamer.Resident? Resident;
@@ -204,7 +209,6 @@ namespace DecaEngine.Editor
 		private bool _appliedSsao;
 		private AmbientOcclusionMode _appliedAoMode;
 		private bool _appliedSsgi;
-		private uint _appliedMsaa;
 		private bool _appliedSky;
 		private string _appliedHdrPath = "";
 		private bool _appliedAniso;
@@ -254,6 +258,583 @@ namespace DecaEngine.Editor
 		private bool _active = true;
 
 		private readonly Dictionary<int, RenderedModel> _rendered = new();
+
+		/// <summary>Анимация скиннед-моделей сцены: держит позы персонажей и читает их компоненты
+		/// (<see cref="ECS.Animator"/> и прочие) каждый кадр. Ключ - сущность ПРЕФАБА: именно на ней
+		/// висят компоненты, а не на env-сущностях инстансов.</summary>
+		private AnimationDriver? _animation;
+
+		/// <summary>Драйвер создаётся лениво - вместе с первой скиннед-моделью сцены. В сценах без
+		/// персонажей его нет вовсе, и кадровый шаг анимации не стоит ничего.</summary>
+		private AnimationDriver EnsureAnimation() => _animation ??= new AnimationDriver(_env.BatchRenderer.Skinning);
+
+		// --- Физика сцены и дебаг-вид (см. ScenePhysics / DebugDraw / DebugLineOverlay) ----------
+
+		/// <summary>Мир физики сцены. Заводится ЛЕНИВО - только когда в сцене есть персонаж с
+		/// компонентом, которому физика нужна (foot IK или рэгдолл): построение статики - это BVH по
+		/// всем треугольникам сцены, и платить за него в сцене без персонажей незачем.</summary>
+		private ScenePhysics? _physics;
+
+		/// <summary>Тела персонажей, которых ведут геймплейные скрипты. В отличие от рэгдоллов, их
+		/// заводит не анимация, а скрипт, и живут они ровно столько, сколько идёт игра.</summary>
+		private readonly CharacterMotionDriver _motion = new();
+
+		/// <summary>Ввод игрока, собранный в <see cref="Render"/> этого кадра. Поле, а не прямая
+		/// запись в привод: ввод собирается при отрисовке, а потребляется в PollScenePhysics, и
+		/// между ними он должен где-то пережить границу кадра. Потребление ОБНУЛЯЕТ поле - скрытый
+		/// вьюпорт перестаёт слать последнее зажатое направление вечно.</summary>
+		private PlayerInput _playerInput;
+
+		/// <summary>Идёт ли Play Mode (см. <see cref="InspectorWindow.IsPlaying"/>). Ставится
+		/// EditorManager'ом каждый кадр.
+		///
+		/// ВРЕМЕННАЯ ПРОВОДКА. Сейчас сцену ведут двое: вьюпорт (физика, анимация - всегда) и
+		/// Play-Mode-системы инспектора (только по кнопке), и этот флаг - единственное, что их
+		/// связывает. Вопрос «кто ведёт сцену» решается отдельно и целиком; до тех пор флаг нужен,
+		/// чтобы персонаж под физикой не бегал по сцене, которую в этот момент редактируют.</summary>
+		public bool IsPlaying { get; set; }
+
+		/// <summary>Шло ли Play в прошлом кадре - чтобы поймать МОМЕНТ остановки. Состояние, которое
+		/// живёт сбоку от ECS, снимком Play Mode не откатывается, и снимать его надо на самом
+		/// переходе.</summary>
+		private bool _wasPlaying;
+
+		/// <summary>Статику надо пересобрать: сцена изменилась структурно или кто-то поехал. Флаг
+		/// свой, а не общий с обводкой выделения: та потребляет свои флаги в тот же кадр, и деление
+		/// одного на двоих означало бы, что успевший первым гасит его для второго.</summary>
+		private bool _physicsStaticsDirty = true;
+
+		/// <summary>Скретч мировой геометрии под статику физики - тот же приём, что у обводки
+		/// выделения: списки переиспользуются, чтобы пересборка не аллоцировала сцену целиком.</summary>
+		private readonly List<Vector3> _physicsPositions = new();
+		private readonly List<uint> _physicsIndices = new();
+
+		/// <summary>Приёмник дебаг-линий кадра. Живёт всегда (он ничего не стоит выключенным), а
+		/// GPU-оверлей под ним - только пока дебаг включён.</summary>
+		private readonly DebugDraw _debugDraw = new();
+		private DebugLineOverlay? _debugLineOverlay;
+
+		/// <summary>Создание оверлея провалилось (не собрались шейдеры) - больше не пробовать.
+		/// Тот же приём, что у дебаг-вида проб: попытка на каждом кадре означала бы поток одинаковых
+		/// ошибок в консоли и компиляцию шейдера в каждом кадре.</summary>
+		private bool _debugOverlayFailed;
+
+		/// <summary>Кадр сцены упал с исключением - вьюпорт остановлен до перезагрузки префаба.
+		/// Иначе устойчивая ошибка означает снос и пересборку сцены на КАЖДОМ кадре: поток
+		/// одинаковых сообщений в консоли и мигающий мусор во вьюпорте вместо диагноза.</summary>
+		private bool _renderFailed;
+
+		/// <summary>Подробности падения уже напечатаны. Флаг НЕ сбрасывается перезагрузкой префаба:
+		/// повторять один и тот же стек по кругу незачем, а перезагрузка при устойчивой ошибке -
+		/// самое частое действие пользователя.</summary>
+		private bool _renderFailureLogged;
+
+		/// <summary>
+		/// Печатает падение кадра сцены ПОСТРОЧНО.
+		///
+		/// Именно построчно: консоль редактора показывает запись одной строкой без переноса, и
+		/// многострочный <c>ex.ToString()</c> обрезается на первом же кадре стека - то есть ровно на
+		/// том месте, ради которого его и печатают. Кадры стека уходят отдельными записями и видны
+		/// целиком.
+		/// </summary>
+		private void LogRenderFailure(Exception ex)
+		{
+			if (_renderFailureLogged)
+			{
+				return;
+			}
+
+			_renderFailureLogged = true;
+
+			EditorConsoleLog.Add(LogLevel.Error,
+				$"Prefab scene: render failed: {ex.GetType().Name}: {ex.Message}");
+
+			for (var inner = ex; inner != null; inner = inner.InnerException)
+			{
+				if (!ReferenceEquals(inner, ex))
+				{
+					EditorConsoleLog.Add(LogLevel.Error,
+						$"  ---> {inner.GetType().Name}: {inner.Message}");
+				}
+
+				// Потолок в 20 кадров: интересна вершина стека, а хвост - это цикл редактора, один
+				// и тот же у любого падения.
+				var frames = (inner.StackTrace ?? string.Empty)
+					.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+				for (int i = 0; i < frames.Length && i < 20; i++)
+				{
+					EditorConsoleLog.Add(LogLevel.Error, "  " + frames[i].TrimEnd('\r').Trim());
+				}
+			}
+		}
+
+		private readonly List<AnimationDriver.CharacterInfo> _debugCharacters = new();
+
+		/// <summary>Сводка для окна дебага. Читается ИЗ окна каждый кадр - поэтому это снимок
+		/// прошлого кадра, а не живые ссылки на состояние вьюпорта.</summary>
+		public IReadOnlyList<AnimationDriver.CharacterInfo> DebugCharacters => _debugCharacters;
+
+		/// <summary>Мир физики сцены для окна дебага; null - физики в сцене нет (см. <see cref="_physics"/>).</summary>
+		public ScenePhysics? DebugPhysics => _physics;
+
+		/// <summary>Сколько вершин дебаг-линий ушло на GPU в последнем кадре и уперлись ли в потолок -
+		/// окно дебага показывает это честно, чтобы «показано не всё» не выглядело как «больше
+		/// ничего нет».</summary>
+		public (int Vertices, bool Overflowed) DebugLineStats => (_debugDraw.TotalCount, _debugDraw.Overflowed);
+
+		/// <summary>
+		/// Кадровый шаг анимации: читает компоненты сущностей префаба, считает позы и диспетчеризует
+		/// GPU-скиннинг. Зовётся ДО исполнения графа - и тени, и forward, и трассировка читают уже
+		/// деформированную геометрию.
+		/// </summary>
+		// Счётчик кадров для покадровой диагностики (DECA_ANIM_DIAG=1).
+		private int _animDiagFrame;
+
+		private void UpdateAnimation(float deltaSeconds)
+		{
+			// Диагностика идёт ДО раннего выхода: если счётчики растут и без персонажей, значит
+			// источник роста вообще не в анимации, и это тоже ответ.
+			// System.Environment полным именем: у вьюпорта есть своё свойство Environment (окружение
+			// сцены), и короткое имя разрешается в него.
+			if (System.Environment.GetEnvironmentVariable("DECA_ANIM_DIAG") == "1" && (_animDiagFrame++ % 10) == 0)
+			{
+				Console.WriteLine($"[animdiag] кадр {_animDiagFrame}: " +
+					$"{((DiligentBatchRenderer)_env.BatchRenderer).DiagCounters}, " +
+					$"записей={_rendered.Count}, персонажей={_animation?.CharacterCount ?? 0}");
+			}
+
+			if (_animation == null || _animation.CharacterCount == 0)
+			{
+				return;
+			}
+
+			// Хранилище префаба, а не окружения: компоненты анимации автор ставит на сущность
+			// префаба, рядом с ModelRenderer. Store пересоздаётся при перезагрузке префаба, поэтому
+			// он берётся из _lastStore, а не кешируется драйвером.
+			var store = _lastStore;
+			if (store == null)
+			{
+				return;
+			}
+
+			// Проводка драйвера к физике и дебагу идёт КАЖДЫЙ кадр: и то, и другое включается
+			// галочками на живой сцене, а драйвер мог быть создан задолго до этого.
+			_animation.Physics = _physics;
+			_animation.Debug = _debugDraw;
+			_animation.DebugOptions = _editorSettings.AnimationDebug;
+			_animation.HighlightJoint = HighlightJoint;
+			_animation.BeginFrame();
+
+			foreach (var record in _rendered.Values)
+			{
+				if (!store.TryGetEntityById(record.EntityId, out var entity))
+				{
+					continue;
+				}
+
+				// Humanoid-разметка модели - каждый кадр, потому что её правят в окне Humanoid на
+				// живой сцене. Сравнение по ссылке внутри SetAvatar делает повторный вызов
+				// бесплатным, а кеш по пути модели - и загрузку тоже.
+				if (!string.IsNullOrEmpty(record.ResolvedPath) &&
+					_models.TryGetValue(record.ResolvedPath, out var avatarState) &&
+					avatarState.Model?.Skeleton != null)
+				{
+					_animation.SetAvatar(record.EntityId,
+						AvatarFor(record.ResolvedPath, avatarState.Model.Skeleton));
+				}
+
+				// Мировой трансформ сущности: поза считается в пространстве МОДЕЛИ, а физика живёт в
+				// мире, и перевод между ними нужен и лучу foot IK, и рэгдоллу.
+				_animation.Update(entity, record.LastWorld, deltaSeconds);
+			}
+
+			_env.BatchRenderer.ExecuteSkinning();
+		}
+
+		// --- Humanoid-разметка (см. HumanoidAvatar) -----------------------------------------------
+
+		/// <summary>Аватары по пути модели. Кеш по ПУТИ, а не по сущности: одна модель встречается в
+		/// сцене много раз, а разметка у неё одна - она свойство рига, а не персонажа.</summary>
+		private readonly Dictionary<string, HumanoidAvatar> _avatars = new();
+
+		/// <summary>Пути моделей, у которых разметка получена автоматом, а не прочитана из файла.
+		/// Различать обязательно: сохранённая разметка - решение человека, автоматическая - догадка,
+		/// и окно Humanoid показывает это прямым текстом.</summary>
+		private readonly HashSet<string> _autoAvatars = new(StringComparer.OrdinalIgnoreCase);
+
+		/// <summary>
+		/// Аватар модели: из файла рядом с ней, а если файла нет - автоматический.
+		///
+		/// Автоматический строится молча намеренно: без него foot IK и рэгдолл требовали бы ручной
+		/// разметки ДО первого запуска, то есть не работали бы «из коробки» ни на одной модели. Цена
+		/// известна и ограничена - авторские поля компонентов всё равно старше разметки, а сама
+		/// разметка видна и правится в окне Humanoid.
+		/// </summary>
+		private HumanoidAvatar AvatarFor(string modelPath, PreparedSkeleton skeleton)
+		{
+			if (_avatars.TryGetValue(modelPath, out var cached))
+			{
+				return cached;
+			}
+
+			var avatar = HumanoidAvatarAsset.Load(modelPath);
+
+			if (avatar == null)
+			{
+				avatar = HumanoidAutoMap.Build(skeleton);
+				_autoAvatars.Add(modelPath);
+			}
+			else
+			{
+				_autoAvatars.Remove(modelPath);
+			}
+
+			_avatars[modelPath] = avatar;
+			return avatar;
+		}
+
+		/// <summary>Автоматическая ли разметка у этой модели - для окна Humanoid.</summary>
+		public bool IsAvatarAuto(string modelPath) => _autoAvatars.Contains(modelPath);
+
+		/// <summary>Забывает разметку модели: следующий кадр перечитает её с диска. Звать после
+		/// сохранения аватара из окна Humanoid - иначе персонажи сцены продолжат жить по разметке,
+		/// которую только что заменили.</summary>
+		public void InvalidateAvatar(string modelPath)
+		{
+			if (!string.IsNullOrEmpty(modelPath))
+			{
+				_avatars.Remove(modelPath);
+				_autoAvatars.Remove(modelPath);
+			}
+		}
+
+		/// <summary>Скиннед-модель выделенной сущности - вход для окна Humanoid. Скелет и путь
+		/// приходят вместе: путь нужен, чтобы положить аватар рядом с моделью, а скелет - чтобы было
+		/// что размечать.</summary>
+		public (PreparedSkeleton? Skeleton, string? ModelPath, string Name) SelectedSkinnedModel
+		{
+			get
+			{
+				if (_highlightedId < 0 || !_rendered.TryGetValue(_highlightedId, out var record) ||
+					string.IsNullOrEmpty(record.ResolvedPath) ||
+					!_models.TryGetValue(record.ResolvedPath, out var state) ||
+					state.Model?.Skeleton == null)
+				{
+					return (null, null, string.Empty);
+				}
+
+				return (state.Model.Skeleton, record.ResolvedPath,
+					System.IO.Path.GetFileName(record.ResolvedPath));
+			}
+		}
+
+		/// <summary>Кость, подсвеченная окном Humanoid. Пусто - подсветки нет.</summary>
+		public string HighlightJoint { get; set; } = string.Empty;
+
+		// --- Физика сцены (см. ScenePhysics) ------------------------------------------------------
+
+		/// <summary>
+		/// Кадровый шаг физики: заводит или убирает мир по надобности, догоняет статику и двигает
+		/// симуляцию. Идёт ДО анимации - и это не вкусовщина: луч foot IK обязан щупать мир в том
+		/// состоянии, в котором он будет нарисован, а рэгдолл в этом же кадре читает позу из тел,
+		/// проинтегрированных ЗДЕСЬ, и тут же задаёт им новую цель.
+		/// </summary>
+		private void PollScenePhysics(float deltaSeconds)
+		{
+			if (!ScenePhysicsWanted())
+			{
+				if (_physics != null)
+				{
+					// Драйвер держит рэгдоллы ЭТОГО мира - без их сноса они остались бы хендлами в
+					// уничтоженной симуляции. Отвязка, а не Clear: персонажи со своими палитрами
+					// скиннинга обязаны пережить выключение физики (см. AnimationDriver.DetachPhysics).
+					_animation?.DetachPhysics();
+					_motion.Clear(_physics);
+					_physics.Dispose();
+					_physics = null;
+				}
+
+				return;
+			}
+
+			if (_physics == null)
+			{
+				_physics = new ScenePhysics(new Vector3(0f, _editorSettings.SceneGravity, 0f));
+				_physicsStaticsDirty = true;
+			}
+
+			// Симуляция идёт ТОЛЬКО в Play. Мир при этом заводится и статику держит всегда - построение
+		// BVH по всей геометрии сцены в момент нажатия кнопки отдало бы первый кадр игры под
+		// подвисание, - но шагов не делает: в режиме редактирования сцена обязана стоять там, где её
+		// поставил автор. Рэгдолл, разъезжающийся, пока автор двигает объекты, - это не «живая
+		// сцена», а невозможность её собрать.
+		//
+		// Ручная пауза остаётся сверху: она останавливает и то, что идёт по Play.
+		_physics.Paused = _editorSettings.ScenePhysicsPaused || !IsPlaying;
+			_physics.TimeScale = _editorSettings.ScenePhysicsTimeScale;
+			_physics.RecordRays = _editorSettings.PhysicsDebug.Rays;
+
+			bool recordContacts = _editorSettings.PhysicsDebug.NeedsContactRecording;
+			if (_physics.World.Contacts.Enabled != recordContacts)
+			{
+				_physics.World.Contacts.Enabled = recordContacts;
+
+				// Выключение обязано и ОЧИСТИТЬ: иначе на экране навсегда остался бы снимок шага,
+				// на котором галочка ещё была включена, и он выглядел бы как живые контакты.
+				if (!recordContacts)
+				{
+					_physics.World.Contacts.Clear();
+				}
+			}
+
+			if (_physicsStaticsDirty)
+			{
+				_physicsStaticsDirty = false;
+				RebuildPhysicsStatics();
+			}
+
+			// Скорость задаётся ДО шага, поза читается ПОСЛЕ. Слить их в один вызов нельзя: скорость,
+			// заданная после шага, применится только к следующему (персонаж отстаёт от собственной
+			// команды на кадр), а поза, прочитанная до шага, - это поза прошлого кадра.
+			_motion.Input = _playerInput;
+			_playerInput = default;
+			_motion.Steer(_lastStore, _physics, IsPlaying, deltaSeconds, _animation);
+
+			_physics.Update(deltaSeconds);
+
+			// Тело сдвинулось - трансформ сущности за ним. SyncScene, который перекладывает трансформы
+			// в инстансы, идёт РАНЬШЕ по кадру, поэтому картинка отстаёт от физики ровно на кадр -
+			// столько же, сколько и Play-Mode-системы, которые EditorManager тикает после вьюпорта.
+			_motion.Apply(_lastStore, _physics);
+		}
+
+		/// <summary>Нужна ли физика этой сцене вообще. Мир заводится только под конкретного
+		/// потребителя - персонажа с foot IK или рэгдоллом либо явно включённый дебаг физики:
+		/// построение статики - это BVH по всей геометрии сцены.</summary>
+		private bool ScenePhysicsWanted()
+		{
+			if (!_editorSettings.ScenePhysicsEnabled)
+			{
+				return false;
+			}
+
+			if (_editorSettings.PhysicsDebug.AnyEnabled)
+			{
+				return true;
+			}
+
+			var store = _lastStore;
+			if (store == null)
+			{
+				return false;
+			}
+
+			foreach (var record in _rendered.Values)
+			{
+				if (store.TryGetEntityById(record.EntityId, out var entity) &&
+					(entity.HasComponent<FootIkComponent>() || entity.HasComponent<RagdollComponent>() ||
+						IsPhysicalCharacter(entity)))
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		/// <summary>Ведёт ли этого персонажа физика геймплейного скрипта. Мир заводится по нему СРАЗУ,
+		/// не дожидаясь Play: статика - это BVH по всей геометрии сцены, и строить его в момент
+		/// нажатия кнопки значило бы отдать первый кадр игры под подвисание.</summary>
+		private static bool IsPhysicalCharacter(Entity entity) => entity.HasComponent<CharacterBodyComponent>();
+
+		/// <summary>
+		/// Состояние привода персонажей - для окна дебага. Молчащий персонаж в редакторе выглядит
+		/// одинаково независимо от того, ЧТО именно его не пускает: физика выключена галочкой, игра не
+		/// запущена, компонент тела не доехал из префаба или тело есть, но упёрлось. Разбирать это
+		/// глазами по коду - самое дорогое, что можно тут сделать, поэтому все четыре числа выведены
+		/// наружу разом.
+		/// </summary>
+		public (bool Playing, bool HasPhysics, bool Paused, int Scripts, int WithBody, int Bodies) ScriptCharacterStatus
+		{
+			get
+			{
+				int scripts = 0;
+				int withBody = 0;
+				var store = _lastStore;
+
+				if (store != null)
+				{
+					// Скрипты и тела считаются ОТДЕЛЬНО: сцена, сгенерированная до появления
+					// Character Body, приезжает со скриптом и без тела, и «1 и 0» отвечает на вопрос
+					// сразу, а «0 из 0» отправило бы искать поломку в физике.
+					foreach (var entity in store.Query<CircleMoveComponent>().Entities)
+					{
+						scripts++;
+						withBody += entity.HasComponent<CharacterBodyComponent>() ? 1 : 0;
+					}
+
+					// Игрок - тоже скрипт движения, только рулит им клавиатура (см. PlayerMoveComponent).
+					foreach (var entity in store.Query<PlayerMoveComponent>().Entities)
+					{
+						scripts++;
+						withBody += entity.HasComponent<CharacterBodyComponent>() ? 1 : 0;
+					}
+				}
+
+				return (IsPlaying, _physics != null, _physics?.Paused ?? false, scripts, withBody,
+					_motion.CharacterCount);
+			}
+		}
+
+		/// <summary>
+		/// Пересобирает статику физики по геометрии сцены. Скиннед-модели в неё НЕ идут: персонаж не
+		/// должен быть полом сам себе - его собственная стопа немедленно нашла бы лучом его же ногу,
+		/// и foot IK поднял бы его на высоту собственного бедра.
+		/// </summary>
+		private void RebuildPhysicsStatics()
+		{
+			if (_physics == null)
+			{
+				return;
+			}
+
+			_physics.BeginStatics();
+
+			foreach (var record in _rendered.Values)
+			{
+				if (!record.Instantiated || string.IsNullOrEmpty(record.ResolvedPath) ||
+					!_models.TryGetValue(record.ResolvedPath, out var state) || state.Model == null ||
+					state.Model.Skeleton != null)
+				{
+					continue;
+				}
+
+				_physicsPositions.Clear();
+				_physicsIndices.Clear();
+				AppendRecordGeometry(record, state.Model, _physicsPositions, _physicsIndices);
+
+				_physics.AddStaticMesh(
+					System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_physicsPositions),
+					System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_physicsIndices));
+			}
+
+			_physics.EndStatics();
+
+			// Скретч держит мировую копию всей сцены - на большом уровне это десятки мегабайт,
+			// которые до следующей пересборки не нужны никому.
+			_physicsPositions.Clear();
+			_physicsIndices.Clear();
+			_physicsPositions.TrimExcess();
+			_physicsIndices.TrimExcess();
+		}
+
+		// --- Дебаг-линии (см. DebugDraw / DebugLineOverlay) ---------------------------------------
+
+		/// <summary>Открывает кадр дебага. Звать ДО любой стадии, которая рисует: список линий - это
+		/// кадр целиком, а не накопитель.</summary>
+		private void BeginDebugFrame()
+		{
+			// Подсветка кости из окна Humanoid включает дебаг сама по себе: её просят как раз тогда,
+			// когда ни один слой ещё не включён - «покажи, какая это кость».
+			_debugDraw.Enabled = _editorSettings.AnimationDebug.AnyEnabled ||
+				_editorSettings.PhysicsDebug.AnyEnabled ||
+				!string.IsNullOrEmpty(HighlightJoint);
+
+			_debugDraw.Clear();
+		}
+
+		/// <summary>Закрывает кадр дебага: дорисовывает то, что принадлежит миру (физика), и заливает
+		/// всё на GPU. Звать ПОСЛЕ анимации и до исполнения графа.</summary>
+		private void EndDebugFrame()
+		{
+			if (_debugDraw.Enabled && _physics != null)
+			{
+				var options = _editorSettings.PhysicsDebug;
+				PhysicsDebugDraw.Draw(_debugDraw, _physics, options);
+
+				if (options.RagdollJoints)
+				{
+					_animation?.DrawRagdollJoints(_debugDraw, options.OnTop);
+				}
+			}
+
+			_animation?.DescribeCharacters(_debugCharacters);
+			PollDebugLineOverlay();
+		}
+
+		/// <summary>Ведёт GPU-оверлей дебаг-линий за содержимым кадра. Создание/снятие пересобирает
+		/// граф (команды заморожены, см. GraphicsPipelineSimple.DebugOverlay), поэтому проверка
+		/// «есть что рисовать» обязана быть дешёвой - она и есть пара сравнений.</summary>
+		private void PollDebugLineOverlay()
+		{
+			if (!_debugDraw.Enabled || _debugDraw.TotalCount == 0)
+			{
+				if (_env.Pipeline.DebugOverlay != null)
+				{
+					_env.Pipeline.DebugOverlay = null;
+					_env.Pipeline.InvalidateGraph();
+				}
+
+				return;
+			}
+
+			if (_debugLineOverlay == null)
+			{
+				if (_debugOverlayFailed)
+				{
+					return;
+				}
+
+				try
+				{
+					_debugLineOverlay = new DebugLineOverlay(_env.DilApi, _graphicsApi, _env.BatchRenderer,
+						_env.Pipeline.Targets?.RenderColorFormat ?? TextureObjectFormat.R8G8B8A8UNorm);
+				}
+				catch (Exception ex)
+				{
+					// Один раз и больше не пробовать: не собравшийся шейдер не соберётся и на
+					// следующем кадре, а поток одинаковых ошибок в консоли скрыл бы настоящие.
+					_debugOverlayFailed = true;
+					EditorConsoleLog.Add(LogLevel.Error, $"Debug draw: overlay unavailable: {ex.Message}");
+					return;
+				}
+			}
+
+			_debugLineOverlay.Intensity = _editorSettings.DebugLineIntensity;
+
+			bool commandsDirty = _debugLineOverlay.Upload(_debugDraw);
+
+			if (_env.Pipeline.DebugOverlay == null)
+			{
+				_env.Pipeline.DebugOverlay = _debugLineOverlay.Draw;
+				commandsDirty = true;
+			}
+
+			if (commandsDirty)
+			{
+				_env.Pipeline.InvalidateGraph();
+			}
+		}
+
+		/// <summary>Снимает дебаг-оверлей с конвейера и освобождает его. Звать перед пересозданием
+		/// окружения и на выходе: оверлей держит буферы и PSO этого конкретного конвейера.</summary>
+		private void ReleaseDebugOverlay()
+		{
+			if (_debugLineOverlay == null)
+			{
+				return;
+			}
+
+			_env.Pipeline.DebugOverlay = null;
+			_env.Pipeline.InvalidateGraph();
+			_env.DilApi.ImmediateContext.Flush();
+			_env.DilApi.ImmediateContext.WaitForIdle();
+
+			_debugLineOverlay.Dispose();
+			_debugLineOverlay = null;
+		}
+
 		private readonly HashSet<int> _visitedThisSync = new();
 		private readonly List<int> _removeScratch = new();
 
@@ -263,6 +844,23 @@ namespace DecaEngine.Editor
 		// сущности префаба. Синк покомпонентно каждый кадр: светов единицы, а ручки инспектора
 		// (цвет/интенсивность/углы) обязаны быть живыми - пул светов и так перезаливается за кадр.
 		private readonly Dictionary<int, Entity> _lightMirrors = new();
+
+		/// <summary>Скретч сборки punctual-светов для бейка проб (см. PollSceneProbeBake) - чтобы не
+		/// аллоцировать список каждый кадр.</summary>
+		private readonly List<PunctualLight> _probeBakeLightsScratch = new();
+
+		/// <summary>TLAS для RT-теней (режим «Ray-traced» комбо Shadow filtering, см.
+		/// ModelPreviewViewport._rtShadowScene - та же роль). Отдельный от _sceneAccel проб: живёт
+		/// независимо от probe-GI, BLAS-ы кешируются по мешам и переживают движение - на позы
+		/// отвечает пересборка TLAS.</summary>
+		private DiligentRayTracingScene? _rtShadowScene;
+		private readonly List<DiligentRayTracingScene.Instance> _rtShadowInstances = new();
+		private bool _appliedRtShadows;
+
+		/// <summary>Режим RT-теней запрошен и устройство умеет inline-трассировку (см.
+		/// ModelLoadOptions.RtShadows - тумблер уровня загрузки).</summary>
+		private bool RtShadowsEnabled() =>
+			_editorSettings.ShadowFilterMode == 4 && _graphicsApi.RayTracing >= RayTracingSupport.Inline;
 		private readonly HashSet<int> _visitedLightsThisSync = new();
 
 		private EntityStore? _lastStore;
@@ -353,6 +951,21 @@ namespace DecaEngine.Editor
 		private ProbeRoundGpu? _sceneGpu;
 		private bool _sceneGpuDisabled;
 
+		// --- Собственный accel SSR (RT-фолбэк отражений БЕЗ probe GI) --------------------------
+		// Когда accel проб недоступен (probe GI выключен/программный/ещё не собрался), SSR строит
+		// геометрию сам: тем же конструктором ProbeGiBaker (сбор треугольников), но без сессии и
+		// бейка. Предпочтение всегда у _sceneAccel - его позы живые (PollSceneProbePoses); свой
+		// пересобирается по смене состава/поз сцены с дебаунсом (пересборка BLAS всей сцены дорогая).
+		private ProbeSceneAccel? _ssrOwnAccel;
+		private List<(ModelLoader Model, Matrix4x4 World)>? _ssrOwnBuiltFor;
+		private float _ssrOwnRebuildDelay = -1f;
+
+		// Наборы текстур RT-хитов (текстурное альбедо отражений, см. SsrHitTextures) - по одному
+		// на каждый accel: живут и умирают вместе с ним, привязка выбирает набор того accel-а,
+		// который реально ушёл в SetRayScene.
+		private SsrHitTextures? _sceneAccelHitTextures;
+		private SsrHitTextures? _ssrOwnHitTextures;
+
 		/// <summary>Записи сцены в порядке списка моделей, отданного бейкеру: по
 		/// ProbeGeometryInstance.SourceModel отсюда берётся ЖИВАЯ мировая матрица записи
 		/// (RenderedModel - класс, LastWorld обновляется гизмо).</summary>
@@ -360,18 +973,8 @@ namespace DecaEngine.Editor
 		private readonly List<Matrix4x4> _probeScenePoses = new();
 		private bool _sceneTlasDirty;
 
-		/// <summary>Мелкие каскады сцены (см. SampleProbeGi): сессия + атласы + GPU-раунд. Каскад i
-		/// покрывает бокс в 2^i раз меньше баундов сцены вокруг точки интереса камеры, той же
-		/// плотностью - то есть ячейкой в 2^i раз мельче. Зеркало ModelPreviewViewport._probeCascades;
-		/// базовый объём остаётся гарантией покрытия.
-		///
-		/// Центра бокса здесь НЕТ: где объём стоит, знает он сам (см.
-		/// ProbeGiViewportShared.VolumeCenter) - копия рядом с сессией разъезжалась бы с ней.</summary>
-		private readonly List<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
-			ProbeRoundGpu Gpu)> _sceneCascades = new();
-
 		/// <summary>Дебаг-вид проб сцены - общий жизненный цикл с превью (см.
-		/// ProbeGiViewportShared.PollOverlays): база + каскады, по оверлею на объём.</summary>
+		/// ProbeGiViewportShared.PollOverlays).</summary>
 		private readonly List<(ProbeDebugOverlay Overlay, ProbeGiTextures Textures)> _sceneDebugOverlays = new();
 		private bool _sceneDebugFailed;
 
@@ -485,7 +1088,7 @@ namespace DecaEngine.Editor
 			ApplyGraphicsSettings();
 
 			// "OK" окна Settings: live-биты применяются сразу, изменившиеся env-level опции
-			// (MSAA/SSAO/скай/HDR-карта/анизотропия) - пересозданием окружения в начале следующего
+			// (скай/HDR-карта/анизотропия) - пересозданием окружения в начале следующего
 			// Update (см. OnGraphicsSettingsChanged). Вьюпорт один и живёт всю сессию редактора -
 			// отписка не требуется.
 			SettingsWindow.PreviewGraphicsApplied += OnGraphicsSettingsChanged;
@@ -500,11 +1103,11 @@ namespace DecaEngine.Editor
 			_appliedSsao = _editorSettings.PreviewSsao;
 			_appliedAoMode = _editorSettings.PreviewAoMode;
 			_appliedSsgi = _editorSettings.PreviewSsgi;
-			_appliedMsaa = (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8);
 			_appliedSky = _editorSettings.PreviewSkyBackground;
 			_appliedHdrPath = ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "";
 			_appliedAniso = _editorSettings.PreviewAnisotropicFiltering;
 			_appliedMaxTextureSize = ClampedMaxTextureSize();
+			_appliedRtShadows = RtShadowsEnabled();
 			_appliedSceneHdr = _editorSettings.SceneViewHdr;
 			_appliedFog = _editorSettings.PreviewFog;
 			_appliedVolumetric = _editorSettings.PreviewVolumetric;
@@ -519,7 +1122,6 @@ namespace DecaEngine.Editor
 				"Prefab Scene Color", "Prefab Scene Depth", _sharedResources,
 				skyBackground: _appliedSky,
 				environmentHdrPath: _appliedHdrPath.Length > 0 ? _appliedHdrPath : null,
-				msaaSamples: _appliedMsaa,
 				ssao: _appliedSsao,
 				shadows: true,
 				aoMode: _appliedAoMode,
@@ -530,8 +1132,15 @@ namespace DecaEngine.Editor
 				bloom: _appliedBloom,
 				colorGrade: _appliedColorGrade,
 				volumetric: _appliedVolumetric,
-				motionVectors: _appliedMotionVectors,
+				// SSR требует буфера векторов (репроекция истории) - включённые отражения тянут
+				// векторы за собой, как TemporalUpscale.
+				motionVectors: _appliedMotionVectors || _editorSettings.PreviewSsr,
 				temporalUpscale: _appliedMotionVectors && _editorSettings.TemporalUpscale,
+				ssr: _editorSettings.PreviewSsr,
+				// RT-фолбэк догоняет ApplyPipelineFeatures: TLAS сцены (ProbeSceneAccel) в момент
+				// создания окружения ещё не существует, а трейс-материал RT-варианта без него
+				// коммитился бы с пустым дескриптором.
+				ssrRayTraced: false,
 				upscalerBackend: _appliedMotionVectors && _editorSettings.TemporalUpscale
 					? Math.Clamp(_editorSettings.UpscalerBackend, 0, 2)
 					: 0);
@@ -555,6 +1164,12 @@ namespace DecaEngine.Editor
 			var up = MathF.Abs(travel.Y) > 0.95f ? Vector3.UnitX : Vector3.UnitY;
 			var view = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, travel, up);
 			sun.Rotation = new Rotation { value = Quaternion.CreateFromRotationMatrix(Matrix4x4.Transpose(view)) };
+
+			// Угловой размер диска - ширина полутени PCSS (ползунок «Sun angular size» окна Graphics):
+			// сущность солнца заводит окружение с нулём, а ноль в шейдере значит «дефолт», и ручка
+			// без этой строки не делала бы ничего.
+			sun.GetComponent<LightComponent>().SunAngularSize =
+				Math.Clamp(_editorSettings.SunAngularSize, 0.05f, 15f);
 
 			if (shadowSettings.BoundsRadius <= 0f)
 			{
@@ -620,9 +1235,209 @@ namespace DecaEngine.Editor
 				Volumetric = _appliedVolumetric,
 				Bloom = _appliedBloom,
 				ColorGrade = _appliedColorGrade,
-				MotionVectors = _appliedMotionVectors,
+				// SSR тянет векторы за собой - см. CreateEnvironment.
+				MotionVectors = _appliedMotionVectors || _editorSettings.PreviewSsr,
 				TemporalUpscale = _appliedMotionVectors && _editorSettings.TemporalUpscale,
+				Ssr = _editorSettings.PreviewSsr,
+				SsrRayTraced = SsrRayTracedEnabled(),
+				SsrHitTextures = _editorSettings.SsrHitTextures,
 			});
+
+			// RT-вариант трейса обязан получить TLAS сцены ДО первого кадра (тот же контракт, что у
+			// RT-теней) - ресурсы могли только что пересоздаться под новый вариант шейдера; probe-поле
+			// для света RT-хитов привязывается по той же причине здесь же.
+			UpdateSsrRayScene();
+			_env.SetSsrProbeField(_probeTextures);
+
+			// Смена RT-фолбэка пересоздала SSR-ресурсы - живые ручки откатились в дефолты.
+			PushSsrSettings();
+		}
+
+
+		/// <summary>Статус RT-фолбэка SSR для окна Graphics: null - работает; иначе человекочитаемая
+		/// причина, почему фича при включённой галке МОЛЧА осталась экранной. Тихий даунгрейд без
+		/// этой строки неотличим от «отражения сломаны»: зеркало в упор показывает голую env-карту
+		/// (чёрную ниже горизонта), и виноватой кажется цветокоррекция.</summary>
+		public string? SsrRayTracedBlockReason
+		{
+			get
+			{
+				if (_graphicsApi.RayTracing < RayTracingSupport.Inline)
+				{
+					return "нет inline-трассировки (нужен D3D12)";
+				}
+				if (_sceneAccel == null && _ssrOwnAccel == null)
+				{
+					return "accel сцены ещё не собран (сцена пуста или идёт загрузка)";
+				}
+				if (_env.Pipeline.SsrResources is not { RayTraced: true })
+				{
+					return "ресурсы SSR ещё не пересобраны под RT-вариант";
+				}
+				return null;
+			}
+		}
+
+		/// <summary>Доступен ли RT-фолбэк SSR прямо сейчас: галка настроек + inline-трассировка +
+		/// СУЩЕСТВУЮЩИЙ accel сцены (ProbeSceneAccel живёт при аппаратном probe GI - его TLAS и
+		/// таблицы атрибутов и питают лучи отражений). Без accel-а фича молча остаётся экранной.</summary>
+		private bool SsrRayTracedEnabled() =>
+			_editorSettings.SsrRayTraced &&
+			_graphicsApi.RayTracing >= RayTracingSupport.Inline &&
+			(_sceneAccel != null || _ssrOwnAccel != null);
+
+		/// <summary>Привязывает TLAS и таблицы атрибутов сцены RT-варианту SSR-трейса. Зовётся после
+		/// каждого создания/пересоздания <see cref="_sceneAccel"/> и после смены фич: дескриптор
+		/// указывает на сам объект TLAS, но ПЕРЕСОЗДАНИЕ объекта привязку протухает.</summary>
+		private void UpdateSsrRayScene()
+		{
+			var accel = _sceneAccel ?? _ssrOwnAccel;
+			if (accel != null)
+			{
+				_env.Pipeline.SsrResources?.SetRayScene(accel.Tlas, accel.MeshTriangles,
+					accel.Instances);
+				PushSsrHitTextures();
+			}
+		}
+
+		/// <summary>Привязывает трейсу набор текстур RT-хитов ТОГО accel-а, что ушёл в SetRayScene
+		/// (индексы текстур в его таблице инстансов указывают именно в этот набор). Зовётся вместе
+		/// с каждым SetRayScene и при апгрейдах стриминга (см. PollSsrOwnRayScene).</summary>
+		private void PushSsrHitTextures()
+		{
+			var ssr = _env.Pipeline.SsrResources;
+			if (ssr is not { RayTraced: true } || ssr.HitTextureMode == 0)
+			{
+				return;
+			}
+
+			var set = _sceneAccel != null ? _sceneAccelHitTextures : _ssrOwnHitTextures;
+			if (set == null)
+			{
+				ssr.SetHitTextures(null, null);
+			}
+			else if (ssr.HitTextureMode == 1)
+			{
+				ssr.SetHitTextures(set.GetAtlas(), null);
+			}
+			else
+			{
+				ssr.SetHitTextures(null, set.GetFullTextures());
+			}
+		}
+
+		/// <summary>Ведёт собственный accel SSR (см. поля у _ssrOwnAccel): нужен, только когда
+		/// RT-фолбэк включён, а accel-а проб нет. Пересборка синхронная и дорогая (BLAS всей
+		/// сцены) - с дебаунсом по сменам состава/поз. Зовётся каждый кадр из Update.</summary>
+		private void PollSsrOwnRayScene(float deltaTime)
+		{
+			bool wanted = _editorSettings.PreviewSsr && _editorSettings.SsrRayTraced
+				&& _graphicsApi.RayTracing >= RayTracingSupport.Inline
+				&& _sceneAccel == null;
+
+			var sceneModels = new List<(ModelLoader Model, Matrix4x4 World)>();
+			if (wanted)
+			{
+				foreach (var record in _rendered.Values)
+				{
+					if (record.Instantiated && !string.IsNullOrEmpty(record.ResolvedPath) &&
+						_models.TryGetValue(record.ResolvedPath, out var state) && state.Model != null)
+					{
+						sceneModels.Add((state.Model, record.LastWorld));
+					}
+				}
+			}
+
+			// Стриминг дорастил текстуру - bindless-привязка указывает на старую, перепушиваем
+			// (наборы обоих accel-ов; проверка - сравнение счётчиков, копейки).
+			if (_ssrOwnHitTextures?.RefreshStreams() == true ||
+				_sceneAccelHitTextures?.RefreshStreams() == true)
+			{
+				PushSsrHitTextures();
+			}
+
+			if (!wanted || sceneModels.Count == 0)
+			{
+				if (_ssrOwnAccel != null)
+				{
+					// Возврат на accel проб / выключение / опустевшая сцена: трейс-материал не
+					// должен держать умирающий TLAS (и отражать призрак старой сцены).
+					_env.Pipeline.SsrResources?.SetHitTextures(null, null);
+					_env.DilApi.ImmediateContext.Flush();
+					_env.DilApi.ImmediateContext.WaitForIdle();
+					_ssrOwnAccel.Dispose();
+					_ssrOwnAccel = null;
+					_ssrOwnBuiltFor = null;
+					_ssrOwnHitTextures?.Dispose();
+					_ssrOwnHitTextures = null;
+					ApplyPipelineFeatures();
+				}
+
+				_ssrOwnRebuildDelay = -1f;
+				return;
+			}
+
+			if (_ssrOwnAccel != null && SameScenePoses(_ssrOwnBuiltFor, sceneModels))
+			{
+				_ssrOwnRebuildDelay = -1f;
+				return;
+			}
+
+			// Дебаунс: драг гизмо меняет позы каждый кадр, а пересборка - BLAS всей сцены.
+			if (_ssrOwnRebuildDelay < 0f)
+			{
+				_ssrOwnRebuildDelay = 0.4f;
+				return;
+			}
+
+			_ssrOwnRebuildDelay -= deltaTime;
+			if (_ssrOwnRebuildDelay > 0f)
+			{
+				return;
+			}
+
+			_ssrOwnRebuildDelay = -1f;
+
+			try
+			{
+				var geometry = new ProbeGiBaker(sceneModels).InstancedGeometry;
+				if (geometry.Instances.Length == 0)
+				{
+					// Геометрии нет (CPU-копии мешей недоступны) - тихий пропуск с бэкоффом.
+					_ssrOwnRebuildDelay = 5f;
+					return;
+				}
+
+				_env.DilApi.ImmediateContext.Flush();
+				_env.DilApi.ImmediateContext.WaitForIdle();
+				_ssrOwnAccel?.Dispose();
+				_ssrOwnAccel = new ProbeSceneAccel(_env.DilApi, geometry);
+				_ssrOwnBuiltFor = sceneModels;
+
+				// Набор текстур хитов сшит с индексами ЭТОЙ геометрии - пересобирается вместе с ней.
+				_ssrOwnHitTextures?.Dispose();
+				var hitModels = new List<ModelLoader>(sceneModels.Count);
+				foreach (var (m, _) in sceneModels)
+				{
+					hitModels.Add(m);
+				}
+				_ssrOwnHitTextures = SsrHitTextures.Build(_graphicsApi, geometry, hitModels);
+
+				// Фича могла ждать появления accel-а (SsrRayTracedEnabled), ресурсы -
+				// пересборки под RT-вариант; привязка внутри ApplyPipelineFeatures.
+				ApplyPipelineFeatures();
+			}
+			catch (Exception ex)
+			{
+				EditorConsoleLog.Add(LogLevel.Warning,
+					$"SSR: собственный accel сцены не собрался: {ex.Message}");
+				_ssrOwnAccel?.Dispose();
+				_ssrOwnAccel = null;
+				_ssrOwnBuiltFor = null;
+
+				// Бэкофф: причина не исчезнет через кадр - не молотим пересборкой.
+				_ssrOwnRebuildDelay = 5f;
+			}
 		}
 
 		/// <summary>Обработчик "OK" окна настроек: диф env-level опций против применённых - при
@@ -630,16 +1445,18 @@ namespace DecaEngine.Editor
 		/// старый таргет ещё может лежать в draw list-е), live-биты применяются сразу.</summary>
 		private void OnGraphicsSettingsChanged()
 		{
-			// Пересоздание - только под то, что запечено не в конвейер: MSAA (в PSO геометрии),
-			// HDRI энвайронмента (пересчёт IBL), анизотропия (в сэмплеры материалов). Остальное -
-			// фичи конвейера, применяются на живом окружении (см. ApplyPipelineFeatures).
+			// Пересоздание - только под то, что запечено не в конвейер: HDRI энвайронмента
+			// (пересчёт IBL), анизотропия (в сэмплеры материалов). Остальное - фичи конвейера,
+			// применяются на живом окружении (см. ApplyPipelineFeatures).
 			bool needsRecreate =
-				_appliedMsaa != (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8) ||
 				_appliedHdrPath != (ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "") ||
 				_appliedAniso != _editorSettings.PreviewAnisotropicFiltering ||
 				// Потолок текстуры печётся при загрузке - как анизотропия, требует перечитывания
 				// моделей, а не просто пересоздания конвейера (см. dropModels в RecreateEnvironment).
-				_appliedMaxTextureSize != ClampedMaxTextureSize();
+				_appliedMaxTextureSize != ClampedMaxTextureSize() ||
+				// RT-тени - кейворд в вариантах шейдера (ModelLoadOptions.RtShadows): пересечение
+				// границы режима «Ray-traced» перечитывает сцену.
+				_appliedRtShadows != RtShadowsEnabled();
 
 			_pendingEnvironmentRecreate |= needsRecreate;
 
@@ -664,12 +1481,6 @@ namespace DecaEngine.Editor
 				// трассировать тем путём, с которым сессию завели (по умолчанию - программным), и включение
 				// аппаратной не давало РОВНО НИЧЕГО до ребейка по другой ручке.
 				_editorSettings.ProbeGiHardwareRayTracing,
-				// Число каскадов сетки - раскладка, а не live-ручка: сессия читает его при сборке
-				// (см. BeginSceneProbeSession), но САМА ручка сюда не входила, и её смена не
-				// перезаводила сессию. То есть в Scene View каскады молча не менялись вовсе - до
-				// следующего ребейка по любой другой ручке. В превью слот был с самого начала
-				// (см. ModelPreviewViewport.ApplyGiSettings).
-				_editorSettings.ProbeGiCascades,
 				// Сторона окто-карты видимости - раскладка атласов (см. ProbeGiBakeResult.VisRes).
 				_editorSettings.ProbeGiVisRes);
 			if (wantedBake != _appliedProbeBake)
@@ -683,7 +1494,7 @@ namespace DecaEngine.Editor
 
 		// Снимок ручек запечки, под которыми заведена текущая сценовая сессия проб.
 		private (bool On, float Sky, int Rays, int Bounces, float Sat, float Density, int Max,
-			bool HardwareTrace, int Cascades, int VisRes) _appliedProbeBake;
+			bool HardwareTrace, int VisRes) _appliedProbeBake;
 
 		/// <summary>Пересоздаёт окружение сцены под новые env-level опции БЕЗ перезагрузки сцены:
 		/// резидентные ModelLoader-ы переезжают в новый батч-рендерер перерегистрацией (CPU-копии
@@ -720,9 +1531,28 @@ namespace DecaEngine.Editor
 			_lightMirrors.Clear();
 			_transformsDirty = false;
 			_structuralDirtySelection = false;
+			_physicsStaticsDirty = true;
 
 			bool dropModels = _appliedAniso != _editorSettings.PreviewAnisotropicFiltering ||
-				_appliedMaxTextureSize != ClampedMaxTextureSize();
+				_appliedMaxTextureSize != ClampedMaxTextureSize() ||
+				// RT-тени - кейворд в вариантах шейдера (в подписи ModelStore): резидентные модели
+				// скомпилированы под другой набор, перерегистрация их не спасёт - перечитываем.
+				_appliedRtShadows != RtShadowsEnabled();
+
+			// TLAS RT-теней держит BLAS-ы по мешам умирающего батч-рендерера - освобождаем до
+			// окружения (GPU уже дождались выше), пересоберётся первым же SyncScene.
+			_rtShadowScene?.Release();
+			_rtShadowScene = null;
+
+			// Собственный accel SSR привязан к материалам умирающего окружения - пересоберётся
+			// первым же PollSsrOwnRayScene нового.
+			_ssrOwnAccel?.Dispose();
+			_ssrOwnAccel = null;
+			_ssrOwnBuiltFor = null;
+
+			// Дебаг-оверлей держит буферы и PSO УМИРАЮЩЕГО конвейера - снимается до его сноса,
+			// пересоздастся сам на первом же кадре с включённым дебагом.
+			ReleaseDebugOverlay();
 
 			_env.Release();
 			_env = CreateEnvironment();
@@ -730,7 +1560,7 @@ namespace DecaEngine.Editor
 			ApplyLightRotation();
 
 			// Переезд резидентных моделей в новый батч-рендерер делает стример: регистрация заново
-			// создаёт GPU-стороны (мега-буферы, PSO под новые форматы/MSAA), сами меши/материалы/
+			// создаёт GPU-стороны (мега-буферы, PSO под новые форматы), сами меши/материалы/
 			// текстуры не перечитываются. Исключение - смена анизотропии (dropModels): она печётся в
 			// сэмплеры при загрузке, кеш непригоден, модели перечитаются с диска обычным путём
 			// SyncScene -> Acquire.
@@ -879,6 +1709,17 @@ namespace DecaEngine.Editor
 					ClearScene();
 					_lastStore = store;
 					_framePending = true;
+
+					// Перезагрузка префаба - это и есть «попробовать ещё раз»: сцена собирается с
+					// нуля, и держать вьюпорт остановленным после неё незачем.
+					_renderFailed = false;
+				}
+
+				// Устойчивая ошибка отрисовки останавливает вьюпорт до перезагрузки префаба (см.
+				// catch ниже): иначе сцена рушится и собирается заново каждый кадр.
+				if (_renderFailed)
+				{
+					return;
 				}
 
 				// Загрузки опрашивает ModelStreamingSystem внутри _env.Root.Update ниже (приоритет по
@@ -886,9 +1727,12 @@ namespace DecaEngine.Editor
 				SyncScene(root.Value);
 				SyncSelectionHighlight(selected);
 				PollProbeBake(deltaTime);
-				PollSceneCascadeRecenter();
 				PollSceneProbeDebugOverlay();
 			}
+
+			// Собственный accel SSR - и при закрытом префабе тоже (там он освобождается вместе с
+			// опустевшей сценой).
+			PollSsrOwnRayScene(deltaTime);
 
 			try
 			{
@@ -902,6 +1746,37 @@ namespace DecaEngine.Editor
 				// Шаг времени временной адаптации экспозиции - каждый кадр, до записи (no-op без
 				// HDR). Кламп сверху - защита от «прыжка» после долгих пауз редактора.
 				_env.SetEyeAdaptationDeltaTime(Math.Min(deltaTime, 0.1f));
+
+				// Анимация - строго ДО Root.Update: внутри него CullingAndRenderSystem ЗАПИСЫВАЕТ
+				// команды кадра, а скиннинг может дозалить (и на пути роста - пересоздать)
+				// мега-буфер вершин. Вызов после записи освобождал бы буфер под уже записанными
+				// командами - ровно это роняло кадр в DrawIndexedIndirect при появлении скиннед-
+				// модели в сцене (см. DiligentBatchRenderer.ExecuteSkinning).
+				// Кадр дебага открывается ДО первой стадии, которая в него пишет: список линий - это
+				// кадр целиком, а не накопитель.
+				BeginDebugFrame();
+
+				// Физика - ДО анимации: луч foot IK обязан щупать мир в том состоянии, в котором
+				// кадр будет нарисован, а рэгдолл читает позу из уже проинтегрированных тел.
+				PollScenePhysics(deltaTime);
+
+				// Анимация тоже идёт ТОЛЬКО в Play, и остановка сделана НУЛЕВЫМ ШАГОМ, а не пропуском
+				// вызова. Разница существенная: с нулевым шагом поза считается целиком (клип
+				// семплируется, foot IK и spring bones применяются) - просто время не двигается.
+				// Пропустив вызов, мы оставили бы персонажа с палитрой прошлого кадра, а свежую
+				// скиннед-модель - вовсе без неё, то есть схлопнутой в точку.
+				UpdateAnimation(IsPlaying ? deltaTime : 0f);
+
+				// Сброс на выходе из Play: время клипа и состояние цикла падения лежат в компонентах и
+				// откатываются снимком (см. InspectorWindow.Stop), а переход позы при подъёме живёт
+				// сбоку, в драйвере, и его надо снять руками - иначе персонаж остался бы навсегда в
+				// промежуточной позе того подъёма, на котором нажали Stop.
+				if (_wasPlaying && !IsPlaying)
+				{
+					_animation?.EndPlay();
+				}
+
+				_wasPlaying = IsPlaying;
 
 				_env.Root.Update(new UpdateTick(deltaTime, time));
 
@@ -918,6 +1793,10 @@ namespace DecaEngine.Editor
 					_env.BatchRenderer.CheckAndReallocateBuffers();
 				}
 
+				// Дебаг-линии дорисовываются и заливаются ПОСЛЕ всех, кто в них пишет, и до графа:
+				// заливка идёт немедленным контекстом, а сам дроу - командой внутри ForwardPass.
+				EndDebugFrame();
+
 				// Кадр исполняется ВСЕГДА, даже без открытого префаба (см. hasRoot выше), - пустая
 				// сцена показывает небо окружения (батч-рендерер безопасен при нуле инстансов:
 				// ExecuteComputeCulling/ExecuteDrawBatching выходят сразу), и назначенная сетка просто
@@ -928,7 +1807,13 @@ namespace DecaEngine.Editor
 			{
 				// См. комментарий в ModelPreviewViewport.Update: исключение отсюда сорвало бы Present
 				// всего редактора - теряем только кадр этого вьюпорта.
-				EditorConsoleLog.Add(LogLevel.Error, $"Prefab scene: render failed: {ex.Message}");
+				//
+				LogRenderFailure(ex);
+
+				// Вьюпорт останавливается до перезагрузки префаба: сцена сносится и собирается
+				// заново на каждом кадре, поэтому устойчивая ошибка превращалась в поток одинаковых
+				// строк и в мигающий мусор во вьюпорте. Остановленная сцена честнее.
+				_renderFailed = true;
 				ClearScene();
 			}
 		}
@@ -997,6 +1882,36 @@ namespace DecaEngine.Editor
 				FrameSelection(selected);
 			}
 
+			// Управление персонажем игрока (см. PlayerMoveComponent): WASD/стрелки в Play, Shift - бег.
+			// Правила те же, что у F: курсор над вьюпортом и текст не занят. ПКМ отдаёт WASD полёту
+			// камеры (SceneCamera) - у него приоритет. Направление переводится в мир ЗДЕСЬ: «W - от
+			// камеры» знает только тот, у кого есть камера, приводу приходит уже мировой вектор.
+			if (IsPlaying && hovered && !ImGui.GetIO().WantTextInput &&
+				!ImGui.IsMouseDown(ImGuiMouseButton.Right))
+			{
+				var forward = _camera.Forward;
+				forward.Y = 0f;
+
+				// Камера, глядящая отвесно вниз, «от камеры» не определяет - берётся мировой +Z,
+				// чтобы управление не отключалось молча (произвольная, но стабильная привязка).
+				forward = forward.LengthSquared() > 1e-6f ? Vector3.Normalize(forward) : Vector3.UnitZ;
+				var right = Vector3.Normalize(Vector3.Cross(Vector3.UnitY, forward));
+
+				var move = Vector3.Zero;
+				if (ImGui.IsKeyDown(ImGuiKey.W) || ImGui.IsKeyDown(ImGuiKey.UpArrow)) move += forward;
+				if (ImGui.IsKeyDown(ImGuiKey.S) || ImGui.IsKeyDown(ImGuiKey.DownArrow)) move -= forward;
+				if (ImGui.IsKeyDown(ImGuiKey.D) || ImGui.IsKeyDown(ImGuiKey.RightArrow)) move += right;
+				if (ImGui.IsKeyDown(ImGuiKey.A) || ImGui.IsKeyDown(ImGuiKey.LeftArrow)) move -= right;
+
+				_playerInput = new PlayerInput
+				{
+					MoveWorld = move.LengthSquared() > 0f ? Vector3.Normalize(move) : Vector3.Zero,
+					Run = ImGui.IsKeyDown(ImGuiKey.LeftShift) || ImGui.IsKeyDown(ImGuiKey.RightShift),
+					// Именно IsKeyPressed: фронт, а не удержание - зажатый Space не автоскок.
+					Jump = ImGui.IsKeyPressed(ImGuiKey.Space, false),
+				};
+			}
+
 			// Сцена (небо окружения) рендерится и без единого объекта - текст поверх только про
 			// реальные события: идущие загрузки или ошибки.
 			var status = CollectStatusText();
@@ -1005,6 +1920,10 @@ namespace DecaEngine.Editor
 				var textSize = ImGui.CalcTextSize(status);
 				drawList.AddText(cursor + (size - textSize) * 0.5f, ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.6f)), status);
 			}
+
+			// Подписи дебага (имена костей) - до гизмо: гизмо должно рисоваться ПОВЕРХ текста, иначе
+			// подпись кости перекрывает ручку, за которую тянут.
+			DrawDebugLabels(drawList, cursor, size);
 
 			bool gizmoChanged = RenderGizmo(drawList, cursor, size, selected);
 
@@ -1025,6 +1944,60 @@ namespace DecaEngine.Editor
 			}
 
 			return gizmoChanged;
+		}
+
+		/// <summary>
+		/// Экранные подписи дебага (имена костей, см. <see cref="DebugDraw.Label"/>) поверх картинки
+		/// вьюпорта. Текст рисует ImGui, а не оверлей линий: у движка нет ни шрифта, ни разметки
+		/// текста в 3D, а имена костей нужны читаемыми - то есть постоянного размера на экране и не
+		/// перекошенными перспективой.
+		///
+		/// Проекция берётся ТЕМИ ЖЕ view/proj, под которыми камера рендерила кадр (см.
+		/// <see cref="RenderGizmo"/>), иначе подпись поедет относительно кости на краях кадра, где
+		/// расхождение проекций как раз и заметно.
+		/// </summary>
+		private void DrawDebugLabels(ImDrawListPtr drawList, Vector2 cursor, Vector2 size)
+		{
+			var labels = _debugDraw.Labels;
+			if (labels.Count == 0 || size.X < 1f || size.Y < 1f)
+			{
+				return;
+			}
+
+			var view = Matrix4x4.CreateLookAtLeftHanded(_lastEye, _camera.Target, Vector3.UnitY);
+			var projection = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(
+				CameraFovDegrees * (MathF.PI / 180f), size.X / size.Y, CameraNear, CameraFar);
+
+			var viewProjection = view * projection;
+
+			for (int i = 0; i < labels.Count; i++)
+			{
+				var label = labels[i];
+				var clip = Vector4.Transform(new Vector4(label.Position, 1f), viewProjection);
+
+				// За камерой и ровно в её плоскости - деление на w дало бы «отражённую» точку, то
+				// есть подпись кости, которая за спиной, приехала бы в кадр.
+				if (clip.W <= 1e-4f)
+				{
+					continue;
+				}
+
+				var ndc = new Vector2(clip.X / clip.W, clip.Y / clip.W);
+				if (ndc.X < -1.2f || ndc.X > 1.2f || ndc.Y < -1.2f || ndc.Y > 1.2f)
+				{
+					continue;
+				}
+
+				var screen = cursor + new Vector2(
+					(ndc.X * 0.5f + 0.5f) * size.X,
+					(0.5f - ndc.Y * 0.5f) * size.Y);
+
+				// Тень на пиксель ниже-правее: подписи ложатся и на светлую, и на тёмную геометрию, и
+				// без неё половина имён нечитаема ровно там, где на них смотрят.
+				drawList.AddText(screen + new Vector2(1f, 1f), ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.75f)),
+					label.Text);
+				drawList.AddText(screen, ImGui.GetColorU32(label.Color), label.Text);
+			}
 		}
 
 		/// <summary>Гизмо манипуляции выделенной сущностью - теми же view/proj, под которыми камера
@@ -1141,16 +2114,53 @@ namespace DecaEngine.Editor
 				// (см. ModelPreviewViewport.PollPendingLoad - тот же порядок).
 				_env.DilApi.ImmediateContext.Flush();
 				_env.DilApi.ImmediateContext.WaitForIdle();
+
+				// Ёмкости под новые батчи/инстансы наращиваются ЗДЕСЬ, пока GPU уже остановлен, а
+				// граф всё равно будет пересобран. Иначе рост обнаруживается позже - в ветке
+				// _transformsDirty, которая идёт ПОСЛЕ записи команд и барьера не делает; она
+				// построена на допущении «движение ёмкости не меняет», и это допущение кто-то должен
+				// обеспечивать. Лишним вызовом это не является: внутри стоит проверка, и при
+				// достаточных ёмкостях он ничего не делает.
+				_env.BatchRenderer.CheckAndReallocateBuffers();
+
+				// Заливку СОДЕРЖИМОГО инстансов здесь делать нельзя, и это главное про это место:
+				// мировые матрицы инстансов производит GpuInstanceBufferSystem внутри
+				// _env.Root.Update, а он идёт ПОЗЖЕ по кадру. На кадре появления модели её матрицы
+				// ещё не посчитаны, и любая заливка отсюда отправила бы на GPU нули - объект
+				// схлопнут в точку и невидим. Дальше его никто не перезаливал, потому что грязных
+				// флагов не осталось, и он оживал только от первого сдвига.
+				//
+				// Поэтому поднимается _transformsDirty: ветка движения идёт ПОСЛЕ Root.Update и
+				// перезальёт инстансы уже с настоящими матрицами - тем же путём, которым это и так
+				// работает при перетаскивании.
+				_transformsDirty = true;
+
+				// Первый шаг анимации СРАЗУ после инстанцирования, до пересборки графа. Персонаж
+				// появляется в драйвере именно здесь, а кадровый UpdateAnimation идёт РАНЬШЕ по
+				// коду - то есть на кадре появления модели скиннинг не диспетчеризовался ни разу,
+				// и приёмник скиннед-инстанса оставался в GPU-буфере незаполненным: модель была
+				// невидима (схлопнута), хотя обводка выделения рисовалась. Появлялась она только
+				// после первого сдвига, который поднимал _transformsDirty и попутно всё дозаливал.
+				// Нулевой шаг времени: позу посчитать нужно, а двигать её - нет.
+				UpdateAnimation(0f);
+
 				_env.Pipeline.InvalidateGraph();
 
 				// Ручки AO/SSGI - только после барьера (SetConstant трогает ImmediateContext).
 				PushPostProcessRanges();
 				ApplyMaterialSettings();
+
+				// TLAS RT-теней - тоже после барьера: свежезагруженные модели принесли новые меши
+				// (BLAS) и материалы (привязка _SceneTlas обязана случиться до их первого дроу).
+				UpdateRtShadowScene();
 				boundsDirty = true;
 
 				// Контур выделения строится по env-инстансам - структурное изменение (модель
 				// догрузилась/сущность удалена) обязано его перепечь (см. SyncSelectionHighlight).
 				_structuralDirtySelection = true;
+
+				// По той же причине устарела и статика физики (см. RebuildPhysicsStatics).
+				_physicsStaticsDirty = true;
 
 				// Геометрия сцены сменилась - пробы пересобираются (мировой BVH бейкера статичен).
 				RequestProbeSession(0.3f);
@@ -1184,6 +2194,69 @@ namespace DecaEngine.Editor
 				{
 					RequestProbeSession(0.4f);
 				}
+
+				// TLAS RT-теней живёт отдельно от проб и следует за позами сам: пересборка верхнего
+				// уровня дешёвая (BLAS-ы кешируются по мешам), гизмо-драг тянет её каждый кадр.
+				UpdateRtShadowScene();
+			}
+		}
+
+		/// <summary>Пересобирает TLAS RT-теней по актуальным позам сцены и привязывает его
+		/// материалам всех резидентных моделей (см. ModelPreviewViewport.UpdateRtShadowScene -
+		/// та же роль; здесь мировая поза инстанса = локальный TRS × мировая матрица записи).
+		/// No-op вне режима «Ray-traced». Вызывается из ветки структурного изменения (после
+		/// барьера) и из ветки движения сущностей.</summary>
+		private void UpdateRtShadowScene()
+		{
+			if (!RtShadowsEnabled())
+			{
+				return;
+			}
+
+			_rtShadowInstances.Clear();
+			foreach (var record in _rendered.Values)
+			{
+				var model = record.Resident?.Model;
+				if (model == null || !record.Instantiated)
+				{
+					continue;
+				}
+
+				foreach (var instance in model.instances)
+				{
+					if (instance.meshId < 0 || instance.meshId >= model.Meshes.Count ||
+						model.Meshes[instance.meshId] is not DiligentMesh mesh ||
+						mesh.IndexCount < 3 || mesh.VertexBuffer == null || mesh.IndexBuffer == null)
+					{
+						continue;
+					}
+
+					var t = instance.transform;
+					var local = Matrix4x4.CreateScale(t.scale.X, t.scale.Y, t.scale.Z) *
+						Matrix4x4.CreateFromQuaternion(t.rotation) *
+						Matrix4x4.CreateTranslation(t.position);
+					_rtShadowInstances.Add(new DiligentRayTracingScene.Instance(mesh,
+						local * record.LastWorld, (uint)_rtShadowInstances.Count));
+				}
+			}
+
+			if (_rtShadowInstances.Count == 0)
+			{
+				return;
+			}
+
+			_rtShadowScene ??= new DiligentRayTracingScene(_env.DilApi);
+			_rtShadowScene.Rebuild(_rtShadowInstances);
+			if (_rtShadowScene.Tlas == null)
+			{
+				return;
+			}
+
+			// Привязка идемпотентна (дескриптор указывает на сам объект TLAS) - после структурного
+			// изменения она докрывает материалы свежезагруженных моделей.
+			foreach (var kvp in ((DiligentBatchRenderer)_env.BatchRenderer).GetMaterials())
+			{
+				kvp.Value.SetAccelStructure("_SceneTlas", _rtShadowScene.Tlas);
 			}
 		}
 
@@ -1203,7 +2276,7 @@ namespace DecaEngine.Editor
 						structuralChange = true;
 					}
 
-					record = new RenderedModel { AssetPath = assetPath };
+					record = new RenderedModel { AssetPath = assetPath, EntityId = entity.Id };
 					_rendered[entity.Id] = record;
 				}
 
@@ -1264,6 +2337,20 @@ namespace DecaEngine.Editor
 							UpdateRecordTransforms(record, state, world);
 							boundsDirty = true;
 							_transformsDirty = true;
+
+							// Объект поехал - его треугольники в статике физики устарели. Стопа
+							// персонажа обязана встать на пол там, где он ТЕПЕРЬ, а не там, где он
+							// был при последней пересборке.
+							//
+							// НО ТОЛЬКО ЕСЛИ ОН В СТАТИКЕ ВООБЩЕ ЕСТЬ. Скиннед-модели в неё не идут
+							// (см. RebuildPhysicsStatics: персонаж не должен быть полом сам себе), и
+							// пересборка на их движение - это работа впустую, которая ЛОМАЕТ сцену:
+							// идущий персонаж двигается каждый кадр, статика пересобирается каждый
+							// кадр, а пересборка снимает и заводит заново меш пола. Тело, стоящее на
+							// нём, каждый кадр теряет накопленные импульсы контакта, не успевает
+							// опереться и проваливается в свободном падении - вместе с рэгдоллами, а
+							// лучи foot IK при этом бьют то в пол, то в пустоту.
+							_physicsStaticsDirty |= state.Model?.Skeleton == null;
 						}
 					}
 				}
@@ -1362,6 +2449,10 @@ namespace DecaEngine.Editor
 			// косметика, а ПИК памяти запечки и заливки - сцена тянет на порядок больше текстур, чем
 			// одиночная модель (см. EditorSettings.PreviewMaxTextureSize).
 			MaxTextureSize = ClampedMaxTextureSize(),
+			RtShadows = RtShadowsEnabled(),
+			// Кейворд записи G-buffer-а отражений - у окружения он теперь безусловный
+			// (см. ModelViewportEnvironment).
+			ReflectionGbuffer = true,
 			// Текстуры не декодируются в фоновой фазе загрузки вовсе - они приезжают из стола по
 			// приоритету от камеры (см. ModelStore). В кадр модель попадает уже с ними: показ ждёт
 			// ModelStore.ModelTexturesReady, иначе она появлялась бы на 1x1-филлерах и домигивала
@@ -1406,6 +2497,7 @@ namespace DecaEngine.Editor
 			_highlightedId = -1;
 			_env.Pipeline.PostOverlay = null;
 			_structuralDirtySelection = true;
+			_physicsStaticsDirty = true;
 		}
 
 		private void OnStreamerResidencyReset(ModelStreamer.Resident resident)
@@ -1425,7 +2517,11 @@ namespace DecaEngine.Editor
 				var combined = ComposeInstanceTransform(instance.transform, world);
 				var entity = ModelViewportGeometry.CreateInstanceEntity(_env.Store, _env.ResourceManager,
 					_env.BatchRenderer, state.MeshIds, state.MaterialIds, state.BatchCache,
-					instance.meshId, instance.materialId, combined);
+					instance.meshId, instance.materialId, combined,
+					model, state.SkinBases,
+					// Все скиннед-инстансы модели принадлежат ОДНОЙ сущности префаба: это один
+					// персонаж из нескольких мешей, и поза у них общая.
+					palette => EnsureAnimation().AddInstance(record.EntityId, model, palette));
 				if (entity != null)
 				{
 					record.EnvEntities.Add(entity.Value);
@@ -1466,11 +2562,27 @@ namespace DecaEngine.Editor
 
 			if (!Matrix4x4.Decompose(combined, out var scale, out var rotation, out var translation))
 			{
-				// Вырожденный/скошенный трансформ (неравномерный скейл под поворотом) - берём хотя бы
-				// позицию, чтобы объект не пропадал из сцены.
+				// Скошенный трансформ (неравномерный скейл под поворотом) - восстанавливаем TRS из
+				// базиса матрицы. Прежний фолбэк "позиция + Identity" молча ВЫБРАСЫВАЛ поворот:
+				// объект рисовался неповёрнутым, а его punctual-тень вдобавок кулилась не там.
+				// Ортонормированный базис под скосом приближение, но приближение В ТОМ ЖЕ месте
+				// мира, а не другая поза.
 				translation = combined.Translation;
-				rotation = Quaternion.Identity;
-				scale = Vector3.One;
+				var bx = new Vector3(combined.M11, combined.M12, combined.M13);
+				var by = new Vector3(combined.M21, combined.M22, combined.M23);
+				var bz = new Vector3(combined.M31, combined.M32, combined.M33);
+				scale = new Vector3(bx.Length(), by.Length(), bz.Length());
+
+				var rx = scale.X > 1e-8f ? bx / scale.X : Vector3.UnitX;
+				var ry = scale.Y > 1e-8f ? by / scale.Y : Vector3.UnitY;
+				ry -= rx * Vector3.Dot(ry, rx);
+				ry = ry.LengthSquared() > 1e-12f ? Vector3.Normalize(ry) : Vector3.UnitY;
+				var rz = Vector3.Cross(rx, ry);
+				rotation = Quaternion.CreateFromRotationMatrix(new Matrix4x4(
+					rx.X, rx.Y, rx.Z, 0f,
+					ry.X, ry.Y, ry.Z, 0f,
+					rz.X, rz.Y, rz.Z, 0f,
+					0f, 0f, 0f, 1f));
 			}
 
 			return new DecaEngine.Graphics.Transform
@@ -1496,6 +2608,10 @@ namespace DecaEngine.Editor
 			record.InstanceIndices.Clear();
 			record.Instantiated = false;
 
+			// Поза персонажа держит нативные объекты ozz и участки палитры, привязанные к уже
+			// снятым инстансам: пережить их она не должна.
+			_animation?.Remove(record.EntityId);
+
 			if (releaseResident && record.Resident != null)
 			{
 				_streamer.Release(record.Resident);
@@ -1509,6 +2625,15 @@ namespace DecaEngine.Editor
 			{
 				return;
 			}
+
+			// Физика сцены умирает вместе со сценой: её статика - это геометрия исчезающих моделей,
+			// а рэгдоллы держат хендлы тел этого мира. Рэгдоллы сносятся ПЕРВЫМИ - иначе они
+			// остались бы хендлами в уничтоженной симуляции. Самих персонажей снимают ниже
+			// RemoveRecord-ы, по одному вместе с их записями.
+			_animation?.DetachPhysics();
+			_physics?.Dispose();
+			_physics = null;
+			_physicsStaticsDirty = true;
 
 			foreach (var record in _rendered.Values)
 			{
@@ -1614,7 +2739,7 @@ namespace DecaEngine.Editor
 				!string.IsNullOrEmpty(record.ResolvedPath) &&
 				_models.TryGetValue(record.ResolvedPath, out var state) && state.Model != null)
 			{
-				AppendRecordGeometry(record, state.Model);
+				AppendRecordGeometry(record, state.Model, _selectionPositions, _selectionIndices);
 			}
 
 			foreach (var child in entity.ChildEntities)
@@ -1624,12 +2749,28 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>Запекает вершины инстансов записи в мировое пространство (CPU-копии вершин живут
-		/// в IMeshObject, пока жива модель - тот же источник, что у probe-GI BVH, см. ProbeGiBaker).</summary>
-		private unsafe void AppendRecordGeometry(RenderedModel record, ModelLoader model)
+		/// в IMeshObject, пока жива модель - тот же источник, что у probe-GI BVH, см. ProbeGiBaker).
+		///
+		/// Приёмник приходит параметром: та же самая мировая геометрия нужна и обводке выделения, и
+		/// статике физики (см. RebuildPhysicsStatics), и переписывать её вторым таким же методом
+		/// значило бы завести второе место, где можно ошибиться с фильтром топологии или с
+		/// трансформом инстанса.</summary>
+		private void AppendRecordGeometry(RenderedModel record, ModelLoader model,
+			List<Vector3> targetPositions, List<uint> targetIndices)
+			=> AppendModelGeometry(model,
+				System.Runtime.InteropServices.CollectionsMarshal.AsSpan(record.InstanceIndices),
+				record.LastWorld, targetPositions, targetIndices);
+
+		/// <summary>Та же запечка, но по ЯВНОМУ списку инстансов и явной мировой матрице - вход для
+		/// headless-прогона сцены (см. <see cref="ScenePhysicsProbe"/>). Вынесено, чтобы у пробника не
+		/// завелась вторая копия фильтра топологии и склейки трансформа инстанса: разойдясь с этой,
+		/// она проверяла бы не ту статику, которую строит редактор.</summary>
+		internal static unsafe void AppendModelGeometry(ModelLoader model, ReadOnlySpan<int> instanceIndices,
+			Matrix4x4 world, List<Vector3> targetPositions, List<uint> targetIndices)
 		{
-			for (int i = 0; i < record.InstanceIndices.Count; i++)
+			for (int i = 0; i < instanceIndices.Length; i++)
 			{
-				var instance = model.instances[record.InstanceIndices[i]];
+				var instance = model.instances[instanceIndices[i]];
 				if (instance.meshId < 0 || instance.meshId >= model.Meshes.Count)
 				{
 					continue;
@@ -1649,7 +2790,7 @@ namespace DecaEngine.Editor
 					continue;
 				}
 
-				var t = ComposeInstanceTransform(instance.transform, record.LastWorld);
+				var t = ComposeInstanceTransform(instance.transform, world);
 				var matrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(t.position, t.rotation, t.scale);
 
 				int vertexCount = UnsafeArray.GetLength(mesh.VertexData);
@@ -1658,14 +2799,14 @@ namespace DecaEngine.Editor
 				// ModelLoader всегда строит 32-битные индексы (см. PreparedMesh.Indices: uint[]).
 				var indices = new ReadOnlySpan<uint>(UnsafeArray.GetPtr<uint>(mesh.IndexData, 0), mesh.IndexCount);
 
-				int baseVertex = _selectionPositions.Count;
+				int baseVertex = targetPositions.Count;
 				for (int v = 0; v < vertexCount; v++)
 				{
-					_selectionPositions.Add(Vector3.Transform(vertices[v].Position, matrix));
+					targetPositions.Add(Vector3.Transform(vertices[v].Position, matrix));
 				}
 				for (int j = 0; j < indices.Length; j++)
 				{
-					_selectionIndices.Add((uint)baseVertex + indices[j]);
+					targetIndices.Add((uint)baseVertex + indices[j]);
 				}
 			}
 		}
@@ -1868,38 +3009,11 @@ namespace DecaEngine.Editor
 				grid += _sceneGpu.Hardware ? ", трассировка аппаратная"
 					: ", трассировка программная";
 
-				// СВЕЖИЕ пробы по всем объёмам - те, что въехали прокруткой и ещё набирают своё поле.
-				// Прежде здесь считались холодные КИРПИЧИ, спрятанные из индирекции; прятать больше
-				// нечего (см. ProbeGiBakeSession.ProbeFresh), но мера «сколько поля сейчас
-				// пересобирается на ходу» осталась полезной ровно тем же: чем дольше и чем больше их
-				// держится, тем заметнее рябь по въехавшей полосе при движении камеры.
-				static int FreshProbes(ProbeGiBakeSession session)
-				{
-					int fresh = 0;
-					foreach (var f in session.ProbeFresh)
-					{
-						if (f != 0)
-						{
-							fresh++;
-						}
-					}
-
-					return fresh;
-				}
-
-				var cold = FreshProbes(s);
-				foreach (var cascade in _sceneCascades)
-				{
-					cold += FreshProbes(cascade.Session);
-				}
-
-				var coldText = cold > 0 ? $", свежих проб {cold}" : string.Empty;
-
 				return s.Realtime
-					? $"{grid}, реальное время{coldText}"
+					? $"{grid}, реальное время"
 					: s.Converged
-						? $"{grid}, готово{coldText}"
-						: $"{grid}, раунд {s.Round}/{s.TargetRounds}{coldText}";
+						? $"{grid}, готово"
+						: $"{grid}, раунд {s.Round}/{s.TargetRounds}";
 			}
 		}
 
@@ -1907,6 +3021,11 @@ namespace DecaEngine.Editor
 		/// света (ProbeGiParams.z), иначе баунс разойдётся по яркости с прямым светом.</summary>
 		private Vector3 ProbeSunColor() =>
 			new Vector3(1f, 0.98f, 0.92f) * Math.Clamp(_editorSettings.ProbeGiSunIntensity, 0.1f, 16f);
+
+		/// <summary>Принудительный ребейк проб сцены - кнопка «Rebake now» окна Graphics (зеркало
+		/// ModelPreviewViewport.RequestProbeRebake; раньше кнопка перепекала только превью, а сессия
+		/// сцены жила старым полем до первого структурного изменения).</summary>
+		public void RequestProbeRebake() => RequestProbeSession(0f);
 
 		/// <summary>Просит пересоздать сессию бейка (изменилась геометрия/позы сцены). Дебаунс -
 		/// драг гизмо шлёт изменение каждый кадр, а новая сессия выбрасывает накопленное поле.</summary>
@@ -1998,7 +3117,6 @@ namespace DecaEngine.Editor
 			_probeSceneRecords.Clear();
 			_probeSceneRecords.AddRange(sceneRecords);
 
-			// Баунды сцены - под каскады: их боксы кратно меньше этого (см. SceneCascadeHalfExtent).
 			_probeSceneBoundsMin = min;
 			_probeSceneBoundsMax = max;
 
@@ -2010,185 +3128,11 @@ namespace DecaEngine.Editor
 			TryBeginSceneProbeGpu();
 		}
 
-		/// <summary>Настройки бейка сцены - общие для базового объёма и каскадов (каскад отличается
-		/// только баундами, см. CreateSceneCascade).</summary>
+		/// <summary>Настройки бейка сцены.</summary>
 		private ProbeGiBakeOptions BuildSceneProbeOptions() =>
 			ProbeGiViewportShared.BuildOptions(_editorSettings);
 
 		private Vector3 _probeSceneBoundsMin, _probeSceneBoundsMax;
-
-		/// <summary>Геометрия каскадов - общая (см. ProbeGiViewportShared), здесь только баунды.</summary>
-		private Vector3 SceneCascadeHalfExtent(int index) =>
-			ProbeGiViewportShared.CascadeHalfExtent(_probeSceneBoundsMin, _probeSceneBoundsMax, index);
-
-		private Vector3 ClampSceneCascadeCenter(Vector3 target, Vector3 half) =>
-			ProbeGiViewportShared.ClampCascadeCenter(_probeSceneBoundsMin, _probeSceneBoundsMax,
-				target, half);
-
-		/// <summary>Точка, за которой следуют каскады probe-GI. Гибрид, и оба его случая выстраданы.
-		///
-		/// ВНУТРИ сцены якорь - сама позиция камеры. Она ротационно-инвариантна по построению, и
-		/// только этим лечится исходный дефект: точка интереса камеры (Eye + Forward * FocusDistance)
-		/// ездит по сфере при ЧИСТОМ ПОВОРОТЕ, когда камера стоит на месте, - при дистанции фокуса 8
-		/// поворот на 90° уводит её на 11 единиц, а порог перецентровки у второго каскада около двух.
-		/// Оглядеться по сторонам означало прокрутить каскады по нескольку раз, а въехавшие кирпичи
-		/// стартуют холодными и пересходятся заново.
-		///
-		/// СНАРУЖИ сцены одной позиции камеры мало, и это вторая половина той же истории. Отлетев от
-		/// здания, камера выходит за баунды, ClampCascadeCenter прижимает объём к краю - и дальше
-		/// движение камеры на него не влияет вовсе: каскады замирают у стенки и перестают следить за
-		/// тем, что ты разглядываешь. Поэтому снаружи якорь - точка, КУДА СМОТРИТ камера: пересечение
-		/// луча взгляда с коробкой сцены. Прокрутка от поворота здесь возвращается, но снаружи она
-		/// безобидна - плотное поле нужно там, куда смотришь, а не за спиной.
-		///
-		/// Луч мимо коробки (смотрим в небо) - остаётся позиция камеры, её и прижмёт кламп: это
-		/// честнее, чем уводить объём в сторону по касательной.</summary>
-		private Vector3 SceneCascadeAnchor()
-		{
-			var eye = _camera.Eye;
-			if (eye.X >= _probeSceneBoundsMin.X && eye.X <= _probeSceneBoundsMax.X
-				&& eye.Y >= _probeSceneBoundsMin.Y && eye.Y <= _probeSceneBoundsMax.Y
-				&& eye.Z >= _probeSceneBoundsMin.Z && eye.Z <= _probeSceneBoundsMax.Z)
-			{
-				return eye;
-			}
-
-			// Пересечение луча с коробкой методом слэбов. Нулевые компоненты направления дают
-			// бесконечности, и это ровно то поведение, которое нужно: ось, вдоль которой луч не
-			// движется, интервал не ограничивает.
-			var dir = _camera.Forward;
-			var inv = new Vector3(
-				MathF.Abs(dir.X) > 1e-6f ? 1f / dir.X : float.PositiveInfinity,
-				MathF.Abs(dir.Y) > 1e-6f ? 1f / dir.Y : float.PositiveInfinity,
-				MathF.Abs(dir.Z) > 1e-6f ? 1f / dir.Z : float.PositiveInfinity);
-
-			var t0 = (_probeSceneBoundsMin - eye) * inv;
-			var t1 = (_probeSceneBoundsMax - eye) * inv;
-			var tNear = Vector3.Min(t0, t1);
-			var tFar = Vector3.Max(t0, t1);
-
-			float enter = MathF.Max(tNear.X, MathF.Max(tNear.Y, tNear.Z));
-			float exit = MathF.Min(tFar.X, MathF.Min(tFar.Y, tFar.Z));
-
-			return exit >= MathF.Max(enter, 0f) ? eye + dir * MathF.Max(enter, 0f) : eye;
-		}
-
-		/// <summary>Создаёт каскад сцены: сессия + атласы (слоты _Ci) + GPU-раунд вокруг точки
-		/// интереса. Зеркало ModelPreviewViewport.CreateProbeCascade.</summary>
-		private (ProbeGiBakeSession, ProbeGiTextures, ProbeRoundGpu) CreateSceneCascade(
-			int index, Vector3 target) =>
-			ProbeGiViewportShared.CreateCascade(_probeBaker!, _scenePipelines!, _sceneAccel, _env,
-				_graphicsApi, _editorSettings,
-				_models.Values.Where(s => s.Model != null).Select(s => s.Model!),
-				$"_sceneProbeGiC{index}_{_probeTextureGeneration++}", index, target,
-				_probeSceneBoundsMin, _probeSceneBoundsMax, ProbeSunColor());
-
-		/// <summary>Ведёт каскады сцены за точкой интереса камеры ПРОКРУТКОЙ объёма (см.
-		/// ProbeGiViewportShared.ScrollVolume): каскад сдвигается на целое число кирпичей, сохраняя
-		/// поле там, где пересёкся сам с собой.
-		///
-		/// Дебаунса здесь больше НЕТ, и это главный итог перехода. Раньше перецентровка означала
-		/// полное пересоздание объёма - Dispose GPU-раунда с выгрузкой всего BVH сцены, Release семи
-		/// атласов, Flush + WaitForIdle (полный стоп GPU на потоке рендера), новая сессия с
-		/// обнулённым полем и переприязка материалов, - и стоила видимого рывка. За один драг камеры
-		/// порог смещения пересекается многократно, поэтому пересоздание приходилось откладывать до
-		/// момента, когда камера ЗАМРЁТ: отсюда и «пробы перестраиваются только когда отпускаешь
-		/// камеру», и сами рывки. Прокрутка не создаёт и не освобождает ничего, стоит осмотра одной
-		/// въехавшей полоски кирпичей - её можно гонять в каждом кадре движения.
-		///
-		/// Заявки подаются ВСЕМ каскадам, которым пора ехать. Ограничение «не больше одного за
-		/// кадр» осталось от пересоздания, стоившего сотен миллисекунд; с прокруткой переезд стоит
-		/// около миллисекунды, а вреда от ограничения теперь много: заявка исполняется не в момент
-		/// подачи, поэтому первый каскад оставался бы «требующим переезда» на КАЖДОМ кадре, навсегда
-		/// забирая очередь себе и морозя остальные.</summary>
-		/// <summary>Номера раскладок каскадов на прошлом опросе - см. CascadeLayoutChanged.</summary>
-		private int _sceneCascadeLayoutStamp;
-
-		private void PollSceneCascadeRecenter()
-		{
-			// Переехавший каскад обязан доехать углом сетки до кбуферов материалов, иначе они
-			// продолжат сэмплить его по старому углу (см. ProbeGiViewportShared.CascadeLayoutChanged).
-			if (ProbeGiViewportShared.CascadeLayoutChanged(_sceneCascades, ref _sceneCascadeLayoutStamp))
-			{
-				ApplyMaterialSettings();
-			}
-
-			if (_sceneCascades.Count == 0 || _probeBaker == null)
-			{
-				return;
-			}
-
-			// Якорь каскадов - ПОЗИЦИЯ камеры, а не её точка интереса. Target у летающей камеры
-			// вычисляется как Eye + Forward * FocusDistance (см. SceneCamera.Target), то есть ездит
-			// по сфере при ЧИСТОМ ПОВОРОТЕ, когда камера физически стоит на месте. При дефолтной
-			// дистанции фокуса 8 поворот на 90° уводит Target на 11 единиц, а порог перецентровки -
-			// четверть бокса каскада (на Sponza это 4.5 у первого и 2.2 у второго, см.
-			// CascadeHalfExtent и NeedsRecenter). Оглядеться по сторонам означало прокрутить оба
-			// каскада по нескольку раз: въехавшие с краю кирпичи стартуют холодными и переcходятся
-			// заново - это и есть «пробы пересчитываются при повороте камеры».
-			// Eye ротационно-инвариантен по построению, поэтому лечит симптом целиком, а не
-			// поднимает порог. Так же предписывает и эталон (RTXGI, docs/DDGIVolume.md, Infinite
-			// Scrolling Movement: «Anchor the infinite scrolling volume to the camera view or a
-			// player character»). Плата - половина бокса каскада оказывается позади камеры; она
-			// приемлема, потому что каскад лишь УПЛОТНЯЕТ поле, а покрытие держит базовый объём.
-			// ModelPreviewViewport этой беды не имеет: там камера орбитальная, и её _orbitTarget при
-			// вращении неподвижен по определению - поэтому правка нужна только здесь.
-			for (int j = 0; j < _sceneCascades.Count; j++)
-			{
-				var session = _sceneCascades[j].Session;
-				var half = SceneCascadeHalfExtent(j + 1);
-				var desired = ClampSceneCascadeCenter(SceneCascadeAnchor(), half);
-
-				// Сверка с ФАКТИЧЕСКИМ центром объёма, а не с заказанным в прошлый раз: заявка на
-				// переезд исполняется на границе раунда, и пока она ждёт, объём стоит там же, где
-				// стоял. Сверяйся мы с заказом - вьюпорт считал бы каскад уже уехавшим.
-				if (!ProbeGiViewportShared.NeedsRecenter(
-						ProbeGiViewportShared.VolumeCenter(session), desired, half))
-				{
-					continue;
-				}
-
-				ProbeGiViewportShared.ScrollVolume(session, desired);
-			}
-		}
-
-		/// <summary>Возвращает материалам плейсхолдеры в слоты каскада - слоты объявлены в шейдере
-		/// безусловно, и пустой дескриптор роняет валидацию Vulkan (VUID-08114).</summary>
-		private void RebindSceneCascadePlaceholders(string suffix)
-		{
-			var placeholder = _env.EnvironmentMap;
-			if (placeholder == null)
-			{
-				return;
-			}
-
-			foreach (var state in _models.Values)
-			{
-				if (state.Model != null)
-				{
-					ProbeGiViewportShared.RebindCascadePlaceholders(state.Model, placeholder, suffix);
-				}
-			}
-		}
-
-		/// <summary>Освобождает каскады сцены (звать за GPU-барьером, порядок как у базового
-		/// объёма: раунд держит представления атласов).</summary>
-		private void ReleaseSceneCascades()
-		{
-			if (_sceneCascades.Count == 0)
-			{
-				return;
-			}
-
-			for (int j = 0; j < _sceneCascades.Count; j++)
-			{
-				RebindSceneCascadePlaceholders($"_C{j + 1}");
-				_sceneCascades[j].Gpu.Dispose();
-				_sceneCascades[j].Textures.Release();
-			}
-
-			_sceneCascades.Clear();
-		}
 
 		/// <summary>Поднимает GPU-путь сцены: атласы под запись из шейдера, аппаратные структуры,
 		/// compute-раунды. Только в реальном времени - ради него всё и делается: движение сущностей
@@ -2210,6 +3154,8 @@ namespace DecaEngine.Editor
 			ReleaseSceneProbeGpu();
 			if (_probeTextures != null)
 			{
+				// РАНЬШЕ освобождения: SRB SSR-трейса держит SH-атласы (свет RT-хитов).
+				_env.SetSsrProbeField(null);
 				_env.DilApi.ImmediateContext.Flush();
 				_env.DilApi.ImmediateContext.WaitForIdle();
 				_probeTextures.Release();
@@ -2235,6 +3181,25 @@ namespace DecaEngine.Editor
 					&& _graphicsApi.RayTracing >= RayTracingSupport.Inline;
 				_sceneAccel = hardware ? new ProbeSceneAccel(_env.DilApi, baker.InstancedGeometry) : null;
 
+				// Набор текстур RT-хитов - вместе с accel-ом: индексы в его таблице инстансов
+				// указывают именно в этот набор. Модели - _probeBakerBuiltFor: снимок, под который
+				// собран ЖИВОЙ бейкер (его порядок = индексы моделей в HitTextureKeys).
+				// НЕ _probeBakerModels - это модели ЗАДАЧИ, и PollProbeBake обнуляет его при её
+				// завершении, то есть здесь он всегда null, набор молча не строился, и bindless
+				// уходил на плейсхолдеры («каша» вместо текстур в отражениях).
+				_sceneAccelHitTextures?.Dispose();
+				_sceneAccelHitTextures = null;
+				if (_sceneAccel != null && _probeBakerBuiltFor != null)
+				{
+					var hitModels = new List<ModelLoader>(_probeBakerBuiltFor.Count);
+					foreach (var (m, _) in _probeBakerBuiltFor)
+					{
+						hitModels.Add(m);
+					}
+					_sceneAccelHitTextures = SsrHitTextures.Build(_graphicsApi,
+						baker.InstancedGeometry, hitModels);
+				}
+
 				if (_scenePipelines != null && _scenePipelines.Hardware != hardware)
 				{
 					_scenePipelines.Dispose();
@@ -2245,16 +3210,14 @@ namespace DecaEngine.Editor
 				_sceneGpu = new ProbeRoundGpu(_env.DilApi, _scenePipelines, session, baker,
 					_probeTextures, _env.EnvironmentMap, _env.ShadowSettings!.EnvYawRadians, _sceneAccel);
 
-				// Каскады - только в реальном времени (запечке нужен один сходящийся объём), вокруг
-				// ПОЗИЦИИ камеры; дальше за ней следит PollSceneCascadeRecenter (там же объяснено,
-				// почему якорь - Eye, а не Target).
-				int cascades = _editorSettings.ProbeGiRealtime
-					? Math.Clamp(_editorSettings.ProbeGiCascades, 1, 3)
-					: 1;
-				for (int i = 1; i < cascades; i++)
+				// RT-фолбэк SSR питается этим же accel-ом: он мог только что появиться (фича ждала
+				// его) или пересоздаться (дескриптор протух) - фичи и привязка обновляются здесь же.
+				if (_editorSettings.SsrRayTraced)
 				{
-					_sceneCascades.Add(CreateSceneCascade(i, SceneCascadeAnchor()));
+					ApplyPipelineFeatures();
 				}
+				UpdateSsrRayScene();
+				_env.SetSsrProbeField(_probeTextures);
 			}
 			catch (Exception ex)
 			{
@@ -2270,8 +3233,7 @@ namespace DecaEngine.Editor
 		private void PollSceneProbeDebugOverlay() =>
 			ProbeGiViewportShared.PollOverlays(_sceneDebugOverlays,
 				ProbesEnabled && _editorSettings.ProbeGiShowProbes && _sceneGpu != null,
-				ref _sceneDebugFailed, _env, _graphicsApi, _probeSession, _probeTextures,
-				_sceneCascades);
+				ref _sceneDebugFailed, _env, _graphicsApi, _probeSession, _probeTextures);
 
 		private void ReleaseSceneProbeDebugOverlay() =>
 			ProbeGiViewportShared.ReleaseOverlays(_sceneDebugOverlays, _env);
@@ -2280,18 +3242,35 @@ namespace DecaEngine.Editor
 		/// дорогая, а от сессии они не зависят).</summary>
 		private void ReleaseSceneProbeGpu()
 		{
-			if (_sceneGpu == null && _sceneAccel == null && _sceneCascades.Count == 0)
+			if (_sceneGpu == null && _sceneAccel == null)
 			{
 				return;
 			}
 
+			// Трейс не должен держать view умирающего атласа текстур хитов (та же дисциплина,
+			// что у probe-атласов выше).
+			if (_sceneAccelHitTextures != null)
+			{
+				_env.Pipeline.SsrResources?.SetHitTextures(null, null);
+			}
+
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
-			ReleaseSceneCascades();
 			_sceneGpu?.Dispose();
 			_sceneGpu = null;
+
+			bool hadAccel = _sceneAccel != null;
 			_sceneAccel?.Dispose();
 			_sceneAccel = null;
+			_sceneAccelHitTextures?.Dispose();
+			_sceneAccelHitTextures = null;
+
+			// RT-вариант SSR-трейса держал дескриптор на только что уничтоженный TLAS - откат на
+			// экранный вариант (SsrRayTracedEnabled без accel-а даёт false, ресурсы пересоберутся).
+			if (hadAccel && _editorSettings.SsrRayTraced)
+			{
+				ApplyPipelineFeatures();
+			}
 		}
 
 		/// <summary>Ведёт TLAS за позами сущностей - сердце динамики сцены: гизмо двигает запись,
@@ -2453,20 +3432,15 @@ namespace DecaEngine.Editor
 			session.RealtimeBlend = Math.Clamp(_editorSettings.ProbeGiRealtimeBlend, 0.01f, 0.5f);
 			session.RealtimeMaxStep = Math.Clamp(_editorSettings.ProbeGiRealtimeMaxStep, 0f, 0.2f);
 			session.RealtimeGamma = Math.Clamp(_editorSettings.ProbeGiRealtimeGamma, 1f, 8f);
+			// Порог сходимости - без этой строки ползунок «Порог сходимости» действовал только при
+			// пересоздании сессии, хотя помечен Live (значение из BuildOptionsCore застывало).
+			session.VariabilityThreshold = MathF.Max(_editorSettings.ProbeGiVariabilityThreshold, 0f);
 			// Релокация проб - такая же live-ручка, как соседние, но её здесь не было: в Scene View
 			// ручка «Relocation» окна Graphics не делала НИЧЕГО, а пробы, замурованные в стенах,
 			// оставались замурованными (в превью слот есть, см. ModelPreviewViewport.PollProbeBake).
 			session.RealtimeRelocation = Math.Clamp(_editorSettings.ProbeGiRealtimeRelocation, 0f, 0.45f);
 
 			PollSceneProbePoses();
-
-			// Переезды каскадов доводятся до GPU ДО всех проверок ниже: сходимость базового объёма,
-			// его забор и бюджет порций гасят раунды каскадов, но не должны морозить их на месте -
-			// камера уезжает, а объём стоит (см. ProbeRoundGpu.SettlePendingScroll).
-			foreach (var cascade in _sceneCascades)
-			{
-				cascade.Gpu.SettlePendingScroll(cascade.Session, baker);
-			}
 
 			// Свет подтягивается перед каждым раундом: поворот солнца откатывает сходимость, и поле
 			// само перетекает к новому решению, не выбрасывая накопленное (см.
@@ -2476,6 +3450,27 @@ namespace DecaEngine.Editor
 				session.SetLighting(Vector3.Normalize(-_env.ShadowSettings.LightDirection),
 					ProbeSunColor(), _env.ShadowSettings.EnvYawRadians, _env.EnvironmentRadiance);
 			}
+
+			// Punctual-света сцены - в бейк той же механикой: движение/правка лампы реально меняет
+			// список (сравнение внутри SetPunctualLights) и откатывает вес раунда. Зеркала уже несут
+			// МИРОВЫЕ Position/Rotation (см. SyncEntity).
+			_probeBakeLightsScratch.Clear();
+			foreach (var mirror in _lightMirrors.Values)
+			{
+				if (mirror.IsNull)
+				{
+					continue;
+				}
+
+				ref var mirrorLight = ref mirror.GetComponent<LightComponent>();
+				if (LightCulling.TryBuildBakeLight(ref mirrorLight, mirror, out var bakeLight))
+				{
+					_probeBakeLightsScratch.Add(bakeLight);
+				}
+			}
+
+			session.SetPunctualLights(
+				System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_probeBakeLightsScratch));
 
 			if (session.Converged)
 			{
@@ -2493,24 +3488,10 @@ namespace DecaEngine.Editor
 
 				try
 				{
-					int volumeCount = 1 + _sceneCascades.Count;
 					// Общий цикл порций (см. ProbeGiViewportShared.DriveChunks): бюджет тратится
-					// целиком, переходя границы раундов.
+					// целиком, переходя границы раундов. Объём один - бюджет лучей кадра весь его.
 					ProbeGiViewportShared.DriveChunks(_sceneGpu, session, baker,
-						_sceneGpu.ChunksPerFrame(session.RaysPerRound, volumeCount));
-
-					// Каскады - общим приводом (см. ProbeGiViewportShared.DriveVolume), каждый со
-					// своим забором и бюджетом порций.
-					if (_env.ShadowSettings != null)
-					{
-						var sunDir = Vector3.Normalize(-_env.ShadowSettings.LightDirection);
-						foreach (var cascade in _sceneCascades)
-						{
-							ProbeGiViewportShared.DriveVolume(cascade.Gpu, cascade.Session, baker,
-								_editorSettings, sunDir, ProbeSunColor(),
-								_env.ShadowSettings.EnvYawRadians, _env.EnvironmentRadiance, volumeCount);
-						}
-					}
+						_sceneGpu.ChunksPerFrame(session.RaysPerRound));
 				}
 				catch (Exception ex)
 				{
@@ -2876,10 +3857,38 @@ namespace DecaEngine.Editor
 					_editorSettings.VolumetricAmbientColorB),
 				Math.Max(_editorSettings.VolumetricAmbientIntensity, 0f),
 				Math.Clamp(_editorSettings.VolumetricAmbientShadowFloor, 0f, 1f));
+
+			_env.SetVolumetricPunctualScatter(Math.Max(_editorSettings.VolumetricPunctualScatter, 0f));
 		}
 
 		private void ApplyGraphicsSettings()
 		{
+			// Радиусы AO/SSGI - живьём, как в превью (ModelPreviewViewport.ApplyGiSettings): раньше
+			// они пушились только из ветки структурного изменения сцены, и ползунки «AO/GI radius»
+			// в Scene View не делали ничего до первого движения объекта.
+			PushPostProcessRanges();
+
+			// Стриминг - живая ручка: радиус читается стримером на каждом Tick, пересоздавать ничего
+			// не нужно. Выключенный стриминг = бесконечный радиус, то есть все модели сцены остаются
+			// резидентными и никто ничего не отпускает (см. EditorSettings.SceneStreaming).
+			_streamer.StreamRadius = _editorSettings.SceneStreaming
+				? MathF.Max(1f, _editorSettings.SceneStreamingRadius)
+				: float.PositiveInfinity;
+
+			// Скиннинг читается в момент ИНСТАНЦИРОВАНИЯ модели, поэтому здесь только пушим значение;
+			// уже показанные модели останутся как есть до переоткрытия префаба (см. EditorSettings).
+			// Переменная окружения DECA_SKINNING=0 при этом остаётся сильнее настройки: она нужна
+			// как аварийный путь, когда редактор не доживает до окна Graphics.
+			if (System.Environment.GetEnvironmentVariable("DECA_SKINNING") != "0")
+			{
+				ModelViewportGeometry.SkinningEnabled = _editorSettings.SceneSkinning;
+			}
+
+			// UAV на мега-буфере вершин - только когда скиннинг включён: иначе его выключение не
+			// возвращало бы описание буфера к исходному, и «выключить и проверить» переставало быть
+			// достоверной проверкой.
+			DiligentBatchRenderer.SkinningUav = ModelViewportGeometry.SkinningEnabled;
+
 			ApplyFogSettings();
 			ApplyVolumetricSettings();
 			ApplyBloomSettings();
@@ -2954,6 +3963,8 @@ namespace DecaEngine.Editor
 				Math.Clamp(_editorSettings.SsgiBlurRadius, 0, SsgiPassResources.MaxBlurRadius),
 				_editorSettings.SsgiDebugView);
 
+			PushSsrSettings();
+
 			ApplyMaterialSettings();
 
 			// Рантайм-тумблер теней меняет ЧИСЛО записей каскадов в данных ShadowPass, а его цикл
@@ -2978,7 +3989,53 @@ namespace DecaEngine.Editor
 					LightElevationMinDegrees, LightElevationMaxDegrees));
 
 			_env.Pipeline.SkyResources?.SetEnvironmentYaw(shadowSettings.EnvYawRadians);
+			PushSsrEnvironment();
 			ApplyMaterialSettings();
+		}
+
+		/// <summary>Живые ручки SSR из настроек. Отдельным методом, потому что зовётся из ДВУХ мест:
+		/// применения настроек и <see cref="ApplyPipelineFeatures"/> - смена RT-фолбэка пересоздаёт
+		/// SSR-ресурсы (в трейс запечён вариант шейдера), и без повторного пуша ручки откатывались бы
+		/// в дефолты.</summary>
+		private void PushSsrSettings()
+		{
+			_env.SetSsrParams(
+				Math.Clamp(_editorSettings.SsrIntensity, 0f, 4f),
+				Math.Clamp(_editorSettings.SsrMaxRoughness, 0.05f, 1f),
+				Math.Clamp(_editorSettings.SsrThickness, 0.01f, 5f),
+				Math.Clamp(_editorSettings.SsrMaxDistance, 1f, 500f),
+				Math.Clamp(_editorSettings.SsrHistoryWeight, 0f, 0.97f),
+				Math.Clamp(_editorSettings.SsrRaysPerPixel, 1, 4),
+				_editorSettings.SsrDebugView,
+				Math.Clamp(_editorSettings.SsrRtBounces, 1, 4),
+				Math.Clamp(_editorSettings.SsrTraceMode, 0, 1));
+			PushSsrEnvironment();
+		}
+
+		/// <summary>Покадровые данные SSR: поворот env-карты (композит вычитает ровно тот env-цвет,
+		/// что вложил форвард) и солнце RT-фолбэка. Цвет солнца - константа дневного света: точный
+		/// вклад ключа в RT-хиты не воспроизвести без полного шейдинга, а для отражений вне экрана
+		/// достаточно правдоподобной яркости.</summary>
+		private void PushSsrEnvironment()
+		{
+			var shadowSettings = _env.ShadowSettings;
+			if (shadowSettings == null)
+			{
+				return;
+			}
+
+			// Цвет ключа - тот же, что у прямого света превью (SimpleCullingAndRenderSystem,
+			// LightColor (1, 0.97, 0.9) x intensity 1); ambient-вес - ambientLevel форвард-пасса
+			// при мировом свете (0.55, см. UnlitInstancedPS) - RT-хиты и экранные пиксели теперь
+			// освещаются одной и той же моделью.
+			// Угловой размер солнца (та же ручка, что у PCSS прямого вида) - мягкость края тени
+			// у RT-хитов: без неё теневой луч бинарный, и в отражении край тени рвался в чёрное.
+			float sunTanHalfAngle = MathF.Tan(
+				Math.Clamp(_editorSettings.SunAngularSize, 0.01f, 20f) * 0.5f * MathF.PI / 180f);
+
+			_env.SetSsrEnvironment(shadowSettings.EnvYawRadians,
+				-Vector3.Normalize(shadowSettings.LightDirection),
+				new Vector3(1f, 0.97f, 0.9f), 0.55f, sunTanHalfAngle);
 		}
 
 		/// <summary>Пушит режим шейдинга + PBR-факторы в кбуфер PreviewSettings каждого материала
@@ -3060,6 +4117,7 @@ namespace DecaEngine.Editor
 					Mode = mode,
 					Channel = channel,
 					EnvYawRadians = _env.ShadowSettings?.EnvYawRadians ?? 0f,
+					ShadowMode = _editorSettings.ShadowFilterMode,
 					// Live-ручки солнца/эмбиента шейдер читает и без probe-GI (ProbeGiParams.z =
 					// интенсивность солнца) - значения те же, что пушит превью.
 					ProbeGiParams = new Vector4(
@@ -3079,7 +4137,7 @@ namespace DecaEngine.Editor
 				// что у превью (см. ModelPreviewViewport.ApplyPreviewSettingsToMaterials).
 				if (_probeTextures != null && ProbesEnabled)
 				{
-					ProbeGiViewportShared.PushGrid(ref data, _probeTextures, _sceneCascades,
+					ProbeGiViewportShared.PushGrid(ref data, _probeTextures,
 						_editorSettings.ProbeGiNormalBias, _editorSettings.ProbeGiViewBias);
 				}
 
@@ -3203,8 +4261,10 @@ namespace DecaEngine.Editor
 			_env.ColorTarget.Resize(newSize);
 			_env.DepthTarget.Resize(sceneSize);
 			_env.SceneCopyTarget.Resize(sceneSize);
-			_env.MsaaColorTarget?.Resize(sceneSize);
-			_env.MsaaDepthTarget?.Resize(sceneSize);
+
+			// G-buffer отражений живёт в рендер-размере вместе с дептом (его читают SSR-пассы).
+			_env.Pipeline.Targets?.NormalRoughnessTarget?.Resize(sceneSize);
+			_env.Pipeline.Targets?.EnvFactorTarget?.Resize(sceneSize);
 			_env.AoTarget?.Resize(sceneSize);
 			_env.GiTarget?.Resize(sceneSize);
 
@@ -3244,11 +4304,20 @@ namespace DecaEngine.Editor
 
 		// --- TRS-иерархия префаба -------------------------------------------------------------------
 
-		private static Matrix4x4 ComputeWorldMatrix(Entity entity)
+		internal static Matrix4x4 ComputeWorldMatrix(Entity entity)
 		{
 			var local = LocalMatrix(entity);
 			var parent = entity.Parent;
 			return parent.IsNull ? local : local * ComputeWorldMatrix(parent);
+		}
+
+		/// <summary>Матрица РОДИТЕЛЬСКОГО пространства сущности, то есть то, чем нужно домножить её
+		/// Position/Rotation, чтобы получить мировые. Нужна всем, кто держит состояние сущности в
+		/// мире, - физике персонажа (см. <see cref="CharacterMotionDriver"/>) прежде всего.</summary>
+		internal static Matrix4x4 ParentToWorldMatrix(Entity entity)
+		{
+			var parent = entity.Parent;
+			return parent.IsNull ? Matrix4x4.Identity : ComputeWorldMatrix(parent);
 		}
 
 		private static Matrix4x4 LocalMatrix(Entity entity)

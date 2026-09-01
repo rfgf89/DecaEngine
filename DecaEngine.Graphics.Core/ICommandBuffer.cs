@@ -22,6 +22,12 @@ public interface ICommandBuffer
 
 	void SetBackBufferTarget(IGraphicsApi api);
 	void SetRenderTarget(IGpuTexture rtv, IGpuTexture dsv, uint rtvSlice = 0, uint dsvSlice = 0);
+
+	/// <summary>MRT-вариант <see cref="SetRenderTarget"/>: несколько цветовых таргетов разом (нулевые
+	/// мипы/слои) - тонкий G-buffer отражений в <see cref="ForwardPass"/> (нормаль/шероховатость +
+	/// множитель env-спекуляра для SSR, см. SsrPass). PSO дроу обязан быть создан с тем же списком
+	/// форматов - на Vulkan несовпадение числа аттачментов с пайплайном ломает рендер-пасс.</summary>
+	void SetRenderTargets(IGpuTexture[] rtvs, IGpuTexture dsv);
 	void ClearRenderTarget(IGpuTexture rtv, Vector4 color, uint slice = 0);
 	void ClearDepthStencil(IGpuTexture dsv, ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0);
 

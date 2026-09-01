@@ -49,11 +49,10 @@ public sealed class SsaoPassResources : IReleaseObject
 	/// (RGBA16F в HDR-режиме превью) - PSO обязан совпадать с привязанным таргетом. Сама AO-оценка
 	/// остаётся grayscale RGBA8: видимость - величина в [0..1], HDR-точность ей не нужна.</param>
 	public SsaoPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, string colorTargetName,
-		uint width, uint height, IGpuTexture depthTarget, IGpuTexture sceneCopyTarget, uint msaaSamples,
+		uint width, uint height, IGpuTexture depthTarget, IGpuTexture sceneCopyTarget,
 		AmbientOcclusionMode aoMode = AmbientOcclusionMode.Ssao,
 		TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
 	{
-		var msaaDepth = msaaSamples > 1;
 		var gtao = aoMode == AmbientOcclusionMode.Gtao;
 		AoTarget = graphicsApi.CreateRenderTarget(new TextureInfo
 		{
@@ -69,8 +68,7 @@ public sealed class SsaoPassResources : IReleaseObject
 		var aoVs = graphicsApi.CreateShader("SSAO Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var compositeVs = graphicsApi.CreateShader("SSAO Composite Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 
-		// PSO без депта и без MSAA: AO и композит всегда считаются в 1x (MSAA-депт читается
-		// через Texture2DMS.Load, см. SsaoMsaaPS.hlsl).
+		// PSO без депта: AO и композит - фуллскрин-треугольники по готовой глубине.
 		var postProcessState = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "SSAO PostProcess PSO",
@@ -83,11 +81,9 @@ public sealed class SsaoPassResources : IReleaseObject
 		});
 
 		// Обе техники пишут grayscale в тот же таргет и композитятся тем же SsaoCompositePS.hlsl.
-		// Разница в том, ЧТО читает оценка: SSAO - сам депт-буфер (и потому имеет парные обёртки под
-		// MSAA), GTAO - префильтрованную цепочку линейных глубин, куда MSAA уже разрешён.
-		var aoShaderFile = gtao
-			? "GtaoPS.hlsl"
-			: (msaaDepth ? "SsaoMsaaPS.hlsl" : "SsaoPS.hlsl");
+		// Разница в том, ЧТО читает оценка: SSAO - сам депт-буфер, GTAO - префильтрованную цепочку
+		// линейных глубин.
+		var aoShaderFile = gtao ? "GtaoPS.hlsl" : "SsaoPS.hlsl";
 		var aoPs = graphicsApi.CreateShader("SSAO PS", "EditorAssets/shader", aoShaderFile, ShaderObjectType.Pixel);
 		AoMaterial = graphicsApi.CreateMaterial("SSAO Material");
 		AoMaterial.SetShader(aoVs, aoPs);
@@ -145,8 +141,7 @@ public sealed class SsaoPassResources : IReleaseObject
 				border: Vector4.Zero);
 
 			_gtaoPrefilterMaterial = CreateFullscreenMaterial(graphicsApi, batchRenderer, depthChainState,
-				"GTAO Depth Prefilter",
-				msaaDepth ? "GtaoDepthPrefilterMsaaPS.hlsl" : "GtaoDepthPrefilterPS.hlsl");
+				"GTAO Depth Prefilter", "GtaoDepthPrefilterPS.hlsl");
 			_gtaoPrefilterMaterial.SetTexture("_DepthTex", depthTarget);
 
 			_gtaoMipMaterials = new IMaterialObject[DepthMipLevels - 1];
@@ -175,9 +170,8 @@ public sealed class SsaoPassResources : IReleaseObject
 			AoMaterial.SetTexture("_DepthTex", depthTarget);
 		}
 
-		// Композит рисует ВНУТРИ ForwardPass в текущий render-таргет геометрии (при MSAA -
-		// мультисемпловый), поэтому его PSO обязан совпадать по SampleCount; фуллскрин-треугольник
-		// пишет во все сэмплы одно значение. AO-оценка выше остаётся 1x (AoTarget не MSAA).
+		// Композит рисует ВНУТРИ ForwardPass в текущий render-таргет геометрии - PSO обязан
+		// совпадать с ним по формату.
 		var compositeState = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "SSAO Composite PSO",
@@ -187,13 +181,10 @@ public sealed class SsaoPassResources : IReleaseObject
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
 			DepthStencilState = new DepthStencilStateInfo { DepthEnable = false },
 			InputLayout = [],
-			SampleCount = msaaSamples,
 		});
 
-		// Композит билатеральный (размытие AO по глубине, см. SsaoCompositeCommon.hlsl), поэтому
-		// у него та же пара обёрток под депт, что у самой оценки AO.
-		var compositeShaderFile = msaaDepth ? "SsaoCompositeMsaaPS.hlsl" : "SsaoCompositePS.hlsl";
-		var compositePs = graphicsApi.CreateShader("SSAO Composite PS", "EditorAssets/shader", compositeShaderFile, ShaderObjectType.Pixel);
+		// Композит билатеральный (размытие AO по глубине, см. SsaoCompositeCommon.hlsl).
+		var compositePs = graphicsApi.CreateShader("SSAO Composite PS", "EditorAssets/shader", "SsaoCompositePS.hlsl", ShaderObjectType.Pixel);
 		CompositeMaterial = graphicsApi.CreateMaterial("SSAO Composite Material");
 		CompositeMaterial.SetShader(compositeVs, compositePs);
 		CompositeMaterial.SetState(compositeState);

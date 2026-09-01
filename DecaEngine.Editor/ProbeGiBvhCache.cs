@@ -23,7 +23,7 @@ namespace DecaEngine.Editor
 		/// Ñ„Ð°Ð¹Ð» Ð¿Ñ€Ð¾Ñ‡Ð¸Ñ‚Ð°ÐµÑ‚ÑÑ ÐºÐ°Ðº Ð¼ÑƒÑÐ¾Ñ€Ð½Ð°Ñ Ð³ÐµÐ¾Ð¼ÐµÑ‚Ñ€Ð¸Ñ. v2: Ð¼Ð°ÑÑÐ¸Ð²Ñ‹ Ð¿Ð¸ÑˆÑƒÑ‚ÑÑ Ð‘Ð›ÐžÐšÐÐœÐ˜ (Ð¿Ð¾Ð±Ð°Ð¹Ñ‚Ð¾Ð²Ñ‹Ð¹ Ð¾Ð±Ñ€Ð°Ð·
 		/// ÑÑ‚Ñ€ÑƒÐºÑ‚ÑƒÑ€), Ð° Ð½Ðµ Ð¿Ð¾ Ð¾Ð´Ð½Ð¾Ð¼Ñƒ float - Ð½Ð° Ð´ÐµÑ€ÐµÐ²Ðµ Sponza ÑÑ‚Ð¾ 884 ÐœÐ‘, Ð¸ Ð¿Ð¾ÑÐ»ÐµÐ¼ÐµÐ½Ñ‚Ð½Ñ‹Ð¹ BinaryWriter
 		/// Ñ‡Ð¸Ñ‚Ð°Ð» Ð¸Ñ… Ð¿Ð¾Ñ‡Ñ‚Ð¸ Ð¿ÑÑ‚ÑŒ ÑÐµÐºÑƒÐ½Ð´, ÑÑŠÐµÐ´Ð°Ñ Ð²ÐµÑÑŒ ÑÐ¼Ñ‹ÑÐ» ÐºÐµÑˆÐ°.</summary>
-		private const int Version = 2;
+		private const int Version = 6; // v6: шероховатость треугольника (бывший Pad4); v5: вершинные окто-нормали (80 байт); v4: металличность; v3: UV/TextureIndex/HitTextureKeys
 
 		/// <summary>Ð‘Ð»Ð¾Ñ‡Ð½Ð°Ñ Ð·Ð°Ð¿Ð¸ÑÑŒ Ð¼Ð°ÑÑÐ¸Ð²Ð° blittable-ÑÑ‚Ñ€ÑƒÐºÑ‚ÑƒÑ€: Ð¾Ð´Ð¸Ð½ Write Ð²Ð¼ÐµÑÑ‚Ð¾ N*Ð¿Ð¾Ð»ÐµÐ¹.</summary>
 		private static void WriteArray<T>(Stream stream, BinaryWriter writer, T[] values) where T : unmanaged
@@ -115,6 +115,7 @@ namespace DecaEngine.Editor
 					WriteArray(stream, writer, data.ObjectTriangles);
 					WriteArray(stream, writer, data.MeshSlots);
 					WriteArray(stream, writer, data.Instances);
+					WriteArray(stream, writer, data.HitTextureKeys);
 				}
 
 				File.Move(tempPath, cachePath, overwrite: true);
@@ -168,6 +169,7 @@ namespace DecaEngine.Editor
 				var objectTriangles = ReadArray<BvhTriangleGpu>(stream, reader);
 				var meshSlots = ReadArray<(int First, int Count)>(stream, reader);
 				var instances = ReadArray<ProbeGeometryInstance>(stream, reader);
+				var hitTextureKeys = ReadArray<(int Model, int Material)>(stream, reader);
 
 				return new ProbeGiBaker.BvhCacheData
 				{
@@ -180,6 +182,7 @@ namespace DecaEngine.Editor
 					ObjectTriangles = objectTriangles,
 					MeshSlots = meshSlots,
 					Instances = instances,
+					HitTextureKeys = hitTextureKeys,
 				};
 			}
 			catch (Exception ex)

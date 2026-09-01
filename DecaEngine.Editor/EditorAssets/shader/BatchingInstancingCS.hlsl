@@ -96,7 +96,12 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
 	DrawData drawData = InstancesDrawData[objectID];
 	PerMeshData meshData = MeshBatchData[batchId];
 
-	float3 centerWorld = rotateQuat(meshData.bounds.xyz * drawData.positionScale.w, drawData.orientation) + drawData.positionScale.xyz;
+	// Центр - ПОКОМПОНЕНТНЫМ масштабом: максимум (positionScale.w) на неравномерном масштабе уносил
+	// центр от геометрии на |bounds.center|*(max-фактический), и повёрнутый инстанс со смещённым
+	// пивотом выпадал из фрустума теневого слайса punctual-света (единственного потребителя этого
+	// кулинга) - объект рисовался, а тень сквозь него не ложилась. Радиус остаётся по максимуму -
+	// для сферы это консервативно при любом повороте.
+	float3 centerWorld = rotateQuat(meshData.bounds.xyz * drawData.scale3.xyz, drawData.orientation) + drawData.positionScale.xyz;
 	float3 center = mul(float4(centerWorld, 1), cullData.view).xyz;
 	float radius = meshData.bounds.w * drawData.positionScale.w;
 

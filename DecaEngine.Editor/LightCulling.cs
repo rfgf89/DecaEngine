@@ -93,6 +93,59 @@ public static class LightCulling
     /// пул он и не попадает - солнце идёт своим путём через каскадные тени, см. CullingAndRenderSystem.)</summary>
     public static bool IsDirectionalLightVisible() => true;
 
+    /// <summary>Сборка записи punctual-света БЕЗ кулинга и теневых слайсов - для бейкера проб
+    /// (<see cref="ProbeGiBakeSession.SetPunctualLights"/>): бейк видит весь объём, а не фрустум
+    /// камеры, и тени считает своими лучами. ShadowParams остаётся нулевым НАРОЧНО - раскладка
+    /// слайсов меняется от камеры каждый кадр и дёргала бы сравнение изменений света вхолостую.
+    /// Формулы углов/направления - зеркало <see cref="TryBuildPunctualLight"/>, менять парой.</summary>
+    public static bool TryBuildBakeLight(ref LightComponent light, Entity lightEntity,
+        out PunctualLight punctualLight)
+    {
+        punctualLight = default;
+
+        if (light.Intensity <= 0f || light.Range <= 0f || !lightEntity.HasComponent<Position>())
+        {
+            return false;
+        }
+
+        GetWorldPositionRotation(lightEntity, out Vector3 worldPos, out Quaternion worldRot);
+
+        switch (light.Type)
+        {
+            case LightType.Point:
+                punctualLight = new PunctualLight
+                {
+                    PositionRange = new Vector4(worldPos, light.Range),
+                    ColorIntensity = new Vector4(light.Color, light.Intensity),
+                };
+                return true;
+
+            case LightType.Spot:
+            {
+                Vector3 dirWorld = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, worldRot));
+                float outerHalfRad = Math.Clamp(light.SpotAngle, 1f, 179f) * (MathF.PI / 360f);
+                float innerFullDeg = light.InnerSpotAngle > 0f
+                    ? MathF.Min(light.InnerSpotAngle, light.SpotAngle)
+                    : light.SpotAngle * 0.8f;
+                float cosOuter = MathF.Cos(outerHalfRad);
+                float cosInner = MathF.Cos(Math.Clamp(innerFullDeg, 0f, 179f) * (MathF.PI / 360f));
+
+                punctualLight = new PunctualLight
+                {
+                    PositionRange = new Vector4(worldPos, light.Range),
+                    ColorIntensity = new Vector4(light.Color, light.Intensity),
+                    DirectionType = new Vector4(dirWorld, 1f),
+                    SpotAngles = new Vector4(cosOuter, 1f / MathF.Max(cosInner - cosOuter, 1e-4f),
+                        MathF.Sin(outerHalfRad), 0f),
+                };
+                return true;
+            }
+
+            default:
+                return false;
+        }
+    }
+
     /// <summary>Кулит один punctual-свет против фрустума камеры МЕТОДОМ ЕГО ТИПА (точечный - сферой
     /// радиуса действия, спот - конусом) и, если свет видим, собирает его GPU-запись. Направленные
     /// света в кластерный пул не идут - направленный свет сцены обслуживается каскадами. Общая для
@@ -118,7 +171,8 @@ public static class LightCulling
         // из Range повторной копией формулы - такая копия у него уже была и уже разошлась.
         var shadowParams = shadowSlices.TryGetValue(lightEntity.Id, out var firstSlice)
             ? new Vector4(firstSlice, Math.Clamp(light.ShadowStrength, 0f, 1f),
-                PunctualShadowScheduler.SliceNearPlane(light.Range), 0f)
+                PunctualShadowScheduler.SliceNearPlane(light.Range),
+                light.SourceRadius > 0f ? light.SourceRadius : 0f)
             : new Vector4(-1f, 0f, 0f, 0f);
 
         switch (light.Type)

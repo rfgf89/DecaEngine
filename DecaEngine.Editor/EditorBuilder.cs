@@ -1,12 +1,36 @@
 ﻿using System.Diagnostics;
 using System.Text;
 using Microsoft.Build.Construction;
+using Microsoft.Build.Evaluation;
 
 namespace DecaEngine.Editor;
 
+/// <summary>
+/// Шаблон нового проекта: что положить в его Assets помимо кода.
+///
+/// Enum, а не строка из списка окна: шаблон выбирают в UI, а исполняет его сборщик, и связывать их
+/// текстом означало бы, что переименование пункта в списке молча превращает выбор в «пустой
+/// проект».
+/// </summary>
+public enum ProjectTemplate
+{
+	/// <summary>Только код: игровой класс и хост. Ассетов нет.</summary>
+	Empty,
+
+	/// <summary>Демо-сцена анимации и физики (см. <see cref="SamplePrefabBuilder"/>): площадка со
+	/// ступенями и пандусом, четыре персонажа под разные слои стека, пара светов.</summary>
+	AnimationSample,
+}
+
 public class EditorBuilder
 {
-	public string Build(string projectName, string outputPath)
+	/// <summary>
+	/// Создаёт проект. <paramref name="log"/> - куда писать ход генерации ассетов: из редактора это
+	/// консоль редактора, из командной строки - обычная. Без него сообщения о том, что демо-сцена не
+	/// собралась, уходили бы в пустоту ровно там, где их и надо читать.
+	/// </summary>
+	public string Build(string projectName, string outputPath,
+		ProjectTemplate template = ProjectTemplate.Empty, Action<string>? log = null)
 	{
 		var projectDir = Path.Combine(outputPath, projectName);
 		var slnPath = Path.Combine(projectDir, $"{projectName}.sln");
@@ -44,49 +68,107 @@ public class EditorBuilder
 		AttachEngineReferences(csprojPath);
 		AttachEngineReferences(assemblyCsprojPath);
 
+		WriteTemplateAssets(gameProjectDir, template, log);
+
 		return slnPath;
 	}
 
-	public static void AttachEngineReferences(string csprojPath)
+	/// <summary>
+	/// Кладёт ассеты шаблона. Идёт ПОСЛЕДНИМ шагом и в try: проект к этому моменту уже собран и
+	/// открывается, а не собравшаяся демо-сцена - это «проект без сцены», а не «проект не создан».
+	/// Ронять созданный проект из-за содержимого его Assets было бы худшим из возможных обменов.
+	/// </summary>
+	private static void WriteTemplateAssets(string gameProjectDir, ProjectTemplate template, Action<string>? log)
 	{
-		var missingPaths = GetEngineProjectPaths(csprojPath)
-			.Select(Path.GetFullPath)
-			.Except(GetExistingReferencePaths(csprojPath), StringComparer.OrdinalIgnoreCase)
-			.ToList();
-
-		if (missingPaths.Count == 0)
+		if (template == ProjectTemplate.Empty)
 		{
 			return;
 		}
 
-		foreach (var enginePath in missingPaths)
+		// Assets лежит рядом с csproj игрового проекта - именно оттуда редактор берёт ассеты
+		// (см. ProjectSession.AssetsPath).
+		string assets = Path.Combine(gameProjectDir, "Assets");
+
+		try
 		{
-			ExecuteCommand($"dotnet add \"{csprojPath}\" reference \"{enginePath}\"");
+			SamplePrefabBuilder.WriteScene(assets, log);
+		}
+		catch (Exception ex)
+		{
+			log?.Invoke($"[sample] демо-сцена не создана: {ex.Message}");
 		}
 	}
 
-	private static HashSet<string> GetExistingReferencePaths(string csprojPath)
+	/// <summary>
+	/// Прописывает ссылки на проекты движка ПРЯМО В csproj, без запуска dotnet.
+	///
+	/// Раньше это делал <c>dotnet add reference</c> - по запуску на каждую ссылку. Движок это два
+	/// десятка проектов, и создание проекта стоило 39 запусков dotnet и 17 секунд; при ОТКРЫТИИ
+	/// проекта (см. ProjectSession) те же запуски шли впустую и печатали в консоль два десятка
+	/// строк «Project already has a reference to ...».
+	///
+	/// Правка XML своими руками отвечает и за скорость, и за тот мусор в консоли: сравнение «что уже
+	/// есть» теперь наше, и ссылки добавляются ровно те, которых нет.
+	/// </summary>
+	public static void AttachEngineReferences(string csprojPath)
 	{
-		var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
-		var project = ProjectRootElement.Open(csprojPath);
+		var enginePaths = GetEngineProjectPaths(csprojPath);
+		if (enginePaths.Count == 0)
+		{
+			return;
+		}
 
-		var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
+
+		// СВОЯ коллекция, а не глобальная. Глобальная кеширует ProjectRootElement по пути и отдаёт
+		// снимок, сделанный при первом открытии, - а csproj между открытиями правят и мы сами, и
+		// dotnet. Именно это и ломало проверку: закешированный (ещё пустой) файл не содержал ни
+		// одной ссылки, все они считались отсутствующими, и на каждое открытие проекта редактор
+		// заново просил dotnet добавить то, что уже добавлено.
+		using var collection = new ProjectCollection();
+		var project = ProjectRootElement.Open(csprojPath, collection);
+
+		if (project == null)
+		{
+			return;
+		}
+
+		var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
 		foreach (var item in project.Items.Where(i => i.ItemType == "ProjectReference"))
 		{
-			var referencePath = item.Include;
-			if (string.IsNullOrWhiteSpace(referencePath))
+			if (string.IsNullOrWhiteSpace(item.Include))
 			{
 				continue;
 			}
 
-			var fullReferencePath = Path.IsPathRooted(referencePath)
-				? referencePath
-				: Path.Combine(projectDir, referencePath);
+			var full = Path.IsPathRooted(item.Include)
+				? item.Include
+				: Path.Combine(projectDir, item.Include);
 
-			result.Add(Path.GetFullPath(fullReferencePath));
+			existing.Add(Path.GetFullPath(full));
 		}
 
-		return result;
+		bool changed = false;
+
+		foreach (var enginePath in enginePaths)
+		{
+			var full = Path.GetFullPath(enginePath);
+			if (!existing.Add(full))
+			{
+				continue;
+			}
+
+			// ОТНОСИТЕЛЬНЫЙ путь - как это делает dotnet: проект с абсолютными путями к движку
+			// перестаёт собираться, стоит перенести папку с ним на другую машину.
+			project.AddItem("ProjectReference", Path.GetRelativePath(projectDir, full));
+			changed = true;
+		}
+
+		if (changed)
+		{
+			project.Save(csprojPath);
+		}
 	}
 
 	private static void AddEngineProjectsToSolution(string slnPath, string csprojPath)
@@ -310,7 +392,10 @@ public class EditorBuilder
 
 	private static void EnableProjectFeatures(string csprojPath)
 	{
-		var project = ProjectRootElement.Open(csprojPath);
+		// Своя коллекция - по той же причине, что в AttachEngineReferences: глобальная отдаёт
+		// закешированный снимок файла, который между вызовами правит dotnet.
+		using var collection = new ProjectCollection();
+		var project = ProjectRootElement.Open(csprojPath, collection)!;
 		var propertyGroup = project.PropertyGroups.FirstOrDefault() ?? project.AddPropertyGroup();
 
 		void SetIfMissing(string name, string value)

@@ -158,7 +158,18 @@ public interface IGraphicsApi : IReleaseObject
 	/// compute-обходом собственного BVH.</summary>
 	public RayTracingSupport RayTracing { get; }
 
+	/// <summary>Умеет ли девайс динамическую индексацию массивов шейдерных ресурсов
+	/// (Texture2D arr[N] с NonUniformResourceIndex) - гейт bindless-режима текстур RT-хитов SSR.
+	/// Дефолт false: включает только Diligent-бэкенд, запросивший фичу при создании девайса.</summary>
+	public bool SupportsShaderResourceArrays => false;
+
 	public IGpuTexture CreateTexture(CpuTextureData data);
+
+	/// <summary>Immutable Texture2DArray из готовых CPU-слоёв одного размера (RGBA8 без sRGB, один
+	/// мип на слой) - атлас текстур RT-хитов SSR. Дефолт null: реализует только Diligent-бэкенд;
+	/// вызывающий обязан пережить отсутствие (режим атласа тогда остаётся на плейсхолдере).</summary>
+	public IGpuTexture? CreateTextureArray(string name, int width, int height,
+		IReadOnlyList<byte[]> layers) => null;
 
 	/// <summary>Immutable 2D-текстура с ЯВНОЙ мип-цепочкой: mipPixels[0] - базовый уровень
 	/// width x height, каждый следующий вдвое меньше (min 1). Нужна там, где мипы несут смысловую

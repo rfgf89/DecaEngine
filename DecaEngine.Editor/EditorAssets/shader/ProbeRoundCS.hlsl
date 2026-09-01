@@ -36,19 +36,29 @@ cbuffer ProbeRoundParams
     // геометрия врёт на движущейся сцене, отскок идёт из поля). w = сон проб: 0 - выключен,
     // иначе 1 + (номер веера & 3) - фаза раунда для пробуждения спящих (см. mainProbe).
     float4 ProbeRelocation;
-    // x = предел релокации СВЕЖЕЙ пробы (её плоскость только что въехала прокруткой объёма, см.
-    // ProbeGiBakeSession.ProbeFresh): у неё своё окно, не общесеточное.
-    float4 ProbeScroll;
+    // x = сколько первых лучей веера ФИКСИРОВАННЫЕ (см. ProbeGiBaker.FixedRayCount),
+    // y = число punctual-светов в _ProbeBakeLights.
+    float4 ProbeRays;
 };
+
+// Punctual-света сцены - прямой свет в точках попадания лучей наравне с солнцем (подход RTXGI:
+// теневой луч к свету + затухание). Зеркало ProbeGiBaker.EvalPunctualLights и структуры
+// PunctualLight (LightData.cs / Instancing.hlsl) - формулы менять только всеми копиями разом.
+// ShadowParams бейку не нужен (тень считается лучом), но страйд обязан совпадать с C#-структурой.
+struct ProbeBakeLight
+{
+    float4 PositionRange;  // xyz - мировая позиция, w - радиус действия
+    float4 ColorIntensity; // rgb - линейный цвет, w - интенсивность
+    float4 DirectionType;  // xyz - направление конуса (спот), w - тип: 0 point, 1 spot
+    float4 SpotAngles;     // x - cos внешнего полуугла, y - 1/(cosInner-cosOuter)
+    float4 ShadowParams;   // не используется
+};
+StructuredBuffer<ProbeBakeLight> _ProbeBakeLights;
 
 // Направления лучей раунда считает CPU и присылает готовыми. Повторять формулу веера Фибоначчи в
 // шейдере нельзя: расхождение в последнем бите синуса увело бы луч на соседний треугольник у
 // силуэта, и сверка с CPU-эталоном перестала бы что-либо значить.
 StructuredBuffer<float4> _ProbeRayDirections;
-
-// Длина окна свежести - зеркало ProbeGiBaker.RelocationRounds. Разъехаться им нельзя: по этому
-// числу считается номер раунда свежей пробы, а значит и вес её бегущего среднего.
-#define PROBE_FRESH_WINDOW 5
 
 // Поле проб, четыре float4 на пробу (раскладка атласов):
 //   [0] rgb = SH L0,  a = видимость неба
@@ -74,14 +84,6 @@ RWStructuredBuffer<float4> _ProbeVisibility;
 cbuffer ProbeGridParams
 {
     float4 ProbeGridCounts;
-    // xyz = тороидальное смещение сетки в пробах: узел c лежит по индексу (c + scroll) mod counts.
-    float4 ProbeGridScroll;
-    // xyz = ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ,
-    // -1 = по этой оси не двигались. Телепорт дальше размера объёма выражается штатно: плоскость 0
-    // и размах во всю ось (см. ProbeGiBakeSession.MarkScrolled - почему тут нет сентинела).
-    float4 ProbeGridClear;
-    // xyz = сколько плоскостей подряд въехало по каждой оси, начиная с ProbeGridClear.
-    float4 ProbeGridClearSpan;
     // xyz = размер вокселя кэша поверхностей, w = число живых вокселей (0 = кэш выключен).
     float4 SurfaceVoxel;
     // xyz = размер воксельной сетки кэша.
@@ -91,46 +93,13 @@ cbuffer ProbeGridParams
     float4 ProbeSkyParams;
 };
 
-// Координаты узла сетки по индексу ХРАНЕНИЯ пробы и обратно - зеркало ProbeGiBaker.StorageIndex /
-// Wrap. Слагаемое counts перед остатком обязательно: смещение бывает отрицательным, а % в HLSL
-// (как и в C#) даёт отрицательный остаток от отрицательного делимого.
+// Координаты узла сетки по индексу ХРАНЕНИЯ пробы - зеркало ProbeGiBaker.StorageIndex. Объём
+// неподвижен (прокрутки больше нет), так что координаты хранения и есть координаты сетки.
 int3 ProbeStorageCoords(uint probe)
 {
     int cx = (int)ProbeGridCounts.x;
     int cy = (int)ProbeGridCounts.y;
     return int3((int)probe % cx, (int)probe / cx % cy, (int)probe / (cx * cy));
-}
-
-int3 ProbeWrap(int3 coords, int3 scroll, int3 counts)
-{
-    return ((coords + scroll) % counts + counts) % counts;
-}
-
-// Въехала ли эта плоскость последней прокруткой - её поле принадлежит месту, откуда объём уехал, и
-// накопители надо не смешивать, а обнулить (эталон RTXGI: DDGIClearScrolledPlane).
-bool ProbeScrolledIn(int3 storage)
-{
-    bool cleared = false;
-    [unroll]
-    for (int axis = 0; axis < 3; axis++)
-    {
-        int plane = (int)ProbeGridClear[axis];
-        if (plane < 0)
-        {
-            continue;
-        }
-
-        // Плоскостей могло въехать несколько подряд; диапазон заворачивается по периоду сетки.
-        int count = (int)ProbeGridCounts[axis];
-        int span = min((int)ProbeGridClearSpan[axis], count);
-        int delta = (storage[axis] - plane % count + count) % count;
-        if (delta < span)
-        {
-            cleared = true;
-        }
-    }
-
-    return cleared;
 }
 
 // Сторона окто-карты видимости. Приходит кбуфером, а не дефайном: это ручка окна Graphics, и
@@ -277,7 +246,6 @@ float3 ProbeGatherIrradiance(float3 pos, float3 normal, out float sunFracOut)
     // Базовый узел ячейки - просто пол координат сетки: у плотной сетки проба есть в каждом узле,
     // искать её больше негде и не через что. Индирекции здесь не осталось вовсе.
     int3 counts = (int3)ProbeGridCounts.xyz;
-    int3 scroll = (int3)ProbeGridScroll.xyz;
     int3 l = clamp((int3)floor(f), 0, counts - 2);
     float3 t = saturate(f - (float3)l);
 
@@ -290,8 +258,7 @@ float3 ProbeGatherIrradiance(float3 pos, float3 normal, out float sunFracOut)
     {
         int3 o = int3(corner & 1, (corner >> 1) & 1, corner >> 2);
         int3 lp = l + o;
-        int3 sp = ProbeWrap(lp, scroll, counts);
-        uint index = (uint)((sp.z * counts.y + sp.y) * counts.x + sp.x);
+        uint index = (uint)((lp.z * counts.y + lp.y) * counts.x + lp.x);
 
         float4 field1 = _ProbeFieldRead[index * 4 + 1];
         float w = (o.x ? t.x : 1.0 - t.x) * (o.y ? t.y : 1.0 - t.y) * (o.z ? t.z : 1.0 - t.z)
@@ -331,6 +298,62 @@ float3 ProbeGatherIrradiance(float3 pos, float3 normal, out float sunFracOut)
     return max(e, 0.0);
 }
 
+// Прямой свет punctual-светов в точке поверхности - зеркало ProbeGiBaker.EvalPunctualLights
+// (см. комментарий у _ProbeBakeLights). Вклад идёт в СТАТИЧНУЮ долю освещения (знаменатель
+// sunFrac, не числитель): реалтайм-модуляция солнечной тенью света ламп касаться не должна.
+float3 ProbeEvalPunctualLights(float3 pos, float3 normal)
+{
+    float3 sum = 0.0;
+    uint count = (uint)ProbeRays.y;
+    for (uint i = 0; i < count; i++)
+    {
+        ProbeBakeLight l = _ProbeBakeLights[i];
+        float3 toLight = l.PositionRange.xyz - pos;
+        float distSq = dot(toLight, toLight);
+        float range = l.PositionRange.w;
+        if (distSq > range * range)
+        {
+            continue;
+        }
+
+        float dist = sqrt(max(distSq, 1e-6));
+        float3 dir = toLight / dist;
+        float ndotl = dot(normal, dir);
+        if (ndotl <= 0.0)
+        {
+            continue;
+        }
+
+        // Гладкое окно затухания - зеркало кластерного шейдинга UnlitInstancedPS.
+        float distRatio2 = distSq / (range * range);
+        float distFactor = saturate(1.0 - distRatio2 * distRatio2);
+        float atten = distFactor * distFactor / (distSq + 1e-2);
+
+        if (l.DirectionType.w > 0.5)
+        {
+            float cd = dot(-dir, l.DirectionType.xyz);
+            float spotFactor = saturate((cd - l.SpotAngles.x) * l.SpotAngles.y);
+            atten *= spotFactor * spotFactor;
+            if (atten <= 0.0)
+            {
+                continue;
+            }
+        }
+
+        // Теневой луч с tmax до света, укороченный эпсилоном с обеих сторон - от самозатенения
+        // поверхности и от геометрии у самой лампы.
+        float shadowStart = ProbeRoundParams.x * 4.0;
+        if (SceneTraceAnyHit(pos + dir * shadowStart, dir, dist - shadowStart * 2.0))
+        {
+            continue;
+        }
+
+        sum += l.ColorIntensity.rgb * l.ColorIntensity.w * (ndotl * atten);
+    }
+
+    return sum;
+}
+
 // Обновление кэша поверхностей - отдельный проход ПЕРЕД раундом проб, зеркало
 // ProbeGiBaker.UpdateSurfaceCache. Резкая часть освещения (солнце) считается теневым лучом на
 // каждый воксель, гладкая (переотскок) берётся из поля проб, которому детализация не нужна.
@@ -354,6 +377,9 @@ void mainSurface(uint3 threadId : SV_DispatchThreadID)
         sunIrradiance = ProbeSunColor.rgb * ndotl;
     }
 
+    // Лампы - в статичную долю, вместе с небом (см. ProbeEvalPunctualLights).
+    float3 lampIrradiance = ProbeEvalPunctualLights(pos, normal);
+
     float3 ambient = 0.0;
     float ambientFrac = 0.0;
     float feedback = ProbeRoundParams.w;
@@ -362,7 +388,7 @@ void mainSurface(uint3 threadId : SV_DispatchThreadID)
         ambient = ProbeGatherIrradiance(pos, normal, ambientFrac) * feedback;
     }
 
-    float3 irradiance = sunIrradiance + ambient;
+    float3 irradiance = sunIrradiance + lampIrradiance + ambient;
     float3 rawAlbedo = _SurfaceAlbedo[voxel].rgb;
     float3 albedo = lerp((float3)ProbeLuminance(rawAlbedo), rawAlbedo, ProbeGridCounts.w);
 
@@ -388,25 +414,9 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // арифметика вокруг беззнаковая, смешивать типы в условиях циклов ни к чему.
     uint visRes = (uint)ProbeVisRes();
 
-    // Пустых слотов у плотной сетки нет по построению - проба есть в каждом узле, и ранний выход
-    // «слот пуст» вместе с запасом пула отсюда ушёл.
-    int3 counts = (int3)ProbeGridCounts.xyz;
-    int3 scroll = (int3)ProbeGridScroll.xyz;
-    int3 storage = ProbeStorageCoords(probe);
-
-    // Координаты УЗЛА - обратный сдвиг прокрутки: узел c лежит по индексу (c + scroll) mod counts,
-    // значит c = (storage - scroll) mod counts.
-    int3 cell = ProbeWrap(storage, -scroll, counts);
-
-    // ХОЛОДНЫЙ раунд: эта плоскость только что въехала прокруткой, и всё, что накоплено в её
-    // текселях, описывает ЧУЖОЕ место - то, откуда объём уехал. Поле принимается целиком,
-    // накопители обнуляются: смешивать новую пробу со старой было бы не «плавным переходом», а
-    // размазыванием освещения одного угла сцены по другому.
-    //
-    // Раньше это состояние приезжало таблицей на слот пула, а снималось отдельным прогревающим
-    // диспатчем (WarmColdBricks). Теперь оно выводится из трёх чисел кбуфера прямо здесь, в том же
-    // диспатче, что и обычная работа, - отдельного прохода и отдельной синхронизации больше нет.
-    bool cold = ProbeScrolledIn(storage);
+    // Пустых слотов у плотной сетки нет по построению - проба есть в каждом узле, а объём
+    // неподвижен (прокрутки больше нет): координаты хранения и есть координаты узла.
+    int3 cell = ProbeStorageCoords(probe);
 
     // СОН ПРОБ (Majercik 2021 §6, упрощённая машина состояний): проба, чьё поле давно спокойно
     // (счётчик calm в _ProbeCounters.w), обновляется раз в 4 раунда - фаза по номеру пробы против
@@ -414,9 +424,9 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // окно релокации закрыто); смена света поднимает вес раунда и будит всех, движение сцены
     // открывает релокацию - тоже всех, а проснувшаяся проба с изменившимся полем сама обнуляет
     // calm внизу. Экономия - до 3/4 лучей кадра на спокойной сцене.
-    int4 countersPrev = cold ? int4(0, 0, 0, 0) : _ProbeCounters[probe];
+    int4 countersPrev = _ProbeCounters[probe];
     int sleepPhase = (int)ProbeRelocation.w;
-    if (!cold && sleepPhase > 0 && countersPrev.w > 16 && ((int)probe & 3) != sleepPhase - 1)
+    if (sleepPhase > 0 && countersPrev.w > 16 && ((int)probe & 3) != sleepPhase - 1)
     {
         return;
     }
@@ -425,7 +435,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // статистики достаточно, большинство лучей в задние грани), не трассируется вовсе - её
     // валидность и так ноль, выборка её не читает, а лучи она жгла бы вслепую. Движение сцены
     // переоткрывает окно (ProbeRelocation.x > 0), и проба получает новый шанс выбраться.
-    if (!cold && ProbeRelocation.z > 0.5 && ProbeRelocation.x == 0.0
+    if (ProbeRelocation.z > 0.5 && ProbeRelocation.x == 0.0
         && countersPrev.x >= 64 && countersPrev.z * 2 > countersPrev.x)
     {
         return;
@@ -435,18 +445,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // задних граней описывала бы узел сетки, а не то место, где проба реально стоит, и релокация
     // не сошлась бы: сдвинувшись наружу, проба продолжала бы считать себя замурованной.
     float4 offsetSlot = _ProbeOffsets[probe];
-    float3 probeOffset = cold ? (float3)0.0 : offsetSlot.xyz;
-
-    // ОКНО РЕЛОКАЦИИ СВЕЖЕЙ ПРОБЫ живёт несколько раундов, а не один, и счётчик этих раундов
-    // хранится в МОДУЛЕ .w слота смещений: |w| = 1 + сколько раундов ещё осталось.
-    //
-    // Место выбрано не от бедности. Само .w занято классификацией (см. probeActive), но она читается
-    // ТОЛЬКО по знаку - и здесь, и в пиксельном шейдере, который из этого атласа берёт одни rgb.
-    // Модуль, таким образом, свободен, и счётчик влезает в уже существующий ресурс: заводить под
-    // него отдельный буфер значило бы вернуть таблицу на пробу, которую эта переделка как раз и
-    // сняла. Одного раунда мало по существу: релокация сходится итеративно (Majercik 2021 §5), а
-    // въехавшая проба - это ровно случай инициализации, ей нужно всё окно.
-    int freshLeft = cold ? PROBE_FRESH_WINDOW - 1 : max((int)abs(offsetSlot.w) - 1, 0);
+    float3 probeOffset = offsetSlot.xyz;
     float3 probePos = ProbeGridOrigin.xyz + (float3)cell * ProbeGridCell.xyz + probeOffset;
 
     int rays = (int)ProbeSunDirection.w;
@@ -470,7 +469,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     //
     // fixedRays == 0 (запечка) - деления нет вовсе: КАЖДЫЙ луч работает и на геометрию, и на
     // радианс, ровно как раньше. Это и сохраняет сверку с CPU-эталоном луч в луч.
-    int fixedRays = (int)ProbeScroll.y;
+    int fixedRays = (int)ProbeRays.x;
     int blendRays = max(rays - fixedRays, 1);
     float domega = 4.0 * 3.14159265 / (float)blendRays;
 
@@ -497,8 +496,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // классифицирована», то есть АКТИВНА. Прими мы ноль за «выключена» - на первом же раунде
     // погасли бы разом все пробы объёма, и до фиксированных лучей, которые могли бы их зажечь
     // обратно, дело дошло бы только на следующем.
-    // Холодная проба и запечка (fixedRays == 0) активны по тем же соображениям: у первой ещё нет
-    // статистики, у второй классификации нет вовсе.
+    // Запечка (fixedRays == 0) активна по тем же соображениям: классификации у неё нет вовсе.
     //
     // И ГЛАВНОЕ УСЛОВИЕ: заморозка разрешена только УСТОЯВШЕЙСЯ пробе - те же ворота, что у сна
     // (устоявшееся реальное время плюс счётчик спокойствия). Без них приём неверен, и это проверено
@@ -511,7 +509,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // Здесь же выборка неактивные пробы читает (см. выше, почему), значит их поле обязано быть
     // верным - и заморозить его можно только после того, как оно таковым стало.
     bool settled = sleepPhase > 0 && countersPrev.w > 16;
-    bool probeActive = cold || fixedRays == 0 || !settled || offsetSlot.w > -0.5;
+    bool probeActive = fixedRays == 0 || !settled || offsetSlot.w > -0.5;
     int rayEnd = probeActive ? rays : fixedRays;
 
     float3 sum0 = 0.0, sumX = 0.0, sumY = 0.0, sumZ = 0.0;
@@ -568,24 +566,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
         ? 1.0 - 1.0 / PROBE_GEOMETRY_WINDOW
         : 1.0;
 
-    // Окто-карта глубин копится суммами, поэтому у холодной пробы её надо именно ОБНУЛИТЬ, а не
-    // пересилить весом: суммы прежнего жильца слота никаким весом не разбавляются, и тест Чебышёва
-    // мерил бы глубины от точки, где этой пробы никогда не было.
-    if (cold)
-    {
-        [loop]
-        for (uint c = 0; c < visRes * visRes; c++)
-        {
-            _ProbeVisibility[visBase + c] = float4(0.0, 0.0, 0.0, 0.0);
-        }
-
-        // Смещение релокации - тоже наследство прежнего жильца, и его надо снять ЗДЕСЬ, а не в
-        // блоке релокации внизу: тот работает только при открытом окне, а с закрытым проба так и
-        // осталась бы отодвинутой от своего узла в сторону чужой стены.
-        // Модуль .w несёт остаток окна релокации (см. freshLeft): въехавшей пробе оно открыто целиком.
-        _ProbeOffsets[probe] = float4(0.0, 0.0, 0.0, (float)(1 + freshLeft));
-    }
-    else if (geometryDecay < 1.0)
+    if (geometryDecay < 1.0)
     {
         [loop]
         for (uint c = 0; c < visRes * visRes; c++)
@@ -761,6 +742,10 @@ void main(uint3 threadId : SV_DispatchThreadID)
                         sunIrradiance = ProbeSunColor.rgb * ndotl;
                     }
 
+                    // Лампы - в статичную долю, как в mainSurface.
+                    float3 lampIrradiance = ProbeEvalPunctualLights(
+                        hit.position + hit.normal * (sceneEpsilon * 4.0), hit.normal);
+
                     float3 prevIrradiance = 0.0;
                     float prevFrac = 0.0;
                     float feedback = ProbeRoundParams.w;
@@ -770,7 +755,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
                             hit.position + hit.normal * ProbeRoundParams.z, hit.normal, prevFrac) * feedback;
                     }
 
-                    float3 irradiance = sunIrradiance + prevIrradiance;
+                    float3 irradiance = sunIrradiance + lampIrradiance + prevIrradiance;
 
                     // Хрома-кламп альбедо: цвет тянется к собственной люме, яркость не меняется
                     // (lerp к люме линеен) - зеркало CPU-версии.
@@ -849,10 +834,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // валидное содержимое, а не устаревшее.
     if (!probeActive)
     {
-        // Счётчик свежести тикает и на этой ветке: замороженная проба обязана дожить своё окно, а не
-        // застрять в нём навсегда (см. freshLeft).
-        _ProbeOffsets[probe] = float4(probeOffset,
-            (nearGeometry ? 1.0 : -1.0) * (float)(1 + max(freshLeft - 1, 0)));
+        _ProbeOffsets[probe] = float4(probeOffset, nearGeometry ? 1.0 : -1.0);
 
         // В общую изменчивость такая проба входит нулём с ПОЛНЫМ весом, а не нулевым: она
         // действительно неизменна - её ровно за устоявшееся поле и заморозили. Исключи мы её из
@@ -869,39 +851,18 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // выбравшаяся из стены проба продолжала бы числиться замурованной. А ПОЛЕ при этом оставалось
     // копиться дальше, как ни в чём не бывало, - хотя описывает ровно ту же старую точку.
     //
-    // На прокрутке это и вылезает. Свежему слоту релокация открыта всё окно свежести
-    // (freshLeft > 0), то есть проба, приведённая прокруткой, первые раунды ЕЗДИТ. Её поле
-    // в это время - смесь замеров из разных точек пространства, и чем дольше копится, тем сильнее
-    // размазано. Перед летящей камерой, где прокрутка идёт непрерывно, это читается как полоса,
-    // которая "сквозит" - показывает освещение соседнего места.
-    // (Проверено от обратного: попытка УСРЕДНИТЬ оценки по окну свежести сделала картину заметно
-    // хуже - она усиливала ровно это смешение. См. комментарий ниже, там разбор.)
-    //
     // Признак переезда брать неоткуда, кроме как из самого сброса: релокация обнуляет счётчики, и
-    // ноль в них у некольдовой пробы означает ровно "прошлый раунд её переселил". Отдельного флага
-    // это не требует, а расходиться со сбросом не может по построению - источник один.
+    // ноль в них означает ровно "прошлый раунд её переселил". Отдельного флага это не требует, а
+    // расходиться со сбросом не может по построению - источник один.
     //
     // Только в реальном времени. В запечке переезд случается один раз на инициализации, поле там
     // ещё пустое, и лечить нечего; зато CPU-путь такого сброса не делает, и разойтись с ним нельзя -
     // на этой сверке держится вся проверка GPU-обхода.
-    bool justRelocated = !cold && ProbeRelocation.z > 0.5 && countersPrev.x == 0;
+    bool justRelocated = ProbeRelocation.z > 0.5 && countersPrev.x == 0;
 
     // Вес раунда - бегущее среднее, посчитанное на CPU (разгонные раунды кладутся целиком).
-    float alpha = (cold || justRelocated) ? 1.0 : ProbeGridOrigin.w;
+    float alpha = justRelocated ? 1.0 : ProbeGridOrigin.w;
 
-    // Усреднения оценок свежей пробы по окну свежести здесь НЕТ, и это проверено на живой сцене.
-    // Идея была очевидной: холодный раунд принимает одну шумную оценку целиком, кирпич проявляется
-    // вместе с её разбросом, значит надо копить среднее за те раунды, пока он всё равно скрыт.
-    // Арифметически верно, а на деле стало ХУЖЕ - блоки перед летящей камерой поплыли сильнее.
-    //
-    // Причина в том, что окно свежести - это ТО ЖЕ САМОЕ окно, в котором пробе открыта релокация
-    // (freshLeft > 0, счётчик лежит в модуле .w слота смещений). Всё это время
-    // проба ездит, и усреднять её оценки значит смешивать замеры из РАЗНЫХ ТОЧЕК пространства -
-    // тем сильнее, чем больше раундов в среднее положить.
-    //
-    // Чинить это усреднением нельзя в принципе, пока релокация и свежесть делят одно окно. Развязать
-    // их - отдельная задача: либо копить только после того, как проба встала, либо сбрасывать
-    // накопление на каждый её переезд.
     uint fieldBase = probe * 4;
 
     // Предыдущее значение берётся из ЧИТАЮЩЕГО буфера. Взять его из _ProbeField (в который раунд
@@ -1065,12 +1026,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // Релокация: проба, стоящая внутри стены или колонны, отодвигается наружу. Это главное лекарство
     // густой сетки - чем мельче ячейка, тем больше проб оказывается замуровано, а такая проба и
     // мигает (её лучи мечутся между задними гранями и небом за краем), и течёт светом сквозь стену.
-    // У СВЕЖЕЙ пробы (её плоскость въехала прокруткой) окно релокации СВОЁ: общесеточное открывать
-    // на каждый сдвиг камеры нельзя - Majercik 2021 §5 двигает пробы только на инициализации, а для
-    // новых проб этот сдвиг инициализацией и является.
-    float relocLimit = freshLeft > 0
-        ? max(ProbeRelocation.x, ProbeScroll.x)
-        : ProbeRelocation.x;
+    float relocLimit = ProbeRelocation.x;
     bool relocated = false;
     if (relocLimit > 0.0)
     {
@@ -1159,10 +1115,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // ветки - и когда релокация выключена, и когда проба не переезжала: иначе проба с закрытым
     // окном релокации никогда бы своё состояние не обновила. В запечке (fixedRays == 0)
     // классификации нет, состояние всегда активное.
-    // Модуль несёт остаток окна релокации свежей пробы (см. freshLeft выше) - раунд его тикает,
-    // а знак, который единственный кто-либо читает, остаётся прежним.
-    int freshNext = max(freshLeft - 1, 0);
-    float probeState = ((fixedRays == 0 || nearGeometry) ? 1.0 : -1.0) * (float)(1 + freshNext);
+    float probeState = (fixedRays == 0 || nearGeometry) ? 1.0 : -1.0;
     _ProbeOffsets[probe] = float4(probeOffset, probeState);
 
     // Те же значения сразу в атласы - материалы читают их без участия CPU.
@@ -1209,3 +1162,4 @@ void main(uint3 threadId : SV_DispatchThreadID)
         }
     }
 }
+

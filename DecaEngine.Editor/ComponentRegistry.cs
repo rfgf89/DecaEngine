@@ -126,6 +126,24 @@ namespace DecaEngine.Editor
 			RegisterComponent<LightComponent>("Rendering/Light");
 
 			RegisterComponent<RotateComponent>("Gameplay/Rotate");
+			RegisterComponent<CircleMoveComponent>("Gameplay/Circle Move");
+			RegisterComponent<PlayerMoveComponent>("Gameplay/Player Move");
+			RegisterComponent<FallRecoverComponent>("Gameplay/Fall & Recover");
+
+			// Тело персонажа - в «Physics», а не в «Gameplay»: это то, чем сущность ЯВЛЯЕТСЯ, а не
+			// то, как она себя ведёт, и добавляют его под любой скрипт движения, а не под один.
+			RegisterComponent<CharacterBodyComponent>("Physics/Character Body");
+
+			// Animation: authoring data only - the runtime pose/ozz/ragdoll state lives in a side
+			// registry, see AnimationComponents.cs for why it cannot be an ECS component.
+			RegisterComponent<Animator>("Animation/Animator");
+			RegisterComponent<LocomotionComponent>("Animation/Locomotion");
+			RegisterComponent<OverlayClipComponent>("Animation/Overlay Clip");
+			RegisterComponent<AdditiveClipComponent>("Animation/Additive Clip");
+			RegisterComponent<FootIkComponent>("Animation/Foot IK");
+			RegisterComponent<SpringBoneComponent>("Animation/Spring Bone Chain");
+			RegisterComponent<LookAtComponent>("Animation/Look At");
+			RegisterComponent<RagdollComponent>("Animation/Ragdoll");
 		}
 
 		// ------------------------------------------------------------------

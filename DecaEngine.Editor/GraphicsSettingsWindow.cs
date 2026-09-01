@@ -39,12 +39,11 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	//
 	// Всё остальное окно применяется живьём, и это правильно: художник крутит ползунок и видит кадр.
 	// Но четыре ручки запечены НЕ в конвейер, а в вещи, которые нельзя переставить на живом
-	// окружении: MSAA сидит в PSO всей геометрии, HDRI требует пересчёта IBL, анизотропия и потолок
+	// окружении: HDRI требует пересчёта IBL, анизотропия и потолок
 	// текстур - в сэмплерах и декодере уже залитых текстур. Любая из них пересоздаёт окружение и
 	// перечитывает модель с диска - секунды на ассете уровня Sponza. Применяться на каждый клик по
 	// комбо они не должны: пройтись по трём ручкам стоило трёх полных перезагрузок подряд, причём
 	// две первых - впустую. Поэтому правятся они здесь, в буфере, и уезжают в EditorSettings разом.
-	private int _pendingMsaa;
 	private bool _pendingAniso;
 	private string _pendingHdr = "";
 	private int _pendingMaxTextureSize;
@@ -52,7 +51,7 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	// Снимок настроек, из которого буфер набран. Нужен не для дифа (диф считается прямо против
 	// EditorSettings), а чтобы заметить правку ТЕХ ЖЕ полей из модалки Settings: она пишет в
 	// EditorSettings напрямую, и без пересинхронизации буфер молча вернул бы старые значения.
-	private (int Msaa, bool Aniso, string Hdr, int MaxTextureSize) _pendingSource;
+	private (bool Aniso, string Hdr, int MaxTextureSize) _pendingSource;
 
 	// --- Состояние отладочного вида каскадов теней (см. DrawShadowCascadesDebug) ---
 	private const int ShadowDebugSize = 512;
@@ -104,6 +103,11 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		if (ImGui.CollapsingHeader("SSGI", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawSsgiSection();
+		}
+
+		if (ImGui.CollapsingHeader("Reflections (SSR)", ImGuiTreeNodeFlags.DefaultOpen))
+		{
+			DrawSsrSection();
 		}
 
 		if (ImGui.CollapsingHeader("Fog"))
@@ -167,7 +171,7 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		{
 			// Вьюпорт диффует сам: кбуферные ручки пушатся сразу, фичи конвейера (AO/SSGI/скай/туман/
 			// объёмник/блум/грейд/экспозиция) перестраивают его на живом окружении, а ручки
-			// перезагрузки (MSAA/HDRI/анизотропия/потолок текстур) пересоздают окружение и
+			// перезагрузки (HDRI/анизотропия/потолок текстур) пересоздают окружение и
 			// перечитывают модель - но они сюда попадают только через ApplyPending.
 			SettingsWindow.RaisePreviewGraphicsApplied();
 			_savePending = true;
@@ -247,6 +251,63 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 			_settings.ProbeGiSunIntensity = sun;
 		}
 		Tooltip("Интенсивность солнца - и аналитического ключа, и баунса в пробах (перепекает их).\nВыше колена тонемапа (~0.76 на светлом альбедо) контраст съедается - крутить вместе с Ambient boost.");
+
+		// Порядок - по возрастанию накладных расходов; хранится ШЕЙДЕРНОЕ значение (см.
+		// EditorSettings.ShadowFilterMode: 0 обязан оставаться PCSS), поэтому индексы комбо
+		// мапятся через таблицу. Верхний пункт (Ray-traced) показывается только на устройстве с
+		// inline-трассировкой - без неё вариант шейдера не соберётся вовсе.
+		bool rtAvailable = _viewport?.RayTracingSupported ?? false;
+		int[] shadowModeValues = rtAvailable ? [1, 2, 0, 3, 4] : [1, 2, 0, 3];
+		var shadowModeLabels = rtAvailable
+			? new[]
+			{
+				"Hard (1 тап)",
+				"PCF 3x3",
+				"PCSS (полутень)",
+				"PCSS HQ (32 тапа)",
+				"Ray-traced (перезагрузка)",
+			}
+			: new[]
+			{
+				"Hard (1 тап)",
+				"PCF 3x3",
+				"PCSS (полутень)",
+				"PCSS HQ (32 тапа)",
+			};
+		var shadowModeIndex = Array.IndexOf(shadowModeValues, _settings.ShadowFilterMode);
+		if (shadowModeIndex < 0)
+		{
+			shadowModeIndex = 2;
+		}
+
+		ImGui.SetNextItemWidth(200 * _scale);
+		if (ImGui.Combo("Shadow filtering", ref shadowModeIndex, shadowModeLabels, shadowModeLabels.Length))
+		{
+			_settings.ShadowFilterMode = shadowModeValues[shadowModeIndex];
+			_changed = true;
+		}
+		Tooltip("Фильтр теней солнца И punctual-светов, по возрастанию цены:\n" +
+			"  Hard - один аппаратный тап, край в тексель. Самый дешёвый.\n" +
+			"  PCF 3x3 - постоянная мягкость в тексель, 9 тапов.\n" +
+			"  PCSS - полутень от углового размера источника (контакт резкий, дальше мягче),\n" +
+			"    16+16 тапов по диску Фогеля, зерно усредняет TAAU.\n" +
+			"  PCSS HQ - тот же PCSS с удвоенным веером (32+32) и более широкой полутенью -\n" +
+			"    для стоп-кадров и работы без TAAU.\n" +
+			"  Ray-traced - тень солнца ТЕНЕВЫМИ ЛУЧАМИ по TLAS (8 лучей в конусе диска):\n" +
+			"    физическая полутень без каскадов и байасов. Переключение ПЕРЕЗАГРУЖАЕТ модель\n" +
+			"    (вариант шейдера собирается DXC). Листва с альфа-тестом затеняет монолитом;\n" +
+			"    punctual-света остаются на PCSS.\n" +
+			"Ширину полутени задают Sun angular size (солнце) и SourceRadius света (лампы).");
+
+		var sunSize = _settings.SunAngularSize;
+		if (Slider("Sun angular size", ref sunSize, 0.25f, 8f, "%.2f°",
+			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
+		{
+			_settings.SunAngularSize = sunSize;
+		}
+		Tooltip("Видимый ДИАМЕТР диска солнца, градусы - ширина полутени PCSS: чем крупнее диск,\n" +
+			"тем мягче тень с расстоянием от объекта (контактная остаётся резкой).\n" +
+			"Реальное солнце ~0.53°; дефолт 1° - мягкость видна и на коротких тенях.");
 
 		ImGui.Spacing();
 		DrawShadowCascadesDebug();
@@ -520,6 +581,143 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		}
 	}
 
+	/// <summary>Стохастические экранные отражения (см. SsrPass). Фича живого конвейера: тонкий
+	/// G-buffer пишется всегда, тумблер лишь ставит/снимает пассы.</summary>
+	private void DrawSsrSection()
+	{
+		ImGui.Spacing();
+
+		var ssr = _settings.PreviewSsr;
+		if (ImGui.Checkbox("SSR (stochastic reflections)", ref ssr))
+		{
+			_settings.PreviewSsr = ssr;
+			_changed = true;
+		}
+		Tooltip("Экранные отражения: стохастический GGX-луч на пиксель по глубине кадра,\nтемпоральная аккумуляция по векторам движения (включаются сами).\nРезультат ЗАМЕНЯЕТ префильтрованный env-спекуляр, а не складывается поверх.\nПрименяется живьём.");
+
+		if (ssr)
+		{
+			var rt = _settings.SsrRayTraced;
+			var rtAvailable = _viewport?.RayTracingSupported ?? false;
+			if (!rtAvailable)
+			{
+				ImGui.BeginDisabled();
+			}
+			if (ImGui.Checkbox("Ray-traced fallback", ref rt))
+			{
+				_settings.SsrRayTraced = rt;
+				_changed = true;
+			}
+			if (!rtAvailable)
+			{
+				ImGui.EndDisabled();
+			}
+			Tooltip("Лучи, промахнувшиеся мимо экрана, добираются inline RayQuery по TLAS сцены\n(та же геометрия, что у аппаратного probe GI - он должен быть включён,\nиначе фолбэк молча не активируется). Хиты, видимые на экране, берут готовый\nпиксель кадра; внеэкранные шейдятся упрощённо (солнце + probe-поле + лампы).\nТребует D3D12 с inline-трассировкой.");
+
+			// Текстурное альбедо внеэкранных RT-хитов - только при включённом RT-фолбэке.
+			if (rt && rtAvailable)
+			{
+				var hitTex = _settings.SsrHitTextures;
+				string[] hitTexModes = ["Off (потриугольное альбедо)", "Атлас 128² (дёшево)", "Bindless (полные текстуры)"];
+				ImGui.SetNextItemWidth(220 * _scale);
+				if (ImGui.Combo("RT hit textures", ref hitTex, hitTexModes, hitTexModes.Length))
+				{
+					_settings.SsrHitTextures = hitTex;
+					_changed = true;
+				}
+				Tooltip("Чем шейдить внеэкранный RT-хит:\nOff - один усреднённый цвет на треугольник (как раньше);\nАтлас - даунсемпленные плитки 128² всех base color текстур одним Texture2DArray\n(у стриминговых/cooked моделей плитка вырождается в средний цвет материала);\nBindless - массив полноразмерных текстур, честные UV-детали в отражениях\n(дороже по дескрипторам; без поддержки девайса тихо падает до атласа).\nСмена пересобирает материалы SSR.");
+
+				var traceMode = _settings.SsrTraceMode;
+				string[] traceModes = ["Экранный марш → RT", "Только RT (без марша)"];
+				ImGui.SetNextItemWidth(220 * _scale);
+				if (ImGui.Combo("Trace mode", ref traceMode, traceModes, traceModes.Length))
+				{
+					_settings.SsrTraceMode = traceMode;
+					_changed = true;
+				}
+				Tooltip("Как ищется точка отражения:\nЭкранный марш → RT - сначала 48 шагов по буферу глубины, RT добирает промахи (по умолчанию);\nТолько RT - марш пропускается, луч сразу идёт по TLAS. Экранные ДАННЫЕ при этом\nне теряются: радианс в точке хита всё равно берётся с экрана репроекцией.\nУходят артефакты марша (ложные хиты за тонкой геометрией, ошибки SSR thickness,\nзатухание у краёв кадра); цена - обход BVH вместо выборок глубины. Live.");
+
+				var rtBounces = _settings.SsrRtBounces;
+				if (SliderInt("RT bounces", ref rtBounces, 1, 4))
+				{
+					_settings.SsrRtBounces = rtBounces;
+				}
+				Tooltip("Отскоков RT-луча ВСЕГО: 1 - только первичный луч (зеркало в зеркале чёрное),\n2 - плюс один зеркальный отскок с металлических хитов (по умолчанию),\n3-4 - длиннее цепочки взаимных отражений хрома. Цена - по трассировке\nна отскок, только на зеркальных пикселях с тёмным хитом. Live.");
+			}
+
+			// Статус ЧЕСТНЫЙ, по фактически собранным ресурсам: галка может стоять, а фича - молча
+			// остаться экранной (нет accel-а/трассировки). Без строки этот даунгрейд неотличим от
+			// «отражения сломаны»: зеркало в упор показывает голую env-карту, чёрную ниже горизонта.
+			if (rt)
+			{
+				var sceneReason = _sceneViewport?.SsrRayTracedBlockReason;
+				ImGui.TextColored(sceneReason == null
+						? new Vector4(0.45f, 0.85f, 0.45f, 1f)
+						: new Vector4(1f, 0.6f, 0.2f, 1f),
+					sceneReason == null ? "Scene View: RT-фолбэк активен" : $"Scene View: {sceneReason}");
+
+				var previewReason = _viewport?.SsrRayTracedBlockReason;
+				ImGui.TextColored(previewReason == null
+						? new Vector4(0.45f, 0.85f, 0.45f, 1f)
+						: new Vector4(1f, 0.6f, 0.2f, 1f),
+					previewReason == null ? "Превью: RT-фолбэк активен" : $"Превью: {previewReason}");
+			}
+
+			var intensity = _settings.SsrIntensity;
+			if (Slider("SSR intensity", ref intensity, 0f, 4f, "%.2f"))
+			{
+				_settings.SsrIntensity = intensity;
+			}
+			Tooltip("Множитель заменяющего отражения. 1 - энергетически честно\n(сколько env-спекуляра вычли, столько трейса и вложили).");
+
+			var maxRough = _settings.SsrMaxRoughness;
+			if (Slider("SSR max roughness", ref maxRough, 0.05f, 1f, "%.2f"))
+			{
+				_settings.SsrMaxRoughness = maxRough;
+			}
+			Tooltip("Потолок шероховатости: выше отражения плавно гаснут (остаётся префильтрованный env).\nЛуч один на пиксель, и на матовых поверхностях остаточный шум дороже,\nчем недостающий спекуляр.");
+
+			var thickness = _settings.SsrThickness;
+			if (Slider("SSR thickness", ref thickness, 0.01f, 5f, "%.2f",
+				ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
+			{
+				_settings.SsrThickness = thickness;
+			}
+			Tooltip("Толщина поверхности при проверке пересечения, мировые единицы.\nМало - лучи проскальзывают сквозь тонкую геометрию (дыры в отражении);\nмного - «прилипание» отражений к силуэтам переднего плана.");
+
+			var maxDist = _settings.SsrMaxDistance;
+			if (Slider("SSR max distance", ref maxDist, 1f, 500f, "%.0f",
+				ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
+			{
+				_settings.SsrMaxDistance = maxDist;
+			}
+			Tooltip("Дальность луча отражения в мировых единицах.");
+
+			var rays = _settings.SsrRaysPerPixel;
+			if (SliderInt("SSR ray reuse", ref rays, 1, 4))
+			{
+				_settings.SsrRaysPerPixel = rays;
+			}
+			Tooltip("Качество резолва: сколько чужих лучей переиспользует каждый пиксель (x2 тапов).\nВес каждого - BRDF/PDF (ratio estimator, как в Stochastic SSR Frostbite):\nрезкость зеркала и ширина матового лоба следуют из физики,\nручка меняет только остаточный шум и цену.");
+
+			var history = _settings.SsrHistoryWeight;
+			if (Slider("SSR history weight", ref history, 0f, 0.97f, "%.2f"))
+			{
+				_settings.SsrHistoryWeight = history;
+			}
+			Tooltip("Вес истории темпоральной аккумуляции: больше - глаже и инертнее\n(шлейф на движении гасится клампом по окрестности), 0 - сырой шум одного луча.");
+
+			var debug = _settings.SsrDebugView;
+			string[] debugModes = ["Off", "Reflection only", "Confidence", "G-buffer normals", "RT hit albedo", "RT bounce chain"];
+			if (ImGui.Combo("SSR debug view", ref debug, debugModes, debugModes.Length))
+			{
+				_settings.SsrDebugView = debug;
+				_changed = true;
+			}
+			Tooltip("Отладочные виды: только отражения (что именно подмешивается), confidence\n(где лучи попали и с каким весом), нормали G-buffer-а (вход трейса).");
+		}
+	}
+
 	/// <summary>Экранный отскок света (см. SsgiPass). Как и AO - фича живого конвейера.</summary>
 	private void DrawSsgiSection()
 	{
@@ -615,25 +813,6 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		}
 		PendingMark(_pendingAniso != _settings.PreviewAnisotropicFiltering);
 
-		// Значение вне списка (правка json руками, старый файл настроек) - НЕ просто показать первый
-		// пункт: комбо тогда рисует "Off", а движок продолжает работать с прежним сэмплингом, и окно
-		// расходится с кадром. Индекс чиним вместе с самой настройкой.
-		int[] msaaOptions = [1, 2, 4, 8];
-		var msaaLabels = new[] { "Off", "2x", "4x", "8x" };
-		var msaaIndex = Array.IndexOf(msaaOptions, _pendingMsaa);
-		if (msaaIndex < 0)
-		{
-			msaaIndex = Array.IndexOf(msaaOptions, 4);
-			_pendingMsaa = msaaOptions[msaaIndex];
-		}
-
-		ImGui.SetNextItemWidth(120 * _scale);
-		if (ImGui.Combo("MSAA", ref msaaIndex, msaaLabels, msaaLabels.Length))
-		{
-			_pendingMsaa = msaaOptions[msaaIndex];
-		}
-		PendingMark(_pendingMsaa != _settings.PreviewMsaaSamples);
-
 		var hdrBuffer = _pendingHdr;
 		ImGui.SetNextItemWidth(240 * _scale);
 		if (ImGui.InputText("Environment HDR", ref hdrBuffer, 512))
@@ -667,6 +846,67 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 			"Intel Sponza с сотнями текстур это гигабайты.\n\n" +
 			"Каждый шаг вниз режет пик ВЧЕТВЕРО. 1024 на превью почти неотличим,\n" +
 			"512 заметно мылит крупные планы.");
+
+		DrawStreamingSettings();
+	}
+
+	/// <summary>
+	/// Стриминг моделей сцены. Ручки ЖИВЫЕ: радиус стример перечитывает на каждом Tick, поэтому
+	/// ни перечитывания моделей, ни пересоздания окружения не требуется - в отличие от потолка
+	/// текстур выше, который печётся при загрузке.
+	/// </summary>
+	private void DrawStreamingSettings()
+	{
+		ImGui.Separator();
+		ImGui.TextDisabled("Сцена");
+
+		bool skinning = _settings.SceneSkinning;
+		if (ImGui.Checkbox("GPU-скиннинг", ref skinning))
+		{
+			_settings.SceneSkinning = skinning;
+			_changed = true;
+		}
+		Tooltip("Деформация скиннед-моделей на GPU.\n\n" +
+			"Выключение НЕ убирает модель - она рисуется в bind-позе обычным статическим\n" +
+			"путём: не заводятся ни отдельные инстансы в мега-буфере вершин, ни батчи под\n" +
+			"них, ни compute-проход. Компоненты анимации при этом остаются в инспекторе.\n\n" +
+			"Ручка ИНСТАНЦИРОВАНИЯ: скиннед-инстансы регистрируются при появлении модели\n" +
+			"в сцене, поэтому переключение действует на следующие инстанцирования -\n" +
+			"уже показанную модель нужно переоткрыть.\n\n" +
+			"Переменная окружения DECA_SKINNING=0 сильнее этой галки: она нужна как\n" +
+			"аварийный путь, когда редактор не доживает до этого окна.");
+
+		bool streaming = _settings.SceneStreaming;
+		if (ImGui.Checkbox("Стриминг по расстоянию", ref streaming))
+		{
+			_settings.SceneStreaming = streaming;
+			_changed = true;
+		}
+		Tooltip("Модели сцены берутся и отпускаются по расстоянию до камеры.\n\n" +
+			"Выключение НЕ отключает загрузку - оно делает все модели сцены постоянно\n" +
+			"резидентными: радиус уходит в бесконечность, и никто ничего не отпускает.\n" +
+			"Память при этом растёт на всю сцену разом.\n\n" +
+			"Практическая польза выключения: стриминг - единственный путь в редакторе,\n" +
+			"где набор мешей и батчей меняется ПО ХОДУ кадров, а не на первом. Тумблер\n" +
+			"позволяет отделить проблемы сцены от проблем стриминга без пересборки.");
+
+		if (!streaming)
+		{
+			return;
+		}
+
+		float radius = _settings.SceneStreamingRadius;
+		ImGui.SetNextItemWidth(160 * _scale);
+		if (ImGui.SliderFloat("Радиус стриминга", ref radius, 10f, 5000f, "%.0f"))
+		{
+			_settings.SceneStreamingRadius = MathF.Max(1f, radius);
+			_changed = true;
+		}
+		Tooltip("Мировые единицы. Дальше радиуса модель отпускается, ближе - берётся.\n\n" +
+			"У выгрузки есть запас (гистерезис x1.15): без него модель на самой границе\n" +
+			"грузилась и выгружалась бы на каждом шаге камеры.\n\n" +
+			"Слишком малый радиус даёт видимое подгружение вокруг камеры, слишком\n" +
+			"большой обесценивает стриминг - сцена всё равно окажется в памяти целиком.");
 	}
 
 	/// <summary>Метка «отредактировано, но ещё не применено» справа от контрола. Без неё буфер
@@ -706,18 +946,6 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 			"Сам кадр не меняет: буфер пока никто не читает, галка стоит одного фуллскрин-дроу.\n" +
 			"Применяется живьём.");
 
-		// MSAA гасит фичу молча - на уровне конвейера ресурсы просто не создаются (см.
-		// PipelineFeatures.MotionVectors). Молчание тут недопустимо: галка стояла бы включённой, а
-		// отладочный вид не показывал бы ничего, и искать причину пришлось бы в математике.
-		if (motion && _settings.PreviewMsaaSamples > 1)
-		{
-			ImGui.TextColored(new Vector4(1f, 0.6f, 0.2f, 1f),
-				"MSAA " + _settings.PreviewMsaaSamples + "x: векторы отключены.");
-			Tooltip("Векторы читают одно-сэмпловый depth, а при MSAA геометрия пишет в мультисемпловый,\n" +
-				"и одиночный остаётся неразрешённым. Ставь MSAA в 1 - апскейлеры с мультисемплингом\n" +
-				"и так взаимоисключающи, они сами себе антиалиасинг.");
-		}
-
 		// Масштаб и джиттер - ДО раннего выхода: они не зависят от галки векторов и обязаны
 		// оставаться доступными, когда векторы выключены.
 		var renderScale = _settings.RenderScale;
@@ -737,7 +965,7 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 			_changed = true;
 		}
 		Tooltip("Суб-пиксельный джиттер проекции (Halton 2/3, 16 фаз) - вторая половина входа\n" +
-			"темпорального апскейлера. Применяется живьём, с MSAA не конфликтует.\n" +
+			"темпорального апскейлера. Применяется живьём.\n" +
 			"БЕЗ потребителя (TAA/апскейлера) картинка дрожит - это сырой вход техники, которой\n" +
 			"ещё нет, а не баг. Отладочный вид векторов при этом ОБЯЗАН оставаться ровно серым:\n" +
 			"векторы считаются по матрицам без джиттера, дрожание вычитает сам апскейлер.");
@@ -772,14 +1000,14 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 				"Применяется живьём; при недоступности молча остаётся TAAU.");
 
 			// Честность: выбран нативный бэкенд, а работает TAAU - молчание тут заставило бы искать
-			// разницу в картинке, которой нет (тот же принцип, что у предупреждения про MSAA выше).
+			// разницу в картинке, которой нет.
 			var activeName = _viewport?.Environment?.ActiveUpscalerName;
 			if (backend != 0 && activeName is null)
 			{
 				ImGui.TextColored(new Vector4(1f, 0.6f, 0.2f, 1f),
 					(backend == 2 ? "DLSS" : "FSR") + " не активен - работает TAAU.");
 				Tooltip("Нет DecaFfxShim.dll/нативной DLL рядом с экзешником, бэкенд не D3D12,\n" +
-					"не то железо (DLSS - только NVIDIA RTX), или буфер векторов не создан (MSAA).\n" +
+					"не то железо (DLSS - только NVIDIA RTX), или буфер векторов не создан.\n" +
 					"Подробности - в консоли ([fsr]/[dlss] ...).");
 			}
 			else if (activeName is not null)
@@ -1267,11 +1495,22 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		Tooltip("Насколько тень режет лучи. 1 - настоящие столбы с чёткими краями,\n" +
 			"0 - тень игнорируется и остаётся однородный объёмный туман.");
 
+		var punctualScatter = _settings.VolumetricPunctualScatter;
+		if (Slider("Свет ламп в среде", ref punctualScatter, 0f, 4f, "%.2f"))
+		{
+			_settings.VolumetricPunctualScatter = punctualScatter;
+		}
+		Tooltip("Рассеяние света point/spot-источников: конус спота и ореол лампы в дымке.\n" +
+			"1 - физическая доля (яркость берётся из самих светов), 0 - среда видит только\n" +
+			"солнце и небо. Тени ламп режут конус той же «Силой тени», что и солнечные.");
+
 		ImGui.Spacing();
 		ImGui.TextDisabled("Качество марша:");
 
+		// Верх = кламп путей применения и пасса (Clamp(4, 256)): прежние 192 оставляли верхнюю
+		// четверть диапазона недостижимой из окна.
 		var steps = _settings.VolumetricSteps;
-		if (SliderInt("Шагов", ref steps, 8, 192))
+		if (SliderInt("Шагов", ref steps, 8, 256))
 		{
 			_settings.VolumetricSteps = steps;
 		}
@@ -1645,21 +1884,6 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 			ImGui.Unindent();
 		}
 
-		if (_settings.ProbeGiRealtime)
-		{
-			var cascades = _settings.ProbeGiCascades;
-			if (SliderInt("Каскады сетки", ref cascades, 1, 3))
-			{
-				_settings.ProbeGiCascades = cascades;
-			}
-			Tooltip("Объёмы проб для БОЛЬШИХ сцен: 1 = одна сетка на всю сцену (как раньше).\n" +
-				"Выше - дополнительные каскады вокруг центра сцены тем же бюджетом проб:\n" +
-				"каждый покрывает бокс вдвое меньше предыдущего, то есть ячейка вдвое мельче.\n" +
-				"Выборка идёт от мелкого к крупному, базовая сетка остаётся гарантией покрытия.\n" +
-				"На маленькой сцене (один объект) смысла нет - там и базовая сетка мелкая;\n" +
-				"на сцене-уровне даёт детализацию GI в центре, не раздувая бюджет кубически.\n" +
-				"Требует реального времени. Ребейк.");
-		}
 
 		// Тумблера CPU/GPU больше нет: раунды крутит только GPU (compute), CPU-раунд остался
 		// эталоном сверки в CLI. Аппаратная трассировка - единственная ручка пути.
@@ -1793,8 +2017,11 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		Tooltip("Насыщенность цветного отскока: 0 - серый баунс, 1 - полный цвет альбедо.\nЯркость баунса не меняется (солнце рассеивается так же сильно) -\nниже значение, тем меньше яркие цветные ткани светят как лампочки.");
 
 		// Низ = ProbeGi.cs: Clamp(options.GridDensity, 4f, 64f) - самая грубая сетка была недоступна.
+		// Верх = 44: значение уходит в бейк с множителем 1.45 (ProbeGiViewportShared.BuildOptions),
+		// а бейкер клампит произведение к 64 - всё выше 44 давало одну и ту же сетку, мёртвая
+		// четверть диапазона ползунка.
 		var density = _settings.ProbeGiGridDensity;
-		if (Slider("Grid density", ref density, 4f, 64f, "%.0f"))
+		if (Slider("Grid density", ref density, 4f, 44f, "%.0f"))
 		{
 			_settings.ProbeGiGridDensity = density;
 		}
@@ -1823,9 +2050,11 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		ImGui.Spacing();
 		if (ImGui.Button("Rebake now", new Vector2(120 * _scale, 0)))
 		{
+			// Оба вьюпорта: раньше кнопка трогала только превью, и Scene View жил старым полем.
 			_viewport.RequestProbeRebake();
+			_sceneViewport?.RequestProbeRebake();
 		}
-		Tooltip("Принудительный ребейк (например, после правки HDR-файла на диске).");
+		Tooltip("Принудительный ребейк превью И сцены (например, после правки HDR-файла на диске).");
 
 		ImGui.SameLine();
 		var debugView = _settings.ProbeGiDebugView;
@@ -1863,7 +2092,7 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 			"  цвет - накопленный пробой свет (SH L0): тёмный в тени, яркий у света;\n" +
 			"  красный - проба считает себя в стене (после релокации таких почти нет);\n" +
 			"  голубая кромка - проба переехала релокацией (видно, кого вытащило).\n" +
-			"Рисуется поверх сцены с её глубиной, MSAA общий. Live, ребейка не требует.");
+			"Рисуется поверх сцены с её глубиной. Live, ребейка не требует.");
 		// --- Отладка BVH (структура ускорения трассировки проб) ---
 		ImGui.Separator();
 
@@ -1911,7 +2140,7 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	/// Settings пишет в те же поля): иначе каждый кадр затирал бы то, что человек сейчас правит.</summary>
 	private void SyncPendingFromSettings(bool force)
 	{
-		var current = (_settings.PreviewMsaaSamples, _settings.PreviewAnisotropicFiltering,
+		var current = (_settings.PreviewAnisotropicFiltering,
 			_settings.PreviewEnvironmentHdr ?? string.Empty, _settings.PreviewMaxTextureSize);
 
 		// Первый кадр окна тоже попадает сюда: _pendingSource пустой и с настройками не совпадает.
@@ -1921,10 +2150,9 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 		}
 
 		_pendingSource = current;
-		_pendingMsaa = current.Item1;
-		_pendingAniso = current.Item2;
-		_pendingHdr = current.Item3;
-		_pendingMaxTextureSize = current.Item4;
+		_pendingAniso = current.Item1;
+		_pendingHdr = current.Item2;
+		_pendingMaxTextureSize = current.Item3;
 	}
 
 	/// <summary>Что в буфере разошлось с настройками, человеческим текстом «было -> стало». Пустой
@@ -1933,10 +2161,6 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	{
 		var changes = new List<string>();
 
-		if (_pendingMsaa != _settings.PreviewMsaaSamples)
-		{
-			changes.Add($"MSAA: {MsaaLabel(_settings.PreviewMsaaSamples)} -> {MsaaLabel(_pendingMsaa)}");
-		}
 
 		if (_pendingAniso != _settings.PreviewAnisotropicFiltering)
 		{
@@ -1955,7 +2179,6 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 
 		return changes;
 
-		static string MsaaLabel(int samples) => samples <= 1 ? "Off" : $"{samples}x";
 		static string OnOff(bool value) => value ? "вкл" : "выкл";
 		static string HdrLabel(string path) =>
 			string.IsNullOrWhiteSpace(path) ? "процедурное небо" : Path.GetFileName(path.Trim());
@@ -2006,7 +2229,6 @@ public class GraphicsSettingsWindow : ImGuiDockingWindow
 	/// и ставят отложенное пересоздание (см. ModelPreviewViewport.OnGraphicsSettingsChanged).</summary>
 	private void ApplyPending()
 	{
-		_settings.PreviewMsaaSamples = _pendingMsaa;
 		_settings.PreviewAnisotropicFiltering = _pendingAniso;
 		_settings.PreviewEnvironmentHdr = _pendingHdr;
 		_settings.PreviewMaxTextureSize = _pendingMaxTextureSize;

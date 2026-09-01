@@ -33,6 +33,23 @@ public readonly struct ModelLoadOptions
 	/// работают битами ВНУТРИ скомпилированной фичи. false - варианты без кода фич вовсе (для
 	/// потребителей без Lighting-превью).</summary>
 	public bool PreviewLightingFeatures { get; init; } = true;
+
+	/// <summary>Компилировать варианты с FEATURE_RT_SHADOWS (теневые лучи по TLAS, inline RayQuery -
+	/// см. UnlitInstancedPS.hlsl): вариант собирается DXC/SM6.5 вместо FXC и объявляет
+	/// RaytracingAccelerationStructure, поэтому включать можно ТОЛЬКО на устройстве с
+	/// inline-трассировкой (IGraphicsApi.RayTracing >= Inline, на практике D3D12). Тумблер уровня
+	/// ЗАГРУЗКИ, как PreviewLightingFeatures: смена перезагружает модель. Вызывающий, включивший
+	/// это, обязан привязать материалам TLAS (см. DiligentMaterial.SetAccelStructure) - иначе
+	/// коммит ресурсов упрётся в пустой дескриптор.</summary>
+	public bool RtShadows { get; init; }
+
+	/// <summary>Компилировать пиксельные варианты с FEATURE_REFLECTION_GBUFFER (запись тонкого
+	/// G-buffer-а отражений вторым/третьим MRT-слотом - см. UnlitInstancedPS.hlsl и SsrPass).
+	/// Обязан совпадать с тем, собран ли батч-рендерер окружения под MRT
+	/// (<see cref="DecaEngine.Graphics.Diligent.DiligentBatchRenderer"/>, reflectionGbuffer):
+	/// на практике - «MSAA выключен». Тумблер уровня ЗАГРУЗКИ, как <see cref="RtShadows"/>.</summary>
+	public bool ReflectionGbuffer { get; init; }
+
 	public float[] LodRatios { get; init; } = DefaultLodRatios;
 
 	/// <summary>Максимальная сторона текстур материалов в пикселях; бо́льшие даунскейлятся (бокс 2x)
@@ -99,7 +116,9 @@ public readonly struct ModelLoadOptions
 		return string.Join('|',
 			VertexShader.Path, PixelShader.Path,
 			OptimizeMesh.ToString(), GenerateLods.ToString(), AnisotropicFiltering.ToString(),
-			MipLodBias.ToString("R"), PreviewLightingFeatures.ToString(), string.Join(',', ratioParts),
+			MipLodBias.ToString("R"), PreviewLightingFeatures.ToString(), RtShadows.ToString(),
+			ReflectionGbuffer.ToString(),
+			string.Join(',', ratioParts),
 			MaxTextureSize.ToString(), StreamTextures.ToString(), StreamInitialTextureSize.ToString(),
 			BakeQuality.ToString(), CacheDirectory ?? string.Empty);
 	}

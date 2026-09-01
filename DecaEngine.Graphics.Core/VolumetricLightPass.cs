@@ -37,7 +37,7 @@ public sealed unsafe class VolumetricLightPassResources : IReleaseObject
 	/// всё равно привязывается плейсхолдер: слот объявлен в шейдере безусловно, и пустой дескриптор
 	/// роняет валидацию Vulkan (VUID-08114).</param>
 	public VolumetricLightPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer,
-		IGpuTexture depthTarget, IGpuTexture sceneCopyTarget, bool msaaDepth,
+		IGpuTexture depthTarget, IGpuTexture sceneCopyTarget,
 		TextureObjectFormat colorFormat, IGpuTexture? adaptationTarget, bool shadowsAvailable)
 	{
 		ShadowsAvailable = shadowsAvailable;
@@ -47,10 +47,9 @@ public sealed unsafe class VolumetricLightPassResources : IReleaseObject
 		var vs = graphicsApi.CreateShader("Volumetric Fullscreen VS", "EditorAssets/shader",
 			"SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Volumetric PS", "EditorAssets/shader",
-			msaaDepth ? "VolumetricMsaaPS.hlsl" : "VolumetricPS.hlsl", ShaderObjectType.Pixel);
+			"VolumetricPS.hlsl", ShaderObjectType.Pixel);
 
-		// Без депта и без MSAA: марш идёт в 1x по уже разрешённому кадру, а мультисемпловый депт
-		// читается через Texture2DMS.Load (см. VolumetricMsaaPS.hlsl).
+		// Без депта: марш идёт по готовому кадру и глубине.
 		var state = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Volumetric PSO",
@@ -110,6 +109,7 @@ public sealed unsafe class VolumetricLightPassResources : IReleaseObject
 		SetSun(new Vector3(0f, 1f, 0f));
 		SetCamera(Vector3.UnitX, Vector3.UnitY, Vector3.UnitZ);
 		SetExposure(adaptationTarget is not null, 0.18f);
+		SetPunctualScatter(1f);
 	}
 
 	/// <summary>Есть ли в конвейере теневой пасс - см. одноимённый параметр конструктора. Без него
@@ -203,7 +203,8 @@ public sealed unsafe class VolumetricLightPassResources : IReleaseObject
 		/// <summary>xyz - мировой forward камеры, w - флор глушения небесной доли затенением.</summary>
 		public Vector4 Forward;
 
-		/// <summary>x - цвета заданы относительно экспозиции, y - key value, zw - резерв.</summary>
+		/// <summary>x - цвета заданы относительно экспозиции, y - key value, z - множитель
+		/// рассеяния punctual-светов (см. <see cref="SetPunctualScatter"/>), w - резерв.</summary>
 		public Vector4 Exposure;
 	}
 
@@ -258,7 +259,16 @@ public sealed unsafe class VolumetricLightPassResources : IReleaseObject
 	/// та же механика, тот же обязательный к совпадению <paramref name="key"/>.</summary>
 	public void SetExposure(bool exposureRelative, float key)
 	{
-		_constants->Exposure = new Vector4(exposureRelative ? 1f : 0f, MathF.Max(key, 1e-4f), 0f, 0f);
+		_constants->Exposure = new Vector4(exposureRelative ? 1f : 0f, MathF.Max(key, 1e-4f),
+			_constants->Exposure.Z, 0f);
+	}
+
+	/// <summary>Множитель рассеяния punctual-светов средой (0 - лампы среду не подсвечивают,
+	/// 1 - физическая доля). В отличие от цветов солнца/неба это не источник, а доля: сами света
+	/// приходят из пула кадра в сценовых линейных единицах.</summary>
+	public void SetPunctualScatter(float intensity)
+	{
+		_constants->Exposure.Z = MathF.Max(intensity, 0f);
 	}
 
 	/// <summary>Переключает ТОЛЬКО режим, сохраняя key - см.

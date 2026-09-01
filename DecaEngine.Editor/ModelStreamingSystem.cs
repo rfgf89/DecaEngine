@@ -52,6 +52,12 @@ namespace DecaEngine.Editor.ECS
 			public readonly Dictionary<int, MeshId> MeshIds = new();
 			public readonly Dictionary<int, MaterialId> MaterialIds = new();
 			public readonly Dictionary<(int, int), BatchId> BatchCache = new();
+
+			/// <summary>Офсеты скин-стримов мешей в GPU-буфере скиннинга (ключ - индекс меша).
+			/// Меша нет в словаре = меш статический. Живёт рядом с MeshIds по той же причине: это
+			/// регистрация модели в батч-рендерере, и снимается она вместе с ней.</summary>
+			public readonly Dictionary<int, int> SkinBases = new();
+
 			public string? Error;
 
 			/// <summary>Мировая точка, по которой считается приоритет загрузки (расстояние до камеры).
@@ -394,7 +400,7 @@ namespace DecaEngine.Editor.ECS
 			var materials = _store.AcquireMaterialSet(resident.StoreHandle!);
 			ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, model, resident.MeshIds, resident.MaterialIds,
 				_env.SharedResources.EnvMapSampler, _env.SceneCopyTarget, _env.EnvironmentMap, materials,
-				_env.SharedResources.SceneColorSampler);
+				_env.SharedResources.SceneColorSampler, resident.SkinBases);
 		}
 
 		/// <summary>Записи без ссылок, которые так и не дожили до готовности (заявка снята Release-ом

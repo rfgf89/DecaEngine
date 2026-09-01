@@ -7,11 +7,20 @@ public static class CsprojOutputResolver
 {
     // Возвращает список существующих файлов сборки (dll/exe и сопутствующие) для указанного csproj.
     // Если buildIfMissing == true и файлов нет — попробует выполнить "dotnet build".
+    /// <param name="platform">
+    /// Платформа сборки (<c>x64</c> и т.п.); null - как решит проект.
+    ///
+    /// Задавать её приходится по существу: движок тянет DiligentEngine, который на AnyCPU просто
+    /// отказывается собираться («does not work correctly on 'AnyCPU' platform»). Без платформы
+    /// сборка падала, выходных файлов не находилось, и открытие проекта заканчивалось сообщением
+    /// «не удалось собрать проект» - при том что руками тот же проект собирается.
+    /// </param>
     public static List<string> GetBuildOutputs(
         string csprojPath,
         string configuration = "Debug",
         string targetFramework = null,
-        bool buildIfMissing = false)
+        bool buildIfMissing = false,
+        string platform = null)
     {
         if (string.IsNullOrEmpty(csprojPath) || !File.Exists(csprojPath))
             throw new FileNotFoundException("csproj not found", csprojPath);
@@ -23,6 +32,8 @@ public static class CsprojOutputResolver
         };
         if (!string.IsNullOrEmpty(targetFramework))
             globals["TargetFramework"] = targetFramework;
+        if (!string.IsNullOrEmpty(platform))
+            globals["Platform"] = platform;
 
         var pc = new ProjectCollection(globals);
         var proj = pc.LoadProject(csprojPath);
@@ -40,6 +51,8 @@ public static class CsprojOutputResolver
         if (!string.IsNullOrEmpty(tf) && !globals.ContainsKey("TargetFramework"))
         {
             globals["TargetFramework"] = tf;
+            if (!string.IsNullOrEmpty(platform))
+                globals["Platform"] = platform;
             pc = new ProjectCollection(globals);
             proj = pc.LoadProject(csprojPath);
         }
@@ -118,21 +131,59 @@ public static class CsprojOutputResolver
         // Если ничего не найдено и разрешено — попробуем собрать проект
         if (results.Count == 0 && buildIfMissing)
         {
-            var psi = new ProcessStartInfo("dotnet", $"build \"{csprojPath}\" -c {configuration}" + (tf != null ? $" -f {tf}" : ""))
+            if (Build(csprojPath, configuration, tf, platform))
             {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            var p = Process.Start(psi);
-            p.WaitForExit();
-            // после сборки попробуем снова (рекурсивно, но уже без попытки билдить снова)
-            if (p.ExitCode == 0)
-                return GetBuildOutputs(csprojPath, configuration, tf, buildIfMissing: false);
+                // после сборки попробуем снова (рекурсивно, но уже без попытки билдить снова)
+                return GetBuildOutputs(csprojPath, configuration, tf, buildIfMissing: false, platform);
+            }
             // если сборка не удалась — возвращаем пустой список
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Собирает проект и возвращает, удалось ли.
+    ///
+    /// ВЫВОД ЧИТАЕТСЯ АСИНХРОННО, и это не удобство, а условие работоспособности. Прежний вариант
+    /// перенаправлял stdout и stderr, но НЕ читал их и сразу звал WaitForExit: как только сборка
+    /// заполняла буфер трубы (несколько килобайт — а сборка проекта, тянущего за собой два десятка
+    /// проектов движка, выдаёт сотни строк), дочерний dotnet вставал на записи, а редактор — на
+    /// ожидании его завершения. Взаимная блокировка навсегда: снаружи это выглядит как «открытие
+    /// проекта зависло».
+    ///
+    /// Вывод пересылается в Console — редактор его перехватывает (см. EditorConsoleLog.Install), и
+    /// ход сборки виден в окне Console вместо тишины на несколько минут.
+    /// </summary>
+    private static bool Build(string csprojPath, string configuration, string targetFramework, string platform)
+    {
+        var arguments = $"build \"{csprojPath}\" -c {configuration}" +
+            (targetFramework != null ? $" -f {targetFramework}" : "") +
+            (!string.IsNullOrEmpty(platform) ? $" -p:Platform={platform}" : "") +
+            " --nologo -v:m";
+
+        var psi = new ProcessStartInfo("dotnet", arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(psi);
+        if (process == null)
+        {
+            return false;
+        }
+
+        process.OutputDataReceived += (_, e) => { if (e.Data != null) Console.WriteLine(e.Data); };
+        process.ErrorDataReceived += (_, e) => { if (e.Data != null) Console.Error.WriteLine(e.Data); };
+
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
+        process.WaitForExit();
+
+        return process.ExitCode == 0;
     }
 }

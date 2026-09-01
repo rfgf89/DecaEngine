@@ -35,6 +35,15 @@ public sealed class ProbeSceneAccel : IDisposable
         /// <summary>Индекс первого треугольника МЕША инстанса в общем буфере атрибутов: к нему
         /// шейдер прибавляет CommittedPrimitiveIndex.</summary>
         public uint FirstTriangle;
+
+        /// <summary>Линейный BaseColorFactor материала - множитель текстурного альбедо хита
+        /// (сама текстура фактора не содержит).</summary>
+        public Vector3 BaseColorFactor;
+
+        /// <summary>Индекс base color текстуры инстанса в наборе текстур хитов
+        /// (см. ProbeInstancedGeometry.HitTextureKeys); -1 - текстуры нет, хит остаётся на
+        /// потриугольном альбедо.</summary>
+        public int TextureIndex;
     }
 
     private readonly IDeviceContext _context;
@@ -117,6 +126,8 @@ public sealed class ProbeSceneAccel : IDisposable
             {
                 Albedo = instance.Albedo,
                 FirstTriangle = (uint)geometry.Meshes[instance.MeshSlot].First,
+                BaseColorFactor = instance.BaseColorFactor,
+                TextureIndex = instance.TextureIndex,
             };
         }
 
@@ -156,7 +167,11 @@ public sealed class ProbeSceneAccel : IDisposable
         {
             Name = "ProbeSceneTLAS",
             MaxInstanceCount = (uint)geometry.Instances.Length,
-            Flags = RaytracingBuildAsFlags.PreferFastTrace,
+            // AllowUpdate - покадровое движение стоит REFIT-а (PERFORM_UPDATE поверх прежней
+            // структуры, канон DXR - см. Raytracing spec / DxrTutorials 14-Refit), а не полной
+            // пересборки. Качество обхода после refit-а деградирует при больших смещениях -
+            // страховкой каждый N-й Rebuild собирает TLAS заново (см. RebuildsPerFullBuild).
+            Flags = RaytracingBuildAsFlags.PreferFastTrace | RaytracingBuildAsFlags.AllowUpdate,
         });
 
         // Раздельные scratch-буферы под BLAS и TLAS. Общий буфер - гонка: сборки идут подряд в
@@ -177,12 +192,15 @@ public sealed class ProbeSceneAccel : IDisposable
             Size = Math.Max(blasScratch, 1024),
         });
 
+        // Скретч - под ОБА режима сборки: refit (Update) обычно требует меньше полной сборки,
+        // но гарантий на это спецификация не даёт.
+        var tlasScratchSizes = _tlas.GetScratchBufferSizes();
         _tlasScratch = device.CreateBuffer(new BufferDesc
         {
             Name = "ProbeSceneScratchTlas",
             Usage = Usage.Default,
             BindFlags = BindFlags.RayTracing,
-            Size = _tlas.GetScratchBufferSizes().Build,
+            Size = Math.Max(tlasScratchSizes.Build, tlasScratchSizes.Update),
         });
 
         _instanceBuffer = device.CreateBuffer(new BufferDesc
@@ -252,6 +270,13 @@ public sealed class ProbeSceneAccel : IDisposable
     /// Порядок матриц - это порядок <see cref="ProbeInstancedGeometry.Instances"/>, он же нумерация
     /// InstanceID в шейдере. Длина обязана совпадать: инстанс, появившийся или исчезнувший в сцене,
     /// меняет и таблицу атрибутов, то есть требует пересоздания всего объекта.</summary>
+    /// <summary>Каждый N-й Rebuild - полная пересборка вместо refit-а: качество обхода
+    /// отрефиченной структуры деградирует по мере ухода инстансов от поз последней полной
+    /// сборки (DXR spec, Acceleration structure update constraints). При покадровом драге
+    /// гизмо это ~раз в секунду - незаметно.</summary>
+    private const int RebuildsPerFullBuild = 64;
+    private int _rebuildsSinceFullBuild;
+
     public void Rebuild(ReadOnlySpan<Matrix4x4> transforms)
     {
         if (transforms.Length != _tlasInstances.Length)
@@ -267,17 +292,26 @@ public sealed class ProbeSceneAccel : IDisposable
             _tlasInstances[i].Transform = ToMatrix3x4(transforms[i]);
         }
 
-        BuildTlas();
+        bool refit = ++_rebuildsSinceFullBuild < RebuildsPerFullBuild;
+        if (!refit)
+        {
+            _rebuildsSinceFullBuild = 0;
+        }
+
+        BuildTlas(refit);
         RebuildMs = sw.ElapsedMilliseconds;
     }
 
-    private void BuildTlas() =>
+    private void BuildTlas(bool update = false) =>
         _context.BuildTLAS(new BuildTLASAttribs
         {
             Tlas = _tlas,
             Instances = _tlasInstances,
             InstanceBuffer = _instanceBuffer,
             ScratchBuffer = _tlasScratch,
+            // REFIT (PERFORM_UPDATE) поверх прежней структуры - цена покадрового движения;
+            // false - полная сборка (первая и каждая N-я, см. RebuildsPerFullBuild).
+            Update = update,
             // Таблиц привязки шейдеров нет: трассировка inline (RayQuery), hit-группы не участвуют -
             // луч возвращает попадание прямо в вызывающий шейдер.
             HitGroupStride = 0,

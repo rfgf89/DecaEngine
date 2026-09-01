@@ -12,7 +12,7 @@ namespace DecaEngine.Editor;
 /// SH L0, красный = невалидная («в стене»), голубая кромка = переехала релокацией.
 ///
 /// Рисуется инлайн в конце ForwardPass (см. GraphicsPipelineSimple.InlineOverlay) - в уже
-/// привязанный render target, с депт-тестом сцены, до резолва MSAA. Ни вершинного буфера, ни
+/// привязанный render target, с депт-тестом сцены. Ни вершинного буфера, ни
 /// инстансинга: один Draw(24 * probeCount), всё восстанавливается из SV_VertexID.
 ///
 /// Живёт по СЕССИИ (сетка и атласы меняются вместе с ней): пересоздаётся там же, где
@@ -28,10 +28,6 @@ public sealed class ProbeDebugOverlay : IDisposable
 
 		/// <summary>xyz - размер сетки проб; по нему VS разворачивает номер шарика в узел.</summary>
 		public Vector4 GridCounts;
-
-		/// <summary>xyz - тороидальное смещение (узел c лежит в текселе (c + scroll) mod counts),
-		/// w - не используется. Цвет шариков переехал в <see cref="Tint"/>.</summary>
-		public Vector4 GridScroll;
 
 		public Vector4 Tint;
 	}
@@ -50,7 +46,7 @@ public sealed class ProbeDebugOverlay : IDisposable
 	/// свой цвет, чтобы отличаться от базовых проб - их шарики мельче и стоят среди базовых.</param>
 	public ProbeDebugOverlay(DiligentGraphicsApi dilApi, IGraphicsApi api,
 		IBatchRenderer batchRenderer, ProbeGiBakeSession session, ProbeGiTextures textures,
-		uint msaaSamples, TextureObjectFormat colorFormat, Vector3 tint = default)
+		TextureObjectFormat colorFormat, Vector3 tint = default)
 	{
 		_vertexCount = (uint)session.ProbeCount * 24u;
 
@@ -78,7 +74,6 @@ public sealed class ProbeDebugOverlay : IDisposable
 				DepthFunc = ComparisonFunctionType.GreaterEqual,
 			},
 			InputLayout = [],
-			SampleCount = msaaSamples,
 		}));
 
 		batchRenderer.BindViewConstants(_material);
@@ -116,7 +111,6 @@ public sealed class ProbeDebugOverlay : IDisposable
 			GridOriginRadius = new Vector4(session.Origin, _radius),
 			GridCellCount = new Vector4(session.Cell, session.ProbeCount),
 			GridCounts = new Vector4(session.CountX, session.CountY, session.CountZ, 0f),
-			GridScroll = new Vector4(session.ScrollX, session.ScrollY, session.ScrollZ, 0f),
 			Tint = new Vector4(_tint, 0f),
 		};
 		_material.SetConstant("ProbeDebugParams", ref constants, HandleAccess.Vertex);

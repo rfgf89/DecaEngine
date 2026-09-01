@@ -157,10 +157,30 @@ public sealed class SelectionOutlineOverlay : IDisposable
 
 		if (positions.Count > 0)
 		{
-			_dilApi.ImmediateContext.UpdateBuffer<Vector3>(((DiligentBufferHandle)_vertexBuffer!).Buffer, 0,
+			// Страховка перед заливкой. Буферы выше растут под размер данных, поэтому выход за
+			// границы означает не «не хватило места», а рассогласование состояния - например
+			// провалившееся создание буфера, оставившее обёртку с пустым нативным объектом.
+			// Заливка мимо буфера даёт не искажённую обводку, а 0xC0000005 внутри UpdateBuffer,
+			// причём на D3D12 сразу, а на Vulkan - когда повезёт; отлаживать это по стеку падения
+			// бесполезно, потому что виновник в нём не виден.
+			var vertexBuffer = ((DiligentBufferHandle)_vertexBuffer!).Buffer;
+			var indexBuffer = ((DiligentBufferHandle)_indexBuffer!).Buffer;
+
+			if (vertexBuffer == null || indexBuffer == null ||
+				positions.Count > _vertexCapacity || indices.Count > _indexCapacity)
+			{
+				Console.WriteLine($"[selection] обводка НЕ залита: вершин {positions.Count}/{_vertexCapacity}, " +
+					$"индексов {indices.Count}/{_indexCapacity}, " +
+					$"буферы {(vertexBuffer == null ? "VB=null " : "")}{(indexBuffer == null ? "IB=null" : "")}");
+
+				_indexCount = 0;
+				return true;
+			}
+
+			_dilApi.ImmediateContext.UpdateBuffer<Vector3>(vertexBuffer, 0,
 				System.Runtime.InteropServices.CollectionsMarshal.AsSpan(positions),
 				global::Diligent.ResourceStateTransitionMode.Transition);
-			_dilApi.ImmediateContext.UpdateBuffer<uint>(((DiligentBufferHandle)_indexBuffer!).Buffer, 0,
+			_dilApi.ImmediateContext.UpdateBuffer<uint>(indexBuffer, 0,
 				System.Runtime.InteropServices.CollectionsMarshal.AsSpan(indices),
 				global::Diligent.ResourceStateTransitionMode.Transition);
 		}

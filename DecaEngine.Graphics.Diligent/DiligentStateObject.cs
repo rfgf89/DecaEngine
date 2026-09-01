@@ -131,6 +131,7 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 	private static DepthStencilStateDesc ToNativeDepthStencilDesc(DepthStencilStateInfo info) => new()
 	{
 		DepthEnable = info.DepthEnable,
+		DepthWriteEnable = info.DepthWriteEnable,
 		DepthFunc = ToNativeComparisonFunction(info.DepthFunc)
 	};
 

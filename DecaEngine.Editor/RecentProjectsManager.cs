@@ -9,7 +9,7 @@ public class RecentProjectEntry
 	public DateTime LastOpened { get; set; }
 }
 
-/// <summary>?????? ? ???????????? ?????? ??????? ???????? ????????.</summary>
+/// <summary>Хранит и персистит список недавно открытых проектов.</summary>
 public class RecentProjectsManager
 {
 	private const int MaxEntries = 10;
@@ -41,6 +41,17 @@ public class RecentProjectsManager
 		Save();
 	}
 
+	/// <summary>Выкидывает записи, чьего .sln больше нет на диске: удалённый проект в списке - это
+	/// пункт меню, единственное действие которого - ошибка загрузки. Сохраняет файл, только если
+	/// список реально изменился (вызывается при каждом открытии меню).</summary>
+	public void Prune()
+	{
+		if (Entries.RemoveAll(e => !File.Exists(e.SlnPath)) > 0)
+		{
+			Save();
+		}
+	}
+
 	private void Load()
 	{
 		try
@@ -56,6 +67,8 @@ public class RecentProjectsManager
 			{
 				Entries = entries.OrderByDescending(e => e.LastOpened).ToList();
 			}
+
+			Prune();
 		}
 		catch
 		{
@@ -78,7 +91,7 @@ public class RecentProjectsManager
 		}
 		catch
 		{
-			// ?????????? ?????? ?????????? ? ??? ?? ????????? ??????????.
+			// Недоступный файл настроек - не повод ронять редактор.
 		}
 	}
 }

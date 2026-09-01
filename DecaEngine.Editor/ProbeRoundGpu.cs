@@ -35,25 +35,13 @@ public sealed class ProbeRoundGpu : IDisposable
 		public Vector4 Chunk;         // x - первый элемент порции, y - за последним, z - потолок луча,
 		                              // w - предел изменения пробы за раунд
 		public Vector4 Relocation;    // x - предел релокации пробы в мировых единицах
-		public Vector4 Scroll;        // x - предел релокации СВЕЖЕЙ пробы (см. ProbeGiBakeSession.ProbeFresh)
+		public Vector4 Rays;          // x - сколько первых лучей веера фиксированные
 	}
 
 	[StructLayout(LayoutKind.Sequential)]
 	private struct GridParams
 	{
 		public Vector4 GridCounts;      // xyz - размер плотной сетки проб, w - насыщенность отскока
-
-		// xyz - тороидальное смещение сетки в пробах: узел c лежит по индексу (c + scroll) mod count
-		// (см. ProbeGiBakeResult.ScrollOffsetX).
-		public Vector4 GridScroll;
-
-		// xyz - ПЕРВАЯ въехавшая прокруткой плоскость по каждой оси, в координатах ХРАНЕНИЯ,
-		// -1 - по этой оси не двигались. Телепорт дальше размера объёма выражается плоскостью 0 и
-		// размахом во всю ось (см. ProbeGiBakeSession.MarkScrolled).
-		public Vector4 GridClear;
-
-		// xyz - сколько плоскостей подряд въехало по каждой оси, начиная с GridClear.
-		public Vector4 GridClearSpan;
 		public Vector4 SurfaceVoxel;    // xyz - размер вокселя кэша, w - число живых вокселей
 		public Vector4 SurfaceCounts;   // xyz - размер воксельной сетки кэша
 		public Vector4 SkyParams;       // x - поворот энвайронмента, y - яркость неба, z - сторона окто-карты видимости, w - кирпичей в ряду пула
@@ -92,9 +80,12 @@ public sealed class ProbeRoundGpu : IDisposable
 	private readonly IBuffer _bvhNodes, _bvhOrder, _bvhTriangles;
 	private readonly IBuffer _rayDirections;
 
-	/// <summary>Атласы объёма - нужны, чтобы прокрутка доехала до материалов одним движением
-	/// (см. <see cref="SyncScrollState"/>): кбуфер раунда и угол объёма в материалах описывают ОДНО
-	/// положение сетки, и разъехаться им нельзя.</summary>
+	/// <summary>Punctual-света для прямого света в точках попадания (см. _ProbeBakeLights в
+	/// шейдере). Потолок - защита размера буфера; сцены с большим числом ламп в объёме бейка молча
+	/// теряют хвост (света сортировкой не приоритезируются - на практике их единицы).</summary>
+	private const int MaxBakeLights = 64;
+	private readonly IBuffer _bakeLights;
+
 	private readonly ProbeGiTextures? _atlases;
 	private readonly IBuffer[] _field = new IBuffer[2];
 	private readonly IBuffer _counters;
@@ -283,6 +274,18 @@ public sealed class ProbeRoundGpu : IDisposable
 			Size = 16,
 		});
 
+		// Default по той же причине, что и буфер направлений ниже. Заливается в начале раунда,
+		// когда света реально изменились (см. RunRound).
+		_bakeLights = device.CreateBuffer(new BufferDesc
+		{
+			Name = "ProbeBakeLights",
+			Usage = Usage.Default,
+			BindFlags = BindFlags.ShaderResource,
+			Mode = BufferMode.Structured,
+			ElementByteStride = (uint)sizeof(PunctualLight),
+			Size = (ulong)(MaxBakeLights * sizeof(PunctualLight)),
+		});
+
 		// Default, а не Dynamic: у динамического буфера подложка переезжает при каждом маппинге, а
 		// представление под него создаётся здесь ОДИН раз - шейдер читал бы протухший вид (поймано
 		// сверкой: поле выходило пустым, потому что все направления лучей приезжали нулями).
@@ -311,8 +314,6 @@ public sealed class ProbeRoundGpu : IDisposable
 			Size = (ulong)(ParamsStride * ParamsSlots),
 		});
 
-		// Размеры сеток от раунда к раунду не меняются, а вот смещение прокрутки и пометки чистки -
-		// меняются (см. SyncScrollState), поэтому кбуфер переливается на каждой прокрутке.
 		_gridParams = device.CreateBuffer(new BufferDesc
 		{
 			Name = "ProbeGridParams",
@@ -341,11 +342,6 @@ public sealed class ProbeRoundGpu : IDisposable
 		{
 			GridCounts = new Vector4(session.CountX, session.CountY, session.CountZ,
 				session.BounceSaturation),
-			GridScroll = new Vector4(session.ScrollX, session.ScrollY, session.ScrollZ, 0f),
-			GridClear = new Vector4(session.ClearPlane[0], session.ClearPlane[1],
-				session.ClearPlane[2], 0f),
-			GridClearSpan = new Vector4(session.ClearPlaneSpan[0], session.ClearPlaneSpan[1],
-				session.ClearPlaneSpan[2], 0f),
 			SurfaceVoxel = surface != null
 				? new Vector4(surface.Voxel, _surfaceVoxelCount)
 				: Vector4.Zero,
@@ -392,6 +388,7 @@ public sealed class ProbeRoundGpu : IDisposable
 				_surfaceSrb[i] = surfaceSrb;
 				BindSceneAndSurface(surfaceSrb, bvhNodes, bvhOrder, bvhTriangles, i);
 				TryBind(surfaceSrb, "_SurfaceRadiance", _surfaceRadiance, BufferViewType.UnorderedAccess);
+				TryBind(surfaceSrb, "_ProbeBakeLights", _bakeLights, BufferViewType.ShaderResource);
 
 				// Проход кэша тоже ПУСКАЕТ ЛУЧИ (теневой луч на воксель, см. mainSurface), поэтому
 				// аппаратные ресурсы ему нужны ровно так же, как раунду проб. Раньше TLAS сюда не
@@ -411,6 +408,7 @@ public sealed class ProbeRoundGpu : IDisposable
 			TryBind(srb, "_SceneBvhOrder", bvhOrder, BufferViewType.ShaderResource);
 			TryBind(srb, "_SceneBvhTriangles", bvhTriangles, BufferViewType.ShaderResource);
 			BindSrv(srb, "_ProbeRayDirections", _rayDirections);
+			TryBind(srb, "_ProbeBakeLights", _bakeLights, BufferViewType.ShaderResource);
 
 			// Пинг-понг: пишем в _field[i], читаем из другого.
 			BindSrv(srb, "_ProbeFieldRead", _field[1 - i]);
@@ -452,38 +450,6 @@ public sealed class ProbeRoundGpu : IDisposable
 
 		msShaders = swPhase.ElapsedMilliseconds;
 		SetupTiming = (msSurface, msExport, msBuffers, msShaders);
-	}
-
-	/// <summary>Догоняет прокрутку сессии: смещение и пометки чистки в кбуфере, угол объёма в атласах.
-	///
-	/// Двух буферов раскладки, которые здесь заливались раньше (углы кирпичей и карта индирекции),
-	/// больше нет вовсе. У плотной сетки координаты пробы ЕСТЬ её индекс, а состояние - свежая ли
-	/// она, разрешена ли ей релокация - выводится из трёх чисел, уже лежащих в кбуфере, а не читается
-	/// из таблицы на слот. Тем самым с раунда снялись две заливки буферов на каждую прокрутку.
-	///
-	/// Зовётся ТОЛЬКО из начала раунда (см. RunRound), сразу за применением отложенной прокрутки, и
-	/// это не перестраховка вдвойне. Смещение описывает, где какая проба стоит в мире: поменяй его
-	/// посреди раунда - первые порции досчитают пробы по старым позициям, остальные по новым, и
-	/// раунд запишет в поле шов ровно по границе порции (та же причина, по которой на границе раунда
-	/// пересобирается TLAS, см. AtRoundStart); а разведи его с применением прокрутки - разъедутся уже
-	/// не порции, а сами потребители позиций (см. ProbeGiBakeSession.Scroll).</summary>
-	private void SyncScrollState(ProbeGiBakeSession session)
-	{
-		if (!session.ScrollStateDirty)
-		{
-			return;
-		}
-
-		session.ScrollStateDirty = false;
-		_gridParamsValue.GridScroll = new Vector4(session.ScrollX, session.ScrollY, session.ScrollZ, 0f);
-		_gridParamsValue.GridClear = new Vector4(session.ClearPlane[0], session.ClearPlane[1],
-			session.ClearPlane[2], 0f);
-		_gridParamsValue.GridClearSpan = new Vector4(session.ClearPlaneSpan[0], session.ClearPlaneSpan[1],
-			session.ClearPlaneSpan[2], 0f);
-
-		_api.ImmediateContext.UpdateBuffer<GridParams>(_gridParams, 0,
-			new ReadOnlySpan<GridParams>(in _gridParamsValue), ResourceStateTransitionMode.Transition);
-		_atlases?.ApplyScroll(session.Result);
 	}
 
 	/// <summary>Во что обошёлся подъём пути, по фазам (мс). Всё это идёт СИНХРОННО на потоке
@@ -684,30 +650,6 @@ public sealed class ProbeRoundGpu : IDisposable
 	/// вторая по новой, и раунд запишет в поле шов.</summary>
 	public bool AtRoundStart => _surfaceChunkStart == 0 && _probeChunkStart == 0;
 
-	/// <summary>Доводит отложенную прокрутку до GPU НЕЗАВИСИМО от того, дойдут ли до этого объёма
-	/// раунды в этом кадре.
-	///
-	/// Это не дубль того, что делает начало раунда, а лечение застоя. Раунды каскада гасятся тремя
-	/// внешними условиями разом - сходимостью БАЗОВОГО объёма, его же забором и бюджетом порций, -
-	/// и пока применение прокрутки жило только внутри RunRound, любое из них морозило каскад на
-	/// месте: камера уезжает, заявки копятся и перезаписывают друг друга, объём стоит. Сам переезд
-	/// забора не требует: это обновление буферов и карты индирекции, оно упорядочено в потоке
-	/// команд и не занимает GPU счётом.
-	///
-	/// Граница раунда всё же обязательна - раскладку нельзя менять между порциями одного раунда
-	/// (см. <see cref="SyncScrollState"/>), - но ждать её долго не приходится: порции идут внутри
-	/// кадра, а не через кадр.</summary>
-	public void SettlePendingScroll(ProbeGiBakeSession session, ProbeGiBaker baker)
-	{
-		if (!AtRoundStart)
-		{
-			return;
-		}
-
-		session.ApplyPendingScroll(baker);
-		SyncScrollState(session);
-	}
-
 	/// <summary>Продвигает раунд на одну порцию работы. Возвращает true, когда раунд ЗАВЕРШЁН -
 	/// только тогда вызывающий двигает счётчики сессии.
 	///
@@ -737,15 +679,6 @@ public sealed class ProbeRoundGpu : IDisposable
 		// иначе пробы одной сетки посчитаются по разным веерам.
 		if (_surfaceChunkStart == 0 && _probeChunkStart == 0)
 		{
-			// ЕДИНСТВЕННОЕ место, где объём переезжает, - и сразу за ним выгрузка раскладки на GPU.
-			// Порядок этих двух строк и есть лечение расхождения: мировые позиции проб читают трое
-			// (материалы, этот раунд, дебаг-оверлей), и стоит применить прокрутку в стороне от
-			// выгрузки - они разъедутся по поколениям раскладки на всё время до следующего раунда
-			// (см. ProbeGiBakeSession.Scroll). Ниже в этом же блоке session.Origin уходит в кбуфер
-			// раунда, так что заявка обязана исполниться именно ЗДЕСЬ, а не после.
-			session.ApplyPendingScroll(baker);
-			SyncScrollState(session);
-
 			var dirs = new Vector4[MaxRaysPerRound];
 			for (int i = 0; i < rayDirections.Length; i++)
 			{
@@ -754,6 +687,16 @@ public sealed class ProbeRoundGpu : IDisposable
 
 			context.UpdateBuffer<Vector4>(_rayDirections, 0, dirs.AsSpan(),
 				ResourceStateTransitionMode.Transition);
+
+			// Punctual-света раунда. Заливаются каждый раунд без сравнения: буфер крошечный
+			// (о трекинге версий тут договариваться не с кем - session.BakeLights подменяется
+			// массивом целиком, см. SetPunctualLights). Хвост сверх MaxBakeLights отбрасывается.
+			int lightCount = Math.Min(session.BakeLights.Length, MaxBakeLights);
+			if (lightCount > 0)
+			{
+				context.UpdateBuffer<PunctualLight>(_bakeLights, 0,
+					session.BakeLights.AsSpan(0, lightCount), ResourceStateTransitionMode.Transition);
+			}
 
 			_maxRayLuminance = session.MaxRayLuminance;
 			_maxStep = session.MaxStep;
@@ -778,23 +721,14 @@ public sealed class ProbeRoundGpu : IDisposable
 						&& alpha <= session.MinBlend * 1.001f && alpha <= 0.05f
 						? 1f + (session.Sequence & 3)
 						: 0f),
-				// Свежим пробам (слот только что заселён прокруткой) релокация разрешена независимо
-				// от общесеточного окна: они появились там, где поля ещё не было, и половина из них
-				// стоит в стенах - а открывать окно всему объёму на каждый сдвиг камеры значило бы
-				// расшатывать ровно то поле, которое прокрутка и бережёт (см. FreshRelocationLimit).
-				// y - сколько первых лучей веера ФИКСИРОВАННЫЕ (см. ProbeGiBaker.FixedRayCount):
+				// x - сколько первых лучей веера ФИКСИРОВАННЫЕ (см. ProbeGiBaker.FixedRayCount):
 				// они не вращаются по номеру раунда, не идут ни в радианс, ни в карту глубин, и
 				// кормят только геометрические решения - релокацию и классификацию. Значение
 				// обязано совпадать с раскладкой, по которой построен _ProbeRayDirections, поэтому
 				// берётся из ТОЙ ЖЕ сессии и в том же месте, где заливается сам веер.
-				Scroll = new Vector4(session.FreshRelocationLimit, session.FixedRays, 0f, 0f),
+				// y - число punctual-светов в _ProbeBakeLights (залиты выше).
+				Rays = new Vector4(session.FixedRays, lightCount, 0f, 0f),
 			};
-
-			// Прогревающего диспатча здесь больше нет. Он существовал, чтобы снять «холод» с
-			// въехавших кирпичей отдельным заходом, не дожидаясь конца раунда: слот доставался
-			// новому кирпичу вместе с ЧУЖИМ полем, показывать такое было нельзя, и индирекция
-			// прятала его до собственных значений. Тороидальной прокрутке прятать нечего - въехавшая
-			// плоскость обнуляется на месте, в том же диспатче, что и обычная работа (см. GridClear).
 		}
 
 		// Сначала до конца прогоняется кэш поверхностей: лучи раунда забирают из него радианс, так
@@ -1043,7 +977,7 @@ public sealed class ProbeRoundGpu : IDisposable
 			return false;
 		}
 
-		if (!session.Realtime || session.VariabilityThreshold <= 0f || session.HasPendingScroll)
+		if (!session.Realtime || session.VariabilityThreshold <= 0f)
 		{
 			return false;
 		}
@@ -1193,6 +1127,7 @@ public sealed class ProbeRoundGpu : IDisposable
 
 		// _pso/_surfacePso принадлежат ProbeRoundPipelines и переживают этот объект - не трогаем.
 		_gridParams.Dispose();
+		_bakeLights.Dispose();
 		_params.Dispose();
 
 		_variabilitySrb?.Dispose();

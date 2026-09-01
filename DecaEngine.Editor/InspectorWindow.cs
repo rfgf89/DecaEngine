@@ -129,7 +129,7 @@ namespace DecaEngine.Editor
 			}
 
 			_playSnapshot = snapshot;
-			_playSystemRoot = new SystemRoot { new RotateSystem() };
+			_playSystemRoot = new SystemRoot { new RotateSystem(), new CircleMoveSystem() };
 			_playSystemRoot.AddStore(_store);
 			_isPlaying = true;
 		}

@@ -31,6 +31,9 @@ struct DrawData
 {
     float4 positionScale;
     float4 orientation;
+    // xyz - покомпонентный масштаб (зеркало DrawData.cs): центр кулинг-сферы обязан масштабироваться
+    // им, а не максимумом из positionScale.w - см. комментарий в C#-структуре.
+    float4 scale3;
 };
 
 struct DrawIndexedIndirectCommand
@@ -106,7 +109,8 @@ struct PunctualLight
     float4 DirectionType;  // xyz - мировое направление конуса (спот), w - тип: 0 point, 1 spot
     float4 SpotAngles;     // x - cos внешнего полуугла, y - 1/(cosInner-cosOuter), z - sin внешнего
     float4 ShadowParams;   // x - первый слайс тени (-1 = нет; точечный: 6 граней подряд), y - сила,
-                           // z - ближняя плоскость слайса (far = PositionRange.w)
+                           // z - ближняя плоскость слайса (far = PositionRange.w),
+                           // w - мировой радиус светящегося тела (0 = дефолт, полутень PCSS)
 };
 
 // Плоский индекс кластера: тайлы экрана идут строками, срезы глубины - самым старшим измерением.

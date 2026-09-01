@@ -87,10 +87,20 @@ public struct RasterizerStateInfo
 	public bool DepthClipDisable;
 }
 
-public struct DepthStencilStateInfo
+public struct DepthStencilStateInfo()
 {
-	public bool DepthEnable;
-	public ComparisonFunctionType DepthFunc;
+	public bool DepthEnable = false;
+	public ComparisonFunctionType DepthFunc = default;
+
+	/// <summary>Пишет ли дроу глубину. По умолчанию ДА - это поведение по умолчанию и у D3D12/Vulkan,
+	/// и у всего, что было в движке до появления этого поля; конструктор без параметров существует
+	/// ровно затем, чтобы инициализаторы объекта (<c>new DepthStencilStateInfo { DepthEnable = true }</c>)
+	/// не получали молча false и не оставляли геометрию без глубины.
+	///
+	/// Выключается там, где дроу обязан ЧИТАТЬ глубину сцены, но не менять её: дебаг-линии (см.
+	/// DebugLineOverlay) рисуются после геометрии, а глубину дальше читают векторы движения, SSR и
+	/// туман - каркас скелета в депт-буфере испортил бы всем троим кадр.</summary>
+	public bool DepthWriteEnable = true;
 }
 
 public struct GraphicsStateInfo

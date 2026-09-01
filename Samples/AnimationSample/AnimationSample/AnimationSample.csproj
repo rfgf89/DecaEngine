@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\DecaEngine\DecaEngine.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.ImGui.Core\DecaEngine.ImGui.Core.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Input.Core\DecaEngine.Input.Core.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Input.Sdl3\DecaEngine.Input.Sdl3.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.ImGui.DiligentRender\DecaEngine.ImGui.DiligentRender.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Utility\DecaEngine.Utility.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Profiling\DecaEngine.Profiling.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Core\DecaEngine.Core.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.SourceGenerator\DecaEngine.SourceGenerator.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Generator\DecaEngine.Generator.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Generic\DecaEngine.Generic.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Sdl3\DecaEngine.Sdl3.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Graphics.Diligent\DecaEngine.Graphics.Diligent.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Core.Build\DecaEngine.Core.Build.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Physics.Bepu\DecaEngine.Physics.Bepu.csproj" />
+  </ItemGroup>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+</Project>

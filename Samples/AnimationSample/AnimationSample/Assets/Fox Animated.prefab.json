@@ -1,0 +1,15 @@
+[{
+    "id": 1,
+    "components": {
+        "name": {"value":"Fox Animated"},
+        "pos": {"x":0,"y":0,"z":0},
+        "rot": {"x":0,"y":0,"z":0,"w":1},
+        "scl3": {"x":0.02,"y":0.02,"z":0.02},
+        "Animator": {"ClipName":"Run","Speed":1,"Loop":true,"Playing":true,"Time":0},
+        "FootIkComponent": {"Enabled":false,"PelvisJoint":"b_Hip_01","LeftUpperJoint":"b_LeftLeg01_015","LeftLowerJoint":"b_LeftLeg02_016","LeftFootJoint":"b_LeftFoot01_017","RightUpperJoint":"b_RightLeg01_019","RightLowerJoint":"b_RightLeg02_020","RightFootJoint":"b_RightFoot01_021","AnkleHeight":0.5,"MaxPelvisDrop":3,"Smoothing":12,"Weight":1,"AlignToNormal":true},
+        "SpringBoneComponent": {"Enabled":true,"RootJoint":"b_Tail01_012","Length":3,"Stiffness":0.08,"Drag":0.2,"TailLength":10,"Gravity":{"X":0,"Y":-20,"Z":0}},
+        "LookAtComponent": {"Enabled":true,"Joint":"b_Head_05","Target":{"X":0,"Y":40,"Z":120},"Forward":{"X":0,"Y":0,"Z":1},"Up":{"X":0,"Y":1,"Z":0},"Weight":0.6},
+        "RagdollComponent": {"Enabled":false,"Physical":false,"ServoStrength":0,"RootJoint":"b_Hip_01","MaxDepth":4,"BoneRadius":2,"TotalMass":12},
+        "ModelRenderer": {"modelRef":{"Path":"Fox.glb"}}
+    }
+}]

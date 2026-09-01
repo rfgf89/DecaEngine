@@ -25,6 +25,24 @@ struct SceneHit
     float3 normal;
     float3 albedo;
 
+    // Текстурное альбедо хита (только аппаратный путь): интерполированный UV треугольника,
+    // индекс base color текстуры в наборе текстур хитов (-1 - текстуры нет) и линейный
+    // BaseColorFactor материала (текстура его не содержит). Потребитель один - RT-отражения SSR
+    // (см. SsrHitAlbedo в SsrTracePS.hlsl); probe GI остаётся на усреднённом albedo выше.
+    float2 uv;
+    int    textureIndex;
+    float3 baseColorFactor;
+
+    // Металличность и шероховатость хита (потриугольные, см. BvhTriangle; программный путь -
+    // 0 и 1: там эти атрибуты не заполняются, а «полностью шероховатый» - безопасный дефолт).
+    float  metalness;
+    float  roughness;
+
+    // Сглаженная (интерполяция вершинных) нормаль - ШЕЙДИНГ RT-хитов: геометрическая normal
+    // выше остаётся у probe GI (паритет с CPU-трассой) и у теста задней грани. Программный
+    // путь дублирует геометрическую.
+    float3 smoothNormal;
+
     // Луч вышел изнутри геометрии (попал в заднюю грань) - для проб это признак «проба в стене».
     bool   backface;
 };
@@ -37,6 +55,12 @@ SceneHit SceneHitMiss()
     result.position = float3(0.0, 0.0, 0.0);
     result.normal = float3(0.0, 1.0, 0.0);
     result.albedo = float3(0.0, 0.0, 0.0);
+    result.uv = float2(0.0, 0.0);
+    result.textureIndex = -1;
+    result.baseColorFactor = float3(1.0, 1.0, 1.0);
+    result.metalness = 0.0;
+    result.roughness = 1.0;
+    result.smoothNormal = float3(0.0, 1.0, 0.0);
     result.backface = false;
     return result;
 }
@@ -51,11 +75,34 @@ RaytracingAccelerationStructure _SceneTlas;
 // пересборки TLAS вместо перестройки всей структуры; это и есть цена динамики.
 struct BvhTriangle
 {
-    float3 a;      float pad0;
-    float3 e1;     float pad1;
-    float3 e2;     float pad2;
-    float3 albedo; float pad3;
+    // uvA/uvB/uvC - UV вершин (A, A+e1, A+e2) двумя half-ами в битах float (бывшие паддинги;
+    // заворот свёрнут к нулю бейкером - см. BvhTriangleGpu.PackUv). Заполнены только у объектной
+    // геометрии аппаратного пути.
+    float3 a;      float uvA;
+    float3 e1;     float uvB;
+    float3 e2;     float uvC;
+    // metalness - B-канал MR-текстуры в центроиде UV x MetallicFactor (бывший паддинг):
+    // детект металла у RT-хита («зеркало в зеркале», см. SsrTracePS).
+    float3 albedo; float metalness;
+    // Вершинные окто-нормали (объектное пространство) - сглаженный шейдинг RT-хитов
+    // (см. BvhTriangleGpu.PackOctNormal). У мировой похлёбки программного пути - нули.
+    // roughness - G-канал MR-текстуры x RoughnessFactor: резкость продолжения цепочки.
+    float nA; float nB; float nC; float roughness;
 };
+
+float3 SceneUnpackOctNormal(float bits)
+{
+    uint packed = asuint(bits);
+    float2 p = float2(f16tof32(packed & 0xFFFFu), f16tof32(packed >> 16));
+    float3 n = float3(p, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0)
+    {
+        float2 s = float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(p.yx)) * s;
+    }
+
+    return normalize(n);
+}
 
 // Альбедо здесь у ИНСТАНСА, а не у треугольника: один меш законно стоит в сцене с разными
 // материалами, а геометрия у его инстансов общая.
@@ -63,7 +110,18 @@ struct SceneInstance
 {
     float3 albedo;
     uint   firstTriangle;   // база нумерации примитивов меша в _SceneMeshTriangles
+
+    // Текстурное альбедо хита: линейный BaseColorFactor материала и индекс base color текстуры
+    // в наборе текстур хитов (-1 - текстуры нет). Зеркало InstanceGpu в ProbeSceneAccel.
+    float3 baseColorFactor;
+    int    textureIndex;
 };
+
+float2 SceneUnpackUv(float bits)
+{
+    uint packed = asuint(bits);
+    return float2(f16tof32(packed & 0xFFFFu), f16tof32(packed >> 16));
+}
 
 StructuredBuffer<BvhTriangle>  _SceneMeshTriangles;
 StructuredBuffer<SceneInstance> _SceneInstances;
@@ -105,7 +163,37 @@ SceneHit SceneTraceClosest(float3 origin, float3 direction, float tMax)
     result.t = query.CommittedRayT();
     result.position = origin + direction * result.t;
     result.normal = n;
-    result.albedo = instance.albedo;
+    // ПОТРИУГОЛЬНОЕ альбедо, как в программном пути ниже (tri.albedo): инстансовое - один
+    // плоский цвет на весь объект, и отражения RT-фолбэка SSR выглядели цветными пятнами
+    // вместо деталей. Треугольники несут альбедо, усреднённое бейкером из текстур.
+    result.albedo = tri.albedo;
+
+    // Текстурное альбедо хита: барицентрики примитива интерполируют UV вершин ровно в том же
+    // базисе (b.x - вес вершины A+e1, b.y - вес A+e2), что и упаковка бейкера.
+    float2 bary = query.CommittedTriangleBarycentrics();
+    float2 uvA = SceneUnpackUv(tri.uvA);
+    result.uv = uvA + (SceneUnpackUv(tri.uvB) - uvA) * bary.x
+                    + (SceneUnpackUv(tri.uvC) - uvA) * bary.y;
+    result.textureIndex = instance.textureIndex;
+    result.baseColorFactor = instance.baseColorFactor;
+    result.metalness = tri.metalness;
+    result.roughness = tri.roughness;
+
+    // Сглаженная нормаль: интерполяция вершинных окто-нормалей теми же барицентриками
+    // (конвенция DXR: bary.x - вес вершины 1 (A+e1), bary.y - вес вершины 2 (A+e2), см.
+    // D3D12 Raytracing spec, TriangleIntersectionAttributes). Перенос в мир - ОБРАТНО-
+    // ТРАНСПОНИРОВАННОЙ матрицей: mul(вектор-строка, WorldToObject3x4) и есть
+    // transpose(WorldToObject) = inverse-transpose(ObjectToWorld) - прямой перенос линейной
+    // частью ObjectToWorld наклонял нормаль на неравномерном масштабе (та же причина, по
+    // которой геометрическая нормаль выше считается по мировым рёбрам). Прижимается к
+    // полусфере геометрической: интерполяция на силуэтах может «перевалить» за грань.
+    float3 nSmoothObj = SceneUnpackOctNormal(tri.nA) * (1.0 - bary.x - bary.y)
+                      + SceneUnpackOctNormal(tri.nB) * bary.x
+                      + SceneUnpackOctNormal(tri.nC) * bary.y;
+    float3x4 worldToObject = query.CommittedWorldToObject3x4();
+    float3 nSmooth = normalize(mul(nSmoothObj, (float3x3)worldToObject));
+    result.smoothNormal = dot(nSmooth, n) < 0.0 ? n : nSmooth;
+
     result.backface = dot(n, direction) > 0.0;
     return result;
 }
@@ -144,10 +232,13 @@ struct BvhNode
 
 struct BvhTriangle
 {
+    // Раскладка обязана совпадать с BvhTriangleGpu (80 байт): паддинги здесь не читаются
+    // (UV/металличность/нормали - атрибуты аппаратного пути), но стрид общий.
     float3 a;      float pad0;
     float3 e1;     float pad1;
     float3 e2;     float pad2;
     float3 albedo; float pad3;
+    float pad4; float pad5; float pad6; float pad7;
 };
 
 StructuredBuffer<BvhNode>     _SceneBvhNodes;
@@ -263,6 +354,7 @@ SceneHit SceneTraceClosest(float3 origin, float3 direction, float tMax)
     result.t = hitT;
     result.position = origin + direction * hitT;
     result.normal = n;
+    result.smoothNormal = n;
     result.albedo = tri.albedo;
     result.backface = dot(n, direction) > 0.0;
     return result;

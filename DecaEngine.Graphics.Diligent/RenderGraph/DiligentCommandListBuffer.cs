@@ -259,6 +259,21 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _deferredContext.SetRenderTargets(rtvs, dsvView, ResourceStateTransitionMode.None);
         }
 
+        /// <summary>См. <see cref="ICommandBuffer.SetRenderTargets"/>.</summary>
+        public void SetRenderTargets(IGpuTexture[] rtvs, IGpuTexture dsv)
+        {
+            var views = new ITextureView?[rtvs.Length];
+            for (int i = 0; i < rtvs.Length; i++)
+            {
+                views[i] = GetTextureView(rtvs[i], TextureViewType.RenderTarget, 0);
+                TransitionAndFlush(views[i]?.GetTexture(), ResourceState.RenderTarget);
+            }
+
+            var dsvView = GetTextureView(dsv, TextureViewType.DepthStencil, 0);
+            if (dsv != null) TransitionAndFlush(dsvView?.GetTexture(), ResourceState.DepthWrite);
+            _deferredContext.SetRenderTargets(views, dsvView, ResourceStateTransitionMode.None);
+        }
+
         public void ClearRenderTarget(IGpuTexture rtv, Vector4 color, uint slice = 0)
         {
             var rtvView = GetTextureView(rtv, TextureViewType.RenderTarget, slice);

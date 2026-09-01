@@ -243,15 +243,6 @@ public class SettingsWindow : ImGuiModalWindow
 			_settings.PreviewAnisotropicFiltering = aniso;
 		}
 
-		int[] msaaOptions = [1, 2, 4, 8];
-		var msaaLabels = new[] { "Off", "2x", "4x", "8x" };
-		var msaaIndex = Math.Max(0, Array.IndexOf(msaaOptions, _settings.PreviewMsaaSamples));
-		ImGui.SetNextItemWidth(120 * _scale);
-		if (ImGui.Combo("MSAA", ref msaaIndex, msaaLabels, msaaLabels.Length))
-		{
-			_settings.PreviewMsaaSamples = msaaOptions[msaaIndex];
-		}
-
 		// Путь к HDR-панораме окружения (пусто = процедурное небо). Байтовый буфер по паттерну
 		// ImGui.InputText.
 		var hdrBuffer = _settings.PreviewEnvironmentHdr ?? string.Empty;

@@ -20,7 +20,7 @@ public sealed class SsgiPassResources : IReleaseObject
 	/// PSO композита, и сам GI-таргет - bounce собирается из линейного HDR-кадра, и в RGBA8 яркие
 	/// участки клипались бы в единицу ещё до композита.</param>
 	public SsgiPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, string colorTargetName,
-		uint width, uint height, IGpuTexture depthTarget, IGpuTexture sceneCopyTarget, bool msaaDepth,
+		uint width, uint height, IGpuTexture depthTarget, IGpuTexture sceneCopyTarget,
 		TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
 	{
 		GiTarget = graphicsApi.CreateRenderTarget(new TextureInfo
@@ -36,8 +36,7 @@ public sealed class SsgiPassResources : IReleaseObject
 		var giVs = graphicsApi.CreateShader("SSGI Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var compositeVs = graphicsApi.CreateShader("SSGI Composite Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 
-		// PSO без депта и без MSAA: GI и композит всегда считаются в 1x (MSAA-депт читается
-		// через Texture2DMS.Load, см. SsgiMsaaPS.hlsl).
+		// PSO без депта: GI и композит - фуллскрин-треугольники по готовой глубине.
 		var postProcessState = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "SSGI PostProcess PSO",
@@ -50,7 +49,7 @@ public sealed class SsgiPassResources : IReleaseObject
 		});
 
 		var giPs = graphicsApi.CreateShader("SSGI PS", "EditorAssets/shader",
-			msaaDepth ? "SsgiMsaaPS.hlsl" : "SsgiPS.hlsl", ShaderObjectType.Pixel);
+			"SsgiPS.hlsl", ShaderObjectType.Pixel);
 		GiMaterial = graphicsApi.CreateMaterial("SSGI Material");
 		GiMaterial.SetShader(giVs, giPs);
 		GiMaterial.SetState(postProcessState);
@@ -62,7 +61,7 @@ public sealed class SsgiPassResources : IReleaseObject
 		// Композит билатеральный (размытие bounce по глубине, см. SsgiCompositeCommon.hlsl),
 		// поэтому у него та же пара обёрток под депт, что у самой оценки GI.
 		var compositePs = graphicsApi.CreateShader("SSGI Composite PS", "EditorAssets/shader",
-			msaaDepth ? "SsgiCompositeMsaaPS.hlsl" : "SsgiCompositePS.hlsl", ShaderObjectType.Pixel);
+			"SsgiCompositePS.hlsl", ShaderObjectType.Pixel);
 		CompositeMaterial = graphicsApi.CreateMaterial("SSGI Composite Material");
 		CompositeMaterial.SetShader(compositeVs, compositePs);
 		CompositeMaterial.SetState(postProcessState);

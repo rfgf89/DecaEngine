@@ -33,7 +33,7 @@ public sealed unsafe class FogPassResources : IReleaseObject
 	/// равно привязывается плейсхолдер: слот объявлен в шейдере безусловно, и пустой дескриптор
 	/// роняет валидацию Vulkan (VUID-08114).</param>
 	public FogPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, IGpuTexture depthTarget,
-		IGpuTexture sceneCopyTarget, bool msaaDepth, TextureObjectFormat colorFormat,
+		IGpuTexture sceneCopyTarget, TextureObjectFormat colorFormat,
 		IGpuTexture? adaptationTarget)
 	{
 		// Свой экземпляр VS - см. комментарий в SsaoPassResources (шареный шейдер освобождался бы
@@ -41,10 +41,9 @@ public sealed unsafe class FogPassResources : IReleaseObject
 		var vs = graphicsApi.CreateShader("Fog Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl",
 			ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Fog PS", "EditorAssets/shader",
-			msaaDepth ? "FogMsaaPS.hlsl" : "FogPS.hlsl", ShaderObjectType.Pixel);
+			"FogPS.hlsl", ShaderObjectType.Pixel);
 
-		// Без депта и без MSAA: туман считается в 1x по уже разрешённому кадру, а мультисемпловый
-		// депт читается через Texture2DMS.Load (см. FogMsaaPS.hlsl).
+		// Без депта: туман считается по готовому кадру и глубине.
 		var state = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Fog PSO",

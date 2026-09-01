@@ -59,6 +59,13 @@ public class DiligentShader : IShaderObject
 	public static int DiagCompileCalls;
 	public static int DiagCompileActual;
 
+	/// <summary>Компиляции зовутся и с фоновых потоков загрузки (см.
+	/// ModelLoader.PrecompileShaderVariants), и с главного (SetShader) - в том числе на ОДНОМ
+	/// экземпляре (шарёный кэш DiligentGraphicsApi): без замка два потока компилировали бы один
+	/// шейдер дважды с гонкой на _nativeShader. Создание ресурсов у IRenderDevice потокобезопасно
+	/// (в отличие от контекстов) - параллельные компиляции РАЗНЫХ экземпляров легальны.</summary>
+	private readonly object _compileLock = new();
+
 	public void Compile()
 	{
 		DiagCompileCalls++;
@@ -68,15 +75,23 @@ public class DiligentShader : IShaderObject
 			return;
 		}
 
-		DiagCompileActual++;
-		var swDiag = System.Diagnostics.Stopwatch.StartNew();
-		try
+		lock (_compileLock)
 		{
-			CompileCore();
-		}
-		finally
-		{
-			DiagCompileMs += swDiag.ElapsedMilliseconds;
+			if (_nativeShader != null)
+			{
+				return;
+			}
+
+			DiagCompileActual++;
+			var swDiag = System.Diagnostics.Stopwatch.StartNew();
+			try
+			{
+				CompileCore();
+			}
+			finally
+			{
+				DiagCompileMs += swDiag.ElapsedMilliseconds;
+			}
 		}
 	}
 
@@ -96,6 +111,15 @@ public class DiligentShader : IShaderObject
 			_ => throw new ArgumentOutOfRangeException()
 		};
 
+		// Inline-трассировка (RayQuery) в варианте шейдера требует DXC и SM 6.5 - штатный FXC не
+		// знает даже идентификатора RaytracingAccelerationStructure (тот же выбор, что у
+		// ProbeRoundPipelines для SCENE_TRACE_HARDWARE). Признак - кейворд варианта: компилятор
+		// решается ЗДЕСЬ, потому что общий путь CreateSharedShader ничего не знает о содержимом
+		// шейдера. Ключ дискового кеша байткода различает варианты по макросам, так что DXC- и
+		// FXC-байткод не перепутаются.
+		bool needsRayQuery = Keywords != null &&
+			(Keywords.Contains("FEATURE_RT_SHADOWS") || Keywords.Contains("FEATURE_RT_REFLECTIONS"));
+
 		var shaderCi = new ShaderCreateInfo
 		{
 			SourceLanguage = ShaderSourceLanguage.Hlsl,
@@ -110,6 +134,8 @@ public class DiligentShader : IShaderObject
 			FilePath = FilePath,
 			ShaderSourceStreamFactory = shaderSourceFactory,
 			Macros = new ShaderMacroArray { Elements = BuildMacros() },
+			ShaderCompiler = needsRayQuery ? ShaderCompiler.Dxc : ShaderCompiler.Default,
+			HLSLVersion = needsRayQuery ? new global::Diligent.Version(6, 5) : default,
 		};
 
 		// Файл шейдера резолвится относительно ТЕКУЩЕЙ директории процесса - при запуске с "чужим"
@@ -121,6 +147,30 @@ public class DiligentShader : IShaderObject
 			throw new FileNotFoundException(
 				$"Shader source not found: '{expectedPath}' (shader '{Name}', CWD '{Environment.CurrentDirectory}'). " +
 				"Проверь, что EditorAssets скопированы в рабочую директорию процесса.", expectedPath);
+		}
+
+		// Дисковый кеш байткода: попадание минует компилятор совсем (большие варианты
+		// UnlitInstancedPS стоят секунды КАЖДЫМ запуском). Ключ включает содержимое исходника со
+		// всеми инклудами, так что правка шейдера инвалидирует запись сама.
+		var bytecodeCache = _api.ShaderBytecodeCache;
+		var cacheKey = bytecodeCache?.ComputeKey(Path.Combine(Environment.CurrentDirectory, FactoryPath),
+			FilePath, Type, EntryPoint, shaderCi.Macros.Elements, shaderCi.CompileFlags);
+		if (bytecodeCache != null && cacheKey != null)
+		{
+			var cachedBytecode = bytecodeCache.TryLoad(cacheKey);
+			if (cachedBytecode != null)
+			{
+				_nativeShader = DiligentShaderBytecodeInterop.CreateShader(_api.Device, Name, diligentType,
+					EntryPoint, cachedBytecode);
+				if (_nativeShader != null)
+				{
+					return;
+				}
+
+				// Битая/несовместимая запись (например, после апдейта Diligent или драйвера) -
+				// убрать и скомпилировать из исходника обычным путём.
+				bytecodeCache.Invalidate(cacheKey);
+			}
 		}
 
 		_nativeShader = _api.Device.CreateShader(shaderCi, out var compilerOutput);
@@ -135,6 +185,15 @@ public class DiligentShader : IShaderObject
 		}
 
 		compilerOutput?.Dispose();
+
+		if (bytecodeCache != null && cacheKey != null)
+		{
+			var compiledBytecode = _nativeShader.GetBytecode();
+			if (compiledBytecode.Length > 0)
+			{
+				bytecodeCache.Store(cacheKey, compiledBytecode.ToArray());
+			}
+		}
 	}
 
 	private static unsafe string ReadCompilerOutput(IDataBlob? blob)

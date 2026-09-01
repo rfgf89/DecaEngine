@@ -78,7 +78,6 @@ namespace DecaEngine.Editor
 		private bool _appliedSsao;
 		private AmbientOcclusionMode _appliedAoMode;
 		private bool _appliedSsgi;
-		private uint _appliedMsaa;
 		private bool _appliedSky;
 		private string _appliedHdrPath = "";
 		private bool _appliedAniso;
@@ -232,27 +231,29 @@ namespace DecaEngine.Editor
 		// кадр движения). Сцена для трассировки замирает, пробы продолжают считаться.
 		private bool _probeAccelFrozen;
 
-		/// <summary>Дополнительные МЕЛКИЕ каскады probe-GI (см. SampleProbeGi в UnlitInstancedPS):
-		/// сессия + атласы + GPU-раунд на каскад. Каскад i покрывает бокс в 2^i раз меньше базового
-		/// вокруг центра сцены той же плотностью, то есть ячейкой в 2^i раз мельче. Базовый объём
-		/// остаётся в старых полях (_probeSession и далее) - он гарантия покрытия, каскады только
-		/// уточняют. Существуют ТОЛЬКО в GPU-пути реального времени: CPU-фолбэк остаётся
-		/// однообъёмным, каскады - фича динамики, а не запечки.
-		///
-		/// Центра бокса здесь НЕТ: где объём стоит, знает он сам (см.
-		/// ProbeGiViewportShared.VolumeCenter) - копия рядом с сессией разъезжалась бы с ней.</summary>
-		private readonly List<(ProbeGiBakeSession Session, ProbeGiTextures Textures,
-			ProbeRoundGpu Gpu)> _probeCascades = new();
-
-		/// <summary>Дебаг-вид проб (шарики, см. ProbeDebugOverlay) - по оверлею на ОБЪЁМ: базовый
-		/// плюс каскады. Каждый помнит атласы, под которые создан, - их пересоздание (новая сессия,
-		/// смена сетки, перецентровка каскада) пересобирает весь набор.</summary>
+		/// <summary>Дебаг-вид проб (шарики, см. ProbeDebugOverlay). Помнит атласы, под которые
+		/// создан, - их пересоздание (новая сессия, смена сетки) пересобирает набор.</summary>
 		private readonly List<(ProbeDebugOverlay Overlay, ProbeGiTextures Textures)> _probeDebugOverlays = new();
 		private bool _probeDebugFailed;
 
 		/// <summary>Умеет ли устройство inline-трассировку - по этому флагу окно Graphics гасит
 		/// галочку аппаратного ускорения.</summary>
 		public bool RayTracingSupported => _graphicsApi.RayTracing >= RayTracingSupport.Inline;
+
+		/// <summary>TLAS для RT-теней (режим «Ray-traced» комбо Shadow filtering, см.
+		/// FEATURE_RT_SHADOWS в UnlitInstancedPS.hlsl). Отдельный от <see cref="_probeAccel"/>:
+		/// тот живёт от бейкера проб и только при аппаратном GPU-пути GI, а теневым лучам TLAS
+		/// нужен независимо от проб. Строится из GPU-мешей резидентной модели
+		/// (DiligentRayTracingScene), в превью модель статична - пересборка только на смену
+		/// модели/сабмеша.</summary>
+		private DiligentRayTracingScene? _rtShadowScene;
+
+		/// <summary>Режим RT-теней запрошен и устройство его умеет. Уровня ЗАГРУЗКИ (кейворд в
+		/// вариантах шейдера, см. ModelLoadOptions.RtShadows) - смена гоняется через пересоздание
+		/// окружения (см. needsRecreate).</summary>
+		private bool RtShadowsEnabled() =>
+			_editorSettings.ShadowFilterMode == 4 && RayTracingSupported;
+		private bool _appliedRtShadows;
 
 		// GPU-путь один раз сорвался - больше не пробуем до перезапуска редактора. Иначе каждая
 		// пересборка сессии повторяла бы отказ, а если он роняет драйвер - в цикле.
@@ -263,7 +264,7 @@ namespace DecaEngine.Editor
 		// в живую сессию каждым раундом, как и поворот света (live-ручки шейдера тем более: они
 		// пушатся кбуфером и бейка не касаются).
 		private (bool On, float Sky, int Rays, int Bounces, float BounceSaturation,
-			float Density, int MaxProbes, bool HardwareTrace, int Cascades, int VisRes) _probeSessionOptions;
+			float Density, int MaxProbes, bool HardwareTrace, int VisRes) _probeSessionOptions;
 
 		// Снимок live-ручек шейдера: Update пушит кбуфер при любом их изменении напрямую, не
 		// полагаясь на событие PreviewGraphicsApplied - слайдеры окна Graphics обязаны работать,
@@ -291,18 +292,6 @@ namespace DecaEngine.Editor
 				}
 
 				var grid = $"{session.CountX}x{session.CountY}x{session.CountZ} проб";
-
-				// Каскады иначе невидимы снаружи: без этой строки не отличить «каскады работают» от
-				// «тихо не создались». Ячейка - главное, ради чего они есть.
-				if (_probeCascades.Count > 0)
-				{
-					float Cell(ProbeGiBakeSession s) => MathF.Min(s.Cell.X, MathF.Min(s.Cell.Y, s.Cell.Z));
-					grid += $" + каскады: яч. {Cell(session):F2}";
-					foreach (var cascade in _probeCascades)
-					{
-						grid += $"/{Cell(cascade.Session):F2}";
-					}
-				}
 
 				// Какой путь трассировки ЖИВОЙ. Снаружи это было невидимо: галка в окне Graphics
 				// показывает ЖЕЛАНИЕ, а путь выбирается при подъёме сессии и законно может с ним не
@@ -415,6 +404,7 @@ namespace DecaEngine.Editor
 					LightElevationMinDegrees, LightElevationMaxDegrees));
 
 			_env.Pipeline.SkyResources?.SetEnvironmentYaw(shadowSettings.EnvYawRadians);
+			PushSsrEnvironment();
 			ApplyPreviewSettingsToMaterials();
 
 			// Пробы под новое направление солнца ничего перезапускать не требуют: PollProbeBake
@@ -527,11 +517,11 @@ namespace DecaEngine.Editor
 			_appliedSsao = _editorSettings.PreviewSsao;
 			_appliedAoMode = _editorSettings.PreviewAoMode;
 			_appliedSsgi = _editorSettings.PreviewSsgi;
-			_appliedMsaa = (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8);
 			_appliedSky = _editorSettings.PreviewSkyBackground;
 			_appliedHdrPath = ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "";
 			_appliedAniso = _editorSettings.PreviewAnisotropicFiltering;
 			_appliedMaxTextureSize = ClampedMaxTextureSize();
+			_appliedRtShadows = RtShadowsEnabled();
 			_appliedEyeAdaptation = _editorSettings.PreviewEyeAdaptation;
 			_appliedFog = _editorSettings.PreviewFog;
 			_appliedVolumetric = _editorSettings.PreviewVolumetric;
@@ -543,7 +533,6 @@ namespace DecaEngine.Editor
 				"Model Preview Color", "Model Preview Depth", _sharedResources,
 				skyBackground: _appliedSky,
 				environmentHdrPath: _appliedHdrPath.Length > 0 ? _appliedHdrPath : null,
-				msaaSamples: _appliedMsaa,
 				ssao: _appliedSsao,
 				shadows: true,
 				aoMode: _appliedAoMode,
@@ -553,11 +542,16 @@ namespace DecaEngine.Editor
 				bloom: _appliedBloom,
 				colorGrade: _appliedColorGrade,
 				volumetric: _appliedVolumetric,
-				motionVectors: _appliedMotionVectors,
+				// SSR тянет векторы за собой (репроекция истории) - как TemporalUpscale.
+				motionVectors: _appliedMotionVectors || _editorSettings.PreviewSsr,
 				temporalUpscale: _appliedMotionVectors && _editorSettings.TemporalUpscale,
 				upscalerBackend: _appliedMotionVectors && _editorSettings.TemporalUpscale
 					? Math.Clamp(_editorSettings.UpscalerBackend, 0, 2)
-					: 0);
+					: 0,
+				ssr: _editorSettings.PreviewSsr,
+				// RT-фолбэк догоняет ApplyPipelineFeatures - accel проб в момент создания окружения
+				// ещё не существует (см. PrefabSceneViewport.CreateEnvironment, та же причина).
+				ssrRayTraced: false);
 
 			// Полный набор каскадов, как у Scene View: один орто-каскад на все баунды (прежний
 			// дефолт) на сцене-уровне (Sponza) даёт мыльную тень - вся карта растянута на габарит.
@@ -571,22 +565,24 @@ namespace DecaEngine.Editor
 			return env;
 		}
 
-		/// <summary>Обработчик "OK" окна настроек: env-level опции (SSAO/MSAA/скай/HDR/анизотропия)
+		/// <summary>Обработчик "OK" окна настроек: env-level опции (скай/HDR/анизотропия)
 		/// при изменении применяются пересозданием окружения с перезагрузкой текущей модели,
 		/// live-биты - как обычно. Ничего не изменилось - ничего и не пересоздаётся.</summary>
 		private void OnGraphicsSettingsChanged()
 		{
 			// Пересоздания окружения требуют только те опции, что запечены НЕ в конвейер:
-			// MSAA (число сэмплов - в PSO всей геометрии), HDRI энвайронмента (пересчёт IBL),
+			// HDRI энвайронмента (пересчёт IBL),
 			// анизотропия (в сэмплеры материалов) и потолок текстур (в декодер загрузчика). Всё
 			// остальное - фичи конвейера, применяются на живом окружении без единой перезагрузки
 			// модели (см. GraphicsPipelineSimple.SetFeatures). Ровно этот список и стоит за кнопкой
 			// "Применить" в окне Graphics - см. GraphicsSettingsWindow.DrawApplyBar.
 			bool needsRecreate =
-				_appliedMsaa != (uint)Math.Clamp(_editorSettings.PreviewMsaaSamples, 1, 8) ||
 				_appliedHdrPath != (ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "") ||
 				_appliedAniso != _editorSettings.PreviewAnisotropicFiltering ||
-				_appliedMaxTextureSize != ClampedMaxTextureSize();
+				_appliedMaxTextureSize != ClampedMaxTextureSize() ||
+				// RT-тени - кейворд в вариантах шейдера модели (см. ModelLoadOptions.RtShadows):
+				// пересечение границы «Ray-traced» перечитывает модель, остальные режимы живые.
+				_appliedRtShadows != RtShadowsEnabled();
 
 			// Пересоздание ОТКЛАДЫВАЕТСЯ до начала следующего Update: "OK" настроек срабатывает
 			// посреди ImGui-кадра, когда превью-картинка со старым биндингом уже может лежать в
@@ -609,6 +605,9 @@ namespace DecaEngine.Editor
 		/// пересобирается (дёшево). Сцена, батч-рендерер и загруженная модель не трогаются.</summary>
 		private void ApplyPipelineFeatures()
 		{
+			// ДО SetFeatures: предикат RT-фолбэка смотрит на живой accel (см. EnsureSsrOwnRayScene).
+			EnsureSsrOwnRayScene();
+
 			_appliedSsao = _editorSettings.PreviewSsao;
 			_appliedAoMode = _editorSettings.PreviewAoMode;
 			_appliedSsgi = _editorSettings.PreviewSsgi;
@@ -631,9 +630,194 @@ namespace DecaEngine.Editor
 				Volumetric = _appliedVolumetric,
 				Bloom = _appliedBloom,
 				ColorGrade = _appliedColorGrade,
-				MotionVectors = _appliedMotionVectors,
+				// SSR тянет векторы за собой - см. CreateEnvironment.
+				MotionVectors = _appliedMotionVectors || _editorSettings.PreviewSsr,
 				TemporalUpscale = _appliedMotionVectors && _editorSettings.TemporalUpscale,
+				Ssr = _editorSettings.PreviewSsr,
+				SsrRayTraced = SsrRayTracedEnabled(),
+				SsrHitTextures = _editorSettings.SsrHitTextures,
 			});
+
+			// RT-вариант трейса обязан получить TLAS ДО первого кадра (см. SsrPassResources.SetRayScene);
+			// probe-поле для света RT-хитов - по той же причине здесь же.
+			UpdateSsrRayScene();
+			_env.SetSsrProbeField(_probeTextures);
+
+			// Смена RT-фолбэка пересоздала SSR-ресурсы - живые ручки откатились в дефолты.
+			ApplySsrSettings();
+		}
+
+
+		/// <summary>Зеркало PrefabSceneViewport.SsrRayTracedBlockReason - для строки статуса окна
+		/// Graphics (см. комментарий там: тихий даунгрейд неотличим от поломки).</summary>
+		public string? SsrRayTracedBlockReason
+		{
+			get
+			{
+				if (_graphicsApi.RayTracing < RayTracingSupport.Inline)
+				{
+					return "нет inline-трассировки (нужен D3D12)";
+				}
+				if (_probeAccel == null && _ssrOwnAccel == null)
+				{
+					return _residentModel == null
+						? "в превью не открыта модель (RT-фолбэк превью ждёт её; Scene View - независим)"
+						: "accel модели ещё не собран (модель грузится)";
+				}
+				if (_env.Pipeline.SsrResources is not { RayTraced: true })
+				{
+					return "ресурсы SSR ещё не пересобраны под RT-вариант";
+				}
+				return null;
+			}
+		}
+
+		/// <summary>Зеркало PrefabSceneViewport.SsrRayTracedEnabled: RT-фолбэку нужен ЛЮБОЙ живой
+		/// accel - проб (предпочтителен) или собственный (см. EnsureSsrOwnRayScene).</summary>
+		private bool SsrRayTracedEnabled() =>
+			_editorSettings.SsrRayTraced &&
+			_graphicsApi.RayTracing >= RayTracingSupport.Inline &&
+			(_probeAccel != null || _ssrOwnAccel != null);
+
+		// Собственный accel SSR превью - RT-фолбэк отражений без probe GI (зеркало
+		// PrefabSceneViewport._ssrOwnAccel, но проще: модель одна и статичная).
+		private ProbeSceneAccel? _ssrOwnAccel;
+		private ModelLoader? _ssrOwnBuiltFor;
+		private float _ssrOwnRetryDelay;
+
+		// Наборы текстур RT-хитов (текстурное альбедо отражений) - по одному на accel, живут
+		// вместе с ним (зеркало PrefabSceneViewport).
+		private SsrHitTextures? _probeAccelHitTextures;
+		private SsrHitTextures? _ssrOwnHitTextures;
+
+		/// <summary>Покадровый привод собственного accel-а SSR: хуки на события загрузки ловили не
+		/// все пути (кук-кеш, смена суб-меша), и статус «accel не собран» висел вечно. Опрос дешёвый
+		/// (сравнение ссылок), сборка - с дебаунсом; смена доступности accel-а перечитывает фичи.</summary>
+		private void PollSsrOwnRayScene(float deltaTime)
+		{
+			_ssrOwnRetryDelay -= deltaTime;
+			if (_ssrOwnRetryDelay > 0f)
+			{
+				return;
+			}
+
+			_ssrOwnRetryDelay = 0.3f;
+
+			bool hadAccel = _ssrOwnAccel != null;
+			EnsureSsrOwnRayScene();
+			if ((_ssrOwnAccel != null) != hadAccel)
+			{
+				ApplyPipelineFeatures();
+			}
+
+			// Стриминг дорастил текстуру - bindless-привязка указывает на старую, перепушиваем.
+			if (_ssrOwnHitTextures?.RefreshStreams() == true ||
+				_probeAccelHitTextures?.RefreshStreams() == true)
+			{
+				PushSsrHitTextures();
+			}
+		}
+
+		/// <summary>Собирает/освобождает собственный accel SSR под текущую модель. Зовётся из
+		/// ApplyPipelineFeatures ДО SetFeatures (предикат RT смотрит на accel) и после загрузки
+		/// модели.</summary>
+		private void EnsureSsrOwnRayScene()
+		{
+			bool wanted = _editorSettings.PreviewSsr && _editorSettings.SsrRayTraced
+				&& _graphicsApi.RayTracing >= RayTracingSupport.Inline
+				&& _probeAccel == null && _residentModel != null;
+
+			if (!wanted || !ReferenceEquals(_ssrOwnBuiltFor, _residentModel))
+			{
+				if (_ssrOwnAccel != null)
+				{
+					_env.Pipeline.SsrResources?.SetHitTextures(null, null);
+					_env.DilApi.ImmediateContext.Flush();
+					_env.DilApi.ImmediateContext.WaitForIdle();
+					_ssrOwnAccel.Dispose();
+					_ssrOwnAccel = null;
+					_ssrOwnBuiltFor = null;
+					_ssrOwnHitTextures?.Dispose();
+					_ssrOwnHitTextures = null;
+				}
+
+				if (!wanted)
+				{
+					return;
+				}
+			}
+
+			if (_ssrOwnAccel != null)
+			{
+				return;
+			}
+
+			try
+			{
+				var geometry = new ProbeGiBaker(_residentModel!).InstancedGeometry;
+				if (geometry.Instances.Length == 0)
+				{
+					// Геометрии нет (CPU-копии мешей недоступны/модель пустая) - тихий пропуск,
+					// а не исключение каждые 0.3 с.
+					return;
+				}
+
+				_ssrOwnAccel = new ProbeSceneAccel(_env.DilApi, geometry);
+				_ssrOwnBuiltFor = _residentModel;
+
+				// Набор текстур хитов сшит с индексами ЭТОЙ геометрии.
+				_ssrOwnHitTextures?.Dispose();
+				_ssrOwnHitTextures = SsrHitTextures.Build(_graphicsApi, geometry,
+					new[] { _residentModel! });
+			}
+			catch (Exception ex)
+			{
+				EditorConsoleLog.Add(LogLevel.Warning,
+					$"SSR: собственный accel модели не собрался: {ex.Message}");
+				_ssrOwnAccel?.Dispose();
+				_ssrOwnAccel = null;
+				_ssrOwnBuiltFor = null;
+
+				// Бэкофф: причина (нет CPU-копий и т.п.) не исчезнет через кадр - не молотим.
+				_ssrOwnRetryDelay = 5f;
+			}
+		}
+
+		/// <summary>Зеркало PrefabSceneViewport.UpdateSsrRayScene.</summary>
+		private void UpdateSsrRayScene()
+		{
+			var accel = _probeAccel ?? _ssrOwnAccel;
+			if (accel != null)
+			{
+				_env.Pipeline.SsrResources?.SetRayScene(accel.Tlas, accel.MeshTriangles,
+					accel.Instances);
+				PushSsrHitTextures();
+			}
+		}
+
+		/// <summary>Зеркало PrefabSceneViewport.PushSsrHitTextures: набор ТОГО accel-а, что ушёл в
+		/// SetRayScene.</summary>
+		private void PushSsrHitTextures()
+		{
+			var ssr = _env.Pipeline.SsrResources;
+			if (ssr is not { RayTraced: true } || ssr.HitTextureMode == 0)
+			{
+				return;
+			}
+
+			var set = _probeAccel != null ? _probeAccelHitTextures : _ssrOwnHitTextures;
+			if (set == null)
+			{
+				ssr.SetHitTextures(null, null);
+			}
+			else if (ssr.HitTextureMode == 1)
+			{
+				ssr.SetHitTextures(set.GetAtlas(), null);
+			}
+			else
+			{
+				ssr.SetHitTextures(null, set.GetFullTextures());
+			}
 		}
 
 		/// <summary>Пересоздаёт превью-окружение под новые env-level опции и перезагружает текущую
@@ -675,6 +859,8 @@ namespace DecaEngine.Editor
 			// Окружение (вместе с батч-рендерером и стором) освобождается целиком - ссылки
 			// отладочного оверлея BVH умирают вместе с ним.
 			ReleaseBvhDebugResources();
+			_rtShadowScene?.Release();
+			_rtShadowScene = null;
 			_batchCache.Clear();
 			_meshIdMap.Clear();
 			_materialIdMap.Clear();
@@ -701,7 +887,7 @@ namespace DecaEngine.Editor
 
 		/// <summary>Применяет live-настройки графики превью из <see cref="EditorSettings"/> (см.
 		/// SettingsWindow): биты фич и рантайм-тумблер теней. Вызывается при создании и после "OK"
-		/// в окне настроек; рестарт-левел опции (MSAA/SSAO/скай/HDR) считываются конструктором.</summary>
+		/// в окне настроек; рестарт-левел опции (скай/HDR) считываются конструктором.</summary>
 		public void ApplyGraphicsSettings()
 		{
 			var flags = PreviewFeatureFlags.None;
@@ -808,7 +994,6 @@ namespace DecaEngine.Editor
 				// с которым сессию завели (по умолчанию - программном), и включение аппаратной не давало
 				// РОВНО НИЧЕГО до следующего ребейка по другой ручке.
 				_editorSettings.ProbeGiHardwareRayTracing,
-				_editorSettings.ProbeGiCascades,
 				// Сторона окто-карты видимости - раскладка атласов, применяется только пересозданием
 				// сессии (см. ProbeGiBakeResult.VisRes).
 				_editorSettings.ProbeGiVisRes);
@@ -899,6 +1084,8 @@ namespace DecaEngine.Editor
 					_editorSettings.VolumetricAmbientColorB),
 				Math.Max(_editorSettings.VolumetricAmbientIntensity, 0f),
 				Math.Clamp(_editorSettings.VolumetricAmbientShadowFloor, 0f, 1f));
+
+			_env.SetVolumetricPunctualScatter(Math.Max(_editorSettings.VolumetricPunctualScatter, 0f));
 		}
 		/// <summary>Мировой радиус влияния AO для текущей модели: явная ручка "AO radius (world)",
 		/// если она задана, иначе доля габаритного радиуса (см. EditorSettings.AoRadiusWorld -
@@ -924,8 +1111,41 @@ namespace DecaEngine.Editor
 		/// <summary>Пуш живых ручек SSGI в кбуферы пасса (no-op при выключенном SSGI - см.
 		/// ModelViewportEnvironment.SetGiParams). Радиус пушится отдельным флагом: до кадрирования
 		/// модели доля баундов даёт ноль, то есть GI без эффекта.</summary>
+		/// <summary>Зеркало PrefabSceneViewport.PushSsrEnvironment: покадровые данные SSR (yaw
+		/// env-карты и солнце RT-фолбэка).</summary>
+		private void PushSsrEnvironment()
+		{
+			var shadowSettings = _env.ShadowSettings;
+			if (shadowSettings == null)
+			{
+				return;
+			}
+
+			// Те же константы света, что у PrefabSceneViewport.PushSsrEnvironment - см. комментарий там.
+			_env.SetSsrEnvironment(shadowSettings.EnvYawRadians,
+				-Vector3.Normalize(shadowSettings.LightDirection),
+				new Vector3(1f, 0.97f, 0.9f), 0.55f);
+		}
+
+		/// <summary>Пуш живых ручек SSR - вместе с SSGI (см. ApplyGiSettings ниже).</summary>
+		private void ApplySsrSettings()
+		{
+			_env.SetSsrParams(
+				Math.Clamp(_editorSettings.SsrIntensity, 0f, 4f),
+				Math.Clamp(_editorSettings.SsrMaxRoughness, 0.05f, 1f),
+				Math.Clamp(_editorSettings.SsrThickness, 0.01f, 5f),
+				Math.Clamp(_editorSettings.SsrMaxDistance, 1f, 500f),
+				Math.Clamp(_editorSettings.SsrHistoryWeight, 0f, 0.97f),
+				Math.Clamp(_editorSettings.SsrRaysPerPixel, 1, 4),
+				_editorSettings.SsrDebugView,
+				Math.Clamp(_editorSettings.SsrRtBounces, 1, 4),
+				Math.Clamp(_editorSettings.SsrTraceMode, 0, 1));
+			PushSsrEnvironment();
+		}
+
 		private void ApplyGiSettings(bool pushRange)
 		{
+			ApplySsrSettings();
 			_env.SetGiParams(
 				Math.Clamp(_editorSettings.SsgiIntensity, 0f, 4f),
 				Math.Clamp(_editorSettings.SsgiSamples, 4, SsgiPassResources.MaxSampleCount),
@@ -1063,6 +1283,7 @@ namespace DecaEngine.Editor
 				Mode = mode,
 				Channel = (int)_previewChannel,
 				EnvYawRadians = _env.ShadowSettings?.EnvYawRadians ?? 0f,
+				ShadowMode = _editorSettings.ShadowFilterMode,
 			};
 
 			// Параметры сетки проб (нули = probe-GI выключен, Origin.w - тумблер в шейдере): атласы
@@ -1071,7 +1292,7 @@ namespace DecaEngine.Editor
 			// мёртвая ветка шейдера их не читает.
 			if (_probeTextures != null && _editorSettings.PreviewProbeGi)
 			{
-				ProbeGiViewportShared.PushGrid(ref data, _probeTextures, _probeCascades,
+				ProbeGiViewportShared.PushGrid(ref data, _probeTextures,
 					_editorSettings.ProbeGiNormalBias, _editorSettings.ProbeGiViewBias);
 			}
 
@@ -1589,6 +1810,8 @@ namespace DecaEngine.Editor
 			}
 
 			_streamer.ClearAll();
+			_rtShadowScene?.Release();
+			_rtShadowScene = null;
 			_residentModel = null;
 			_residentPath = null;
 			_meshIdMap.Clear();
@@ -1631,12 +1854,69 @@ namespace DecaEngine.Editor
 			// загрузки, как анизотропия: смена масштаба подхватится следующей загрузкой модели.
 			MipLodBias = MathF.Log2(Math.Clamp(_editorSettings.RenderScale, 0.25f, 1f)),
 			MaxTextureSize = ClampedMaxTextureSize(),
+			RtShadows = RtShadowsEnabled(),
+			// Кейворд записи G-buffer-а отражений - у окружения он теперь безусловный
+			// (см. ModelViewportEnvironment).
+			ReflectionGbuffer = true,
 			// Текстуры не декодируются в фоновой фазе загрузки вовсе - они приезжают из стола по
 			// приоритету от камеры (см. ModelStore). В кадр модель попадает уже с ними: показ ждёт
 			// ModelStore.ModelTexturesReady, иначе она появлялась бы на 1x1-филлерах и домигивала
 			// текстуры десятки кадров.
 			StreamTextures = true
 		};
+
+		/// <summary>Строит TLAS RT-теней по резидентной модели и привязывает его её материалам.
+		/// No-op вне режима «Ray-traced» и без модели. Прежняя структура освобождается: смена
+		/// модели/сабмеша меняет набор мешей, а BLAS-кэш DiligentRayTracingScene ключуется мешами
+		/// умершей модели. Вызывать только после барьера (Flush + WaitForIdle).</summary>
+		private void UpdateRtShadowScene()
+		{
+			_rtShadowScene?.Release();
+			_rtShadowScene = null;
+
+			if (!RtShadowsEnabled() || _residentModel == null)
+			{
+				return;
+			}
+
+			var instances = new List<DiligentRayTracingScene.Instance>();
+			foreach (var instance in _residentModel.instances)
+			{
+				if (instance.meshId < 0 || instance.meshId >= _residentModel.Meshes.Count ||
+					_residentModel.Meshes[instance.meshId] is not DiligentMesh mesh ||
+					mesh.IndexCount < 3 || mesh.VertexBuffer == null || mesh.IndexBuffer == null)
+				{
+					continue;
+				}
+
+				var t = instance.transform;
+				instances.Add(new DiligentRayTracingScene.Instance(mesh,
+					Matrix4x4.CreateScale(t.scale.X, t.scale.Y, t.scale.Z) *
+					Matrix4x4.CreateFromQuaternion(t.rotation) *
+					Matrix4x4.CreateTranslation(t.position),
+					(uint)instances.Count));
+			}
+
+			if (instances.Count == 0)
+			{
+				return;
+			}
+
+			_rtShadowScene = new DiligentRayTracingScene(_env.DilApi);
+			_rtShadowScene.Rebuild(instances);
+			if (_rtShadowScene.Tlas == null)
+			{
+				return;
+			}
+
+			for (int i = 0; i < _residentModel.materialObjects.Count; i++)
+			{
+				if (_residentModel.materialObjects.GetAt(i).Value is DiligentMaterial material)
+				{
+					material.SetAccelStructure("_SceneTlas", _rtShadowScene.Tlas);
+				}
+			}
+		}
 
 		/// <summary>Потолок текстуры в том виде, в каком он уходит в загрузчик. Отдельным методом,
 		/// потому что то же значение сравнивает диф перезагрузки: сравнивать сырую настройку с
@@ -1755,6 +2035,18 @@ namespace DecaEngine.Editor
 				_loadedSubMesh = subMeshIndex;
 				_loadError = null;
 				ApplyPreviewSettingsToMaterials();
+
+				// TLAS RT-теней - после барьера выше (сборка BLAS/TLAS трогает ImmediateContext)
+				// и строго ДО первого дроу: вариант с FEATURE_RT_SHADOWS объявляет _SceneTlas, и
+				// коммит ресурсов без привязки упёрся бы в пустой дескриптор.
+				UpdateRtShadowScene();
+
+				// RT-фолбэк SSR мог ждать модель (собственный accel строится от неё) - фичи
+				// перечитываются здесь же; внутри и сборка accel-а, и привязка TLAS.
+				if (_editorSettings.PreviewSsr && _editorSettings.SsrRayTraced)
+				{
+					ApplyPipelineFeatures();
+				}
 
 				// Probe-GI пересчитывается под новую модель: сброс безопасен - барьер выше уже
 				// дождался GPU, а раунды пойдут из PollProbeBake.
@@ -1916,8 +2208,7 @@ namespace DecaEngine.Editor
 
 			_probeSessionOptions = (true, options.SkyIntensity, options.RaysPerProbe, options.Bounces,
 				options.BounceSaturation, options.GridDensity, options.MaxProbes,
-				_editorSettings.ProbeGiHardwareRayTracing, _editorSettings.ProbeGiCascades,
-				_editorSettings.ProbeGiVisRes);
+				_editorSettings.ProbeGiHardwareRayTracing, _editorSettings.ProbeGiVisRes);
 
 			// Сессия пересоздаётся - GPU-путь прошлой сессии и его атласы обязаны уйти ДО того, как
 			// появятся новые. BeginProbeSession зовётся на каждое изменение настроек (с дебаунсом),
@@ -1973,16 +2264,29 @@ namespace DecaEngine.Editor
 				if (!hardware && _probeAccel != null)
 				{
 					// Аппаратную трассировку выключили - структуры больше не нужны.
+					_env.Pipeline.SsrResources?.SetHitTextures(null, null);
 					_probeAccel.Dispose();
 					_probeAccel = null;
+					_probeAccelHitTextures?.Dispose();
+					_probeAccelHitTextures = null;
 				}
 
 				// Строятся ОДИН РАЗ на модель: геометрия от настроек probe-GI не зависит (см. поле).
 				// Движение объектов их тоже не пересоздаёт - на него отвечает пересборка TLAS в
 				// PollProbeAccel.
-				_probeAccel ??= hardware
-					? new ProbeSceneAccel(_env.DilApi, _probeBaker.InstancedGeometry)
-					: null;
+				if (_probeAccel == null && hardware)
+				{
+					_probeAccel = new ProbeSceneAccel(_env.DilApi, _probeBaker.InstancedGeometry);
+
+					// Набор текстур RT-хитов - вместе с accel-ом: индексы в его таблице инстансов
+					// указывают именно в этот набор (модель та же, под которую собран бейкер;
+					// ключи переживают дисковый кеш BVH).
+					_probeAccelHitTextures?.Dispose();
+					_probeAccelHitTextures = _residentModel != null
+						? SsrHitTextures.Build(_graphicsApi, _probeBaker.InstancedGeometry,
+							new[] { _residentModel })
+						: null;
+				}
 
 				_probeInstancePoses.Clear();
 
@@ -2005,21 +2309,13 @@ namespace DecaEngine.Editor
 				_probeGpu = new ProbeRoundGpu(_env.DilApi, _probePipelines, session, _probeBaker,
 					_probeTextures, _env.EnvironmentMap, _env.ShadowSettings!.EnvYawRadians, _probeAccel);
 
-				// Мелкие каскады - только в реальном времени: запечке нужен один сходящийся объём.
-				// Центрируются на точке интереса камеры и дальше следуют за ней (см.
-				// PollProbeCascadeRecenter).
-				int cascades = _editorSettings.ProbeGiRealtime
-					? Math.Clamp(_editorSettings.ProbeGiCascades, 1, 3)
-					: 1;
-				for (int i = 1; i < cascades; i++)
+				// RT-фолбэк SSR питается этим же accel-ом (см. PrefabSceneViewport - та же связка).
+				if (_editorSettings.SsrRayTraced)
 				{
-					_probeCascades.Add(CreateProbeCascade(i, _orbitTarget));
+					ApplyPipelineFeatures();
 				}
-
-				if (_probeCascades.Count > 0)
-				{
-					ApplyPreviewSettingsToMaterials();
-				}
+				UpdateSsrRayScene();
+				_env.SetSsrProbeField(_probeTextures);
 			}
 			catch (Exception ex)
 			{
@@ -2027,74 +2323,6 @@ namespace DecaEngine.Editor
 					$"Probe GI: GPU path unavailable, falling back to CPU: {ex.Message}");
 				_probeGpuDisabled = true;
 				ReleaseProbeGpu();
-			}
-		}
-
-		/// <summary>Половина бокса каскада i: базовые баунды, делённые на 2^i, - тот же бюджет проб
-		/// на меньший объём и есть выигрыш плотности.</summary>
-		private Vector3 CascadeHalfExtent(int index) =>
-			ProbeGiViewportShared.CascadeHalfExtent(_probeBoundsMin, _probeBoundsMax, index);
-
-		private Vector3 ClampCascadeCenter(Vector3 target, Vector3 half) =>
-			ProbeGiViewportShared.ClampCascadeCenter(_probeBoundsMin, _probeBoundsMax, target, half);
-
-		/// <summary>Создаёт каскад i вокруг точки интереса: сессия + атласы (слоты _Ci) + GPU-раунд.
-		/// Тот же бюджет и плотность на бокс в 2^i раз меньше = ячейка в 2^i раз мельче.</summary>
-		private (ProbeGiBakeSession, ProbeGiTextures, ProbeRoundGpu) CreateProbeCascade(
-			int index, Vector3 target) =>
-			ProbeGiViewportShared.CreateCascade(_probeBaker!, _probePipelines!, _probeAccel, _env,
-				_graphicsApi, _editorSettings, new[] { _residentModel! },
-				$"_probeGiC{index}_{_probeTextureGeneration++}", index, target,
-				_probeBoundsMin, _probeBoundsMax, ProbeSunColor());
-
-		/// <summary>Ведёт каскады за точкой интереса камеры - это и делает их каскадами, а не просто
-		/// вложенными сетками. Объём сдвигается ПРОКРУТКОЙ (см. ProbeGiViewportShared.ScrollVolume),
-		/// когда точка ушла от его центра дальше четверти бокса (гистерезис: мелкие движения камеры
-		/// не трогают ничего).
-		///
-		/// Раньше здесь стояло пересоздание каскада с холодным стартом поля - и с дебаунсом, потому
-		/// что стоило оно видимого рывка (Dispose GPU-раунда с выгрузкой всего BVH, Release атласов,
-		/// Flush + WaitForIdle, новая сессия). Прокрутка сохраняет поле в уцелевшей части объёма и не
-		/// создаёт ни одного ресурса, поэтому ни холодного старта, ни дебаунса больше нет.
-		///
-		/// Заявки подаются ВСЕМ каскадам, которым пора ехать. Ограничение «не больше одного за кадр»
-		/// осталось от пересоздания, стоившего сотен миллисекунд; с прокруткой переезд стоит около
-		/// миллисекунды, а вреда от ограничения теперь много: заявка исполняется не в момент подачи,
-		/// поэтому первый каскад оставался бы «требующим переезда» на КАЖДОМ кадре, навсегда забирая
-		/// очередь себе и морозя остальные.</summary>
-		/// <summary>Номера раскладок каскадов на прошлом опросе - см. CascadeLayoutChanged.</summary>
-		private int _probeCascadeLayoutStamp;
-
-		private void PollProbeCascadeRecenter()
-		{
-			// Переехавший каскад обязан доехать углом сетки до кбуферов материалов, иначе они
-			// продолжат сэмплить его по старому углу (см. ProbeGiViewportShared.CascadeLayoutChanged).
-			if (ProbeGiViewportShared.CascadeLayoutChanged(_probeCascades, ref _probeCascadeLayoutStamp))
-			{
-				ApplyPreviewSettingsToMaterials();
-			}
-
-			if (_probeCascades.Count == 0 || _probeBaker == null)
-			{
-				return;
-			}
-
-			for (int j = 0; j < _probeCascades.Count; j++)
-			{
-				var session = _probeCascades[j].Session;
-				var half = CascadeHalfExtent(j + 1);
-				var desired = ClampCascadeCenter(_orbitTarget, half);
-
-				// Сверка с ФАКТИЧЕСКИМ центром объёма, а не с заказанным в прошлый раз: заявка на
-				// переезд исполняется на границе раунда, и пока она ждёт, объём стоит там же, где
-				// стоял. Сверяйся мы с заказом - вьюпорт считал бы каскад уже уехавшим.
-				if (!ProbeGiViewportShared.NeedsRecenter(
-						ProbeGiViewportShared.VolumeCenter(session), desired, half))
-				{
-					continue;
-				}
-
-				ProbeGiViewportShared.ScrollVolume(session, desired);
 			}
 		}
 
@@ -2109,8 +2337,10 @@ namespace DecaEngine.Editor
 			}
 
 			// Первым: замороженные команды графа рисуют оверлей по этим атласам - освободить их под
-			// живыми командами значит оставить дроу с мёртвыми дескрипторами.
+			// живыми командами значит оставить дроу с мёртвыми дескрипторами. SSR-трейс тоже держит
+			// SH-атласы (свет RT-хитов) - возвращаем его слоты на плейсхолдер.
 			ReleaseProbeDebugOverlay();
+			_env.SetSsrProbeField(null);
 
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
@@ -2120,49 +2350,13 @@ namespace DecaEngine.Editor
 			_probeTextures = null;
 		}
 
-		/// <summary>Освобождает GPU-путь раунда (вместе с каскадами - они существуют только в нём),
-		/// но НЕ структуры ускорения: те живут по модели и переживают пересоздание сессии (см.
-		/// _probeAccel). Звать РАНЬШЕ освобождения атласов базового объёма: раунды держат на них
-		/// представления, и обратный порядок роняет драйвер.</summary>
+		/// <summary>Освобождает GPU-путь раунда, но НЕ структуры ускорения: те живут по модели и
+		/// переживают пересоздание сессии (см. _probeAccel). Звать РАНЬШЕ освобождения атласов:
+		/// раунды держат на них представления, и обратный порядок роняет драйвер.</summary>
 		private void ReleaseProbeGpu()
 		{
 			_probeGpu?.Dispose();
 			_probeGpu = null;
-
-			if (_probeCascades.Count == 0)
-			{
-				return;
-			}
-
-			// Атласы каскадов - только после возврата ПЛЕЙСХОЛДЕРОВ в материалы и барьера: слоты
-			// _C1/_C2 привязаны статически, и освобождение под живыми привязками оставило бы
-			// материалам мёртвые дескрипторы, даже при Origin.w = 0 (мёртвая ветка не спасает от
-			// валидации привязок). Кбуфер занулит PushProbeGridConstants следующим кадром.
-			if (_residentModel != null)
-			{
-				for (int i = 1; i <= 2; i++)
-				{
-					RebindCascadePlaceholders($"_C{i}");
-				}
-			}
-
-			_env.DilApi.ImmediateContext.Flush();
-			_env.DilApi.ImmediateContext.WaitForIdle();
-
-			foreach (var cascade in _probeCascades)
-			{
-				cascade.Gpu.Dispose();
-				cascade.Textures.Release();
-			}
-
-			_probeCascades.Clear();
-		}
-
-		/// <summary>Возвращает слотам каскада безопасную текстуру-плейсхолдер (та же env-карта, что
-		/// при создании окружения, см. ModelViewportEnvironment) перед освобождением его атласов.</summary>
-		private void RebindCascadePlaceholders(string suffix)
-		{
-			ProbeGiViewportShared.RebindCascadePlaceholders(_residentModel!, _env.EnvironmentMap, suffix);
 		}
 
 		/// <summary>Покадровый привод probe-GI: забирает завершившийся раунд в атласы, тикает дебаунс
@@ -2253,6 +2447,9 @@ namespace DecaEngine.Editor
 			session.RealtimeMaxStep = Math.Clamp(_editorSettings.ProbeGiRealtimeMaxStep, 0f, 0.2f);
 			session.RealtimeGamma = Math.Clamp(_editorSettings.ProbeGiRealtimeGamma, 1f, 8f);
 			session.RealtimeRelocation = Math.Clamp(_editorSettings.ProbeGiRealtimeRelocation, 0f, 0.45f);
+			// Порог сходимости - та же живая ручка, что и соседние (см. PrefabSceneViewport: без
+			// этой строки ползунок действовал только при пересоздании сессии).
+			session.VariabilityThreshold = MathF.Max(_editorSettings.ProbeGiVariabilityThreshold, 0f);
 
 			PollProbeAccel(session);
 
@@ -2263,14 +2460,6 @@ namespace DecaEngine.Editor
 			{
 				session.SetLighting(Vector3.Normalize(-_env.ShadowSettings.LightDirection),
 					ProbeSunColor(), _env.ShadowSettings.EnvYawRadians, _env.EnvironmentRadiance);
-			}
-
-			// Переезды каскадов доводятся до GPU ДО всех проверок ниже: сходимость базового объёма,
-			// его забор и бюджет порций гасят раунды каскадов, но не должны морозить их на месте -
-			// камера уезжает, а объём стоит (см. ProbeRoundGpu.SettlePendingScroll).
-			foreach (var cascade in _probeCascades)
-			{
-				cascade.Gpu.SettlePendingScroll(cascade.Session, baker);
 			}
 
 			if (session.Converged)
@@ -2297,28 +2486,11 @@ namespace DecaEngine.Editor
 				{
 					// Порции и раунды - общим циклом (см. ProbeGiViewportShared.DriveChunks): бюджет
 					// тратится целиком, переходя границы раундов, а не обрывается на первом же.
-					int volumeCount = 1 + _probeCascades.Count;
+					// Объём один - весь лучевой бюджет кадра его.
 					ProbeGiViewportShared.DriveChunks(_probeGpu, session, baker,
 						Math.Max(ProbeChunksPerFrame,
-							_probeGpu.ChunksPerFrame(session.RaysPerRound, volumeCount)));
+							_probeGpu.ChunksPerFrame(session.RaysPerRound)));
 					_probeRoundMs = _probeRoundSw.ElapsedMilliseconds;
-
-					// Мелкие каскады - общим приводом (см. ProbeGiViewportShared.DriveVolume), каждый
-					// со своим забором и тем же бюджетом порций.
-					if (_env.ShadowSettings != null)
-					{
-						var sunDir = Vector3.Normalize(-_env.ShadowSettings.LightDirection);
-						foreach (var cascade in _probeCascades)
-						{
-							ProbeGiViewportShared.DriveVolume(cascade.Gpu, cascade.Session, baker,
-								_editorSettings, sunDir, ProbeSunColor(),
-								_env.ShadowSettings.EnvYawRadians, _env.EnvironmentRadiance,
-								// ЧИСЛО ОБЪЁМОВ, а не бюджет порций: здесь стоял ProbeChunksPerFrame (8), и
-								// каждый каскад получал восьмую часть лучевого бюджета вместо своей доли
-								// (см. ProbeRoundGpu.ChunksPerFrame) - на двух каскадах это вчетверо медленнее чем надо.
-								volumeCount);
-						}
-					}
 				}
 				catch (Exception ex)
 				{
@@ -2436,8 +2608,7 @@ namespace DecaEngine.Editor
 		private void PollProbeDebugOverlay() =>
 			ProbeGiViewportShared.PollOverlays(_probeDebugOverlays,
 				_editorSettings.PreviewProbeGi && _editorSettings.ProbeGiShowProbes,
-				ref _probeDebugFailed, _env, _graphicsApi, _probeSession, _probeTextures,
-				_probeCascades);
+				ref _probeDebugFailed, _env, _graphicsApi, _probeSession, _probeTextures);
 
 		private void ReleaseProbeDebugOverlay() =>
 			ProbeGiViewportShared.ReleaseOverlays(_probeDebugOverlays, _env);
@@ -2533,8 +2704,23 @@ namespace DecaEngine.Editor
 			ReleaseProbeGpu();
 
 			// Структуры ускорения привязаны к геометрии модели - уходят вместе с бейкером.
+			bool hadProbeAccel = _probeAccel != null;
+			if (hadProbeAccel)
+			{
+				// Трейс не должен держать view умирающего атласа текстур хитов.
+				_env.Pipeline.SsrResources?.SetHitTextures(null, null);
+			}
 			_probeAccel?.Dispose();
 			_probeAccel = null;
+			_probeAccelHitTextures?.Dispose();
+			_probeAccelHitTextures = null;
+
+			// RT-вариант SSR-трейса держал дескриптор на уничтоженный TLAS - откат на экранный
+			// вариант (SsrRayTracedEnabled без accel-а даёт false).
+			if (hadProbeAccel && _editorSettings.SsrRayTraced)
+			{
+				ApplyPipelineFeatures();
+			}
 			_probeBaker = null;
 			_probeSession = null;
 			_probeRoundTask = null;
@@ -2671,6 +2857,9 @@ namespace DecaEngine.Editor
 				return;
 			}
 
+			// Собственный accel SSR (RT-фолбэк без probe GI) - опрос покадровый, см. метод.
+			PollSsrOwnRayScene(deltaTime);
+
 			if (_pendingEnvironmentRecreate)
 			{
 				_pendingEnvironmentRecreate = false;
@@ -2684,7 +2873,6 @@ namespace DecaEngine.Editor
 			PollPendingLoad();
 			PollProbeBake(deltaTime);
 			PollBvhDebugOverlay();
-			PollProbeCascadeRecenter();
 			PollProbeDebugOverlay();
 
 			// Live-ручки probe-GI/солнца из окна Graphics - пуш по факту изменения значения
@@ -2873,7 +3061,7 @@ namespace DecaEngine.Editor
 			// crashes instead of cleanly releasing it (see ImGuiRender.ReleaseRenderTargetBinding).
 			imGuiRender.ReleaseRenderTargetBinding(_textureRef.GetTexID());
 
-			// Сценовые таргеты (депт/HDR/scene-copy/MSAA/AO/GI) - в РЕНДЕР-размере: при масштабе
+			// Сценовые таргеты (депт/HDR/scene-copy/AO/GI) - в РЕНДЕР-размере: при масштабе
 			// рендера меньше 1 сцена рисуется в уменьшенные, а до отображаемого её поднимает тонемап
 			// (см. GraphicsPipelineSimple.SetRenderScale). ColorTarget всегда display - его сэмплирует
 			// ImGui.
@@ -2886,8 +3074,10 @@ namespace DecaEngine.Editor
 			// а после Resize это уже ДРУГАЯ нативная текстура - резидентным материалам нужно перепривязать
 			// _SceneColor, иначе они продолжат сэмплировать уничтоженную (см. RegisterModelResources).
 			_env.SceneCopyTarget.Resize(sceneSize);
-			_env.MsaaColorTarget?.Resize(sceneSize);
-			_env.MsaaDepthTarget?.Resize(sceneSize);
+
+			// G-buffer отражений живёт в рендер-размере вместе с дептом (его читают SSR-пассы).
+			_env.Pipeline.Targets?.NormalRoughnessTarget?.Resize(sceneSize);
+			_env.Pipeline.Targets?.EnvFactorTarget?.Resize(sceneSize);
 			_env.AoTarget?.Resize(sceneSize);
 			_env.GiTarget?.Resize(sceneSize);
 

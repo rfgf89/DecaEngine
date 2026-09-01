@@ -201,7 +201,9 @@ cbuffer PreviewSettings
     // PreviewShadowSettings.EnvYawRadians) - сдвиг equirect-U в SampleEnvironment, чтобы
     // отражения/ambient вращались синхронно с ключевым светом. 0 (zero-init) = без поворота.
     float PbrEnvYaw;
-    float PbrPad0;
+    // Режим фильтрации теней (SHADOW_MODE_*, см. дефайны выше). 0 (zero-init от сцен вне превью)
+    // = PCSS - дефолтное качество.
+    int PbrShadowMode;
     // KHR_materials_sheen: rgb = sheenColorFactor (линейный; ноль = выключено), w =
     // sheenRoughnessFactor. Читается только под MATERIAL_SHEEN.
     float4 PbrSheenColorRoughness;
@@ -293,15 +295,156 @@ static const int FeatureHdrOutput = 8;
 // ступенька резкости.
 #define SUN_CASCADE_BLEND_UV 0.06
 
+// --- PCSS: полутень от углового размера солнца ---
+// Тангенс ПОЛУугла видимого диска приходит в lightData.SpotAngles.w (см.
+// CullingAndRenderSystem.SunTanHalfAngle). 0 - пайплайн поле не заполняет (превью), берём дефолт:
+// диск в один градус (реальное солнце ~0.53, чуть крупнее - край читается мягким и на коротких
+// тенях).
+#define SUN_DEFAULT_TAN_HALF_ANGLE 0.00873
+
+// Режимы фильтрации теней (PbrShadowMode, комбо «Shadow filtering» окна Graphics), по
+// возрастанию накладных расходов: HARD - 1 аппаратный тап; PCF - фикс. бокс 3x3; PCSS - полутень
+// от углового размера источника (дефолт); PCSS_HQ - тот же PCSS с удвоенным веером и более
+// широкой полутенью. НОЛЬ обязан оставаться PCSS: сцены вне превью кбуфер не заполняют, и
+// zero-init должен давать дефолтное качество, а не самое дешёвое.
+#define SHADOW_MODE_PCSS 0
+#define SHADOW_MODE_HARD 1
+#define SHADOW_MODE_PCF 2
+#define SHADOW_MODE_PCSS_HQ 3
+// Теневые лучи по TLAS (inline RayQuery) вместо shadow map - только в варианте шейдера с
+// FEATURE_RT_SHADOWS (DXC/SM6.5, см. ниже); без него режим тихо падает в PCSS - в т.ч. на
+// Vulkan, где RaytracingAccelerationStructure не доходит до DXC (см. ProbeRoundPipelines).
+#define SHADOW_MODE_RT 4
+
+#if FEATURE_RT_SHADOWS
+// Лучей в конусе углового размера солнца на пиксель. Зерно усредняет TAAU - как у PCSS.
+#define RT_SHADOW_RAYS 8
+// Отступ старта луча вдоль нормали от самопересечения с собственным треугольником. Константа в
+// МИРОВЫХ единицах: у RT-луча нет текселя shadow map, от которого масштабировался normal-offset
+// растрового пути.
+#define RT_SHADOW_NORMAL_OFFSET 0.02
+#define RT_SHADOW_TMAX 1e4
+
+// TLAS сцены - тот же, что у probe-GI (см. ProbeSceneAccel); привязывается к материалам
+// DiligentBatchRenderer-ом только когда вариант с этим кейвордом реально запрошен.
+RaytracingAccelerationStructure _SceneTlas;
+#endif
+
+// Тапов на диск Фогеля - и в поиске блокеров, и в PCF. 16+16 на пиксель вместо полного прохода
+// прямоугольника у классического PCSS: недобор выборок закрывают пер-пиксельное вращение диска
+// (IGN ниже) и temporal-сглаживание (TAAU), которому остаточный шум по вкусу. HQ удваивает веер -
+// для стоп-кадров и сцен без TAAU, где зерно нечем усреднить.
+#define SUN_PCSS_TAPS 16
+#define SUN_PCSS_HQ_TAPS 32
+
+// Радиус поиска блокеров, тексели. Блокеры дальше не видны - значит и полутень шире
+// SUN_PCSS_MAX_PENUMBRA_TEXELS искать не имеет смысла на этом каскаде: очень длинные мягкие тени
+// уходят в более грубый каскад, у которого тексель крупнее.
+#define SUN_PCSS_SEARCH_TEXELS 12.0
+#define SUN_PCSS_MAX_PENUMBRA_TEXELS 20.0
+#define SUN_PCSS_HQ_SEARCH_TEXELS 16.0
+#define SUN_PCSS_HQ_MAX_PENUMBRA_TEXELS 32.0
+
+// Мировой диапазон глубины каскада в ДОЛЯХ его ширины: zfar = 4.5r при ширине 2r (znear 0.01
+// пренебрежим). Зеркалит casterExtension + receiverExtension в CullingAndRenderSystem.UpdateCascades
+// и SimpleCullingAndRenderSystem.BuildLightData - менять только втроём, иначе полутень получит
+// неверный мировой масштаб.
+#define SUN_CASCADE_DEPTH_RANGE_RATIO 2.25
+
+// --- PCSS punctual-теней (перспективные слайсы) - те же диски Фогеля, что у солнца ---
+// Дефолтный мировой радиус светящегося тела, метры - когда ShadowParams.w не заполнен
+// (LightComponent.SourceRadius = 0): габарит лампочки.
+#define PUNCTUAL_DEFAULT_SOURCE_RADIUS 0.05
+// Радиус поиска блокеров и потолок радиуса PCF, тексели слайса. Потолок ЖЁСТКИЙ: грани куба
+// рисуются с перехлёстом ~2% (около 20 текселей из 1024, см. PunctualShadowScheduler) - тапы
+// дальше уезжали бы на чужую грань.
+#define PUNCTUAL_PCSS_SEARCH_TEXELS 10.0
+#define PUNCTUAL_PCSS_MAX_PENUMBRA_TEXELS 16.0
+
+// Interleaved gradient noise (Jimenez, 2014): дешёвый пер-пиксельный [0,1) для вращения диска.
+// Джиттер TAAU каждый кадр чуть сдвигает привязку пикселей к поверхности, так что паттерн не
+// стоит на месте и усредняется темпорально без отдельного счётчика кадров.
+float InterleavedGradientNoise(float2 pixel)
+{
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+}
+
+// i-й из count тапов диска Фогеля, повёрнутого на phi; радиус нормирован в [0,1].
+float2 VogelDiskSample(int i, int count, float phi)
+{
+    float r = sqrt((float(i) + 0.5) / float(count));
+    float theta = float(i) * 2.39996323 + phi; // золотой угол
+    float s, c;
+    sincos(theta, s, c);
+    return r * float2(c, s);
+}
+
 // firstCascade - индекс ПЕРВОГО каскада, который реально дал вклад (-1: точка не попала ни в один и
 // объявлена освещённой). Нужен отладочному каналу 26: «пятно тени» и «пятно от смены каскада»
 // выглядят на экране одинаково, и без индекса их не разделить.
-float SampleWorldLightShadow(float3 worldPos, float3 N, out float firstCascade)
+#if FEATURE_RT_SHADOWS
+// Тень солнца ТЕНЕВЫМИ ЛУЧАМИ по TLAS - верх лестницы Shadow filtering: физическая полутень без
+// каскадов, байасов и краевых текселей вовсе. Конус лучей раскрыт на угловой размер диска
+// (Sun angular size), вращение диска - тем же IGN, что у PCSS. Ограничение против shadow map:
+// альфа-тест листвы TLAS не видит (BLAS - сплошная геометрия), крона затеняет монолитом.
+float SampleWorldLightShadowRT(float3 worldPos, float3 N, float2 pixelPos, float sunTanHalfAngle)
+{
+    float3 sunDir = normalize(lightData.LightDirection.xyz);
+
+    // Базис поперёк направления на солнце - в нём раскрывается конус.
+    float3 tangentSeed = abs(sunDir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent1 = normalize(cross(tangentSeed, sunDir));
+    float3 tangent2 = cross(sunDir, tangent1);
+
+    float3 origin = worldPos + N * RT_SHADOW_NORMAL_OFFSET;
+    float phi = InterleavedGradientNoise(pixelPos) * 6.2831853;
+
+    float sum = 0.0;
+    [loop]
+    for (int r = 0; r < RT_SHADOW_RAYS; r++)
+    {
+        float2 disk = VogelDiskSample(r, RT_SHADOW_RAYS, phi) * sunTanHalfAngle;
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = normalize(sunDir + tangent1 * disk.x + tangent2 * disk.y);
+        ray.TMin = 0.0;
+        ray.TMax = RT_SHADOW_TMAX;
+
+        // ACCEPT_FIRST_HIT - теневому лучу ближайшее попадание не нужно (зеркало SceneTrace.hlsl).
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+        query.TraceRayInline(_SceneTlas, RAY_FLAG_NONE, 0xFF, ray);
+        query.Proceed();
+        sum += query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+    }
+
+    return sum / float(RT_SHADOW_RAYS);
+}
+#endif
+
+float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out float firstCascade)
 {
     firstCascade = -1.0;
 
     const float texel = 1.0 / SUN_SHADOW_TEXELS;
     const float margin = SUN_CASCADE_MARGIN_TEXELS * texel;
+
+    float sunTanHalfAngle = lightData.SpotAngles.w > 0.0
+        ? lightData.SpotAngles.w
+        : SUN_DEFAULT_TAN_HALF_ANGLE;
+
+#if FEATURE_RT_SHADOWS
+    // RT-режим минует каскады целиком; firstCascade остаётся -1 (отладочный канал 26 честно
+    // покажет «каскад не выбран»). Punctual-света в RT-режиме остаются на PCSS - их ветка сама
+    // падает в PCSS на любом незнакомом значении режима.
+    if (PbrShadowMode == SHADOW_MODE_RT)
+    {
+        return SampleWorldLightShadowRT(worldPos, N, pixelPos, sunTanHalfAngle);
+    }
+#endif
+
+    // Одно вращение диска на пиксель - блокер-серч и PCF всех каскадов крутятся согласованно,
+    // иначе полутень на стыке каскадов шумит двумя несовпадающими паттернами.
+    float phi = InterleavedGradientNoise(pixelPos) * 6.2831853;
 
     // Последний заполненный каскад: ему полосу перехода не даём - смешивать не с чем, а фейд в
     // «освещено» на его краю выглядел бы как срез тени в воздухе. Он же покрывает случай превью
@@ -319,7 +462,11 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, out float firstCascade)
     float shadow = 0.0;
     float acc = 0.0;
 
-    [unroll]
+    // [loop] здесь и на всех PCSS-тапах ниже - СОЗНАТЕЛЬНО, ради времени КОМПИЛЯЦИИ: FXC (D3D12
+    // компилирует модельные варианты им, см. DiligentShader) разворачивал 4 каскада x 32 тапа плюс
+    // пробные циклы в простыню, и вариант стоил 7.5 с компиляции; с [loop] - 1.3 с, байткод втрое
+    // меньше. Код итераций идентичен, меняется только развёртка.
+    [loop]
     for (int c = 0; c < 4; c++)
     {
         if (acc >= 1.0)
@@ -376,17 +523,87 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, out float firstCascade)
         // добивка, крупнее нельзя (peter-panning у основания фигур). Глубинный диапазон у всех
         // каскадов одинаковый (см. BuildLightData), так что константа работает на любом уровне.
         float referenceDepth = lightNdc.z - 0.0004;
+        float lit;
 
-        float sum = 0.0;
-        [unroll]
-        for (int y = -1; y <= 1; y++)
+        // Режим фильтрации - юниформ-ветка (PbrShadowMode одинаков для всего кадра, дивергенции
+        // нет), режимы по возрастанию цены: HARD / PCF / PCSS / PCSS_HQ.
+        if (PbrShadowMode == SHADOW_MODE_HARD)
         {
+            // Один аппаратный тап: билинейное сравнение даёт край в тексель шириной.
+            lit = ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
+                float3(shadowUv, (float)c), referenceDepth);
+        }
+        else if (PbrShadowMode == SHADOW_MODE_PCF)
+        {
+            // Фиксированный бокс 3x3 - прежний путь: постоянная мягкость в тексель, без полутени.
+            float pcfSum = 0.0;
             [unroll]
-            for (int x = -1; x <= 1; x++)
+            for (int y = -1; y <= 1; y++)
             {
-                sum += ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
-                    float3(shadowUv + float2(x, y) * texel, (float)c), referenceDepth);
+                [unroll]
+                for (int x = -1; x <= 1; x++)
+                {
+                    pcfSum += ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
+                        float3(shadowUv + float2(x, y) * texel, (float)c), referenceDepth);
+                }
             }
+
+            lit = pcfSum / 9.0;
+        }
+        else
+        {
+        bool hq = PbrShadowMode == SHADOW_MODE_PCSS_HQ;
+        int taps = hq ? SUN_PCSS_HQ_TAPS : SUN_PCSS_TAPS;
+
+        // --- PCSS, шаг 1: поиск блокеров - средняя глубина текселей, заслоняющих точку, в диске
+        // Фогеля. Load вместо сэмплера: нужна точечная выборка БЕЗ сравнения, а второго сэмплера у
+        // ShadowMaps нет и не надо. Радиус диска (и поиска, и PCF ниже) ограничен запасом до кромки
+        // каскада: edge уже за вычетом margin, так что тапы не адресуются за карту, а пиксель у
+        // кромки всё равно доберёт вес из следующего каскада (полоса перехода шире любого радиуса).
+        float maxRadiusTexels = min(hq ? SUN_PCSS_HQ_MAX_PENUMBRA_TEXELS : SUN_PCSS_MAX_PENUMBRA_TEXELS,
+            edge * SUN_SHADOW_TEXELS);
+        float searchRadius = min(hq ? SUN_PCSS_HQ_SEARCH_TEXELS : SUN_PCSS_SEARCH_TEXELS,
+            maxRadiusTexels);
+
+        float avgBlocker = 0.0;
+        float blockerCount = 0.0;
+        [loop] // время компиляции FXC - см. комментарий у каскадного цикла
+        for (int b = 0; b < taps; b++)
+        {
+            float2 searchUv = shadowUv + VogelDiskSample(b, taps, phi) * searchRadius * texel;
+            float d = ShadowMaps.Load(int4(int2(searchUv * SUN_SHADOW_TEXELS), c, 0)).r;
+            if (d < referenceDepth)
+            {
+                avgBlocker += d;
+                blockerCount += 1.0;
+            }
+        }
+
+        // Шаг 2: ширина полутени. Для направленного света это расстояние до блокера, умноженное на
+        // тангенс полуугла диска солнца; глубина ndc переводится в мировую через диапазон каскада
+        // (SUN_CASCADE_DEPTH_RANGE_RATIO). Без блокеров радиус остаётся минимальным - тексель:
+        // полностью освещённые/затенённые области получают дешёвое сглаживание края вместо
+        // жёсткого бокса 3x3.
+        float filterRadius = 1.0;
+        if (blockerCount > 0.0)
+        {
+            avgBlocker /= blockerCount;
+            float blockerDistWorld = (referenceDepth - avgBlocker) * cascadeWorld * SUN_CASCADE_DEPTH_RANGE_RATIO;
+            filterRadius = clamp(blockerDistWorld * sunTanHalfAngle / texelWorld, 1.0, maxRadiusTexels);
+        }
+
+        // Шаг 3: PCF по тому же диску, повёрнутому на полоборота, - тапы не совпадают с тапами
+        // поиска, суммарный паттерн на пиксель вдвое плотнее.
+        float sum = 0.0;
+        [loop] // время компиляции FXC - см. комментарий у каскадного цикла
+        for (int t = 0; t < taps; t++)
+        {
+            float2 tapUv = shadowUv + VogelDiskSample(t, taps, phi + 3.1415926) * filterRadius * texel;
+            sum += ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
+                float3(tapUv, (float)c), referenceDepth);
+        }
+
+        lit = sum / float(taps);
         }
 
         if (firstCascade < 0.0)
@@ -394,7 +611,7 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, out float firstCascade)
             firstCascade = (float)c;
         }
 
-        shadow += (sum / 9.0) * take;
+        shadow += lit * take;
         acc += take;
     }
 
@@ -812,11 +1029,27 @@ struct PSInput
 struct PSOutput
 {
     float4 color : SV_TARGET; // Final pixel color.
+#if FEATURE_REFLECTION_GBUFFER
+    // Тонкий G-buffer отражений (см. SsrPass / PipelineRenderTargets.NormalRoughnessTarget):
+    // RT1 - нормаль ШЕЙДИНГА в мире (после нормал-мапы и two-sided флипа) + perceptual roughness;
+    // RT2 - множитель env-спекуляра БЕЗ окклюзии неба (Fr * specularWeight * occlusion, rgb) +
+    // сама envOcclusion в альфе. SSR ЗАМЕНЯЕТ префильтрованное окружение трейсом:
+    // hdr += conf * factor * (ssr - envOcclusion * envColor) - что вычитается, ровно то форвард
+    // и сложил, а трейс окклюзией неба не глушится (см. комментарий у записи ниже).
+    float4 gbNormalRough : SV_TARGET1;
+    float4 gbEnvFactor : SV_TARGET2;
+#endif
 };
 
 PSOutput Main(in PSInput input)
 {
     PSOutput output;
+#if FEATURE_REFLECTION_GBUFFER
+    // Нули по умолчанию: ранние return-ы (режимы превью, отладочные каналы) оставляют пиксель
+    // невидимым для SSR-композита (w = 0), как и очистка таргета в ForwardPass.
+    output.gbNormalRough = float4(0.0, 0.0, 0.0, 1.0);
+    output.gbEnvFactor = float4(0.0, 0.0, 0.0, 0.0);
+#endif
 
     float3 normal = normalize(input.normal);
 
@@ -973,7 +1206,7 @@ PSOutput Main(in PSInput input)
             // Конвенция ОСНОВНОГО пайплайна (см. CullingAndRenderSystem): LightData.LightDirection
             // указывает НА солнце - SimpleCullingAndRenderSystem теперь пишет так же.
             keyDir = normalize(lightData.LightDirection.xyz);
-            keyShadow = SampleWorldLightShadow(input.worldPos, N, dbgSunCascade);
+            keyShadow = SampleWorldLightShadow(input.worldPos, N, input.pos.xy, dbgSunCascade);
 
             // Мировой ключ слабее камерного (3.5 тюнился под риг без IBL-солнца): источник, из
             // которого он выведен, УЖЕ светит через энвайронмент-отражения - полная двойная
@@ -1252,25 +1485,101 @@ PSOutput Main(in PSInput input)
                                 / max((shadowFar - shadowNear) * shadowZ * shadowZ, 1e-6);
                             float shadowBias = shadowWorldBias * shadowNdcPerWorld;
 
-                            // PCF 3x3 - как у каскадов солнца (см. SampleWorldLightShadow): одиночный
-                            // тап давал ступенчатую кромку в тексель шириной, и остаточное акне нечем
-                            // было размазать. Тапы у кромки грани куба выходят за её квадрат не дальше
-                            // одного текселя из 1024, а грани рисуются с перехлёстом 2% (~20 текселей,
-                            // см. PunctualShadowScheduler) - за чужую грань выборка не уезжает, и
-                            // адресация сэмплера всё равно Clamp.
+                            // PCSS - как у каскадов солнца (см. SampleWorldLightShadow), но слайс
+                            // перспективный: глубины NDC нелинейны, поэтому и средний блокер, и
+                            // ширина полутени считаются в МИРОВЫХ метрах вдоль оси слайса через
+                            // инверсию проекции z = n*f / (f - ndc*(f-n)). Выход за грань куба
+                            // держит потолок PUNCTUAL_PCSS_MAX_PENUMBRA_TEXELS (перехлёст граней
+                            // ~20 текселей, см. PunctualShadowScheduler) плюс Clamp-адресация.
                             const float punctualTexel = 1.0 / PUNCTUAL_SHADOW_MAP_SIZE;
-                            float shadowSum = 0.0;
-                            [unroll]
-                            for (int sy = -1; sy <= 1; sy++)
+                            float shadowSum;
+                            float shadowTapCount;
+
+                            // Тот же режим фильтрации, что у солнца (PbrShadowMode, юниформ-ветка).
+                            if (PbrShadowMode == SHADOW_MODE_HARD)
                             {
+                                shadowSum = PunctualShadowMaps.SampleCmpLevelZero(
+                                    PunctualShadowMaps_sampler,
+                                    float3(shadowUv, shadowSlice),
+                                    shadowNdc.z - shadowBias);
+                                shadowTapCount = 1.0;
+                            }
+                            else if (PbrShadowMode == SHADOW_MODE_PCF)
+                            {
+                                // Фиксированный бокс 3x3 - прежний путь punctual-теней.
+                                shadowSum = 0.0;
+                                shadowTapCount = 9.0;
                                 [unroll]
-                                for (int sx = -1; sx <= 1; sx++)
+                                for (int sy = -1; sy <= 1; sy++)
                                 {
-                                    shadowSum += PunctualShadowMaps.SampleCmpLevelZero(
-                                        PunctualShadowMaps_sampler,
-                                        float3(shadowUv + float2(sx, sy) * punctualTexel, shadowSlice),
-                                        shadowNdc.z - shadowBias);
+                                    [unroll]
+                                    for (int sx = -1; sx <= 1; sx++)
+                                    {
+                                        shadowSum += PunctualShadowMaps.SampleCmpLevelZero(
+                                            PunctualShadowMaps_sampler,
+                                            float3(shadowUv + float2(sx, sy) * punctualTexel, shadowSlice),
+                                            shadowNdc.z - shadowBias);
+                                    }
                                 }
+                            }
+                            else
+                            {
+                            bool punctualHq = PbrShadowMode == SHADOW_MODE_PCSS_HQ;
+                            int punctualTaps = punctualHq ? SUN_PCSS_HQ_TAPS : SUN_PCSS_TAPS;
+                            float punctualPhi = InterleavedGradientNoise(input.pos.xy) * 6.2831853;
+
+                            // Шаг 1: средний блокер по диску Фогеля (Load - точечный тап без
+                            // сравнения, второй сэмплер не нужен).
+                            float avgBlockerNdc = 0.0;
+                            float blockerCount = 0.0;
+                            [loop] // время компиляции FXC - см. комментарий у каскадного цикла солнца
+                            for (int pb = 0; pb < punctualTaps; pb++)
+                            {
+                                float2 sUv = shadowUv
+                                    + VogelDiskSample(pb, punctualTaps, punctualPhi) * PUNCTUAL_PCSS_SEARCH_TEXELS * punctualTexel;
+                                int2 sTexel = clamp(int2(sUv * PUNCTUAL_SHADOW_MAP_SIZE),
+                                    0, (int)PUNCTUAL_SHADOW_MAP_SIZE - 1);
+                                float d = PunctualShadowMaps.Load(int4(sTexel, shadowSlice, 0)).r;
+                                if (d < shadowNdc.z - shadowBias)
+                                {
+                                    avgBlockerNdc += d;
+                                    blockerCount += 1.0;
+                                }
+                            }
+
+                            // Шаг 2: ширина полутени = (глубина приёмника - глубина блокера) *
+                            // радиус тела света / глубина блокера (подобие треугольников источник-
+                            // блокер-приёмник), в текселях слайса НА ГЛУБИНЕ ПРИЁМНИКА.
+                            float sourceRadius = punctual.ShadowParams.w > 0.0
+                                ? punctual.ShadowParams.w
+                                : PUNCTUAL_DEFAULT_SOURCE_RADIUS;
+                            float filterTexels = 1.0;
+                            if (blockerCount > 0.0)
+                            {
+                                avgBlockerNdc /= blockerCount;
+                                float blockerZ = shadowNear * shadowFar
+                                    / max(shadowFar - avgBlockerNdc * (shadowFar - shadowNear), 1e-6);
+                                float penumbraWorld = max(shadowZ - blockerZ, 0.0) * sourceRadius
+                                    / max(blockerZ, shadowNear);
+                                float texelAtReceiver = 2.0 * shadowTanHalfFov * shadowZ
+                                    / PUNCTUAL_SHADOW_MAP_SIZE;
+                                filterTexels = clamp(penumbraWorld / max(texelAtReceiver, 1e-6),
+                                    1.0, PUNCTUAL_PCSS_MAX_PENUMBRA_TEXELS);
+                            }
+
+                            // Шаг 3: PCF по диску, повёрнутому на полоборота от диска поиска.
+                            shadowSum = 0.0;
+                            shadowTapCount = (float)punctualTaps;
+                            [loop] // время компиляции FXC - см. комментарий у каскадного цикла солнца
+                            for (int pt = 0; pt < punctualTaps; pt++)
+                            {
+                                float2 tapUv = shadowUv
+                                    + VogelDiskSample(pt, punctualTaps, punctualPhi + 3.1415926) * filterTexels * punctualTexel;
+                                shadowSum += PunctualShadowMaps.SampleCmpLevelZero(
+                                    PunctualShadowMaps_sampler,
+                                    float3(tapUv, shadowSlice),
+                                    shadowNdc.z - shadowBias);
+                            }
                             }
 
                             // ВРЕМЕННЫЙ замер для каналов 22..24 - ДВЕ глубины в системе координат
@@ -1297,16 +1606,26 @@ PSOutput Main(in PSInput input)
                             // пиксель считается освещённым, больше - уходит в тень).
                             dbgShadowBiasWorld = shadowWorldBias;
 
-                            float shadowLit = shadowSum / 9.0;
+                            float shadowLit = shadowSum / shadowTapCount;
                             dbgPunctual.w = shadowLit;
                             punctualAtten *= lerp(1.0, shadowLit, saturate(punctual.ShadowParams.y));
                         }
                     }
                 }
 
-                direct += ShadePbrLight(N, V, punctualL,
-                    punctual.ColorIntensity.rgb * punctual.ColorIntensity.w * punctualAtten,
+                float3 punctualRadiance = punctual.ColorIntensity.rgb * punctual.ColorIntensity.w * punctualAtten;
+                float3 punctualContrib = ShadePbrLight(N, V, punctualL, punctualRadiance,
                     albedo, metallic, roughness, transmission, dielectricF0, specularWeight);
+
+#if MATERIAL_SHEEN
+                // Ворс - как у ключа/заполняющего выше: базовый отклик глушится альбедо лоба
+                // (энергосохранение), сверху Charlie-лоб этого света. Без этого ткань под лампой
+                // теряла сатиновый блик, который в солнечном свете есть.
+                punctualContrib = punctualContrib * sheenScaling
+                    + ShadeSheenLight(N, V, punctualL, punctualRadiance, sheenColor, sheenRoughness);
+#endif
+
+                direct += punctualContrib;
             }
         }
 
@@ -1501,6 +1820,24 @@ PSOutput Main(in PSInput input)
                         * SheenAlbedoE(NdotV, sheenRoughness) * occlusion * envShadow;
         ambient *= sheenScaling;
         envSpecular = envSpecular * sheenScaling + envSheen;
+#endif
+
+#if FEATURE_REFLECTION_GBUFFER
+        {
+            // Множитель БЕЗ envOcclusion: окклюзия неба (запечённая видимость probe GI /
+            // аппроксимация envShadow) гасит только ПРЕФИЛЬТРОВАННУЮ карту - интерьеру нечего
+            // зеркалить из зенита, - но SSR-трейс отражает реальную экранную геометрию, и глушить
+            // его этой окклюзией значило убивать отражения именно там, где они нужнее всего
+            // (зеркало в интерьере). envOcclusion уезжает отдельно в альфу: композит вычитает
+            // ровно тот env-вклад, что сложил форвард (factor * envOcclusion * envColor), а
+            // трейс подмешивает без неё (factor * ssr).
+            float3 gbFactor = Fr * lerp(specularWeight, 1.0, metallic) * occlusion;
+#if MATERIAL_SHEEN
+            gbFactor *= sheenScaling;
+#endif
+            output.gbNormalRough = float4(N, roughness);
+            output.gbEnvFactor = float4(gbFactor, envOcclusion);
+        }
 #endif
 
         // Diagnostic hooks (PreviewProbe): raw linear dumps of the individual lighting terms.

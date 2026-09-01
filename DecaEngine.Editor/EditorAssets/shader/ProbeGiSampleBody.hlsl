@@ -88,7 +88,12 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
     float sunFracSum = 0.0;
     float weightSum = 0.0;
 
-    [unroll]
+    // [loop] - ради времени КОМПИЛЯЦИИ, не выполнения: тело угла большое (~10 Load-ов), инклюд
+    // разворачивается на три каскада, и unroll 8 углов был главным вкладом в 7.5 с FXC-компиляции
+    // варианта UnlitInstancedPS (с [loop] по всем тяжёлым циклам - 1.3 с, см. комментарий у
+    // каскадного цикла солнца там же). Runtime-у выборка проб не узкое место и с развёрткой не
+    // была - см. замер у билинейки карты глубин ниже.
+    [loop]
     for (int corner = 0; corner < 8; corner++)
     {
         int3 offset = int3(corner & 1, (corner >> 1) & 1, corner >> 2);

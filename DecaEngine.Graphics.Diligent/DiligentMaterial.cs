@@ -25,6 +25,11 @@ public class DiligentMaterial : IMaterialObject
 	public bool OwnsShaders { get; set; } = true;
 	private readonly Dictionary<string, DiligentBufferHandle> _constantBuffers = new();
 	private readonly Dictionary<string, IDeviceObject> _pendingResources = new();
+
+	/// <summary>Массивные переменные (Texture2D name[N] в шейдере): все элементы биндятся одним
+	/// SetArray. Параллельный стор к <see cref="_pendingResources"/> - там переменная одноэлементная
+	/// по построению.</summary>
+	private readonly Dictionary<string, IDeviceObject[]> _pendingResourceArrays = new();
 	private readonly Dictionary<string, ImmutableSamplerDesc> _immutableSamplers = new();
 
 	private readonly ConcurrentDictionary<string, ShaderResourceVariableDesc> _variablesDesc = new();
@@ -128,6 +133,81 @@ public class DiligentMaterial : IMaterialObject
 			}
 
 			DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
+		}
+	}
+
+	/// <summary>Привязка TLAS (inline ray tracing в пиксельном шейдере - RT-режим Shadow filtering,
+	/// см. FEATURE_RT_SHADOWS в UnlitInstancedPS.hlsl). Стадия строго пиксельная - Compute в
+	/// лейауте графического PSO ломает привязку на Vulkan (см. комментарий в SetBuffer). Дескриптор
+	/// указывает на САМ объект TLAS, так что его пересборка (Rebuild при движении сцены) привязку
+	/// не протухает - то же свойство, что у ProbeRoundGpu.BindAccel.</summary>
+	public void SetAccelStructure(string name, ITopLevelAS tlas)
+	{
+		if (tlas == null)
+		{
+			return;
+		}
+
+		DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, ShaderType.Pixel, ref _isDirty);
+		_pendingResources[name] = tlas;
+		DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
+	}
+
+	/// <summary>Привязка «сырого» структурированного Diligent-буфера как SRV пиксельной стадии -
+	/// таблицы атрибутов сцены для inline-трассировки в пиксельном шейдере (_SceneMeshTriangles /
+	/// _SceneInstances у SSR с FEATURE_RT_REFLECTIONS, см. ProbeSceneAccel). Стадия строго пиксельная
+	/// по той же причине, что у <see cref="SetAccelStructure"/>.</summary>
+	public void SetStructuredBufferSrv(string name, IBuffer buffer)
+	{
+		if (buffer == null)
+		{
+			return;
+		}
+
+		DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, ShaderType.Pixel, ref _isDirty);
+		_pendingResources[name] = buffer.GetDefaultView(BufferViewType.ShaderResource);
+		DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
+	}
+
+	/// <summary>Привязка МАССИВА текстур в одну шейдерную переменную `Texture2D name[N]` (SRV
+	/// пиксельной стадии) - «bindless»-режим текстур RT-хитов у SSR. Размер массива обязан
+	/// совпадать с N в шейдере, и КАЖДЫЙ слот обязан держать живой view (Vulkan не терпит пустых
+	/// дескрипторов - см. плейсхолдер shadow map-ов): свободные слоты вызывающий заполняет любым
+	/// валидным Texture2D. Стадия строго пиксельная - по той же причине, что у
+	/// <see cref="SetAccelStructure"/>.</summary>
+	public void SetTextureSrvArray(string name, IReadOnlyList<IGpuTexture> textures)
+	{
+		if (textures == null || textures.Count == 0)
+		{
+			return;
+		}
+
+		var views = new IDeviceObject[textures.Count];
+		for (int i = 0; i < textures.Count; i++)
+		{
+			ITexture native = textures[i] switch
+			{
+				DiligentGpuTexture t => t.Texture,
+				DiligentRenderTarget rt => rt.Texture,
+				_ => null,
+			};
+
+			if (native == null)
+			{
+				return;
+			}
+
+			views[i] = native.GetDefaultView(TextureViewType.ShaderResource);
+		}
+
+		DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, ShaderType.Pixel, ref _isDirty);
+		_pendingResourceArrays[name] = views;
+		if (!_isDirty && _variables.TryGetValue(name, out var vars))
+		{
+			foreach (var variable in vars)
+			{
+				variable.SetArray(views, 0, SetShaderResourceFlags.AllowOverwrite);
+			}
 		}
 	}
 
@@ -446,6 +526,15 @@ public class DiligentMaterial : IMaterialObject
 				{
 					foreach (var variable in variables)
 						variable.Set(pendingResource.Value, SetShaderResourceFlags.AllowOverwrite);
+				}
+			}
+
+			foreach (var pendingArray in _pendingResourceArrays)
+			{
+				if (_variables.TryGetValue(pendingArray.Key, out var variables))
+				{
+					foreach (var variable in variables)
+						variable.SetArray(pendingArray.Value, 0, SetShaderResourceFlags.AllowOverwrite);
 				}
 			}
 

@@ -20,10 +20,7 @@ cbuffer ProbeDebugParams
     float4 DebugGridCell;
     // xyz = размер сетки проб.
     float4 DebugGridCounts;
-    // xyz = тороидальное смещение сетки в пробах.
-    float4 DebugGridScroll;
-    // xyz = цветовая метка ОБЪЁМА: каскады подкрашиваются, чтобы их шарики отличались от базовых
-    // (они мельче и стоят среди них).
+    // xyz = цветовая метка объёма.
     float4 DebugTint;
 };
 
@@ -73,12 +70,10 @@ PSInput Main(uint vid : SV_VertexID)
     uint corner = vid - probe * 24;
 
     // Мировая позиция узла - зеркало mainProbe в ProbeRoundCS.hlsl: номер шарика есть индекс
-    // ХРАНЕНИЯ, а координаты узла получаются обратным сдвигом прокрутки.
+    // хранения, а объём неподвижен - индекс хранения и есть координаты узла.
     int3 counts = (int3)DebugGridCounts.xyz;
-    int3 scroll = (int3)DebugGridScroll.xyz;
-    int3 storage = int3((int)probe % counts.x, (int)probe / counts.x % counts.y,
-                        (int)probe / (counts.x * counts.y));
-    int3 cell = ((storage - scroll) % counts + counts) % counts;
+    int3 cell = int3((int)probe % counts.x, (int)probe / counts.x % counts.y,
+                     (int)probe / (counts.x * counts.y));
 
     int3 texel = int3(DebugProbeTexel(probe), 0);
     float3 offset = _ProbeOffset.Load(texel).rgb;

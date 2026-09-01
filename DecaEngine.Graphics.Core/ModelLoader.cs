@@ -311,7 +311,8 @@ public static class MeshUtility
 		}
 	}
 
-	public static unsafe (Vertex[] vertices, uint[] indices) OptimizeMeshData(Vertex[] vertices, uint[] indices)
+	public static unsafe (T[] vertices, uint[] indices) OptimizeMeshData<T>(T[] vertices, uint[] indices)
+		where T : unmanaged, IMeshVertex
 	{
 		if (indices.Length == 0 || indices.Length % 3 != 0)
 		{
@@ -320,19 +321,19 @@ public static class MeshUtility
 
 		int vertexCount = vertices.Length;
 		var remap = new uint[vertexCount];
-		var workingVertices = (Vertex[])vertices.Clone();
+		var workingVertices = (T[])vertices.Clone();
 		var workingIndices = (uint[])indices.Clone();
 
 		var uniqueVertexCount = (int)Meshopt.GenerateVertexRemap(remap, workingIndices, workingVertices);
 
-		var remappedVertices = new Vertex[vertexCount];
+		var remappedVertices = new T[vertexCount];
 		Meshopt.RemapVertexBuffer(remappedVertices, workingVertices, remap);
 		Meshopt.RemapIndexBuffer(workingIndices, workingIndices, remap);
 
 		Meshopt.OptimizeVertexCache(workingIndices, workingIndices, (UIntPtr)uniqueVertexCount);
 
-		var finalVertices = new Span<Vertex>(remappedVertices, 0, uniqueVertexCount);
-		Meshopt.OptimizeVertexFetch(MemoryMarshal.Cast<Vertex, uint>(finalVertices), workingIndices, finalVertices);
+		var finalVertices = new Span<T>(remappedVertices, 0, uniqueVertexCount);
+		Meshopt.OptimizeVertexFetch(MemoryMarshal.Cast<T, uint>(finalVertices), workingIndices, finalVertices);
 
 		var finalPositions = new Vector3[uniqueVertexCount];
 		for (int i = 0; i < finalPositions.Length; i++)
@@ -357,10 +358,11 @@ public static class MeshUtility
 		return (finalVertices.ToArray(), finalIndices);
 	}
 
-	public static unsafe (Vertex[] vertices, uint[] indices, LodLevel[] lodLevels) GenerateLodGroupData(
-		Vertex[] baseVertices, uint[] baseIndices, float[] levels)
+	public static unsafe (T[] vertices, uint[] indices, LodLevel[] lodLevels) GenerateLodGroupData<T>(
+		T[] baseVertices, uint[] baseIndices, float[] levels)
+		where T : unmanaged, IMeshVertex
 	{
-		List<Vertex[]> allVertices = new() { baseVertices };
+		List<T[]> allVertices = new() { baseVertices };
 		List<uint[]> allIndices = new() { baseIndices };
 		List<LodLevel> lodLevelsList = new();
 
@@ -428,7 +430,7 @@ public static class MeshUtility
 			var remap = new uint[baseVertexCount];
 			var uniqueLodVertexCount = (int)Meshopt.GenerateVertexRemap(remap, finalLodIndices, baseVertices);
 
-			var lodVerticesResult = new Vertex[uniqueLodVertexCount];
+			var lodVerticesResult = new T[uniqueLodVertexCount];
 			var remappedLodIndices = new uint[simplifiedIndexCount];
 
 			Meshopt.RemapVertexBuffer(lodVerticesResult, baseVertices, remap);
@@ -451,7 +453,7 @@ public static class MeshUtility
 			lodError = Math.Max(lodError * 1.5f, resultError);
 		}
 
-		var combinedVertices = new Vertex[currentVertexOffset];
+		var combinedVertices = new T[currentVertexOffset];
 		var combinedIndices = new uint[currentIndexOffset];
 
 		int vOffset = 0, iOffset = 0;
@@ -464,6 +466,42 @@ public static class MeshUtility
 		}
 
 		return (combinedVertices, combinedIndices, lodLevelsList.ToArray());
+	}
+
+	/// <summary>Сшивает геометрию и скин-стрим в одну вершину для прогона через meshopt (см.
+	/// <see cref="IMeshVertex"/>).</summary>
+	public static SkinnedVertex[] PackSkinned(Vertex[] vertices, SkinVertex[] skin)
+	{
+		var packed = new SkinnedVertex[vertices.Length];
+		for (int i = 0; i < packed.Length; i++)
+		{
+			packed[i] = new SkinnedVertex
+			{
+				Geometry = vertices[i],
+				// Скин-стрим короче геометрии быть не должен, но развариванием вершин под плоские
+				// нормали занимается вызывающий, и рассинхрон здесь дал бы не диагностируемый краш,
+				// а тихо покорёженного персонажа. Недостающие вершины прибиваются к корню.
+				Skin = i < skin.Length ? skin[i] : new SkinVertex { W0 = (ushort)SkinVertex.WeightScale },
+			};
+		}
+
+		return packed;
+	}
+
+	/// <summary>Обратная операция к <see cref="PackSkinned"/>: meshopt отработал, дальше стримы живут
+	/// порознь (в .dmdl и в GPU-буферах).</summary>
+	public static (Vertex[] Vertices, SkinVertex[] Skin) UnpackSkinned(SkinnedVertex[] packed)
+	{
+		var vertices = new Vertex[packed.Length];
+		var skin = new SkinVertex[packed.Length];
+
+		for (int i = 0; i < packed.Length; i++)
+		{
+			vertices[i] = packed[i].Geometry;
+			skin[i] = packed[i].Skin;
+		}
+
+		return (vertices, skin);
 	}
 }
 
@@ -481,11 +519,45 @@ public struct InstanceData
 	public int materialId;
 }
 
-public struct Vertex
+/// <summary>
+/// То, что meshopt-проходы (<see cref="MeshUtility.OptimizeMeshData{T}"/>,
+/// <see cref="MeshUtility.GenerateLodGroupData{T}"/>) обязаны уметь достать из вершины: позицию для
+/// упрощения и UV как атрибут его метрики. Существует ради скиннед-мешей: их вершина - это
+/// <see cref="Vertex"/> ПЛЮС <see cref="SkinVertex"/>, и прогонять её через meshopt нужно ЦЕЛИКОМ.
+///
+/// Иначе не обойтись: и склейка дублей, и упрощение переставляют, схлопывают и выбрасывают вершины,
+/// возвращая таблицы перестановок не для всех проходов (OptimizeVertexFetch переупорядочивает
+/// буфер, ничего не возвращая). Скин-стрим, лежащий параллельным массивом, после такого прохода
+/// разъезжается с геометрией - веса достаются чужим вершинам, и персонаж рвётся в клочья. Склейка
+/// заодно начинает учитывать веса: две вершины с одинаковыми позицией/нормалью/UV, но разными
+/// костями больше не сливаются в одну.
+/// </summary>
+public interface IMeshVertex
+{
+	Vector3 Position { get; }
+	Vector2 TexCoord { get; }
+}
+
+/// <summary>Геометрия + скиннинг одной вершины единым blittable-блоком - только для прогона через
+/// meshopt (см. <see cref="IMeshVertex"/>). В .dmdl и в GPU едет разложенным на два стрима.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SkinnedVertex : IMeshVertex
+{
+	public Vertex Geometry;
+	public SkinVertex Skin;
+
+	public readonly Vector3 Position => Geometry.Position;
+	public readonly Vector2 TexCoord => Geometry.TexCoord;
+}
+
+public struct Vertex : IMeshVertex
 {
 	public Vector3 Position;
 	public Vector2 TexCoord;
 	public Vector3 Normal;
+
+	readonly Vector3 IMeshVertex.Position => Position;
+	readonly Vector2 IMeshVertex.TexCoord => TexCoord;
 
 	/// <summary>
 	/// Per-vertex tangent, xyz = направление роста U на поверхности (мировое после VS), w = знак
@@ -749,6 +821,48 @@ public class ModelLoader
 	/// view - a derivative-based tangent computed from degenerate (0,0) UVs is meaningless.
 	/// </summary>
 	public List<bool> MeshHasUv = new();
+
+	/// <summary>Скелет модели, null у статической (см. <see cref="PreparedSkeleton"/>). Общий на всю
+	/// модель, живёт на CPU: скиннинг-палитра считается по нему покадрово, а процедурный слой (IK,
+	/// рэгдолл, spring bones) правит позу до того, как она уедет в GPU.</summary>
+	public PreparedSkeleton Skeleton;
+
+	/// <summary>Клипы модели, разложенные по джойнтам <see cref="Skeleton"/>.</summary>
+	public List<PreparedAnimation> Animations = new();
+
+	/// <summary>Параллельно <see cref="Meshes"/>: скин-стрим меша (null у статических). Держится на
+	/// CPU до сборки GPU-буфера скиннинга - см. <see cref="SkinVertex"/>.</summary>
+	public List<SkinVertex[]> MeshSkin = new();
+
+	/// <summary>Линейное альбедо каждого треугольника меша (ключ - meshId), из base color текстур -
+	/// см. <see cref="ComputeTriangleAlbedoFromTextures"/>. Пусто у мешей без текстуры/UV/пикселей.</summary>
+	public Dictionary<int, Vector3[]> TriangleAlbedo { get; } = new();
+
+	/// <summary>Металличность каждого треугольника меша (ключ - meshId): B-канал metallic-roughness
+	/// текстуры в центроиде UV x MetallicFactor. Потребитель - «зеркало в зеркале» RT-отражений
+	/// (детект металла у TLAS-хита, см. SceneTrace.hlsl): по одному лишь альбедо светлый хром
+	/// (серебро/золото) неотличим от белой штукатурки. Строится тем же проходом, что
+	/// <see cref="TriangleAlbedo"/>, только при живых CPU-пикселях MR-текстуры; без неё потребитель
+	/// падает на MetallicFactor материала.</summary>
+	public Dictionary<int, float[]> TriangleMetalness { get; } = new();
+
+	/// <summary>Шероховатость каждого треугольника меша (ключ - meshId): G-канал
+	/// metallic-roughness текстуры в центроиде UV x RoughnessFactor. Потребитель тот же, что у
+	/// <see cref="TriangleMetalness"/>: RT-отражения (насколько резко металлический хит отражает
+	/// дальше - без неё зеркальный хром и матовое железо шейдились одинаково размыто). Без
+	/// CPU-пикселей MR-текстуры словарь пуст - фолбэк на RoughnessFactor материала.</summary>
+	public Dictionary<int, float[]> TriangleRoughness { get; } = new();
+
+	/// <summary>Сторона плитки <see cref="MaterialAlbedoTile"/>.</summary>
+	public const int AlbedoTileSize = 128;
+
+	/// <summary>Даунсемпленная до <see cref="AlbedoTileSize"/>² плитка base color текстуры
+	/// материала (ключ - materialId): RGBA8 в sRGB, усреднение в ЛИНЕЙНОМ пространстве (среднее по
+	/// sRGB темнит контрастные текстуры), БЕЗ BaseColorFactor - его умножает потребитель. Источник
+	/// слоёв атласа текстур RT-хитов (дешёвый режим, см. SsrHitTextures в редакторе). Как и
+	/// <see cref="TriangleAlbedo"/>, строится только пока живы CPU-пиксели: у стриминга и
+	/// cooked-моделей словарь пуст, потребитель падает на плитку среднего цвета материала.</summary>
+	public Dictionary<int, byte[]> MaterialAlbedoTile { get; } = new();
 
 	public OrderedDictionary<int, IMaterialObject> materialObjects = new();
 
@@ -1557,6 +1671,29 @@ public class ModelLoader
 		var primitiveToMeshIdMap = new Dictionary<MeshPrimitive, int>();
 		var meshWork = new List<MeshWorkItem>();
 
+		// Скелет и клипы - ДО обхода примитивов: скин-стрим вершин переводит локальные индексы скина
+		// в индексы джойнтов скелета, значит скелет к этому моменту обязан существовать.
+		prepared.Skeleton = SkinningImport.BuildSkeleton(model, out var nodeToJoint);
+		prepared.Animations.AddRange(SkinningImport.BuildAnimations(model, prepared.Skeleton, nodeToJoint));
+
+		// Скин висит на УЗЛЕ, а не на примитиве, но скин-стрим нужен именно примитиву - отсюда
+		// предпроход. Один и тот же примитив под двумя узлами с разными скинами разрешается в пользу
+		// первого: glTF такое допускает, живые ассеты - нет, а тащить в PreparedMesh вариант на скин
+		// значило бы дублировать всю геометрию ради несуществующего случая.
+		var primitiveToSkin = new Dictionary<MeshPrimitive, Skin>();
+		foreach (var node in model.LogicalNodes)
+		{
+			if (node.Mesh == null || node.Skin == null)
+			{
+				continue;
+			}
+
+			foreach (var primitive in node.Mesh.Primitives)
+			{
+				primitiveToSkin.TryAdd(primitive, node.Skin);
+			}
+		}
+
 		foreach (var logicalMesh in model.LogicalMeshes)
 		{
 			var baseMeshName = logicalMesh.Name ?? $"Mesh_{logicalMesh.LogicalIndex}";
@@ -1679,6 +1816,10 @@ public class ModelLoader
 					HasUv = uvsAccessor != null,
 					HasNormals = normalsAccessor != null,
 					HasTangents = tangents != null,
+					// Читается ЗДЕСЬ, а не в параллельной фазе ниже: SharpGLTF не потокобезопасен.
+					SourceSkin = primitiveToSkin.TryGetValue(primitive, out var primitiveSkin)
+						? SkinningImport.ReadSkinVertices(primitive, primitiveSkin, nodeToJoint, sourceVertices.Length)
+						: null,
 				});
 			}
 		}
@@ -1691,6 +1832,7 @@ public class ModelLoader
 			var work = meshWork[workIndex];
 			var sourceVertices = work.SourceVertices;
 			var sourceIndices = work.SourceIndices;
+			var sourceSkin = work.SourceSkin;
 
 			if (work.Topology == MeshTopologyTriangles)
 			{
@@ -1707,8 +1849,19 @@ public class ModelLoader
 				if (!work.HasNormals)
 				{
 					var flatVertices = new Vertex[sourceIndices.Length];
+					// Скин разваривается ВМЕСТЕ с геометрией: индексы вершин переписываются на
+					// 0..N-1, и стрим, оставшийся в старой индексации, раздал бы вершинам чужие кости.
+					var flatSkin = sourceSkin != null ? new SkinVertex[sourceIndices.Length] : null;
+
 					for (int t = 0; t + 2 < sourceIndices.Length; t += 3)
 					{
+						if (flatSkin != null)
+						{
+							flatSkin[t] = sourceSkin[sourceIndices[t]];
+							flatSkin[t + 1] = sourceSkin[sourceIndices[t + 1]];
+							flatSkin[t + 2] = sourceSkin[sourceIndices[t + 2]];
+						}
+
 						var v0 = sourceVertices[sourceIndices[t]];
 						var v1 = sourceVertices[sourceIndices[t + 1]];
 						var v2 = sourceVertices[sourceIndices[t + 2]];
@@ -1731,12 +1884,14 @@ public class ModelLoader
 					}
 
 					sourceVertices = flatVertices;
+					sourceSkin = flatSkin;
 				}
 			}
 			var (boundsCenter, boundsRadius) = MeshUtility.ComputeBoundsData(sourceVertices);
 
 			var finalVertices = sourceVertices;
 			var finalIndices = sourceIndices;
+			var finalSkin = sourceSkin;
 			LodLevel[] lodLevels = null;
 
 			if (work.Topology == MeshTopologyTriangles)
@@ -1752,15 +1907,38 @@ public class ModelLoader
 					MeshUtility.GenerateTangents(sourceVertices, sourceIndices);
 				}
 
-				if (options.OptimizeMesh)
+				if (finalSkin == null)
 				{
-					(finalVertices, finalIndices) = MeshUtility.OptimizeMeshData(finalVertices, finalIndices);
-				}
+					if (options.OptimizeMesh)
+					{
+						(finalVertices, finalIndices) = MeshUtility.OptimizeMeshData(finalVertices, finalIndices);
+					}
 
-				if (options.GenerateLods)
+					if (options.GenerateLods)
+					{
+						(finalVertices, finalIndices, lodLevels) =
+							MeshUtility.GenerateLodGroupData(finalVertices, finalIndices, options.LodRatios);
+					}
+				}
+				else
 				{
-					(finalVertices, finalIndices, lodLevels) =
-						MeshUtility.GenerateLodGroupData(finalVertices, finalIndices, options.LodRatios);
+					// Скиннед-меш проходит те же проходы, но СШИТОЙ вершиной: meshopt переставляет,
+					// склеивает и выбрасывает вершины, не отдавая наружу полную таблицу перестановки,
+					// и параллельный скин-стрим после этого разъезжается с геометрией (см. IMeshVertex).
+					var packed = MeshUtility.PackSkinned(finalVertices, finalSkin);
+
+					if (options.OptimizeMesh)
+					{
+						(packed, finalIndices) = MeshUtility.OptimizeMeshData(packed, finalIndices);
+					}
+
+					if (options.GenerateLods)
+					{
+						(packed, finalIndices, lodLevels) =
+							MeshUtility.GenerateLodGroupData(packed, finalIndices, options.LodRatios);
+					}
+
+					(finalVertices, finalSkin) = MeshUtility.UnpackSkinned(packed);
 				}
 			}
 
@@ -1769,6 +1947,7 @@ public class ModelLoader
 				Name = work.Name,
 				Vertices = finalVertices,
 				Indices = finalIndices,
+				SkinVertices = finalSkin,
 				LodLevels = lodLevels,
 				BoundsCenter = boundsCenter,
 				BoundsRadius = boundsRadius,
@@ -1807,6 +1986,28 @@ public class ModelLoader
 			{
 				if (primitiveToMeshIdMap.TryGetValue(primitive, out int meshId))
 				{
+					// Скиннед-примитив: по спеке glTF трансформация узла с мешом ИГНОРИРУЕТСЯ - меш
+					// живёт в пространстве скина, и всё положение задают джойнты. Запечь сюда
+					// WorldMatrix значило бы применить трансформацию узла дважды (второй раз - через
+					// матрицы джойнтов), и персонаж уезжал бы вдвое дальше от начала координат.
+					// Инстанс остаётся единичным: мировое размещение задаёт трансформ ENTITY, а поза -
+					// палитра скиннинг-матриц.
+					if (prepared.Meshes[meshId].SkinVertices != null)
+					{
+						prepared.Instances.Add(new InstanceData
+						{
+							transform = new Transform
+							{
+								position = Vector3.Zero,
+								rotation = Quaternion.Identity,
+								scale = Vector3.One,
+							},
+							meshId = meshId,
+							materialId = primitive.Material?.LogicalIndex ?? -1,
+						});
+						continue;
+					}
+
 					if (!trsValid)
 					{
 						var cacheKey = (meshId, node.WorldMatrix);
@@ -1865,8 +2066,12 @@ public class ModelLoader
 		// Шейдеры модели берутся из ОБЩЕГО кэша бэкенда: варианты у разных моделей практически
 		// всегда одни и те же, а компиляция идёт синхронно на потоке рендера (см. CreateSharedShader).
 		// Материалы модели помечены OwnsShaders=false, так что шарёный экземпляр никто не убьёт.
+		// FEATURE_RT_SHADOWS и на ВЕРШИННИКЕ: сам вершинник кейворд не читает, но он переключает
+		// компилятор на DXC/SM6.5 (см. DiligentShader) - D3D12 запрещает смешивать DXBC и DXIL в
+		// одном PSO, и FXC-вершинник с DXC-пикселем ломал создание пайплайна.
+		var vsKeywords = options.RtShadows ? new[] { "FEATURE_RT_SHADOWS" } : null;
 		var modelShaderVs = graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
-			ShaderObjectType.Vertex);
+			ShaderObjectType.Vertex, keywords: vsKeywords);
 		result._ownedShaders.Add(modelShaderVs);
 
 		// Пиксельные ВАРИАНТЫ по shader keywords (см. шапку UnlitInstancedPS.hlsl): эффекты,
@@ -1897,49 +2102,7 @@ public class ModelLoader
 		}
 
 		// pm == null - встроенный дефолтный материал (без текстур/расширений).
-		List<string> BuildMaterialKeywords(PreparedMaterial pm)
-		{
-			var keywords = new List<string>();
-
-			if (options.PreviewLightingFeatures)
-			{
-				keywords.Add("FEATURE_NORMAL_MAPS");
-				keywords.Add("FEATURE_OCCLUSION");
-				keywords.Add("FEATURE_SHADOWS");
-			}
-
-			if (pm == null)
-			{
-				return keywords;
-			}
-
-			if (pm.BaseColorTexture != null)
-			{
-				keywords.Add("HAS_BASECOLOR_TEXTURE");
-			}
-			if (pm.MetallicRoughnessTexture != null)
-			{
-				keywords.Add("HAS_MR_TEXTURE");
-			}
-			if (pm.AlphaCutoff > 0f)
-			{
-				keywords.Add("MATERIAL_ALPHA_CLIP");
-			}
-			if (pm.TransmissionFactor > 0f)
-			{
-				keywords.Add("MATERIAL_TRANSMISSION");
-				if (pm.Dispersion > 0f)
-				{
-					keywords.Add("MATERIAL_DISPERSION");
-				}
-			}
-			if (pm.SheenColorFactor != Vector3.Zero)
-			{
-				keywords.Add("MATERIAL_SHEEN");
-			}
-
-			return keywords;
-		}
+		List<string> BuildMaterialKeywords(PreparedMaterial pm) => BuildKeywordsFromPrepared(options, pm);
 
 		var defaultMaterial = graphicsApi.CreateMaterial("Default Material");
 
@@ -2566,9 +2729,10 @@ public class ModelLoader
 			{
 				if (pointShaderVs == null && vsFileName == "UnlitInstancedVS.hlsl")
 				{
-					// Добавляется в _ownedShaders сразу после создания - см. ниже.
+					// Добавляется в _ownedShaders сразу после создания - см. ниже. Кейворды - как у
+					// основного вершинника (DXC-паритет с RT-вариантом пикселя).
 					pointShaderVs = graphicsApi.CreateSharedShader("Model Point Vertex Shader", vsFactoryPath,
-						"UnlitInstancedPointVS.hlsl", ShaderObjectType.Vertex);
+						"UnlitInstancedPointVS.hlsl", ShaderObjectType.Vertex, keywords: vsKeywords);
 					result._ownedShaders.Add(pointShaderVs);
 				}
 
@@ -2626,17 +2790,482 @@ public class ModelLoader
 
 			result.Meshes.Add(meshObj);
 			result.MeshHasUv.Add(preparedMesh.HasUv);
+			result.MeshSkin.Add(preparedMesh.SkinVertices);
 
 			yield return (long)preparedMesh.Vertices.Length * VertexSizeBytes + (long)preparedMesh.Indices.Length * sizeof(uint);
 		}
 
+		result.Skeleton = prepared.Skeleton;
+		result.Animations.AddRange(prepared.Animations);
 		result.instances.AddRange(prepared.Instances);
+
+		// Потриугольное альбедо из текстур - пока CPU-пиксели base color ещё живы (после
+		// финализации они освобождаются). Потребитель - probe-GI бейкер: цвет отскока и
+		// RT-отражений в разрешении треугольников вместо одного среднего на материал.
+		ComputeTriangleAlbedoFromTextures(result, prepared);
 	}
 
-	/// <summary>Те же shader-кейворды, что строит локальный BuildMaterialKeywords внутри
-	/// <see cref="BuildFromPreparedIncremental"/>, но выведенные из уже посчитанных
-	/// <see cref="MaterialPbrFactors"/> вместо сырого <see cref="PreparedMaterial"/> (которого больше
-	/// нет - PrepareModel-данные живут только до конца ПЕРВОЙ финализации, см. ModelLoadRequest.FinalizeChunk).
+	/// <summary>Линейное альбедо КАЖДОГО треугольника меша: base color текстуры в центроиде UV
+	/// (точечная выборка с заворотом) x линейный фактор. Ключ - meshId; меши без текстуры/UV или
+	/// без CPU-пикселей (стриминг, cooked-модель) пропускаются - потребитель падает на средний
+	/// цвет материала (<see cref="MaterialPbrFactors.AverageBaseColor"/>). Стоимость - единицы
+	/// миллисекунд на Sponza (одна выборка на треугольник) на фоне декода текстур.</summary>
+	private static void ComputeTriangleAlbedoFromTextures(ModelLoader result, PreparedModel prepared)
+	{
+		var materialByLogical = new Dictionary<int, PreparedMaterial>();
+		foreach (var pm in prepared.Materials)
+		{
+			materialByLogical[pm.LogicalIndex] = pm;
+
+			// Плитка альбедо материала - тем же проходом, пока CPU-пиксели живы.
+			var tileSource = pm.BaseColorTexture;
+			if (tileSource?.Pixels != null && tileSource.Width > 0 && tileSource.Height > 0 &&
+				!result.MaterialAlbedoTile.ContainsKey(pm.LogicalIndex))
+			{
+				result.MaterialAlbedoTile[pm.LogicalIndex] = BuildAlbedoTile(tileSource);
+			}
+		}
+
+		// COOKED-путь: пикселей нет, но атрибуты приехали из .dmdl готовыми - распаковываем и
+		// выходим (см. PreparedModel.TriangleAttributes / EnsureTriangleAttributes).
+		if (prepared.TriangleAttributes.Count > 0)
+		{
+			foreach (var (meshId, packed) in prepared.TriangleAttributes)
+			{
+				int count = packed.Length / 5;
+				var albedoOut = new Vector3[count];
+				var metalOut = new float[count];
+				var roughOut = new float[count];
+				for (int t = 0; t < count; t++)
+				{
+					int b = t * 5;
+					albedoOut[t] = new Vector3(
+						MathF.Pow(packed[b] / 255f, 2.2f),
+						MathF.Pow(packed[b + 1] / 255f, 2.2f),
+						MathF.Pow(packed[b + 2] / 255f, 2.2f));
+					metalOut[t] = packed[b + 3] / 255f;
+					roughOut[t] = packed[b + 4] / 255f;
+				}
+
+				result.TriangleAlbedo[meshId] = albedoOut;
+				result.TriangleMetalness[meshId] = metalOut;
+				result.TriangleRoughness[meshId] = roughOut;
+			}
+
+			return;
+		}
+
+		foreach (var inst in prepared.Instances)
+		{
+			if (inst.meshId < 0 || inst.meshId >= prepared.Meshes.Count ||
+				result.TriangleAlbedo.ContainsKey(inst.meshId))
+			{
+				continue;
+			}
+
+			if (!materialByLogical.TryGetValue(inst.materialId, out var pm))
+			{
+				continue;
+			}
+
+			// Пикселей base color может не быть (стриминг/cooked) - это НЕ повод пропускать меш
+			// целиком: потриугольная металличность/шероховатость берётся из СВОЕЙ текстуры (ниже),
+			// а альбедо тогда честно падает на средний цвет материала.
+			var texture = pm.BaseColorTexture;
+			bool hasBasePixels = texture?.Pixels != null && texture.Width > 0 && texture.Height > 0;
+
+			var mesh = prepared.Meshes[inst.meshId];
+			if (!mesh.HasUv || mesh.Vertices == null || mesh.Indices == null || mesh.Indices.Length < 3)
+			{
+				continue;
+			}
+
+			// Средний цвет материала - фолбэк альбедо, когда пикселей нет (тот же источник, что у
+			// потребителя: MaterialPbrFactors.AverageBaseColor).
+			var factor = hasBasePixels
+				? new Vector3(pm.BaseColorFactor.X, pm.BaseColorFactor.Y, pm.BaseColorFactor.Z)
+				: new Vector3(ComputeAverageBaseColor(pm).X, ComputeAverageBaseColor(pm).Y,
+					ComputeAverageBaseColor(pm).Z);
+			int triCount = mesh.Indices.Length / 3;
+			var albedo = new Vector3[triCount];
+
+			// Буфер выборок - ОДИН на меш: stackalloc внутри цикла по треугольникам копит стек
+			// (кадр метода не освобождается до выхода) и на модели уровня Sponza его срывает.
+			Span<Vector2> taps = stackalloc Vector2[7];
+
+			// Металличность - тем же проходом (те же центроиды UV), из B-канала MR-текстуры
+			// (glTF: G - roughness, B - metallic; данные ЛИНЕЙНЫЕ, без sRGB-декода).
+			var mrTexture = pm.MetallicRoughnessTexture;
+
+			// Пикселей MR-текстуры нет (стриминг/cooked), а материал ПОТЕНЦИАЛЬНО металлический
+			// (фактор > 0.5 - у glTF-материалов с MR-текстурой он по умолчанию 1): декодируем её
+			// МЕЛКО, только ради потриугольных метал/шероховатости. Без этого сцена со стримингом
+			// получала фолбэк «фактор = 1» по обоим каналам, то есть «весь материал - шершавый
+			// металл»: цепочка отскоков RT-отражений не запускалась НИКОГДА (диагностика -
+			// отладочный вид «RT bounce chain»: сплошь зелёный). Стоимость ограничена: декод
+			// идёт только у металлических материалов и в 256px.
+			// Пиксели - в ЛОКАЛЬНЫХ переменных, а не в PreparedTexture: тот же экземпляр может уйти
+			// в печку ассетов, и подмена его пикселей мелким декодом запекла бы в .dtex 256px.
+			var mrPixels = mrTexture?.Pixels;
+			int mrWidth = mrTexture?.Width ?? 0;
+			int mrHeight = mrTexture?.Height ?? 0;
+
+			if (mrPixels == null && mrTexture?.StreamSource != null && pm.MetallicFactor > 0.5f)
+			{
+				try
+				{
+					var encoded = mrTexture.StreamSource.EncodedBytes
+						?? (mrTexture.StreamSource.FilePath != null && File.Exists(mrTexture.StreamSource.FilePath)
+							? File.ReadAllBytes(mrTexture.StreamSource.FilePath)
+							: null);
+					if (encoded != null)
+					{
+						var levels = DecodeEncodedImageLadder(encoded, 256, 256, 2);
+						if (levels.Count > 0)
+						{
+							var top = levels[levels.Count - 1];
+							mrPixels = top.Pixels;
+							mrWidth = top.Width;
+							mrHeight = top.Height;
+						}
+					}
+				}
+				catch (Exception)
+				{
+					// Декод - оптимизация качества отражений, а не источник правды: не вышло -
+					// молча падаем на факторы материала.
+				}
+			}
+
+			bool hasMrPixels = mrPixels != null && mrWidth > 0 && mrHeight > 0;
+			var metalness = hasMrPixels ? new float[triCount] : null;
+			var roughness = hasMrPixels ? new float[triCount] : null;
+
+			for (int t = 0; t < triCount; t++)
+			{
+				uint i0 = mesh.Indices[t * 3], i1 = mesh.Indices[t * 3 + 1], i2 = mesh.Indices[t * 3 + 2];
+				if (i0 >= mesh.Vertices.Length || i1 >= mesh.Vertices.Length || i2 >= mesh.Vertices.Length)
+				{
+					albedo[t] = factor;
+					if (metalness != null)
+					{
+						metalness[t] = pm.MetallicFactor;
+						roughness![t] = pm.RoughnessFactor;
+					}
+					continue;
+				}
+
+				// СЕМЬ точек по треугольнику вместо одного центроида: центр, вершины (поджатые
+				// внутрь) и середины рёбер. Одна выборка ловит шум текстуры - в MR-картах
+				// реальных ассетов канал металличности «крапчатый», и у отдельных треугольников
+				// неметаллической ткани центроид попадал в тексель 0.6+, что в RT-отражениях
+				// читалось выбросами по треугольникам. Усреднение убирает крапинки, не размывая
+				// крупные детали (внутри треугольника цвет всё равно один).
+				var uvA = mesh.Vertices[i0].TexCoord;
+				var uvB = mesh.Vertices[i1].TexCoord;
+				var uvC = mesh.Vertices[i2].TexCoord;
+				var uvCentroid = (uvA + uvB + uvC) / 3f;
+				taps[0] = uvCentroid;
+				taps[1] = Vector2.Lerp(uvA, uvCentroid, 0.25f);
+				taps[2] = Vector2.Lerp(uvB, uvCentroid, 0.25f);
+				taps[3] = Vector2.Lerp(uvC, uvCentroid, 0.25f);
+				taps[4] = Vector2.Lerp((uvA + uvB) * 0.5f, uvCentroid, 0.25f);
+				taps[5] = Vector2.Lerp((uvB + uvC) * 0.5f, uvCentroid, 0.25f);
+				taps[6] = Vector2.Lerp((uvC + uvA) * 0.5f, uvCentroid, 0.25f);
+
+				var albedoSum = Vector3.Zero;
+				float metalSum = 0f, roughSum = 0f;
+				int albedoTaps = 0, mrTaps = 0;
+
+				foreach (var tap in taps)
+				{
+					// Заворот UV как у Wrap-сэмплера (отрицательные тоже).
+					float u = tap.X - MathF.Floor(tap.X);
+					float v = tap.Y - MathF.Floor(tap.Y);
+
+					if (hasBasePixels)
+					{
+						int px = Math.Clamp((int)(u * texture!.Width), 0, texture.Width - 1);
+						int py = Math.Clamp((int)(v * texture.Height), 0, texture.Height - 1);
+						int idx = (py * texture.Width + px) * 4;
+						if (idx + 2 < texture.Pixels!.Length)
+						{
+							// sRGB -> linear тем же pow(2.2), что и шейдер (см. UnlitInstancedPS.hlsl).
+							albedoSum += new Vector3(
+								MathF.Pow(texture.Pixels[idx] / 255f, 2.2f),
+								MathF.Pow(texture.Pixels[idx + 1] / 255f, 2.2f),
+								MathF.Pow(texture.Pixels[idx + 2] / 255f, 2.2f));
+							albedoTaps++;
+						}
+					}
+
+					if (metalness != null)
+					{
+						int mx = Math.Clamp((int)(u * mrWidth), 0, mrWidth - 1);
+						int my = Math.Clamp((int)(v * mrHeight), 0, mrHeight - 1);
+						int mBase = (my * mrWidth + mx) * 4;
+						if (mBase + 2 < mrPixels!.Length)
+						{
+							// glTF-упаковка: G - roughness, B - metallic; данные линейные.
+							metalSum += mrPixels[mBase + 2] / 255f;
+							roughSum += mrPixels[mBase + 1] / 255f;
+							mrTaps++;
+						}
+					}
+				}
+
+				albedo[t] = albedoTaps > 0 ? albedoSum / albedoTaps * factor : factor;
+
+				if (metalness != null)
+				{
+					metalness[t] = mrTaps > 0 ? metalSum / mrTaps * pm.MetallicFactor : pm.MetallicFactor;
+					roughness![t] = mrTaps > 0 ? roughSum / mrTaps * pm.RoughnessFactor : pm.RoughnessFactor;
+				}
+			}
+
+			result.TriangleAlbedo[inst.meshId] = albedo;
+			if (metalness != null)
+			{
+				result.TriangleMetalness[inst.meshId] = metalness;
+				result.TriangleRoughness[inst.meshId] = roughness!;
+			}
+		}
+	}
+
+	/// <summary>Считает <see cref="PreparedModel.TriangleAttributes"/> - упакованные потриугольные
+	/// альбедо/металличность/шероховатость - ПОКА ЖИВЫ ПИКСЕЛИ текстур. Зовётся печкой ассетов
+	/// перед записью .dmdl: у cooked-модели пикселей нет, и без этого блока RT-отражения теряли и
+	/// текстурный цвет хитов, и материал (цепочка отскоков не запускалась - «металла в сцене
+	/// нет»). Побочный эффект осознан: на модель уходит 5 байт на треугольник в кеше.</summary>
+	internal static void EnsureTriangleAttributes(PreparedModel prepared)
+	{
+		if (prepared.TriangleAttributes.Count > 0)
+		{
+			return;
+		}
+
+		// Считаем тем же кодом, что и на обычной загрузке, - через временный контейнер.
+		var scratch = new ModelLoader();
+		ComputeTriangleAlbedoFromTextures(scratch, prepared);
+
+		foreach (var (meshId, albedo) in scratch.TriangleAlbedo)
+		{
+			scratch.TriangleMetalness.TryGetValue(meshId, out var metal);
+			scratch.TriangleRoughness.TryGetValue(meshId, out var rough);
+
+			var packed = new byte[albedo.Length * 5];
+			for (int t = 0; t < albedo.Length; t++)
+			{
+				int b = t * 5;
+				packed[b] = EncodeUnitSrgb(albedo[t].X);
+				packed[b + 1] = EncodeUnitSrgb(albedo[t].Y);
+				packed[b + 2] = EncodeUnitSrgb(albedo[t].Z);
+				packed[b + 3] = EncodeUnit(metal != null && t < metal.Length ? metal[t] : 0f);
+				packed[b + 4] = EncodeUnit(rough != null && t < rough.Length ? rough[t] : 1f);
+			}
+
+			prepared.TriangleAttributes[meshId] = packed;
+		}
+	}
+
+	private static byte EncodeUnit(float value) =>
+		(byte)Math.Clamp((int)(Math.Clamp(value, 0f, 1f) * 255f + 0.5f), 0, 255);
+
+	private static byte EncodeUnitSrgb(float linear) =>
+		EncodeUnit(MathF.Pow(Math.Clamp(linear, 0f, 1f), 1f / 2.2f));
+
+	/// <summary>Бокс-даунсемпл base color текстуры в плитку <see cref="AlbedoTileSize"/>² (см.
+	/// <see cref="MaterialAlbedoTile"/>). Усреднение в линейном пространстве, но по РАЗРЕЖЕННОЙ
+	/// сетке (до 4x4 сэмплов на тексель плитки, как stride у ComputeAverageBaseColor): полный
+	/// проход по 2К-текстуре стоил бы сотни миллионов выборок на модель, а плитке 128² больше
+	/// точности и не нужно.</summary>
+	private static byte[] BuildAlbedoTile(PreparedTexture texture)
+	{
+		const int size = AlbedoTileSize;
+
+		// sRGB -> linear через таблицу: pow на каждый сэмпл - главная цена всего прохода.
+		Span<float> toLinear = stackalloc float[256];
+		for (int i = 0; i < 256; i++)
+		{
+			toLinear[i] = MathF.Pow(i / 255f, 2.2f);
+		}
+
+		var tile = new byte[size * size * 4];
+		var pixels = texture.Pixels!;
+		for (int ty = 0; ty < size; ty++)
+		{
+			int y0 = (int)((long)ty * texture.Height / size);
+			int y1 = Math.Max(y0 + 1, (int)((long)(ty + 1) * texture.Height / size));
+			int strideY = Math.Max(1, (y1 - y0) / 4);
+			for (int tx = 0; tx < size; tx++)
+			{
+				int x0 = (int)((long)tx * texture.Width / size);
+				int x1 = Math.Max(x0 + 1, (int)((long)(tx + 1) * texture.Width / size));
+				int strideX = Math.Max(1, (x1 - x0) / 4);
+
+				float r = 0f, g = 0f, b = 0f;
+				int count = 0;
+				for (int y = y0; y < y1; y += strideY)
+				{
+					int row = y * texture.Width;
+					for (int x = x0; x < x1; x += strideX)
+					{
+						int idx = (row + x) * 4;
+						if (idx + 2 >= pixels.Length)
+						{
+							continue;
+						}
+
+						r += toLinear[pixels[idx]];
+						g += toLinear[pixels[idx + 1]];
+						b += toLinear[pixels[idx + 2]];
+						count++;
+					}
+				}
+
+				int outIdx = (ty * size + tx) * 4;
+				if (count > 0)
+				{
+					float inv = 1f / count;
+					tile[outIdx] = (byte)Math.Clamp((int)(MathF.Pow(r * inv, 1f / 2.2f) * 255f + 0.5f), 0, 255);
+					tile[outIdx + 1] = (byte)Math.Clamp((int)(MathF.Pow(g * inv, 1f / 2.2f) * 255f + 0.5f), 0, 255);
+					tile[outIdx + 2] = (byte)Math.Clamp((int)(MathF.Pow(b * inv, 1f / 2.2f) * 255f + 0.5f), 0, 255);
+				}
+
+				tile[outIdx + 3] = 255;
+			}
+		}
+
+		return tile;
+	}
+
+	/// <summary>Shader-кейворды материала по сырому <see cref="PreparedMaterial"/> - единственный
+	/// источник истины и для финализации (локальный BuildMaterialKeywords внутри
+	/// <see cref="BuildFromPreparedIncremental"/>), и для фоновой прекомпиляции
+	/// (<see cref="PrecompileShaderVariants"/>): разойдись наборы, прекомпиляция грела бы не те
+	/// варианты, и финализация снова компилировала бы синхронно на GPU-потоке.
+	/// pm == null - встроенный дефолтный материал (без текстур/расширений).</summary>
+	private static List<string> BuildKeywordsFromPrepared(ModelLoadOptions options, PreparedMaterial pm)
+	{
+		var keywords = new List<string>();
+
+		if (options.PreviewLightingFeatures)
+		{
+			keywords.Add("FEATURE_NORMAL_MAPS");
+			keywords.Add("FEATURE_OCCLUSION");
+			keywords.Add("FEATURE_SHADOWS");
+		}
+
+		// Теневые лучи по TLAS - вариант компилируется DXC/SM6.5 (см. DiligentShader) и требует
+		// привязанного TLAS; включается только на устройстве с inline-трассировкой.
+		if (options.RtShadows)
+		{
+			keywords.Add("FEATURE_RT_SHADOWS");
+		}
+
+		// Тонкий G-buffer отражений вторым/третьим MRT-слотом (см. ModelLoadOptions.ReflectionGbuffer).
+		if (options.ReflectionGbuffer)
+		{
+			keywords.Add("FEATURE_REFLECTION_GBUFFER");
+		}
+
+		if (pm == null)
+		{
+			return keywords;
+		}
+
+		if (pm.BaseColorTexture != null)
+		{
+			keywords.Add("HAS_BASECOLOR_TEXTURE");
+		}
+		if (pm.MetallicRoughnessTexture != null)
+		{
+			keywords.Add("HAS_MR_TEXTURE");
+		}
+		if (pm.AlphaCutoff > 0f)
+		{
+			keywords.Add("MATERIAL_ALPHA_CLIP");
+		}
+		if (pm.TransmissionFactor > 0f)
+		{
+			keywords.Add("MATERIAL_TRANSMISSION");
+			if (pm.Dispersion > 0f)
+			{
+				keywords.Add("MATERIAL_DISPERSION");
+			}
+		}
+		if (pm.SheenColorFactor != Vector3.Zero)
+		{
+			keywords.Add("MATERIAL_SHEEN");
+		}
+
+		return keywords;
+	}
+
+	/// <summary>Компилирует шейдер-варианты модели ЕЩЁ В ФОНОВОЙ фазе загрузки (см.
+	/// ModelLoadRequest): наборы кейвордов известны сразу после парса материалов, а создание
+	/// ресурсов у IRenderDevice, в отличие от контекстов, потокобезопасно. Без этого компиляция
+	/// происходила лениво - из DiligentMaterial.SetShader во время финализации, то есть синхронно
+	/// на GPU-потоке: секунды фриза на КАЖДЫЙ ещё не виденный вариант UnlitInstancedPS (12+ с у
+	/// Sponza при холодном кеше байткода, см. DiligentShaderBytecodeCache). Здесь же варианты
+	/// компилируются параллельно, пока грузятся текстуры, и финализации остаётся готовый
+	/// нативный объект из общего кэша (CreateSharedShader выдаёт ТОТ ЖЕ экземпляр - ключ кэша
+	/// совпадает с ключом, который потом соберёт GetPixelShaderVariant).
+	///
+	/// Материалы-клоны не-треугольных топологий не греются: их вершинный шейдер зависит от
+	/// топологии (см. BuildTopologyClones), встречаются они редко и компилируются по-старому.</summary>
+	private static void PrecompileShaderVariants(IGraphicsApi graphicsApi, ModelLoadOptions options,
+		PreparedModel prepared, CancellationToken cancellationToken)
+	{
+		var (vsFactoryPath, vsFileName) = options.VertexShader.ToShaderFactoryParts();
+		var (psFactoryPath, psFileName) = options.PixelShader.ToShaderFactoryParts();
+
+		var shaders = new List<IShaderObject>
+		{
+			// Кейворды вершинника - как в финализации (DXC-паритет RT-варианта, см. там же).
+			graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
+				ShaderObjectType.Vertex,
+				keywords: options.RtShadows ? new[] { "FEATURE_RT_SHADOWS" } : null)
+		};
+
+		var seenVariants = new HashSet<string>(StringComparer.Ordinal);
+		void AddVariant(PreparedMaterial pm)
+		{
+			var keywords = BuildKeywordsFromPrepared(options, pm);
+			keywords.Sort(StringComparer.Ordinal);
+			var cacheKey = string.Join(";", keywords);
+			if (!seenVariants.Add(cacheKey))
+			{
+				return;
+			}
+
+			shaders.Add(graphicsApi.CreateSharedShader(
+				cacheKey.Length == 0 ? "Model Pixel Shader" : $"Model Pixel Shader [{cacheKey}]",
+				psFactoryPath, psFileName, ShaderObjectType.Pixel, "Main", keywords.ToArray()));
+		}
+
+		// null-материалы модели получают встроенный дефолтный (см. BuildFromPreparedIncremental) -
+		// его вариант нужен всегда.
+		AddVariant(null);
+		foreach (var pm in prepared.Materials)
+		{
+			if (!pm.IsNull)
+			{
+				AddVariant(pm);
+			}
+		}
+
+		// Параллельно: вариантов единицы, но холодный стоит секунды - последовательный прогрев
+		// растягивал бы фоновую фазу почти на их сумму. Compile идемпотентен и сам держит замок
+		// экземпляра, отмена проверяется на входе в каждый элемент.
+		Parallel.ForEach(shaders, new ParallelOptions { CancellationToken = cancellationToken },
+			shader => shader.Compile());
+	}
+
+	/// <summary>Те же shader-кейворды, что и <see cref="BuildKeywordsFromPrepared"/>, но выведенные
+	/// из уже посчитанных <see cref="MaterialPbrFactors"/> вместо сырого <see cref="PreparedMaterial"/>
+	/// (которого больше нет - PrepareModel-данные живут только до конца ПЕРВОЙ финализации, см.
+	/// ModelLoadRequest.FinalizeChunk).
 	/// pbr == null - встроенный дефолтный материал (материал-клон без источника), как и pm == null там.</summary>
 	private static List<string> BuildKeywordsFromFactors(ModelLoadOptions options, MaterialPbrFactors? pbr)
 	{
@@ -2647,6 +3276,17 @@ public class ModelLoader
 			keywords.Add("FEATURE_NORMAL_MAPS");
 			keywords.Add("FEATURE_OCCLUSION");
 			keywords.Add("FEATURE_SHADOWS");
+		}
+
+		// Зеркало BuildKeywordsFromPrepared - наборы обязаны совпадать (см. комментарий там).
+		if (options.RtShadows)
+		{
+			keywords.Add("FEATURE_RT_SHADOWS");
+		}
+
+		if (options.ReflectionGbuffer)
+		{
+			keywords.Add("FEATURE_REFLECTION_GBUFFER");
 		}
 
 		if (pbr == null)
@@ -2715,8 +3355,10 @@ public class ModelLoader
 		var (vsFactoryPath, vsFileName) = options.VertexShader.ToShaderFactoryParts();
 		var (psFactoryPath, psFileName) = options.PixelShader.ToShaderFactoryParts();
 
+		// Кейворды вершинника - как в финализации (DXC-паритет RT-варианта, см. там же).
 		var modelShaderVs = graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
-			ShaderObjectType.Vertex);
+			ShaderObjectType.Vertex,
+			keywords: options.RtShadows ? new[] { "FEATURE_RT_SHADOWS" } : null);
 
 		var pixelShaderVariants = new Dictionary<string, IShaderObject>();
 		IShaderObject GetPixelShaderVariant(List<string> keywords)
@@ -3420,6 +4062,9 @@ public class ModelLoader
 		public bool HasUv;
 		public bool HasNormals;
 		public bool HasTangents;
+
+		/// <summary>Скин-стрим примитива, null у статической геометрии (см. <see cref="SkinVertex"/>).</summary>
+		public SkinVertex[] SourceSkin;
 	}
 
 	internal sealed class PreparedMesh
@@ -3428,6 +4073,10 @@ public class ModelLoader
 		public Vertex[] Vertices;
 		public uint[] Indices;
 		public LodLevel[] LodLevels;
+
+		/// <summary>Скиннинг-атрибуты, параллельные <see cref="Vertices"/>; null - меш статический и
+		/// рисуется прежним путём без compute-скиннинга.</summary>
+		public SkinVertex[] SkinVertices;
 		public Vector3 BoundsCenter;
 		public float BoundsRadius;
 		public bool HasUv;
@@ -3441,6 +4090,14 @@ public class ModelLoader
 		public List<PreparedMaterial> Materials = new();
 		public List<PreparedMesh> Meshes = new();
 		public List<InstanceData> Instances = new();
+
+		/// <summary>Скелет модели, null у статической. Один на модель, даже если скинов несколько
+		/// (см. <see cref="SkinningImport.BuildSkeleton"/>).</summary>
+		public PreparedSkeleton Skeleton;
+
+		/// <summary>Клипы, разложенные по джойнтам <see cref="Skeleton"/>. Пусто, если скелета нет
+		/// или ни один клип его не задевает.</summary>
+		public List<PreparedAnimation> Animations = new();
 
 		/// <summary>Реестр материалов-клонов для не-треугольных топологий: синтетический ключ ->
 		/// (исходный glTF-материал, код топологии). Заполняется в PrepareModel, материализуется в
@@ -3456,6 +4113,14 @@ public class ModelLoader
 		/// несжатыми - главный вкладчик в пиковую память загрузки.</summary>
 		public int DecodedImages;
 		public long DecodedBytes;
+
+		/// <summary>Потриугольные атрибуты материала (ключ - meshId), по 5 байт на треугольник:
+		/// альбедо RGB в sRGB-кодировке + металличность + шероховатость. Считаются ПО ПИКСЕЛЯМ
+		/// текстур, поэтому обязаны попадать в .dmdl: в cooked-модели пикселей нет вовсе, и
+		/// пересчитать это на загрузке не из чего - без них у RT-отражений оставались плоский
+		/// средний цвет и «неизвестный» материал (цепочка отскоков не запускалась никогда).
+		/// Пусто = ещё не считалось (см. <see cref="EnsureTriangleAttributes"/>).</summary>
+		public Dictionary<int, byte[]> TriangleAttributes = new();
 	}
 
 	/// <summary>
@@ -3498,6 +4163,9 @@ public class ModelLoader
 			PrepareTask = Task.Run(() =>
 			{
 				_prepared = PrepareModel(modelPath, options, combinedProgress, cancellationToken);
+				// Прогрев шейдер-вариантов ЗДЕСЬ, в фоне - иначе они компилируются лениво из
+				// SetShader во время финализации, синхронно на GPU-потоке (см. PrecompileShaderVariants).
+				PrecompileShaderVariants(graphicsApi, options, _prepared, cancellationToken);
 			}, cancellationToken);
 		}
 

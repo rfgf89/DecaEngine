@@ -19,6 +19,11 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 	private readonly EditorSettings _editorSettings;
 
 	private OpenFolderDialog? _openFolderDialog;
+
+	/// <summary>Проект, открытие которого сейчас идёт в фоне (см. LoadProjectFromSln): нужен, чтобы
+	/// по завершении дописать его в недавние и в заголовок окна.</summary>
+	private string? _pendingProjectSln;
+
 	private bool _autoLoadAttempted;
 	private bool _settingsAutoOpened;
 	private int _autoOpenFrame;
@@ -64,6 +69,9 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 			}
 		}
 
+		// Открытие проекта идёт в фоне - его завершение подхватывается здесь, каждый кадр.
+		PollProjectLoad();
+
 		_newProjectWindow.Render(0);
 		_settingsWindow.Render(0);
 
@@ -85,6 +93,14 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 				if (ImGui.BeginMenu("Recently Project"))
 				{
+					// Чистка от удалённых с диска проектов - В МОМЕНТ ОТКРЫТИЯ меню, а не каждый
+					// кадр: File.Exists на каждый пункт при отвалившемся сетевом диске - это
+					// подвисание меню на каждом кадре, пока оно открыто.
+					if (ImGui.IsWindowAppearing())
+					{
+						_recentProjects.Prune();
+					}
+
 					if (_recentProjects.Entries.Count == 0)
 					{
 						ImGui.TextDisabled("Нет недавних проектов");
@@ -287,11 +303,28 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 		LoadProjectFromSln(slnFile);
 	}
 
+	/// <summary>Начинает открытие проекта. Дожидается его <see cref="PollProjectLoad"/> - открытие
+	/// идёт в фоне (сборка проекта занимает минуты, см. ProjectSession.BeginLoadProject), и держать
+	/// на нём кадр нельзя.</summary>
 	private void LoadProjectFromSln(string slnPath)
 	{
-		_projectSession.LoadProject(slnPath);
+		_pendingProjectSln = slnPath;
+		_projectSession.BeginLoadProject(slnPath);
+	}
 
-		if (_projectSession.State != AssemblyAppState.NotLoaded)
+	/// <summary>Доводит открытие до конца и делает то, что зависит от результата: список недавних и
+	/// заголовок окна. Звать каждый кадр.</summary>
+	private void PollProjectLoad()
+	{
+		if (!_projectSession.PollLoad())
+		{
+			return;
+		}
+
+		var slnPath = _pendingProjectSln;
+		_pendingProjectSln = null;
+
+		if (slnPath is not null && _projectSession.State != AssemblyAppState.NotLoaded)
 		{
 			_recentProjects.Add(slnPath);
 			_windowHandle.SetTitle($"{_projectSession.DisplayName} - DecaEngine Editor");

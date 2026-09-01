@@ -47,6 +47,12 @@ namespace DecaEngine
 		public IWindowHandle WindowHandle { get; set; }
 		public DiligentPsoManager PsoManager { get; private set; }
 
+		/// <summary>Дисковый кеш байткода шейдеров (HLSL -> DXIL/DXBC/SPIR-V), null - выключен
+		/// (DECA_SHADER_CACHE=0 или не удалось создать директорию). Дополняет PsoManager: тот
+		/// кеширует только драйверную часть PSO, а секунды на большие варианты UnlitInstancedPS
+		/// съедает именно компилятор - см. DiligentShaderBytecodeCache.</summary>
+		public DiligentShaderBytecodeCache? ShaderBytecodeCache { get; private set; }
+
 		/// <summary>См. <see cref="IGraphicsApi.PresentInterval"/>. Дефолт 1 (vsync) - осознанный, см.
 		/// комментарий в <see cref="Present"/>; переменная окружения DECA_VSYNC перекрывает его при
 		/// старте (0 - без ожидания, 1..4 - интервалы синхронизации).</summary>
@@ -106,6 +112,13 @@ namespace DecaEngine
 					: RayTracingSupport.Pipeline;
 			}
 		}
+
+		/// <summary>Включил ли девайс динамическую индексацию массивов шейдерных ресурсов
+		/// (ShaderResourceRuntimeArrays, запрошена Optional в Initialize) - гейт bindless-режима
+		/// текстур RT-хитов SSR. На D3D12 есть всегда; на Vulkan зависит от драйвера.</summary>
+		public bool SupportsShaderResourceArrays =>
+			_renderDevice != null &&
+			Device.GetDeviceInfo().Features.ShaderResourceRuntimeArrays == DeviceFeatureState.Enabled;
 
 		public DiligentGraphicsApi(IWindowHandle windowHandle)
 		{
@@ -177,6 +190,10 @@ namespace DecaEngine
 		/// PS-варианта стоит секунды.</summary>
 		private readonly Dictionary<string, DiligentShader> _shaderCache = new();
 
+		/// <summary>Кэш дёргают и фоновые потоки загрузки (см. ModelLoader.PrecompileShaderVariants),
+		/// и главный - словарь без замка рвался бы гонкой на ресайзе.</summary>
+		private readonly object _shaderCacheLock = new();
+
 		/// <summary>
 		/// Шейдер из общего кэша - ТОЛЬКО для потребителей, чьи материалы помечены OwnsShaders=false
 		/// (сейчас это загрузка моделей, см. ModelLoader.BuildFromPreparedIncremental). Обычный
@@ -197,21 +214,24 @@ namespace DecaEngine
 			var key = string.Concat(factoryPath, "|", filePath, "|", entryPoint, "|", ((int)type).ToString(), "|",
 				keywords == null ? "" : string.Join(";", keywords));
 
-			if (_shaderCache.TryGetValue(key, out var cached))
+			lock (_shaderCacheLock)
 			{
-				return cached;
+				if (_shaderCache.TryGetValue(key, out var cached))
+				{
+					return cached;
+				}
+
+				// Шареный между моделями объект: его Release игнорируется (см. DiligentShader.IsShared) -
+				// иначе освобождение одной модели убило бы нативный шейдер, которым пользуются живые
+				// материалы другой.
+				var shader = new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords)
+				{
+					IsShared = true,
+				};
+
+				_shaderCache[key] = shader;
+				return shader;
 			}
-
-			// Шареный между моделями объект: его Release игнорируется (см. DiligentShader.IsShared) -
-			// иначе освобождение одной модели убило бы нативный шейдер, которым пользуются живые
-			// материалы другой.
-			var shader = new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords)
-			{
-				IsShared = true,
-			};
-
-			_shaderCache[key] = shader;
-			return shader;
 		}
 
 		public IShaderObject CreateShader(string name, string factoryPath, string filePath, ShaderObjectType type)
@@ -232,12 +252,15 @@ namespace DecaEngine
 		/// <summary>Освобождает кэш шейдеров (их Release игнорирует IsShared - только отсюда).</summary>
 		private void ReleaseShaderCache()
 		{
-			foreach (var shader in _shaderCache.Values)
+			lock (_shaderCacheLock)
 			{
-				shader.ReleaseShared();
-			}
+				foreach (var shader in _shaderCache.Values)
+				{
+					shader.ReleaseShared();
+				}
 
-			_shaderCache.Clear();
+				_shaderCache.Clear();
+			}
 		}
 
 		private static TextureAddressMode ToDiligent(TextureAddress mode)
@@ -411,6 +434,96 @@ namespace DecaEngine
 			};
 
 			return new DiligentGpuTexture(data.Name, textureInfo, nativeTexture);
+		}
+
+		/// <summary>
+		/// Texture2DArray из готовых CPU-слоёв ОДНОГО размера (RGBA8, один мип на слой). Нужна
+		/// атласу текстур RT-хитов (см. SsrHitTextures): остальные пути создания сэмплируемых
+		/// текстур прибиты к Tex2d. Формат - UNorm без sRGB, как у всех текстур движка: перевод в
+		/// линейное пространство делает шейдер (pow 2.2), см. DiligentResourceFormats.
+		/// </summary>
+		public unsafe IGpuTexture CreateTextureArray(string name, int width, int height,
+			IReadOnlyList<byte[]> layers)
+		{
+			if (layers.Count == 0)
+			{
+				throw new ArgumentException("Texture array needs at least one layer", nameof(layers));
+			}
+
+			var desc = new TextureDesc
+			{
+				Name = name,
+				Type = ResourceDimension.Tex2dArray,
+				Width = (uint)width,
+				Height = (uint)height,
+				ArraySizeOrDepth = (uint)layers.Count,
+				Format = TextureFormat.RGBA8_UNorm,
+				BindFlags = BindFlags.ShaderResource,
+				Usage = Usage.Immutable,
+				MipLevels = 1,
+			};
+
+			var handles = new System.Runtime.InteropServices.GCHandle[layers.Count];
+			try
+			{
+				var subResources = new TextureSubResData[layers.Count];
+				for (int i = 0; i < layers.Count; i++)
+				{
+					if (layers[i].Length < width * height * 4)
+					{
+						throw new ArgumentException(
+							$"Texture array '{name}' layer {i} holds {layers[i].Length} bytes, expected {width * height * 4}");
+					}
+
+					handles[i] = System.Runtime.InteropServices.GCHandle.Alloc(
+						layers[i], System.Runtime.InteropServices.GCHandleType.Pinned);
+					subResources[i] = new TextureSubResData
+					{
+						Data = handles[i].AddrOfPinnedObject(),
+						Stride = (uint)(width * 4),
+					};
+				}
+
+				var textureData = new TextureData { SubResources = subResources, Context = ImmediateContext };
+				var nativeTexture = Device.CreateTexture(desc, textureData);
+				if (nativeTexture == null)
+				{
+					throw new InvalidOperationException(
+						$"Failed to create texture array '{name}' ({width}x{height}x{layers.Count}) - likely out of GPU memory.");
+				}
+
+				ImmediateContext.TransitionResourceStates(
+				[
+					new StateTransitionDesc()
+					{
+						Resource = nativeTexture,
+						OldState = ResourceState.Unknown,
+						NewState = ResourceState.ShaderResource,
+						Flags = StateTransitionFlags.UpdateState
+					}
+				]);
+
+				var textureInfo = new DecaEngine.Graphics.Core.TextureInfo
+				{
+					name = name,
+					width = (uint)width,
+					height = (uint)height,
+					format = TextureObjectFormat.R8G8B8A8UNorm,
+					type = TextureType.Texture2DArray,
+				};
+
+				return new DiligentGpuTexture(name, textureInfo, nativeTexture);
+			}
+			finally
+			{
+				foreach (var handle in handles)
+				{
+					if (handle.IsAllocated)
+					{
+						handle.Free();
+					}
+				}
+			}
 		}
 
 		/// <summary>
@@ -781,6 +894,12 @@ namespace DecaEngine
 			// рабочей директории (см. DiligentPsoManager).
 			PsoManager = new DiligentPsoManager(Device,
 				Path.Combine(Environment.CurrentDirectory, $"cache.{backend.ToString().ToLowerInvariant()}.pso"));
+			// Директория тоже пер-бэкендная: DXIL, DXBC и SPIR-V взаимно нечитаемы, а ключ записи
+			// на разных бэкендах совпал бы с точностью до макроса DECA_VULKAN (см. тот же довод у
+			// файла PSO-кеша выше).
+			ShaderBytecodeCache = DiligentShaderBytecodeCache.Create(
+				Path.Combine(Environment.CurrentDirectory, $"cache.{backend.ToString().ToLowerInvariant()}.shaders"),
+				backend.ToString());
 			WindowHandle.OnWindowResize += OnWindowHandleResize;
 
 			void SetupD3D11()
@@ -877,6 +996,11 @@ namespace DecaEngine
 					// создание устройства, а так фича просто останется выключенной, и вызывающий
 					// уйдёт на compute-обход своего BVH (см. IGraphicsApi.RayTracing).
 					RayTracing = DeviceFeatureState.Optional,
+					// Динамическая индексация массивов шейдерных ресурсов (Texture2D arr[N] с
+					// NonUniformResourceIndex) - «bindless»-текстуры RT-хитов SSR. Тоже Optional:
+					// на D3D12 бесплатно всегда, на Vulkan включает descriptor indexing, если
+					// драйвер умеет; наличие проверяется через SupportsShaderResourceArrays.
+					ShaderResourceRuntimeArrays = DeviceFeatureState.Optional,
 				};
 
 				engineFactory.CreateDeviceAndContextsD3D12(createInfo, out var renderDevice, out var deviceContexts);
@@ -945,6 +1069,11 @@ namespace DecaEngine
 					// создание устройства, а так фича просто останется выключенной, и вызывающий
 					// уйдёт на compute-обход своего BVH (см. IGraphicsApi.RayTracing).
 					RayTracing = DeviceFeatureState.Optional,
+					// Динамическая индексация массивов шейдерных ресурсов (Texture2D arr[N] с
+					// NonUniformResourceIndex) - «bindless»-текстуры RT-хитов SSR. Тоже Optional:
+					// на D3D12 бесплатно всегда, на Vulkan включает descriptor indexing, если
+					// драйвер умеет; наличие проверяется через SupportsShaderResourceArrays.
+					ShaderResourceRuntimeArrays = DeviceFeatureState.Optional,
 				};
 
 				engineFactory.CreateDeviceAndContextsVk(createInfo, out var renderDevice, out var deviceContexts);

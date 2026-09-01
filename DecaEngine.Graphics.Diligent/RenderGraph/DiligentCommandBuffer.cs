@@ -23,6 +23,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             None,
             SetBackBufferTarget,
             SetRenderTarget,
+            SetRenderTargetsMulti,
             ClearRenderTarget,
             ClearDepthStencil,
             SetVertexBuffers,
@@ -260,6 +261,25 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             if (!_isRecording) return;
             ref var cmd = ref NextCommand(CommandType.SetRenderTarget);
             cmd.Obj1 = rtvView; cmd.Obj2 = dsvView;
+        }
+
+        /// <summary>См. <see cref="ICommandBuffer.SetRenderTargets"/>. Массив вьюх аллоцируется при
+        /// ЗАПИСИ (запись у графа происходит один раз на компиляцию, реплей массив только читает) -
+        /// хелпер-массив на 1 слот здесь не годится, команд с разными наборами в буфере несколько.</summary>
+        public void SetRenderTargets(IGpuTexture[] rtvs, IGpuTexture dsv)
+        {
+            var views = new ITextureView[rtvs.Length];
+            for (int i = 0; i < rtvs.Length; i++)
+            {
+                views[i] = GetTextureView(rtvs[i], TextureViewType.RenderTarget, 0);
+                AddTransitionInternal(views[i]?.GetTexture(), ResourceState.RenderTarget);
+            }
+
+            var dsvView = GetTextureView(dsv, TextureViewType.DepthStencil, 0);
+            if (dsv != null) AddTransitionInternal(dsvView?.GetTexture(), ResourceState.DepthWrite);
+            if (!_isRecording) return;
+            ref var cmd = ref NextCommand(CommandType.SetRenderTargetsMulti);
+            cmd.Obj1 = views; cmd.Obj2 = dsvView;
         }
 
         public void ClearRenderTarget(IGpuTexture rtv, Vector4 color, uint slice = 0)
@@ -502,6 +522,9 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                             if (rtv != null) { _rtvHelper[0] = rtv; rtvs = _rtvHelper; }
                             _context.SetRenderTargets(rtvs, (ITextureView)cmd.Obj2, ResourceStateTransitionMode.None);
                         }
+                        break;
+                    case CommandType.SetRenderTargetsMulti:
+                        _context.SetRenderTargets((ITextureView[])cmd.Obj1, (ITextureView)cmd.Obj2, ResourceStateTransitionMode.None);
                         break;
                     case CommandType.ClearRenderTarget:
                         _context.ClearRenderTarget((ITextureView)cmd.Obj1, cmd.Vec, ResourceStateTransitionMode.None);

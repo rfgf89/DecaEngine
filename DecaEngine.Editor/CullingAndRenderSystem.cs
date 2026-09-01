@@ -147,7 +147,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                             LightPos = lightEntity.Position.value.AsVector4(),
                             LightColor = new Vector4(light.Color, light.Intensity),
                             LightDirection = new Vector4(-lightDirection, 1.0f),
-                            SpotAngles = new Vector4(0, 0, light.ShadowStrength, 0),
+                            SpotAngles = new Vector4(0, 0, light.ShadowStrength, SunTanHalfAngle(in light)),
                             CascadeMatrix0 = viewData.viewProj,
                             CascadeMatrix1 = viewData.viewProj,
                             CascadeMatrix2 = viewData.viewProj,
@@ -226,6 +226,15 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         });
     }
 
+    /// <summary>Тангенс полуугла видимого диска солнца - уходит в SpotAngles.w, оттуда PCSS в
+    /// UnlitInstancedPS.SampleWorldLightShadow выводит ширину полутени. Дефолт нуля компонента -
+    /// см. комментарий у LightComponent.SunAngularSize.</summary>
+    private static float SunTanHalfAngle(in LightComponent light)
+    {
+        float diameterDeg = light.SunAngularSize > 0f ? light.SunAngularSize : 1.0f;
+        return MathF.Tan(diameterDeg * 0.5f * MathF.PI / 180f);
+    }
+
     private static unsafe LightData BuildLightData(ref CascadedShadowComponent cascadedShadow, ref LightComponent light, Entity lightEntity,
         Vector3 lightDirection, Vector4 cascadeSizes, Vector4 cascadeNearPlanes, Vector4 cascadeSplits)
     {
@@ -236,7 +245,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 LightPos = lightEntity.Position.value.AsVector4(),
                 LightColor = new Vector4(light.Color, light.Intensity),
                 LightDirection = new Vector4(-lightDirection, 1.0f),
-                SpotAngles = new Vector4(0, 0, light.ShadowStrength, 0),
+                SpotAngles = new Vector4(0, 0, light.ShadowStrength, SunTanHalfAngle(in light)),
                 CascadeMatrix0 = (ptr + 0)->CreateViewData().viewProj,
                 CascadeMatrix1 = (ptr + 1)->CreateViewData().viewProj,
                 CascadeMatrix2 = (ptr + 2)->CreateViewData().viewProj,

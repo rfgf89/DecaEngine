@@ -19,6 +19,14 @@ namespace DecaEngine.Editor;
 public enum WindowType
 {
 	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView, Settings, Graphics,
+
+	/// <summary>Отладка анимации и физики (см. <see cref="AnimationPhysicsDebugWindow"/>) - слои
+	/// дебаг-вида и счётчики. В отличие от окна отладки рендер-графа доступно и в Release: это
+	/// рабочий инструмент аниматора, а не внутренняя диагностика.</summary>
+	AnimationPhysics,
+
+	/// <summary>Разметка humanoid выделенной модели (см. <see cref="HumanoidWindow"/>).</summary>
+	Humanoid,
 #if DEBUG
 	/// <summary>Окно отладки рендер-графа (см. <see cref="RenderGraphDebugWindow"/>) - только в DEBUG,
 	/// потому что снимки графа в Release не собираются вовсе.</summary>
@@ -215,6 +223,14 @@ public class EditorManager : TimeLoopCore
 			// открывается из меню Window; ссылка на вьюпорт нужна для статуса/ребейка проб.
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Graphics,
 				() => new GraphicsSettingsWindow("Graphics", _editorSettings, _modelPreviewViewport, _prefabSceneViewport, _imGuiManager.ImGuiRender));
+			// Отладка анимации и физики (см. AnimationPhysicsDebugWindow) - тоже из меню Window:
+			// слои дебаг-вида включают под конкретный вопрос, а не держат открытыми постоянно.
+			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.AnimationPhysics,
+				() => new AnimationPhysicsDebugWindow("Animation & Physics", _editorSettings, _prefabSceneViewport, _imGuiManager.ImGuiRender));
+			// Разметка humanoid - по ВЫДЕЛЕННОЙ в сцене сущности (см. HumanoidWindow), поэтому окну
+			// хватает ссылки на вьюпорт сцены: выделение он и так знает.
+			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Humanoid,
+				() => new HumanoidWindow("Humanoid", _prefabSceneViewport, _imGuiManager.ImGuiRender));
 			new AssetBrowserWindow("Asset Browser", _projectSession, inspectorWindow, _modelIconCache, _modelIconBaker, _imGuiManager.ImGuiRender).Show();
 			projectWindow.Show();
 			//_debugWindow = new DebugWindow("Debug", _ecsWorld, _batchRenderer, _imGuiManager.ImGuiRender);
@@ -299,6 +315,11 @@ public class EditorManager : TimeLoopCore
 			_prefabSceneViewport.SetActive(!modelPreviewMode);
 
 			_modelPreviewViewport.Update(deltaTime, time);
+
+			// Play Mode - ДО шага вьюпорта: внутри него физика персонажей заводит и снимает тела по
+			// этому флагу, и узнав о нажатии кнопки кадром позже, она пропустила бы ровно тот кадр, в
+			// котором персонаж обязан стронуться.
+			_prefabSceneViewport.IsPlaying = _inspectorWindow.IsPlaying;
 			_prefabSceneViewport.Update(deltaTime, time, _inspectorWindow.Root, _inspectorWindow.PrefabPath,
 				_inspectorWindow.Selected);
 			_modelIconBaker.Update(deltaTime, time);

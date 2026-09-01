@@ -160,9 +160,12 @@ namespace DecaEngine.Editor
 		/// отражения вращались синхронно с ключевым светом. 0 (zero-init) = без поворота.</summary>
 		public float EnvYawRadians;
 
-		// Explicit padding up to the next 16-byte boundary, so the float4s below stay aligned with
-		// the HLSL cbuffer layout (SetConstant uploads Marshal.SizeOf rounded UP to 16).
-		public int Pad1;
+		// Occupies the old explicit padding slot, so the float4s below stay aligned with the HLSL
+		// cbuffer layout (SetConstant uploads Marshal.SizeOf rounded UP to 16).
+		/// <summary>Режим фильтрации теней (SHADOW_MODE_* в UnlitInstancedPS.hlsl): 0 = PCSS
+		/// (обязан оставаться нулём - zero-init сцен вне превью должен давать дефолтное качество),
+		/// 1 = Hard, 2 = PCF 3x3, 3 = PCSS HQ. См. EditorSettings.ShadowFilterMode.</summary>
+		public int ShadowMode;
 
 		/// <summary>KHR_materials_sheen: rgb = sheenColorFactor (ноль = выключено), w =
 		/// sheenRoughnessFactor. См. <see cref="MaterialPbrFactors.SheenColorRoughness"/>.</summary>
@@ -243,7 +246,7 @@ namespace DecaEngine.Editor
 		public SystemRoot Root { get; }
 		public Entity CameraEntity { get; }
 
-		/// <summary>Создаёт и владеет всеми офскрин-таргетами (цвет/депт/scene-copy/MSAA/AO)
+		/// <summary>Создаёт и владеет всеми офскрин-таргетами (цвет/депт/scene-copy/AO)
 		/// <see cref="Pipeline"/> сам - как свопчейн владел бы back buffer-ом, см.
 		/// <see cref="GraphicsPipelineSimple"/>. Свойства ниже - тонкие проксирующие делегаты, чтобы
 		/// вызывающему коду (ModelPreviewViewport, ModelIconBaker) не пришлось лезть в Pipeline самому.</summary>
@@ -268,14 +271,6 @@ namespace DecaEngine.Editor
 		/// <summary>CPU-выборка радианса окружения по направлению (та же панорама, что в
 		/// <see cref="EnvironmentMap"/>) - источник неба для CPU-бейка проб (см. ProbeGiBaker).</summary>
 		public Func<Vector3, Vector3> EnvironmentRadiance { get; }
-
-		/// <summary>MSAA sample count окружения (1 = выключено).</summary>
-		public uint MsaaSamples { get; }
-
-		/// <summary>Мультисемпловая пара таргетов при <see cref="MsaaSamples"/> &gt; 1, иначе null -
-		/// геометрия рисуется в них и резолвится в <see cref="ColorTarget"/> (см. ForwardPass).</summary>
-		public IRenderTarget? MsaaColorTarget => Pipeline.Targets?.MsaaColorTarget;
-		public IRenderTarget? MsaaDepthTarget => Pipeline.Targets?.MsaaDepthTarget;
 
 		/// <summary>AO-таргет SSAO-пасса (null = SSAO выключен). Владеет им и пересоздаёт при
 		/// Resize <see cref="Pipeline"/> - см. <see cref="GraphicsPipelineSimple.SsaoResources"/>.</summary>
@@ -335,7 +330,7 @@ namespace DecaEngine.Editor
 		/// модели (та же семантика, что у резидент-кеша всегда была).</summary>
 		public void Release()
 		{
-			// Освобождает и все офскрин-таргеты (цвет/депт/scene-copy/MSAA), и sky/SSAO-ресурсы
+			// Освобождает и все офскрин-таргеты (цвет/депт/scene-copy), и sky/SSAO-ресурсы
 			// (материалы + AO-таргет) - их создаёт и владеет ими Pipeline (см. GraphicsPipelineSimple),
 			// а не это окружение.
 			Pipeline.Release();
@@ -388,8 +383,7 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>Отладочный вид векторов движения - живая ручка окна Graphics (см.
-		/// MotionVectorDebugPassResources.SetDebugView). No-op когда векторы выключены, а также при
-		/// MSAA: с ним ресурсы векторов не создаются вовсе (см. GraphicsPipelineSimple.EnsureResources).
+		/// MotionVectorDebugPassResources.SetDebugView). No-op когда векторы выключены.
 		///
 		/// <paramref name="rangePixels"/> - на скольких пикселях смещения шкала упирается в край.</summary>
 		public void SetMotionVectorDebug(bool enabled, float rangePixels)
@@ -397,14 +391,12 @@ namespace DecaEngine.Editor
 			Pipeline.MotionVectorDebugResources?.SetDebugView(enabled, rangePixels);
 		}
 
-		/// <summary>Есть ли у конвейера буфер векторов движения на самом деле: галка векторов при MSAA
-		/// молча не срабатывает (векторы и мультисемплинг взаимоисключающи - см.
-		/// PipelineFeatures.MotionVectors), и окну настроек нужно чем-то это показать.</summary>
+		/// <summary>Есть ли у конвейера буфер векторов движения на самом деле - окну настроек.</summary>
 		public bool MotionVectorsAvailable => Pipeline.MotionVectorResources is not null;
 
 		/// <summary>Суб-пиксельный джиттер проекции - живая ручка окна Graphics (см.
-		/// GraphicsPipelineSimple.SetTemporalJitter). От векторов движения не зависит и с MSAA не
-		/// конфликтует: это мутация одной матрицы на CPU, а не ресурсы конвейера.</summary>
+		/// GraphicsPipelineSimple.SetTemporalJitter). От векторов движения не зависит:
+		/// это мутация одной матрицы на CPU, а не ресурсы конвейера.</summary>
 		public void SetTemporalJitter(bool enabled)
 		{
 			Pipeline.SetTemporalJitter(enabled);
@@ -463,8 +455,7 @@ namespace DecaEngine.Editor
 
 		/// <summary>Живой выбор бэкенда слота апскейлера: 0 - встроенный TAAU, 1 - FSR, 2 - DLSS
 		/// (индексы = EditorSettings.UpscalerBackend). Смена ждёт GPU: конвейер перепривязывает
-		/// вход тонемапа на живом материале. No-op, когда буфера векторов нет (MSAA или выключенные
-		/// векторы); при отсутствии шима/DLL/железа TryCreate вернёт null - остаётся TAAU.</summary>
+		/// вход тонемапа на живом материале. No-op, когда буфера векторов нет (выключенные векторы); при отсутствии шима/DLL/железа TryCreate вернёт null - остаётся TAAU.</summary>
 		public void SetUpscalerBackend(int kind)
 		{
 			if (kind == ActiveUpscalerKind && (kind == 0) == (Pipeline.NativeUpscaler is null))
@@ -484,6 +475,20 @@ namespace DecaEngine.Editor
 
 			if (Pipeline.MotionVectorResources is null || Pipeline.Targets?.HdrColorTarget is null)
 			{
+				return;
+			}
+
+			// Нативные бэкенды апскейлеров живут в шиме, собранном под D3D12 (см. native/DecaFfxShim:
+			// он линкует d3d12/dxgi и nvsdk_ngx_d). На Vulkan-устройстве им передаются указатели на
+			// чужие типы ресурсов, и DecaDlss_Create падает по доступу ПРЯМО В КОНСТРУКТОРЕ
+			// окружения - то есть редактор не стартует вовсе и сменить настройку уже негде.
+			// Тихий откат на встроенный TAAU здесь честнее: он и так штатный фоллбек при отсутствии
+			// шима или неподходящего железа.
+			if (DilApi.Device.GetDeviceInfo().Type != global::Diligent.RenderDeviceType.D3D12)
+			{
+				Console.WriteLine($"[upscaler] бэкенд {kind} доступен только на D3D12 - остаётся встроенный TAAU");
+				Pipeline.SetNativeUpscaler(null);
+				ActiveUpscalerKind = 0;
 				return;
 			}
 
@@ -539,6 +544,43 @@ namespace DecaEngine.Editor
 			Pipeline.SsgiResources?.SetParams(intensity, sampleCount, maxLuminance, saturation);
 		}
 
+		/// <summary>Собран ли батч-рендерер окружения под тонкий G-buffer отражений (MRT-слоты в PSO
+		/// геометрии) - предикат для <c>ModelLoadOptions.ReflectionGbuffer</c> вьюпортов.</summary>
+		public bool ReflectionGbuffer => BatchRenderer.ReflectionGbuffer;
+
+		/// <summary>Живые ручки SSR - окно Graphics (см. SsrPassResources). No-op пока SSR не включался.</summary>
+		public void SetSsrParams(float intensity, float maxRoughness, float thickness, float maxDistance,
+			float historyWeight, int raysPerPixel, int debugView,
+			int rtBounces = SsrPassResources.DefaultRtBounces, int traceMode = 0)
+		{
+			Pipeline.SsrResources?.SetParams(intensity, maxRoughness, thickness, maxDistance,
+				historyWeight, raysPerPixel, debugView, rtBounces, traceMode);
+		}
+
+		/// <summary>Поворот env-карты и солнце RT-фолбэка для SSR - пушится вьюпортом вместе с
+		/// остальными покадровыми данными света (см. SsrPassResources).</summary>
+		/// <param name="sunTanHalfAngle">Тангенс половинного углового размера солнца - мягкость
+		/// края тени у RT-хитов (см. SsrPassResources.SetSun).</param>
+		public void SetSsrEnvironment(float envYawRadians, Vector3 dirTowardSun, Vector3 sunColor,
+			float ambient, float sunTanHalfAngle = 0f)
+		{
+			Pipeline.SsrResources?.SetEnvironmentYaw(envYawRadians);
+			Pipeline.SsrResources?.SetSun(dirTowardSun, sunColor, ambient, sunTanHalfAngle);
+		}
+
+		/// <summary>Свет RT-хитов SSR из probe-поля: SH-атласы + сетка базового объёма. null -
+		/// поля нет (слоты возвращаются на плейсхолдер). ОБЯЗАТЕЛЕН с null ПЕРЕД освобождением
+		/// атласов - SRB трейса иначе держал бы уничтоженные текстуры (см.
+		/// SsrPassResources.SetProbeField).</summary>
+		public void SetSsrProbeField(ProbeGiTextures? textures)
+		{
+			Pipeline.SsrResources?.SetProbeField(
+				textures?.Sh0, textures?.Sh1, textures?.Sh2, textures?.Sh3,
+				textures?.GridOrigin ?? Vector4.Zero,
+				textures?.GridCell ?? Vector4.Zero,
+				textures?.GridCounts ?? Vector4.Zero);
+		}
+
 		/// <summary>Живые ручки тумана - окно Graphics (см. FogPassResources). No-op когда туман выключен.
 		/// Сама галка живой НЕ является: пассу нужны депт и scene-copy, то есть он создаётся вместе с
 		/// конвейером (см. GraphicsPipelineSimple) и переключается пересозданием окружения.</summary>
@@ -586,6 +628,13 @@ namespace DecaEngine.Editor
 		{
 			Pipeline.VolumetricResources?.SetColors(sunColor, sunIntensity, ambientColor, ambientIntensity,
 				ambientShadowFloor);
+		}
+
+		/// <summary>Множитель рассеяния punctual-светов средой - см.
+		/// VolumetricLightPassResources.SetPunctualScatter.</summary>
+		public void SetVolumetricPunctualScatter(float intensity)
+		{
+			Pipeline.VolumetricResources?.SetPunctualScatter(intensity);
 		}
 
 		/// <summary>Есть ли в конвейере теневой пасс - без него god rays невозможны, остаётся ровный
@@ -685,9 +734,6 @@ namespace DecaEngine.Editor
 		/// бейкер иконок оставляет false, чтобы PNG сохраняли прозрачный фон.</param>
 		/// <param name="environmentHdrPath">Путь к equirect .hdr для IBL-окружения; null/пусто или
 		/// ошибка чтения - процедурное небо (см. <see cref="PreviewEnvironmentMap.Create"/>).</param>
-		/// <param name="msaaSamples">MSAA (1 = выключено): геометрия рисуется в мультисемпловую
-		/// пару таргетов и резолвится в <see cref="ColorTarget"/> (см. ForwardPass). Тумблер уровня
-		/// создания окружения - PSO пекутся под sample count.</param>
 		/// <param name="ssao">Экранное контактное затемнение (AO-пасс, см. ForwardPass/SsaoCommon.hlsl).
 		/// false = пасс не создаётся вовсе, кадр идентичен прежнему.</param>
 		/// <param name="aoMode">Техника AO-пасса при включённом <paramref name="ssao"/>: классический
@@ -712,22 +758,26 @@ namespace DecaEngine.Editor
 		public ModelViewportEnvironment(IGraphicsApi graphicsApi, uint width, uint height,
 			string colorTargetName, string depthTargetName, SharedViewportResources sharedResources,
 			bool skyBackground = false,
-			string environmentHdrPath = null, uint msaaSamples = 1, bool ssao = false, bool shadows = false,
+			string environmentHdrPath = null, bool ssao = false, bool shadows = false,
 			AmbientOcclusionMode aoMode = AmbientOcclusionMode.Ssao, bool ssgi = false, bool eyeAdaptation = false,
 			bool mainCascades = false, bool fog = false, bool bloom = false, bool colorGrade = false,
 			bool volumetric = false, bool motionVectors = false, bool temporalUpscale = false,
-			int upscalerBackend = 0)
+			int upscalerBackend = 0, bool ssr = false, bool ssrRayTraced = false)
 		{
 			GraphicsApi = graphicsApi;
 			DilApi = (DiligentGraphicsApi)graphicsApi;
-			MsaaSamples = Math.Max(1u, msaaSamples);
 			SharedResources = sharedResources;
 
 			// Формат цветового таргета пекётся во все PSO геометрии. Офскрин-конвейер теперь ВСЕГДА
 			// HDR (см. GraphicsPipelineSimple), поэтому формат один и тот же при любом наборе фич -
 			// именно поэтому тумблеры пост-обработки больше не требуют пересоздания окружения.
-			BatchRenderer = new DiligentBatchRenderer(DilApi, MsaaSamples,
-				TextureObjectFormat.R16G16B16A16Float);
+			//
+			// Тонкий G-buffer отражений (MRT-слоты в PSO геометрии) - безусловно, по той же логике
+			// безусловного HDR: тумблер SSR остаётся живой фичей, а не пересозданием окружения.
+			// Модели при этом обязаны грузиться с ModelLoadOptions.ReflectionGbuffer = true (см.
+			// BuildLoadOptions вьюпортов).
+			BatchRenderer = new DiligentBatchRenderer(DilApi,
+				TextureObjectFormat.R16G16B16A16Float, reflectionGbuffer: true);
 
 			// Резолвится из общего контейнера - НЕ создаётся заново: несколько окружений с одним и тем
 			// же HDRI-путём (или все процедурные) делят одну GPU-текстуру, см. SharedViewportResources.
@@ -755,7 +805,7 @@ namespace DecaEngine.Editor
 				};
 			}
 
-			// Цвет/депт/scene-copy/MSAA/sky/SSAO-ресурсы создаёт и владеет ими Pipeline сам, изнутри
+			// Цвет/депт/scene-copy/sky/SSAO-ресурсы создаёт и владеет ими Pipeline сам, изнутри
 			// своего render-графа (см. GraphicsPipelineSimple, SkyPassResources, SsaoPass) - здесь
 			// передаются только тумблеры/готовый EnvironmentMap.
 			//
@@ -765,11 +815,12 @@ namespace DecaEngine.Editor
 			// задаём средне-серым под тон подложки: билинейная фильтрация на краях силуэта
 			// подмешивает цвет фоновых текселей, и сильно выбивающийся RGB давал бы грязную обводку.
 			Pipeline = new GraphicsPipelineSimple(graphicsApi, BatchRenderer, colorTargetName, depthTargetName,
-				width, height, new Vector4(0.4f, 0.4f, 0.4f, 0f), MsaaSamples,
+				width, height, new Vector4(0.4f, 0.4f, 0.4f, 0f),
 				skyBackground: skyBackground, environmentMap: EnvironmentMap,
 				ssao: ssao, enableShadowPass: shadows, aoMode: aoMode, ssgi: ssgi, eyeAdaptation: eyeAdaptation,
 				fog: fog, bloom: bloom, colorGrade: colorGrade, volumetric: volumetric,
-				motionVectors: motionVectors, temporalUpscale: temporalUpscale);
+				motionVectors: motionVectors, temporalUpscale: temporalUpscale,
+				ssr: ssr, ssrRayTraced: ssrRayTraced);
 
 			if (upscalerBackend != 0 && temporalUpscale)
 			{
@@ -919,10 +970,24 @@ namespace DecaEngine.Editor
 		/// целиком (сохраняет прежнее поведение "нет графического API/окружения").</param>
 		/// <param name="sceneCopySampler">Общий "_SceneColor_Sampler" (см. <see cref="SharedViewportResources"/>) -
 		/// привязывается вместе с <paramref name="sceneCopy"/> только к transmissive-материалам.</param>
+		/// <summary>
+		/// Аварийный выключатель скиннинга: <c>DECA_SKINNING=0</c> регистрирует скиннед-меши как
+		/// обычные статические (bind-поза), не заводя ни отдельных инстансов в мега-буфере, ни
+		/// батчей под них, ни compute-прохода. Нужен для локализации: делит вопрос «падает из-за
+		/// скиннинга или из-за чего-то ещё» на два независимых, каждый проверяется одним запуском.
+		/// </summary>
+		/// <remarks>Переменная окружения задаёт лишь СТАРТОВОЕ значение и остаётся как аварийный
+		/// путь: она действует до чтения настроек, то есть работает даже когда редактор падает
+		/// раньше, чем доходит до окна Graphics. Дальше значение ведёт настройка
+		/// <see cref="EditorSettings.SceneSkinning"/>.</remarks>
+		public static bool SkinningEnabled { get; set; } =
+			Environment.GetEnvironmentVariable("DECA_SKINNING") != "0";
+
 		public static void RegisterModelResources(DiligentBatchRenderer batchRenderer, ModelLoader modelLoader,
 			Dictionary<int, MeshId> meshIdMap, Dictionary<int, MaterialId> materialIdMap,
 			ISamplerObject? envMapSampler = null, IGpuTexture? sceneCopy = null, IGpuTexture? environmentMap = null,
-			OrderedDictionary<int, IMaterialObject>? materials = null, ISamplerObject? sceneCopySampler = null)
+			OrderedDictionary<int, IMaterialObject>? materials = null, ISamplerObject? sceneCopySampler = null,
+			Dictionary<int, int>? skinBaseMap = null)
 		{
 			var materialSet = materials ?? modelLoader.materialObjects;
 
@@ -1046,6 +1111,14 @@ namespace DecaEngine.Editor
 				}
 
 				meshIdMap[i] = batchRenderer.Register(modelLoader.Meshes[i]);
+
+				// Скин-стрим меша - в общий GPU-буфер скиннинга. Один раз на МЕШ, а не на инстанс:
+				// веса у всех инстансов одной модели общие, различается только палитра.
+				if (SkinningEnabled && skinBaseMap != null &&
+					i < modelLoader.MeshSkin.Count && modelLoader.MeshSkin[i] != null)
+				{
+					skinBaseMap[i] = batchRenderer.Skinning.RegisterSkinStream(modelLoader.MeshSkin[i]);
+				}
 			}
 		}
 
@@ -1057,11 +1130,30 @@ namespace DecaEngine.Editor
 		public static Entity? CreateInstanceEntity(EntityStore store, RenderResourceManager resourceManager,
 			DiligentBatchRenderer batchRenderer, Dictionary<int, MeshId> meshIdMap,
 			Dictionary<int, MaterialId> materialIdMap, Dictionary<(int, int), BatchId> batchCache,
-			int meshIndex, int materialIndex, DecaEngine.Graphics.Transform t)
+			int meshIndex, int materialIndex, DecaEngine.Graphics.Transform t,
+			ModelLoader? skinnedModel = null, Dictionary<int, int>? skinBaseMap = null,
+			Action<int>? onSkinnedPalette = null)
 		{
 			if (!meshIdMap.TryGetValue(meshIndex, out var meshId))
 			{
 				return null;
+			}
+
+			// Скиннед-меш: инстансу нужен СВОЙ приёмник деформированных вершин и свой участок
+			// палитры, поэтому и meshId, и батч у него собственные - общий батч означал бы, что все
+			// персонажи с этой моделью рисуют одну и ту же позу. Кеш батчей для таких мешей поэтому
+			// намеренно не используется (см. ниже).
+			int paletteOffset = -1;
+			bool skinned = SkinningEnabled &&
+				skinnedModel?.Skeleton != null &&
+				skinBaseMap != null &&
+				onSkinnedPalette != null &&
+				skinBaseMap.ContainsKey(meshIndex);
+
+			if (skinned)
+			{
+				(meshId, paletteOffset) = batchRenderer.RegisterSkinnedInstance(
+					meshId, skinnedModel!.Skeleton.JointCount, skinBaseMap![meshIndex]);
 			}
 
 			if (!materialIdMap.TryGetValue(materialIndex, out var matId))
@@ -1082,7 +1174,12 @@ namespace DecaEngine.Editor
 				}
 			}
 
-			if (!batchCache.TryGetValue((meshIndex, materialIndex), out var batchId))
+			BatchId batchId;
+			if (skinned)
+			{
+				batchId = batchRenderer.CreateBatch(meshId, matId);
+			}
+			else if (!batchCache.TryGetValue((meshIndex, materialIndex), out batchId))
 			{
 				batchId = batchRenderer.CreateBatch(meshId, matId);
 				batchCache[(meshIndex, materialIndex)] = batchId;
@@ -1095,6 +1192,15 @@ namespace DecaEngine.Editor
 				Tags.Get<GpuUpdateTag>());
 
 			resourceManager.RegisterRenderable(entity, batchId);
+
+			if (skinned)
+			{
+				// Наружу отдаётся только офсет палитры: КОМУ принадлежит этот скиннед-инстанс,
+				// решает вызывающий (в сцене - сущность префаба, в пробнике - сам пробник), и
+				// тащить сюда его модель владения незачем.
+				onSkinnedPalette!(paletteOffset);
+			}
+
 			return entity;
 		}
 

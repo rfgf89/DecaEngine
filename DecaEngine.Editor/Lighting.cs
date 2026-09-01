@@ -21,6 +21,14 @@ public struct LightComponent : IComponent
     // 0 (дефолт свежедобавленного компонента) = авто: 80% внешнего (см. CullingAndRenderSystem).
     public float InnerSpotAngle;
     public float ShadowStrength; // 0.0 to 1.0
+    // Видимый угловой ДИАМЕТР диска солнца, градусы - от него PCSS выводит ширину полутени
+    // (см. UnlitInstancedPS.SampleWorldLightShadow). 0 (дефолт свежедобавленного компонента) =
+    // авто: 1 градус (реальное солнце ~0.53, чуть крупнее - мягкость видна и на коротких тенях).
+    public float SunAngularSize;
+    // Мировой РАДИУС светящегося тела point/spot-света, метры - от него PCSS выводит ширину
+    // полутени punctual-тени (см. кластерный цикл UnlitInstancedPS). 0 = авто: 5 см (лампочка);
+    // крупным площадникам-панелям ставить их реальный полуразмер.
+    public float SourceRadius;
 }
 
 public struct SunComponent : IComponent

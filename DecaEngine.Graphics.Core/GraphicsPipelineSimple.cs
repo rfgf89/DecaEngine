@@ -11,10 +11,7 @@ namespace DecaEngine.Core;
 /// включении и дальше живут в конвейере, а граф пересобирается заново (дёшево - нативные текстуры
 /// переиспользуются из пула графа, см. <see cref="IRenderGraph.ResetPasses"/>).
 ///
-/// Чего здесь НЕТ и почему: MSAA. Число сэмплов пекётся в PSO ВСЕЙ геометрии (см.
-/// <see cref="DiligentBatchRenderer"/>), а не только в пост-обработку, поэтому остаётся опцией
-/// уровня создания окружения. Авто-экспозиция здесь есть, но она не структурная - см.
-/// <see cref="EyeAdaptation"/>.</summary>
+/// Авто-экспозиция здесь есть, но она не структурная - см. <see cref="EyeAdaptation"/>.</summary>
 public struct PipelineFeatures : IEquatable<PipelineFeatures>
 {
 	/// <summary>Тени от мирового ключевого света: <see cref="ShadowPass"/> в графе.</summary>
@@ -33,6 +30,26 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 
 	public bool Ssgi;
 
+	/// <summary>Стохастические экранные отражения (<see cref="SsrPass"/>): GGX-важностный луч на
+	/// пиксель по тонкому G-buffer-у (см. <see cref="PipelineRenderTargets.NormalRoughnessTarget"/>),
+	/// темпоральная аккумуляция по векторам движения, энергетически корректная замена
+	/// env-спекуляра. Требует <see cref="MotionVectors"/> - без них ресурсы молча не создаются.</summary>
+	public bool Ssr;
+
+	/// <summary>RT-фолбэк отражений при включённом <see cref="Ssr"/>: лучи, промахнувшиеся мимо
+	/// экрана, добираются inline RayQuery по TLAS сцены (FEATURE_RT_REFLECTIONS, DXC/SM6.5).
+	/// Смена пересоздаёт материалы SSR (в них запечён шейдер), но не окружение - как AoMode.
+	/// Включивший ОБЯЗАН привязать сцену через <see cref="SsrPassResources.SetRayScene"/>.</summary>
+	public bool SsrRayTraced;
+
+	/// <summary>Текстурное альбедо RT-хитов при включённом <see cref="SsrRayTraced"/>: 0 - выкл
+	/// (потриугольное усреднённое альбедо), 1 - атлас даунсемпленных плиток (Texture2DArray,
+	/// дёшево), 2 - «bindless»-массив полноразмерных base color текстур (дороже по памяти
+	/// дескрипторов; на бэкенде без ShaderResourceRuntimeArrays тихо падает до атласа). Смена
+	/// пересоздаёт материалы SSR (в них запечён шейдер), как <see cref="SsrRayTraced"/>.
+	/// Включивший ОБЯЗАН привязать текстуры через <see cref="SsrPassResources.SetHitTextures"/>.</summary>
+	public int SsrHitTextures;
+
 	/// <summary>Экспонировать кадр по ЗАМЕРЕННОЙ яркости, а не по ручной экспокоррекции. Не
 	/// структурная фича: цепочка замера в HDR-конвейере есть всегда (она копеечная - пять дроу
 	/// 64x64 и мельче), а тумблер лишь переключает тонемап между измеренной и ручной экспозицией,
@@ -49,9 +66,7 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 	/// (апскейлеры DLSS/FSR, TAA). Сами по себе кадр не меняют: пасс лишь заполняет свой буфер, и
 	/// пока его никто не читает, фича стоит одного фуллскрин-дроу.
 	///
-	/// Несовместима с MSAA и потому молча не создаётся при <c>msaaSamples &gt; 1</c> (см.
-	/// <see cref="GraphicsPipelineSimple.EnsureResources"/>): апскейлер обязан получать
-    /// одно-сэмпловый кадр, он сам себе антиалиасинг.</summary>
+	/// Апскейлер сам себе антиалиасинг - никакого мультисемплинга в конвейере нет.</summary>
 	public bool MotionVectors;
 
 	/// <summary>Темпоральный апскейл (<see cref="TemporalUpscalePass"/>): сцена в рендер-разрешении +
@@ -68,6 +83,9 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 		       Ssao == other.Ssao &&
 		       AoMode == other.AoMode &&
 		       Ssgi == other.Ssgi &&
+		       Ssr == other.Ssr &&
+		       SsrRayTraced == other.SsrRayTraced &&
+		       SsrHitTextures == other.SsrHitTextures &&
 		       EyeAdaptation == other.EyeAdaptation &&
 		       Fog == other.Fog &&
 		       Volumetric == other.Volumetric &&
@@ -98,6 +116,9 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 		hash.Add(Ssao);
 		hash.Add((int)AoMode);
 		hash.Add(Ssgi);
+		hash.Add(Ssr);
+		hash.Add(SsrRayTraced);
+		hash.Add(SsrHitTextures);
 		hash.Add(EyeAdaptation);
 		hash.Add(Fog);
 		hash.Add(Volumetric);
@@ -131,7 +152,6 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	private readonly PipelineRenderTargets? _targets;
 	private readonly string? _colorTargetName;
 	private readonly IGpuTexture? _environmentMap;
-	private readonly uint _msaaSamples;
 	private readonly Vector4 _clearColor;
 
 	private PipelineFeatures _features;
@@ -142,6 +162,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	private SkyPassResources? _skyResources;
 	private SsaoPassResources? _ssaoResources;
 	private SsgiPassResources? _ssgiResources;
+	private SsrPassResources? _ssrResources;
 	private FogPassResources? _fogResources;
 	private VolumetricLightPassResources? _volumetricResources;
 	private BloomPassResources? _bloomResources;
@@ -160,6 +181,14 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	/// <summary>Техника AO, под которую собраны текущие <see cref="_ssaoResources"/> - в их материалы
 	/// запечён шейдер, так что смена техники требует пересоздания (но не окружения).</summary>
 	private AmbientOcclusionMode _ssaoBuiltMode;
+
+	/// <summary>Собраны ли текущие <see cref="_ssrResources"/> с RT-фолбэком - смена варианта
+	/// трейс-шейдера требует пересоздания ресурсов, как смена техники AO.</summary>
+	private bool _ssrBuiltRayTraced;
+
+	/// <summary>Режим текстур RT-хитов, с которым собраны текущие <see cref="_ssrResources"/>
+	/// (после клампов EnsureResources) - его смена тоже пересоздаёт материалы SSR.</summary>
+	private int _ssrBuiltHitTextures;
 
 	/// <summary>Были ли тени доступны, когда собирались <see cref="_volumetricResources"/> - его
 	/// материал берёт каскадный shadow map через IBatchRenderer.BindShadowResources.</summary>
@@ -236,6 +265,10 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	/// <summary>См. <see cref="SsaoResources"/>.</summary>
 	public SsgiPassResources? SsgiResources => _ssgiResources;
 
+	/// <summary>См. <see cref="SsaoResources"/>. Через неё вьюпорт пушит живые ручки SSR, поворот
+	/// env-карты, солнце RT-фолбэка и привязывает TLAS сцены (SetRayScene).</summary>
+	public SsrPassResources? SsrResources => _ssrResources;
+
 	/// <summary>См. <see cref="SsaoResources"/>. Через неё вьюпорт пушит живые ручки дымки,
 	/// направление солнца и покадровый базис камеры.</summary>
 	public FogPassResources? FogResources => _fogResources;
@@ -255,7 +288,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	/// отдельная фича (см. <see cref="PipelineFeatures.EyeAdaptation"/>).</summary>
 	public EyeAdaptationPassResources? EyeAdaptationResources => _eyeAdaptationResources;
 
-	/// <summary>Non-null once motion vectors have been enabled at least once на конвейере БЕЗ MSAA
+	/// <summary>Non-null once motion vectors have been enabled at least once
 	/// (см. <see cref="PipelineFeatures.MotionVectors"/>). Отсюда апскейлер возьмёт свой входной
 	/// буфер, а отладочный вид - картинку векторов.</summary>
 	public MotionVectorPassResources? MotionVectorResources => _motionVectorResources;
@@ -320,8 +353,19 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	/// <see cref="InvalidateGraph"/> - иначе заморожённые команды продолжат играть старое.</summary>
 	public Action<ICommandBuffer>? InlineOverlay { get; set; }
 
+	/// <summary>
+	/// ВТОРОЙ инлайн-оверлей, исполняемый сразу за <see cref="InlineOverlay"/>, - дебаг-линии
+	/// анимации и физики (см. DebugLineOverlay в редакторе).
+	///
+	/// Отдельное свойство, а не «пусть вызывающий сам склеит делегаты»: этими двумя хуками владеют
+	/// РАЗНЫЕ подсистемы вьюпорта (дебаг-вид проб ведёт probe-GI, дебаг-линии - окно дебага), и
+	/// каждая снимает свой хук независимо от другой. Общий слот означал бы, что выключение проб
+	/// молча гасит и линии.
+	/// </summary>
+	public Action<ICommandBuffer>? DebugOverlay { get; set; }
+
 	/// <summary>Оверлей ОТДЕЛЬНЫМ пассом в самом конце кадра - после ForwardPass (включая резолв
-	/// MSAA) и всей пост-обработки, то есть поверх готового отображаемого ColorTarget: контур
+	/// и всей пост-обработки, то есть поверх готового отображаемого ColorTarget: контур
 	/// выделения Scene View и подобное (см. <see cref="PostOverlayPass"/>). Хук сам привязывает свои
 	/// таргеты и вьюпорт. Читается при ЗАПИСИ команд графа - после смены значения вызывающий обязан
 	/// позвать <see cref="InvalidateGraph"/>, как и с <see cref="InlineOverlay"/>.</summary>
@@ -333,24 +377,24 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	}
 
 	/// <param name="colorTargetName">Non-null selects off-screen mode: the pipeline creates and owns
-	/// its own color/depth/scene-copy(/MSAA) targets instead of drawing to the swap chain's back
+	/// its own color/depth/scene-copy targets instead of drawing to the swap chain's back
 	/// buffer (see <see cref="DecaEngine.Editor.ModelViewportEnvironment"/>). Null draws straight to
 	/// the back buffer and every other creation parameter below is ignored.</param>
 	/// <param name="debugName">Имя конвейера в окне отладки рендер-графа (см.
 	/// <see cref="GraphicsPipelineRegistry"/>). Null - имя выводится из <paramref name="colorTargetName"/>.</param>
 	public GraphicsPipelineSimple(IGraphicsApi api, IBatchRenderer batchRenderer, string? colorTargetName,
-		string? depthTargetName, uint width, uint height, Vector4 clearColor, uint msaaSamples = 1,
+		string? depthTargetName, uint width, uint height, Vector4 clearColor,
 		bool skyBackground = false, IGpuTexture? environmentMap = null, bool ssao = false, bool enableShadowPass = false,
 		AmbientOcclusionMode aoMode = AmbientOcclusionMode.Ssao, bool ssgi = false, bool eyeAdaptation = false,
 		bool fog = false, bool bloom = false, bool colorGrade = false, bool volumetric = false,
-		bool motionVectors = false, bool temporalUpscale = false, string? debugName = null)
+		bool motionVectors = false, bool temporalUpscale = false, bool ssr = false,
+		bool ssrRayTraced = false, string? debugName = null)
 	{
 		_api = api;
 		_batchRenderer = batchRenderer;
 		_clearColor = clearColor;
 		_colorTargetName = colorTargetName;
 		_environmentMap = environmentMap;
-		_msaaSamples = Math.Max(1u, msaaSamples);
 		_renderGraph = _api.CreateRenderGraph();
 
 		_features = new PipelineFeatures
@@ -367,6 +411,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			ColorGrade = colorGrade,
 			MotionVectors = motionVectors,
 			TemporalUpscale = temporalUpscale,
+			Ssr = ssr,
+			SsrRayTraced = ssrRayTraced,
 		};
 
 		if (colorTargetName is not null)
@@ -374,7 +420,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			// hdr: true БЕЗУСЛОВНО - см. комментарий класса: формат цветового таргета перестал
 			// зависеть от набора фич, и тумблеры больше не тянут за собой пересборку PSO геометрии.
 			_targets = new PipelineRenderTargets(api, colorTargetName, depthTargetName!, width, height,
-				_msaaSamples, hdr: true);
+				hdr: true);
 
 			_viewPortRef = new Ref<Vector2>(new Vector2(width, height));
 
@@ -446,7 +492,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	{
 		if (_features.SkyBackground && _skyResources is null && _environmentMap is not null)
 		{
-			_skyResources = new SkyPassResources(_api, _batchRenderer, _environmentMap, _msaaSamples,
+			_skyResources = new SkyPassResources(_api, _batchRenderer, _environmentMap,
 				RenderColorFormat);
 		}
 
@@ -462,7 +508,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		// грейда и отладки векторов - они живут после точки апскейла (тонемапа).
 		var (width, height) = RenderTargetSize;
 		var (displayWidth, displayHeight) = TargetSize;
-		var renderDepth = _targets.MsaaDepthTarget ?? _targets.DepthTarget;
+		var renderDepth = _targets.DepthTarget;
 
 		// HDR-хребет конвейера: замер яркости и тонемап есть ВСЕГДА, тумблер авто-экспозиции лишь
 		// переключает тонемап между измеренной и ручной экспозицией (см. PipelineFeatures.EyeAdaptation).
@@ -485,20 +531,20 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		if (_features.Ssao && _ssaoResources is null)
 		{
 			_ssaoResources = new SsaoPassResources(_api, _batchRenderer, _colorTargetName!, width, height,
-				renderDepth, _targets.SceneCopyTarget, _msaaSamples, _features.AoMode, RenderColorFormat);
+				renderDepth, _targets.SceneCopyTarget, _features.AoMode, RenderColorFormat);
 			_ssaoBuiltMode = _features.AoMode;
 		}
 
 		if (_features.Ssgi && _ssgiResources is null)
 		{
 			_ssgiResources = new SsgiPassResources(_api, _batchRenderer, _colorTargetName!, width, height,
-				renderDepth, _targets.SceneCopyTarget, _targets.MsaaDepthTarget is not null, RenderColorFormat);
+				renderDepth, _targets.SceneCopyTarget, RenderColorFormat);
 		}
 
 		if (_features.Fog && _fogResources is null)
 		{
 			_fogResources = new FogPassResources(_api, _batchRenderer, renderDepth, _targets.SceneCopyTarget,
-				_targets.MsaaDepthTarget is not null, RenderColorFormat,
+				RenderColorFormat,
 				_eyeAdaptationResources!.AdaptationTarget);
 		}
 
@@ -513,7 +559,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		if (_features.Volumetric && _volumetricResources is null)
 		{
 			_volumetricResources = new VolumetricLightPassResources(_api, _batchRenderer, renderDepth,
-				_targets.SceneCopyTarget, _targets.MsaaDepthTarget is not null, RenderColorFormat,
+				_targets.SceneCopyTarget, RenderColorFormat,
 				_eyeAdaptationResources!.AdaptationTarget, _features.Shadows);
 			_volumetricBuiltWithShadows = _features.Shadows;
 		}
@@ -530,12 +576,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				displayWidth, displayHeight);
 		}
 
-		// Векторы движения читают ОДНО-СЭМПЛОВЫЙ депт: при MSAA геометрия рисует в MsaaDepthTarget, и
-		// DepthTarget остаётся неразрешённым, а Texture2DMS.Load потребовал бы отдельного варианта
-		// шейдера, как у тумана. Заводить его незачем - фича существует ради апскейлеров, а те с MSAA
-		// взаимоисключающи (см. PipelineFeatures.MotionVectors), поэтому при MSAA ресурсы просто не
-		// создаются и пасс не встаёт в граф.
-		if (_features.MotionVectors && _motionVectorResources is null && _targets.MsaaDepthTarget is null)
+		if (_features.MotionVectors && _motionVectorResources is null)
 		{
 			_motionVectorResources = new MotionVectorPassResources(_api, _batchRenderer, _colorTargetName!,
 				_targets.DepthTarget, width, height);
@@ -548,8 +589,40 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				_motionVectorResources.MotionTarget, width, height, displayWidth, displayHeight);
 		}
 
+		// SSR - строго ПОСЛЕ блока векторов (резолву нужен их буфер) и только там, где создан
+		// тонкий G-buffer отражений (HDR-режим - см. PipelineRenderTargets) и есть env-карта
+		// (композит вычитает её вклад). Смена RT-фолбэка пересоздаёт ресурсы: в трейс-материал
+		// запечён вариант шейдера, как у техники AO.
+		var ssrRayTraced = _features.SsrRayTraced && _api.RayTracing >= RayTracingSupport.Inline;
+
+		// Текстуры RT-хитов: без RT-фолбэка режим бессмыслен, а bindless без поддержки
+		// динамической индексации массивов на бэкенде тихо съезжает на атлас.
+		var ssrHitTextures = ssrRayTraced ? Math.Clamp(_features.SsrHitTextures, 0, 2) : 0;
+		if (ssrHitTextures == 2 && !_api.SupportsShaderResourceArrays)
+		{
+			ssrHitTextures = 1;
+		}
+
+		if (_features.Ssr && _ssrResources is not null &&
+		    (_ssrBuiltRayTraced != ssrRayTraced || _ssrBuiltHitTextures != ssrHitTextures))
+		{
+			_ssrResources.Release();
+			_ssrResources = null;
+		}
+
+		if (_features.Ssr && _ssrResources is null && _motionVectorResources is not null &&
+		    _targets.NormalRoughnessTarget is not null && _environmentMap is not null)
+		{
+			_ssrResources = new SsrPassResources(_api, _batchRenderer, _colorTargetName!, width, height,
+				_targets.DepthTarget, _targets.NormalRoughnessTarget, _targets.EnvFactorTarget!,
+				_targets.SceneCopyTarget, _motionVectorResources.MotionTarget, _environmentMap,
+				ssrRayTraced, RenderColorFormat, ssrHitTextures);
+			_ssrBuiltRayTraced = ssrRayTraced;
+			_ssrBuiltHitTextures = ssrHitTextures;
+		}
+
 		// Слот апскейлера - строго ПОСЛЕ блока векторов: без их буфера аккумулятору нечем
-		// репроецировать историю, поэтому при MSAA (векторы не создаются) фича молча не срабатывает -
+		// репроецировать историю, поэтому без них фича молча не срабатывает -
 		// ровно как сами векторы, и окно Graphics предупреждает об этом тем же способом.
 		if (_features.TemporalUpscale && _temporalUpscaleResources is null &&
 		    _motionVectorResources is not null)
@@ -593,6 +666,12 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		var structural = !_features.StructurallyEquals(features);
 		var needsWait =
 			(features.Ssao && _ssaoResources is not null && _ssaoBuiltMode != features.AoMode) ||
+			// Пересборка SSR-материалов под другой вариант трейса (см. EnsureResources).
+			(features.Ssr && _ssrResources is not null &&
+			 (_ssrBuiltRayTraced != (features.SsrRayTraced && _api.RayTracing >= RayTracingSupport.Inline) ||
+			  _ssrBuiltHitTextures != ((features.SsrRayTraced && _api.RayTracing >= RayTracingSupport.Inline)
+				  ? Math.Clamp(features.SsrHitTextures, 0, _api.SupportsShaderResourceArrays ? 2 : 1)
+				  : 0))) ||
 			(features.Volumetric && _volumetricResources is not null &&
 			 _volumetricBuiltWithShadows != features.Shadows) ||
 			// Смена АКТИВНОСТИ апскейла переключает вход тонемапа (HDR-кадр <-> выход апскейлера)
@@ -639,6 +718,12 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		{
 			_ssgiResources?.Release();
 			_ssgiResources = null;
+		}
+
+		if (!_features.Ssr)
+		{
+			_ssrResources?.Release();
+			_ssrResources = null;
 		}
 
 		if (!_features.Fog)
@@ -701,7 +786,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		var (renderWidth, renderHeight) = RenderTargetSize;
 		var (displayWidth, displayHeight) = TargetSize;
 
-		var renderDepth = _targets.MsaaDepthTarget ?? _targets.DepthTarget;
+		var renderDepth = _targets.DepthTarget;
 		_ssaoResources?.RebindTargets(renderDepth, _targets.SceneCopyTarget);
 		_ssgiResources?.RebindTargets(renderDepth, _targets.SceneCopyTarget);
 		_fogResources?.RebindTargets(renderDepth, _targets.SceneCopyTarget);
@@ -710,9 +795,15 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_gradeResources?.RebindTargets(displayWidth, displayHeight);
 		_eyeAdaptationResources?.RebindTargets(_targets.HdrColorTarget!);
 
-		// Одно-сэмпловый депт, а не renderDepth: см. EnsureResources - при MSAA этих ресурсов
-		// попросту нет.
 		_motionVectorResources?.RebindTargets(_targets.DepthTarget, renderWidth, renderHeight);
+
+		// Строго ПОСЛЕ ребинда векторов (SSR читает их буфер, а RebindTargets выше его пересоздал).
+		if (_motionVectorResources is not null && _targets.NormalRoughnessTarget is not null)
+		{
+			_ssrResources?.RebindTargets(_targets.DepthTarget, _targets.NormalRoughnessTarget,
+				_targets.EnvFactorTarget!, _targets.SceneCopyTarget,
+				_motionVectorResources.MotionTarget, renderWidth, renderHeight);
+		}
 
 		// Строго ПОСЛЕ ребинда самих векторов: их RebindTargets ресайзит MotionTarget, пересоздавая
 		// нативную текстуру, и привяжись дебаг (и апскейлер - он тоже читает буфер векторов) раньше -
@@ -765,7 +856,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	public float RenderScale => _renderScale;
 
 	/// <summary>Размер, в котором при текущем масштабе живут СЦЕНОВЫЕ таргеты (депт, HDR-кадр,
-	/// scene-copy, MSAA, векторы, AO/GI) для данного отображаемого размера. Отображаемый ColorTarget
+	/// scene-copy, векторы, AO/GI) для данного отображаемого размера. Отображаемый ColorTarget
 	/// масштабом не трогается - апскейл делает тонемап (см. TonemapPS.hlsl).</summary>
 	public Vector2 SceneSizeFor(Vector2 displaySize) => _renderScale >= 1f
 		? displaySize
@@ -854,9 +945,11 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_renderGraph.AddPass(new ForwardPass(_batchRenderer, _lastCameras, _renderViewPortRef, renderColor,
 			_targets?.DepthTarget, _clearColor, _targets?.SceneCopyTarget,
 			_features.SkyBackground ? _skyResources : null,
-			_targets?.MsaaColorTarget, _targets?.MsaaDepthTarget,
 			_features.Ssao ? _ssaoResources : null,
-			() => InlineOverlay));
+			// Склейка двух хуков в один делегат: многоадресный Action исполняет их по очереди, а
+			// null-и Combine отбрасывает сам, так что «оверлея нет» остаётся ровно null.
+			() => (Action<ICommandBuffer>?)Delegate.Combine(InlineOverlay, DebugOverlay),
+			_targets?.NormalRoughnessTarget, _targets?.EnvFactorTarget));
 
 		// Векторы движения - сразу за геометрией: пассу нужна только готовая глубина, и до всей
 		// пост-обработки он успевает заполнить буфер, который дальше заберёт апскейлер. Кадр он не
@@ -871,8 +964,18 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		// в источнике света уже есть контактные тени, и bounce их корректно учитывает.
 		if (_features.Ssgi && _ssgiResources is not null)
 		{
-			var renderDepth = _targets!.MsaaDepthTarget ?? _targets.DepthTarget;
+			var renderDepth = _targets!.DepthTarget;
 			_renderGraph.AddPass(new SsgiPass(_ssgiResources, renderColor!, _targets.SceneCopyTarget, renderDepth, _renderViewPortRef));
+		}
+
+		// SSR - после SSGI (в отражения попадает кадр с непрямым светом; свой снимок сцены пасс
+		// переснимает сам) и до замера яркости: отражения входят в экспозицию наравне с остальным.
+		if (_features.Ssr && _ssrResources is not null && _motionVectorResources is not null &&
+		    _targets!.NormalRoughnessTarget is not null)
+		{
+			_renderGraph.AddPass(new SsrPass(_ssrResources, renderColor!, _targets.SceneCopyTarget,
+				_targets.DepthTarget, _targets.NormalRoughnessTarget, _targets.EnvFactorTarget!,
+				_motionVectorResources.MotionTarget, _renderViewPortRef));
 		}
 
 		// Замер яркости - по ГОТОВОМУ линейному кадру (со всем непрямым светом), тонемап - следом:
@@ -903,14 +1006,14 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		// «после замера яркости» у него ровно та же, что у тумана, - см. абзац выше.
 		if (_features.Volumetric && _volumetricResources is not null)
 		{
-			var volumetricDepth = _targets!.MsaaDepthTarget ?? _targets.DepthTarget;
+			var volumetricDepth = _targets!.DepthTarget;
 			_renderGraph.AddPass(new VolumetricLightPass(_volumetricResources, _batchRenderer,
 				renderColor!, _targets.SceneCopyTarget, volumetricDepth, _renderViewPortRef));
 		}
 
 		if (_features.Fog && _fogResources is not null)
 		{
-			var renderDepth = _targets!.MsaaDepthTarget ?? _targets.DepthTarget;
+			var renderDepth = _targets!.DepthTarget;
 			_renderGraph.AddPass(new FogPass(_fogResources, renderColor!, _targets.SceneCopyTarget,
 				renderDepth, _renderViewPortRef));
 		}
@@ -1008,6 +1111,18 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		UnwindTemporalJitter();
 		LatchMotionVectors();
 		ApplyTemporalJitter();
+
+		// Фаза стохастического шума SSR - раз в кадр (см. SsrPassResources.AdvanceFrame); там же
+		// защёлкивается viewProj прошлого кадра - репроекция ВИРТУАЛЬНОГО образа отражения у
+		// зеркал (см. SsrResolvePS, приём RTG гл.32) - тем же порядком, что у LatchMotionVectors.
+		if (_features.Ssr && _ssrResources is not null)
+		{
+			_ssrResources.AdvanceFrame();
+			if (_hasGraphData && _lastCameras.IsCreated && _lastCameras.Length > 0)
+			{
+				_ssrResources.UpdateFromView(_lastCameras.viewData.GetRef(0, false).viewProj);
+			}
+		}
 
 		// Апскейлеру - джиттер ИМЕННО этого кадра (потому после ApplyTemporalJitter): шейдер вычитает
 		// его из выборки текущего кадра, см. TemporalUpscalePS.hlsl.
@@ -1162,6 +1277,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_renderGraph.Release();
 		_ssaoResources?.Release();
 		_ssgiResources?.Release();
+		_ssrResources?.Release();
 		_fogResources?.Release();
 		_volumetricResources?.Release();
 		_bloomResources?.Release();

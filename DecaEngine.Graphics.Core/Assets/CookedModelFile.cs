@@ -39,7 +39,19 @@ public static class CookedModelFile
 	// нельзя, поэтому старые версии просто объявляются промахом.
 	// 4: добавлен PreparedMaterial.AlphaMode - без него MASK и BLEND схлопывались в один AlphaCutoff,
 	// и BLEND-накладки (декали грязи Intel Sponza) нечем было исключить из кастеров тени.
-	public const int FormatVersion = 4;
+	// 5: добавлены PreparedModel.TriangleAttributes (потриугольные альбедо/металличность/
+	// шероховатость по 5 байт) - считаются по пикселям текстур, которых у cooked-модели нет; без
+	// них RT-отражения теряли текстурный цвет хитов и материал (см. ModelLoader).
+	// 6: те же атрибуты, но выборка УСРЕДНЕНА по семи точкам треугольника вместо одного текселя
+	// в центроиде - один тексель ловил крапинки MR-карты, и отдельные треугольники становились
+	// «металлическими» (выбросы в RT-отражениях). Версия поднята именно чтобы старые кеши с
+	// шумными атрибутами перепеклись: содержимое блока внешне то же, и без бампа они считались
+	// бы валидными навсегда.
+	// 7: добавлены скелет, скин-стрим мешей и анимационные клипы (см. SkinningData.cs). Скиннед-меш
+	// в файле версии 6 и ниже записан БЕЗ весов и с запечённой в инстанс матрицей узла - то есть как
+	// статический в bind-позе; отличить его от честной статики по содержимому нельзя, поэтому
+	// старые версии, как и всегда здесь, объявляются промахом кеша.
+	public const int FormatVersion = 7;
 
 	public const string Extension = ".dmdl";
 
@@ -68,6 +80,14 @@ public static class CookedModelFile
 				WriteMaterials(writer, prepared);
 				WriteBlittable(writer, CollectionsMarshal.AsSpan(prepared.Instances));
 				WriteTopologyClones(writer, prepared);
+
+				// Потриугольные атрибуты материала - ОБЯЗАТЕЛЬНО здесь: считать их можно только
+				// пока живы пиксели текстур (см. ModelLoader.EnsureTriangleAttributes).
+				ModelLoader.EnsureTriangleAttributes(prepared);
+				WriteTriangleAttributes(writer, prepared);
+
+				WriteSkeleton(writer, prepared);
+				WriteAnimations(writer, prepared);
 			}
 
 			File.Move(tempPath, path, overwrite: true);
@@ -99,6 +119,9 @@ public static class CookedModelFile
 			ReadMaterials(reader, prepared);
 			prepared.Instances.AddRange(ReadBlittable<InstanceData>(reader));
 			ReadTopologyClones(reader, prepared);
+			ReadTriangleAttributes(reader, prepared);
+			ReadSkeleton(reader, prepared);
+			ReadAnimations(reader, prepared);
 
 			return prepared;
 		}
@@ -131,6 +154,10 @@ public static class CookedModelFile
 			WriteBlittable<Vertex>(writer, mesh.Vertices);
 			WriteBlittable<uint>(writer, mesh.Indices);
 			WriteBlittable<LodLevel>(writer, mesh.LodLevels);
+
+			// Скин-стрим: пустой блок = статический меш (см. PreparedMesh.SkinVertices). Отличать
+			// «нет стрима» от «стрим нулевой длины» здесь не нужно - меш без вершин не скиннится.
+			WriteBlittable<SkinVertex>(writer, mesh.SkinVertices);
 		}
 	}
 
@@ -158,6 +185,9 @@ public static class CookedModelFile
 			// ModelLoader.UploadLodGroup): null означает «группа не строилась».
 			var lods = ReadBlittable<LodLevel>(reader);
 			mesh.LodLevels = lods.Length > 0 ? lods : null;
+
+			var skin = ReadBlittable<SkinVertex>(reader);
+			mesh.SkinVertices = skin.Length > 0 ? skin : null;
 
 			prepared.Meshes.Add(mesh);
 		}
@@ -343,6 +373,149 @@ public static class CookedModelFile
 			int sourceMaterial = reader.ReadInt32();
 			int topology = reader.ReadInt32();
 			prepared.TopologyMaterialClones[key] = (sourceMaterial, topology);
+		}
+	}
+
+	/// <summary>Потриугольные атрибуты материала (см. PreparedModel.TriangleAttributes): meshId ->
+	/// упаковка по 5 байт на треугольник. Пишутся сырым блоком - на Sponza это единицы мегабайт
+	/// против сотен у геометрии.</summary>
+	private static void WriteTriangleAttributes(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	{
+		writer.Write(prepared.TriangleAttributes.Count);
+
+		foreach (var (meshId, packed) in prepared.TriangleAttributes)
+		{
+			writer.Write(meshId);
+			writer.Write(packed.Length);
+			writer.Write(packed);
+		}
+	}
+
+	private static void ReadTriangleAttributes(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	{
+		int count = reader.ReadInt32();
+		ThrowIfImplausibleCount(count);
+
+		for (int i = 0; i < count; i++)
+		{
+			int meshId = reader.ReadInt32();
+			int length = reader.ReadInt32();
+			ThrowIfImplausibleCount(length);
+			prepared.TriangleAttributes[meshId] = reader.ReadBytes(length);
+		}
+	}
+
+	/// <summary>Скелет: имена джойнтов строками, всё остальное - сырыми blittable-блоками. Блок
+	/// длиной 0 означает статическую модель (см. <see cref="PreparedSkeleton"/>).</summary>
+	private static void WriteSkeleton(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	{
+		var skeleton = prepared.Skeleton;
+		if (skeleton == null)
+		{
+			writer.Write(0);
+			return;
+		}
+
+		writer.Write(skeleton.JointCount);
+		foreach (var name in skeleton.JointNames)
+		{
+			writer.Write(name ?? string.Empty);
+		}
+
+		WriteBlittable(writer, skeleton.Parents);
+		WriteBlittable(writer, skeleton.BindLocals);
+		WriteBlittable(writer, skeleton.InverseBind);
+	}
+
+	private static void ReadSkeleton(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	{
+		int jointCount = reader.ReadInt32();
+		ThrowIfImplausibleCount(jointCount);
+
+		if (jointCount == 0)
+		{
+			return;
+		}
+
+		var skeleton = new PreparedSkeleton { JointNames = new string[jointCount] };
+		for (int i = 0; i < jointCount; i++)
+		{
+			skeleton.JointNames[i] = reader.ReadString();
+		}
+
+		skeleton.Parents = ReadBlittable<int>(reader);
+		skeleton.BindLocals = ReadBlittable<Transform>(reader);
+		skeleton.InverseBind = ReadBlittable<Matrix4x4>(reader);
+
+		// Длины трёх параллельных массивов заданы одним счётчиком джойнтов, и рассинхрон здесь -
+		// признак битого файла, а не «скелета поменьше»: с коротким Parents расчёт модельных матриц
+		// вылетит за границы уже в первом кадре анимации, далеко от места настоящей ошибки.
+		if (skeleton.Parents.Length != jointCount ||
+			skeleton.BindLocals.Length != jointCount ||
+			skeleton.InverseBind.Length != jointCount)
+		{
+			throw new InvalidDataException("Cooked model skeleton block is inconsistent.");
+		}
+
+		prepared.Skeleton = skeleton;
+	}
+
+	/// <summary>Клипы: по дорожке на джойнт, каналы независимы (см. <see cref="JointTrack"/>).
+	/// Времена и значения ключей пишутся раздельными сырыми блоками - у длинных клипов это
+	/// единственный весомый кусок, и пополевая запись стоила бы на них больше, чем вся геометрия.</summary>
+	private static void WriteAnimations(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	{
+		writer.Write(prepared.Animations.Count);
+
+		foreach (var clip in prepared.Animations)
+		{
+			writer.Write(clip.Name ?? string.Empty);
+			writer.Write(clip.Duration);
+			writer.Write(clip.Tracks.Length);
+
+			foreach (var track in clip.Tracks)
+			{
+				WriteBlittable(writer, track.TranslationTimes);
+				WriteBlittable(writer, track.Translations);
+				WriteBlittable(writer, track.RotationTimes);
+				WriteBlittable(writer, track.Rotations);
+				WriteBlittable(writer, track.ScaleTimes);
+				WriteBlittable(writer, track.Scales);
+			}
+		}
+	}
+
+	private static void ReadAnimations(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	{
+		int clipCount = reader.ReadInt32();
+		ThrowIfImplausibleCount(clipCount);
+
+		for (int i = 0; i < clipCount; i++)
+		{
+			var clip = new PreparedAnimation
+			{
+				Name = reader.ReadString(),
+				Duration = reader.ReadSingle(),
+			};
+
+			int trackCount = reader.ReadInt32();
+			ThrowIfImplausibleCount(trackCount);
+
+			clip.Tracks = new JointTrack[trackCount];
+			for (int t = 0; t < trackCount; t++)
+			{
+				clip.Tracks[t] = new JointTrack
+				{
+					TranslationTimes = ReadBlittable<float>(reader),
+					Translations = ReadBlittable<Vector3>(reader),
+					RotationTimes = ReadBlittable<float>(reader),
+					Rotations = ReadBlittable<Quaternion>(reader),
+					ScaleTimes = ReadBlittable<float>(reader),
+					Scales = ReadBlittable<Vector3>(reader),
+				};
+			}
+
+			prepared.Animations.Add(clip);
 		}
 	}
 

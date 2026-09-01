@@ -21,13 +21,12 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	private readonly IGpuTexture? _sceneCopy;
 	private readonly SkyPassResources? _sky;
 	private readonly SsaoPassResources? _ssao;
-	private readonly IGpuTexture? _msaaColorTarget;
-	private readonly IGpuTexture? _msaaDepthTarget;
+	private readonly IGpuTexture? _normalRoughTarget;
+	private readonly IGpuTexture? _envFactorTarget;
 	private readonly Vector4 _clearColor;
 
 	/// <summary>Инлайн-оверлей поверх геометрии (дебаг-вид проб и т.п.): рисуется в конце каждого
-	/// вида, в УЖЕ привязанный render target, до резолва MSAA - оверлей мультисэмплится вместе со
-	/// сценой и честно тестируется её депт-буфером.
+	/// вида, в УЖЕ привязанный render target - оверлей честно тестируется депт-буфером сцены.
 	///
 	/// Геттер, а не значение: команды графа заморожены, но перезаписываются по InvalidateGraph -
 	/// геттер даёт вызывающему включать/выключать оверлей без пересоздания пасса (см.
@@ -52,11 +51,22 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	/// </summary>
 	public ForwardPass(IBatchRenderer batchRenderer, RenderCamerasData renderScene, Ref<Vector2> viewPortRef,
 		IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor, IGpuTexture? sceneCopy = null,
-		SkyPassResources? sky = null, IGpuTexture? msaaColorTarget = null, IGpuTexture? msaaDepthTarget = null,
-		SsaoPassResources? ssao = null, Func<Action<ICommandBuffer>?>? overlay = null)
+		SkyPassResources? sky = null,
+		SsaoPassResources? ssao = null, Func<Action<ICommandBuffer>?>? overlay = null,
+		IGpuTexture? normalRoughTarget = null, IGpuTexture? envFactorTarget = null)
 	{
 		_sky = sky;
 		_overlay = overlay;
+
+		// Тонкий G-buffer отражений (см. PipelineRenderTargets.NormalRoughnessTarget): геометрия
+		// пишет его вторым/третьим MRT-слотом. Требует офскрин-таргета. Оба таргета обязаны прийти
+		// вместе: PSO геометрии собраны под три слота (DiligentBatchRenderer.GeometryTargetFormats),
+		// и на Vulkan биндить меньше нельзя.
+		if (colorTarget is not null && normalRoughTarget is not null && envFactorTarget is not null)
+		{
+			_normalRoughTarget = normalRoughTarget;
+			_envFactorTarget = envFactorTarget;
+		}
 
 		// AO рисуется инлайн МЕЖДУ opaque- и transmissive-дроу (см. SsaoPassResources.
 		// WriteInlineCommands): стекло преломляет уже затенённый фон, но само экранным AO не
@@ -65,14 +75,6 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		// игнорируется вместе с ним.
 		_ssao = colorTarget is not null && sceneCopy is not null ? ssao : null;
 
-		// MSAA (опционально, только с офскрин-таргетом): геометрия рисуется в мультисемпловую пару,
-		// затем резолвится в colorTarget (его сэмплируют ImGui/readback). Оба таргета обязаны быть
-		// заданы вместе; без них - прежний одиночный путь.
-		if (colorTarget is not null && msaaColorTarget is not null && msaaDepthTarget is not null)
-		{
-			_msaaColorTarget = msaaColorTarget;
-			_msaaDepthTarget = msaaDepthTarget;
-		}
 		_batchRenderer = batchRenderer;
 		_renderScene = renderScene;
 		_viewPortRef = viewPortRef;
@@ -95,19 +97,8 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	/// объявления ни зависимостей, ни времён жизни не прибавится.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
-		if (_msaaColorTarget is not null)
-		{
-			builder.WriteTarget(builder.ImportTexture(_msaaColorTarget));
-		}
-
-		if (_msaaDepthTarget is not null)
-		{
-			builder.WriteTarget(builder.ImportTexture(_msaaDepthTarget));
-		}
-
 		if (_colorTarget is not null)
 		{
-			// Пишется в любом случае: без MSAA - самой геометрией, с MSAA - резолвом в конце.
 			builder.WriteTarget(builder.ImportTexture(_colorTarget));
 		}
 
@@ -123,6 +114,12 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 			var sceneCopy = builder.ImportTexture(_sceneCopy);
 			builder.WriteTarget(sceneCopy);
 			builder.ReadTarget(sceneCopy);
+		}
+
+		if (_normalRoughTarget is not null)
+		{
+			builder.WriteTarget(builder.ImportTexture(_normalRoughTarget));
+			builder.WriteTarget(builder.ImportTexture(_envFactorTarget!));
 		}
 
 		return default;
@@ -158,10 +155,8 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 			_batchRenderer.TransitionPunctualShadowsForRead(cmd);
 		}
 
-		// При включённом MSAA вся геометрия рисуется в мультисемпловую пару, а _colorTarget
-		// становится resolve-приёмником в конце кадра.
-		var renderColor = _msaaColorTarget ?? _colorTarget;
-		var renderDepth = _msaaColorTarget is not null ? _msaaDepthTarget : _depthTarget;
+		var renderColor = _colorTarget;
+		var renderDepth = _depthTarget;
 
 		if (renderColor is not null)
 		{
@@ -170,6 +165,14 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 			if (renderDepth is not null)
 			{
 				cmd.ClearDepthStencil(renderDepth, ClearDepthStencilFlags.Depth, 0.0f, 0);
+			}
+
+			// G-buffer отражений чистится нулями: нуль в w EnvFactor - «lit-путь не прошёл», такие
+			// пиксели SSR-композит не трогает (небо, режимы превью без PBR).
+			if (_normalRoughTarget is not null)
+			{
+				cmd.ClearRenderTarget(_normalRoughTarget, Vector4.Zero);
+				cmd.ClearRenderTarget(_envFactorTarget!, Vector4.Zero);
 			}
 		}
 		else
@@ -208,9 +211,23 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 
 				var cullResult = _batchRenderer.ExecuteComputeCulling(cmd);
 
+				// PSO геометрии при G-buffer-е отражений собраны под три MRT-слота - все батч-дроу
+				// идут с привязанной тройкой, а небо/AO/оверлеи (одиночные PSO) - с одиночным
+				// таргетом; перепривязки ниже расставлены ровно по этим границам.
 				if (_sceneCopy is null)
 				{
+					if (_normalRoughTarget is not null)
+					{
+						cmd.SetRenderTargets([renderColor!, _normalRoughTarget, _envFactorTarget!], renderDepth);
+					}
+
 					_batchRenderer.ExecuteDrawBatching(cmd, cullResult);
+
+					if (_normalRoughTarget is not null)
+					{
+						cmd.SetRenderTarget(renderColor, renderDepth);
+					}
+
 					_overlay?.Invoke()?.Invoke(cmd);
 					continue;
 				}
@@ -219,24 +236,22 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				// _sceneCopy, и только после - transmissive-материалы (см.
 				// IBatchRenderer.SetMaterialTransparent), сэмплирующие этот снимок как "сцену за
 				// стеклом" (_SceneColor в UnlitInstancedPS.hlsl). Копировать привязанный RT нельзя -
-				// таргет отвязывается на время копии и привязывается обратно. С MSAA снимок
-				// получается резолвом (мультисемпловую текстуру шейдер сэмплировать не может).
+				// таргет отвязывается на время копии и привязывается обратно.
 				//
 				// Переход снимка в ShaderResource ДО opaque-дроу обязателен: _SceneColor статически
 				// привязан в SRB всех материалов (в т.ч. opaque), и в первом кадре текстура ещё в
 				// UNDEFINED - валидация Vulkan падает на самом первом дроу, не дойдя до копии.
 				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
+
+				if (_normalRoughTarget is not null)
+				{
+					cmd.SetRenderTargets([renderColor!, _normalRoughTarget, _envFactorTarget!], renderDepth);
+				}
+
 				_batchRenderer.ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.OpaqueOnly);
 
 				cmd.SetRenderTarget(null, null);
-				if (_msaaColorTarget is not null)
-				{
-					cmd.ResolveTexture(_msaaColorTarget, _sceneCopy);
-				}
-				else
-				{
-					cmd.CopyTexture(_colorTarget, _sceneCopy);
-				}
+				cmd.CopyTexture(_colorTarget, _sceneCopy);
 				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
 
 				// Экранное AO - здесь, а не пост-пассом поверх готового кадра: оценка по opaque-депту,
@@ -260,19 +275,26 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 					_ssao.WriteInlineCommands(cmd, renderColor!, renderDepth!, _viewPortRef);
 				}
 
-				cmd.SetRenderTarget(renderColor, renderDepth);
+				if (_normalRoughTarget is not null)
+				{
+					cmd.SetRenderTargets([renderColor!, _normalRoughTarget, _envFactorTarget!], renderDepth);
+				}
+				else
+				{
+					cmd.SetRenderTarget(renderColor, renderDepth);
+				}
+
 				cmd.SetViewport(_viewPortRef);
 				_batchRenderer.ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.TransparentOnly);
+
+				// Оверлей - одиночным PSO, см. комментарий у первой перепривязки выше.
+				if (_normalRoughTarget is not null)
+				{
+					cmd.SetRenderTarget(renderColor, renderDepth);
+				}
+
 				_overlay?.Invoke()?.Invoke(cmd);
 			}
-		}
-
-		// Финальный резолв MSAA-кадра в одиночный _colorTarget - именно его сэмплируют
-		// ImGui/readback; без MSAA геометрия рисовалась прямо в него, и резолв не нужен.
-		if (_msaaColorTarget is not null)
-		{
-			cmd.SetRenderTarget(null, null);
-			cmd.ResolveTexture(_msaaColorTarget, _colorTarget);
 		}
 	}
 }

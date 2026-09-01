@@ -1,4 +1,5 @@
-﻿using DecaEngine.Graphics.Core;
+﻿using System.Collections.Generic;
+using DecaEngine.Graphics.Core;
 using Diligent;
 
 namespace DecaEngine.Core;
@@ -45,6 +46,22 @@ public interface IMaterialObject : IStateObject
 
 	public void SetSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel);
 	public void SetImmutableSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel);
+
+	/// <summary>Привязка TLAS для inline-трассировки в пиксельном шейдере (RT-тени материалов,
+	/// RT-фолбэк SSR - см. SsrPassResources.SetRayScene). Дефолт - no-op: реализует только
+	/// Diligent-бэкенд (DiligentMaterial.SetAccelStructure, стадия строго пиксельная).</summary>
+	public void SetAccelStructure(string name, ITopLevelAS tlas) { }
+
+	/// <summary>Привязка «сырого» структурированного Diligent-буфера как SRV пиксельной стадии
+	/// (таблицы атрибутов сцены для RT-фолбэка SSR). Дефолт - no-op, как у
+	/// <see cref="SetAccelStructure"/>.</summary>
+	public void SetStructuredBufferSrv(string name, IBuffer buffer) { }
+
+	/// <summary>Привязка массива текстур в одну шейдерную переменную `Texture2D name[N]` (SRV
+	/// пиксельной стадии) - «bindless»-текстуры RT-хитов SSR. Число элементов обязано совпадать с N
+	/// в шейдере, каждый слот - живой Texture2D (свободные добиваются плейсхолдером). Дефолт -
+	/// no-op, как у <see cref="SetAccelStructure"/>.</summary>
+	public void SetTextureSrvArray(string name, IReadOnlyList<IGpuTexture> textures) { }
 }
 
 // ?????: ????????? ????????? ??? Compute
