@@ -24,6 +24,11 @@
 
     <ItemGroup>
       <PackageReference Include="Hexa.NET.ImGui.Widgets" Version="1.2.18" />
+      <!-- Явный пин против ABI-рассинхрона: Widgets тянет ImGuizmo 2.2.8.4, а ImGui у нас прямой
+           ссылкой 2.2.10-prerelease. Нативный cimguizmo 2.2.8.4 читает структуру контекста cimgui
+           2.2.10 - это и было «редкое 0xC0000005 в BeginFrameNative»: не гонка, а раскладка памяти,
+           совпадающая через раз. Версия ОБЯЗАНА совпадать с Hexa.NET.ImGui (см. ImGui.Core). -->
+      <PackageReference Include="Hexa.NET.ImGuizmo" Version="2.2.10-prerelease" />
       <PackageReference Include="Microsoft.Build.Runtime" Version="18.6.3" ExcludeAssets="runtime;contentFiles" />
       <!-- Транзитивный пин: MSBuild-пакеты тянут 10.0.3 с известной уязвимостью (NU1903,
            GHSA-23rf-6693-g89p). Прямая ссылка поднимает до исправленной версии. -->
