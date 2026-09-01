@@ -31,8 +31,6 @@
     </ItemGroup>
 
     <ItemGroup>
-      <ClCompile Include="Assets\Shaders\ImGuiFrag.hlsl" />
-      <ClCompile Include="Assets\Shaders\ImGuiVertex.hlsl" />
     </ItemGroup>
 
     <ItemGroup>

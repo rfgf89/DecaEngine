@@ -17,4 +17,20 @@
       <PackageReference Include="Evergine.Mathematics" Version="2026.5.26.372" />
     </ItemGroup>
 
+    <!--
+        Шейдеры ImGui едут вместе с этим проектом, а не с приложением. Ищет их
+        ImGuiDiligentRender.CreateDeviceResources - по пути <рабочий каталог>/Assets/Shaders, - и
+        любой, кто подключает этот рендер, обязан получить их в свой вывод.
+
+        Раньше они лежали в проекте СЭМПЛОВ (DecaEngine/Assets/Shaders) вперемешку с тринадцатью
+        демонстрационными, а редактор получал их только потому, что ссылался на сэмплы. Когда эта
+        ссылка ушла как ненужная, редактор перестал стартовать: Diligent не смог создать шейдеры
+        шрифта, PSO остался без вершинного шейдера, и падало уже на NullReferenceException.
+    -->
+    <ItemGroup>
+      <Content Include="Assets\**">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+
 </Project>
