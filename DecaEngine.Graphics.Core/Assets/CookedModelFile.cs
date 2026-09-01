@@ -58,7 +58,7 @@ public static class CookedModelFile
 	/// <summary>Пишет cooked-модель атомарно (временный файл + Move) - по той же причине, что и
 	/// <see cref="DtexFile.Write"/>: бейк идёт в фоне и переживает закрытие редактора не всегда, а
 	/// обрезанный .dmdl по имени неотличим от целого.</summary>
-	internal static void Write(string path, ModelLoader.PreparedModel prepared)
+	internal static void Write(string path, PreparedModel prepared)
 	{
 		var directory = Path.GetDirectoryName(path);
 		if (!string.IsNullOrEmpty(directory))
@@ -102,7 +102,7 @@ public static class CookedModelFile
 	/// <summary>Читает cooked-модель. null - файла нет, он от другой версии формата или повреждён;
 	/// вызывающий трактует это как промах кеша и печёт заново (см. <see cref="DtexFile.TryRead"/>
 	/// о том, почему битый кеш обязан лечиться сам).</summary>
-	internal static ModelLoader.PreparedModel? TryRead(string path)
+	internal static PreparedModel? TryRead(string path)
 	{
 		try
 		{
@@ -114,7 +114,7 @@ public static class CookedModelFile
 				return null;
 			}
 
-			var prepared = new ModelLoader.PreparedModel();
+			var prepared = new PreparedModel();
 			ReadMeshes(reader, prepared);
 			ReadMaterials(reader, prepared);
 			prepared.Instances.AddRange(ReadBlittable<InstanceData>(reader));
@@ -139,7 +139,7 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void WriteMeshes(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	private static void WriteMeshes(BinaryWriter writer, PreparedModel prepared)
 	{
 		writer.Write(prepared.Meshes.Count);
 
@@ -161,14 +161,14 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void ReadMeshes(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	private static void ReadMeshes(BinaryReader reader, PreparedModel prepared)
 	{
 		int count = reader.ReadInt32();
 		ThrowIfImplausibleCount(count);
 
 		for (int i = 0; i < count; i++)
 		{
-			var mesh = new ModelLoader.PreparedMesh
+			var mesh = new PreparedMesh
 			{
 				Name = reader.ReadString(),
 				Topology = reader.ReadInt32(),
@@ -193,7 +193,7 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void WriteMaterials(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	private static void WriteMaterials(BinaryWriter writer, PreparedModel prepared)
 	{
 		writer.Write(prepared.Materials.Count);
 
@@ -252,14 +252,14 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void ReadMaterials(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	private static void ReadMaterials(BinaryReader reader, PreparedModel prepared)
 	{
 		int count = reader.ReadInt32();
 		ThrowIfImplausibleCount(count);
 
 		for (int i = 0; i < count; i++)
 		{
-			var material = new ModelLoader.PreparedMaterial
+			var material = new PreparedMaterial
 			{
 				LogicalIndex = reader.ReadInt32(),
 				IsNull = reader.ReadBoolean(),
@@ -310,7 +310,7 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void WriteTexture(BinaryWriter writer, ModelLoader.PreparedTexture texture)
+	private static void WriteTexture(BinaryWriter writer, PreparedTexture texture)
 	{
 		if (texture?.CacheKey == null)
 		{
@@ -333,14 +333,14 @@ public static class CookedModelFile
 		writer.Write(texture.Height);
 	}
 
-	private static ModelLoader.PreparedTexture? ReadTexture(BinaryReader reader)
+	private static PreparedTexture? ReadTexture(BinaryReader reader)
 	{
 		if (!reader.ReadBoolean())
 		{
 			return null;
 		}
 
-		return new ModelLoader.PreparedTexture
+		return new PreparedTexture
 		{
 			CacheKey = reader.ReadString(),
 			AddressMode = (TextureAddress)reader.ReadInt32(),
@@ -350,7 +350,7 @@ public static class CookedModelFile
 		};
 	}
 
-	private static void WriteTopologyClones(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	private static void WriteTopologyClones(BinaryWriter writer, PreparedModel prepared)
 	{
 		writer.Write(prepared.TopologyMaterialClones.Count);
 
@@ -362,7 +362,7 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void ReadTopologyClones(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	private static void ReadTopologyClones(BinaryReader reader, PreparedModel prepared)
 	{
 		int count = reader.ReadInt32();
 		ThrowIfImplausibleCount(count);
@@ -379,7 +379,7 @@ public static class CookedModelFile
 	/// <summary>Потриугольные атрибуты материала (см. PreparedModel.TriangleAttributes): meshId ->
 	/// упаковка по 5 байт на треугольник. Пишутся сырым блоком - на Sponza это единицы мегабайт
 	/// против сотен у геометрии.</summary>
-	private static void WriteTriangleAttributes(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	private static void WriteTriangleAttributes(BinaryWriter writer, PreparedModel prepared)
 	{
 		writer.Write(prepared.TriangleAttributes.Count);
 
@@ -391,7 +391,7 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void ReadTriangleAttributes(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	private static void ReadTriangleAttributes(BinaryReader reader, PreparedModel prepared)
 	{
 		int count = reader.ReadInt32();
 		ThrowIfImplausibleCount(count);
@@ -407,7 +407,7 @@ public static class CookedModelFile
 
 	/// <summary>Скелет: имена джойнтов строками, всё остальное - сырыми blittable-блоками. Блок
 	/// длиной 0 означает статическую модель (см. <see cref="PreparedSkeleton"/>).</summary>
-	private static void WriteSkeleton(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	private static void WriteSkeleton(BinaryWriter writer, PreparedModel prepared)
 	{
 		var skeleton = prepared.Skeleton;
 		if (skeleton == null)
@@ -427,7 +427,7 @@ public static class CookedModelFile
 		WriteBlittable(writer, skeleton.InverseBind);
 	}
 
-	private static void ReadSkeleton(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	private static void ReadSkeleton(BinaryReader reader, PreparedModel prepared)
 	{
 		int jointCount = reader.ReadInt32();
 		ThrowIfImplausibleCount(jointCount);
@@ -463,7 +463,7 @@ public static class CookedModelFile
 	/// <summary>Клипы: по дорожке на джойнт, каналы независимы (см. <see cref="JointTrack"/>).
 	/// Времена и значения ключей пишутся раздельными сырыми блоками - у длинных клипов это
 	/// единственный весомый кусок, и пополевая запись стоила бы на них больше, чем вся геометрия.</summary>
-	private static void WriteAnimations(BinaryWriter writer, ModelLoader.PreparedModel prepared)
+	private static void WriteAnimations(BinaryWriter writer, PreparedModel prepared)
 	{
 		writer.Write(prepared.Animations.Count);
 
@@ -485,7 +485,7 @@ public static class CookedModelFile
 		}
 	}
 
-	private static void ReadAnimations(BinaryReader reader, ModelLoader.PreparedModel prepared)
+	private static void ReadAnimations(BinaryReader reader, PreparedModel prepared)
 	{
 		int clipCount = reader.ReadInt32();
 		ThrowIfImplausibleCount(clipCount);

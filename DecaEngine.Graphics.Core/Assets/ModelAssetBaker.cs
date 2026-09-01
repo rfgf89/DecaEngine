@@ -3,7 +3,7 @@ namespace DecaEngine.Graphics.Assets;
 
 /// <summary>
 /// Печёт текстуры подготовленной модели в .dtex и проставляет слотам ключи кеша. Работает по
-/// <c>ModelLoader.PreparedModel</c>, то есть после того, как фоновая фаза загрузки уже декодировала
+/// <c>PreparedModel</c>, то есть после того, как фоновая фаза загрузки уже декодировала
 /// картинки, - собственного разбора glTF здесь нет.
 /// </summary>
 internal static class ModelAssetBaker
@@ -16,7 +16,7 @@ internal static class ModelAssetBaker
 	/// без дедупликации BC7-кодирование 4K-картинки честно выполнялось бы дважды на каждый такой
 	/// материал. На сценах уровня Sponza это разница между минутами и десятками минут.
 	/// </summary>
-	public static void BakeTextures(ModelLoader.PreparedModel prepared, AssetCache cache,
+	public static void BakeTextures(PreparedModel prepared, AssetCache cache,
 		ModelLoadOptions options, CancellationToken cancellationToken)
 	{
 		cache.EnsureDirectories();
@@ -42,7 +42,7 @@ internal static class ModelAssetBaker
 			BakeSlot(material.ThicknessTexture, TextureSlotKind.Thickness);
 		}
 
-		void BakeSlot(ModelLoader.PreparedTexture texture, TextureSlotKind kind)
+		void BakeSlot(PreparedTexture texture, TextureSlotKind kind)
 		{
 			if (texture?.Pixels == null || texture.SourceImage == null)
 			{
@@ -116,7 +116,7 @@ internal static class ModelAssetBaker
 	/// Ошибка такого рода не диагностируется вообще - модель просто «выцветает», - поэтому дешевле
 	/// объявить промах и перепечь.
 	/// </summary>
-	public static bool AllTexturesPresent(ModelLoader.PreparedModel prepared, AssetCache cache)
+	public static bool AllTexturesPresent(PreparedModel prepared, AssetCache cache)
 	{
 		foreach (var material in prepared.Materials)
 		{
@@ -137,7 +137,7 @@ internal static class ModelAssetBaker
 
 		return true;
 
-		bool SlotPresent(ModelLoader.PreparedTexture texture) =>
+		bool SlotPresent(PreparedTexture texture) =>
 			texture?.CacheKey == null || File.Exists(cache.TexturePath(texture.CacheKey));
 	}
 }
