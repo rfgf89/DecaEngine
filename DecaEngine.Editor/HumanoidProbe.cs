@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Graphics;
+using DecaEngine.Animation;
+using DecaEngine.Core;
 
 namespace DecaEngine.Editor;
 

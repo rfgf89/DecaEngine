@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>
 /// Построение ДЕЛЬТА-клипа для аддитивного бленда - портированный AdditiveAnimationBuilder ozz:

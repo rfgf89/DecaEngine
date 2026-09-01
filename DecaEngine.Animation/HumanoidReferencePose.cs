@@ -1,7 +1,8 @@
 using System;
 using System.Numerics;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>Насколько поза похожа на T: по каждой конечности - отклонение её направления от
 /// ожидаемого, в градусах. Числа, а не «да/нет»: поза почти никогда не идеальна, и решать, годится

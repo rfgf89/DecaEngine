@@ -4,6 +4,7 @@ using System.Numerics;
 using BepuPhysics;
 using DecaEngine.Graphics;
 using DecaEngine.Physics;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor;
 

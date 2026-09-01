@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using DecaEngine.Graphics;
+using DecaEngine.Animation;
+using DecaEngine.Core;
 
 namespace DecaEngine.Editor;
 

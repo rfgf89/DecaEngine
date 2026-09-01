@@ -2,8 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>
 /// Чтение и запись аватара рядом с моделью: <c>Fox.glb</c> -> <c>Fox.avatar.json</c>.

@@ -1,6 +1,7 @@
 using System.Numerics;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>
 /// Скиннинг-атрибуты одной вершины: до четырёх джойнтов с весами. Лежит ОТДЕЛЬНЫМ стримом,

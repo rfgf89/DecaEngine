@@ -8,6 +8,7 @@ using Engine.ImGui.Core;
 using Friflo.Engine.ECS;
 using Hexa.NET.ImGui;
 using DecaEngine.Scene;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor;
 

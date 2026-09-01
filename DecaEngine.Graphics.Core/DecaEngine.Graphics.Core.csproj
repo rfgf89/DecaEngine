@@ -5,7 +5,8 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+      <ProjectReference Include="..\DecaEngine.Animation\DecaEngine.Animation.csproj" />
+    <ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
     </ItemGroup>
 
     <ItemGroup>

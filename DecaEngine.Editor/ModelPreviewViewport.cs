@@ -12,6 +12,7 @@ using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using Hexa.NET.ImGui;
 using DecaEngine.Scene;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {

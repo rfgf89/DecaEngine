@@ -1,17 +1,18 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using DecaEngine.Animation;
 using DecaEngine.Core;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Physics;
+using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
 // В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
 // имя разрешается неоднозначно.
-using Transform = DecaEngine.Graphics.Transform;
-using DecaEngine.Scene;
+using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 

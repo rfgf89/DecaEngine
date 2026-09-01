@@ -12,6 +12,7 @@ using Diligent;
 using MeshOptimizer;
 using StbImageSharp;
 using UnsafeCollections.Collections.Unsafe;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
@@ -503,13 +504,6 @@ public static class MeshUtility
 
 		return (vertices, skin);
 	}
-}
-
-public struct Transform
-{
-	public Vector3 position;
-	public Quaternion rotation;
-	public Vector3 scale;
 }
 
 public struct InstanceData

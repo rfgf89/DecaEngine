@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>Результат запроса «что под этой точкой». Абстракция, а не тип физики: солвер живёт в
 /// графическом слое и не должен тянуть за собой BepuPhysics - вызывающий подставляет свой

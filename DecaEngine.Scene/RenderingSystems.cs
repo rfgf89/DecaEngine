@@ -3,6 +3,9 @@ using System;
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Core.Entities;
+// Здесь Transform - ECS-компонент Friflo (мировая матрица), а НЕ TRS-структура DecaEngine.Core.
+// Оба имени видны в этом файле, поэтому выбор сделан явно, а не отдан порядку using.
+using Transform = Friflo.Engine.ECS.Transform;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS.Systems;
 

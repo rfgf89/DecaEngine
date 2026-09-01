@@ -8,6 +8,7 @@ using DecaEngine.Graphics.ProbeGi;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using DecaEngine.Scene;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
@@ -1132,7 +1133,7 @@ namespace DecaEngine.Editor
 		public static Entity? CreateInstanceEntity(EntityStore store, RenderResourceManager resourceManager,
 			DiligentBatchRenderer batchRenderer, Dictionary<int, MeshId> meshIdMap,
 			Dictionary<int, MaterialId> materialIdMap, Dictionary<(int, int), BatchId> batchCache,
-			int meshIndex, int materialIndex, DecaEngine.Graphics.Transform t,
+			int meshIndex, int materialIndex, DecaEngine.Core.Transform t,
 			ModelLoader? skinnedModel = null, Dictionary<int, int>? skinBaseMap = null,
 			Action<int>? onSkinnedPalette = null)
 		{

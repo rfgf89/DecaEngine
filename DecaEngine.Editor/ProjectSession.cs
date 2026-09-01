@@ -4,6 +4,7 @@ using DecaEngine.Core.Build;
 using DecaEngine.Graphics.Assets;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {

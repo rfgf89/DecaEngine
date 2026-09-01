@@ -16,6 +16,7 @@ using Hexa.NET.ImGui;
 using Hexa.NET.ImGuizmo;
 using UnsafeCollections.Collections.Unsafe;
 using DecaEngine.Scene;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
@@ -2557,8 +2558,8 @@ namespace DecaEngine.Editor
 			record.LastWorld = world;
 		}
 
-		private static DecaEngine.Graphics.Transform ComposeInstanceTransform(
-			DecaEngine.Graphics.Transform instanceLocal, Matrix4x4 world)
+		private static DecaEngine.Core.Transform ComposeInstanceTransform(
+			DecaEngine.Core.Transform instanceLocal, Matrix4x4 world)
 		{
 			var combined = MathUtils.CreateTrs(
 				instanceLocal.position, instanceLocal.rotation, instanceLocal.scale) * world;
@@ -2588,7 +2589,7 @@ namespace DecaEngine.Editor
 					0f, 0f, 0f, 1f));
 			}
 
-			return new DecaEngine.Graphics.Transform
+			return new DecaEngine.Core.Transform
 			{
 				position = translation,
 				rotation = rotation,

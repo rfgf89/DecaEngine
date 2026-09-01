@@ -6,6 +6,7 @@ using BepuPhysics;
 using BepuPhysics.Collidables;
 using DecaEngine.Graphics;
 using DecaEngine.Physics;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Scene;
 

@@ -3,6 +3,7 @@ using DecaEngine.Core;
 using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics.Core;
 using StbImageSharp;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor;
 

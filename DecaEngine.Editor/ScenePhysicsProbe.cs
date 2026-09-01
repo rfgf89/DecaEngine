@@ -11,6 +11,7 @@ using DecaEngine.Graphics;
 using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Unsafe;
 using DecaEngine.Scene;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor;
 

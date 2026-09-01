@@ -1,5 +1,6 @@
 using System.Numerics;
 using DecaEngine.Graphics;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Tests.Graphics;
 

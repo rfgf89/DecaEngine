@@ -1,7 +1,8 @@
 using System;
 using System.Numerics;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>
 /// Поза скелета в трёх представлениях сразу: локальные TRS, модельные матрицы и палитра

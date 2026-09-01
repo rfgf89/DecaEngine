@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!--
+		Рантайм анимации: скелет и клипы как данные, поза и сэмплирование через нативный ozz,
+		аддитивные клипы, IK стоп, пружинные кости, гуманоидный аватар и его референс-поза.
+
+		Лежал в DecaEngine.Graphics.Core, хотя графики в нём нет: во всех девяти файлах нет ни
+		одного using на DecaEngine - только System.*. Единственной внешней зависимостью был
+		Transform, объявленный посреди ModelLoader.cs; он уехал в Core.
+
+		Импортная сторона (SkinningImport - разбор скина из glTF) осталась в Graphics.Core рядом с
+		ModelLoader: она принадлежит загрузке моделей, а не проигрыванию анимации. Направление
+		получилось Graphics.Core -> Animation: загрузчик ПРОИЗВОДИТ PreparedSkeleton/
+		PreparedAnimation, рантайм их ПОТРЕБЛЯЕТ. Обратной стрелки нет.
+	-->
+	<ItemGroup>
+		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+	</ItemGroup>
+
+</Project>

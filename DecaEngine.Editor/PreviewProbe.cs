@@ -10,6 +10,7 @@ using DecaEngine.Graphics.ProbeGi;
 using DecaEngine.Sdl;
 using Friflo.Engine.ECS.Systems;
 using DecaEngine.Scene;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor;
 
@@ -802,7 +803,7 @@ public static class PreviewProbe
 					continue;
 				}
 
-				var worldTransform = new DecaEngine.Graphics.Transform
+				var worldTransform = new DecaEngine.Core.Transform
 				{
 					position = wPos,
 					rotation = wRot,

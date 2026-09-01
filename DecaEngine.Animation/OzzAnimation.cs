@@ -2,8 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>
 /// Обёртка нативного ozz-animation (см. native/DecaOzzShim). Граница проведена по КРУПНЫМ

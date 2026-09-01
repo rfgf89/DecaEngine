@@ -2,6 +2,7 @@
 using System.Numerics;
 using DecaEngine.Core;
 using DecaEngine.Graphics.Diligent;
+using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {

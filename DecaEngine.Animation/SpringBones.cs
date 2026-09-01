@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using DecaEngine.Core;
 
-namespace DecaEngine.Graphics;
+namespace DecaEngine.Animation;
 
 /// <summary>
 /// Цепочка костей вторичного движения: хвост, коса, полы плаща, подвески. Кости идут ОТ КОРНЯ К
