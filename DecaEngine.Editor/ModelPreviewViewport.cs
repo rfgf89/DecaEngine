@@ -450,15 +450,7 @@ namespace DecaEngine.Editor
 			}
 
 			_pendingUpscalerApply = false;
-			_env.SetUpscalerBackend(_editorSettings.TemporalUpscale && _editorSettings.PreviewMotionVectors
-				? Math.Clamp(_editorSettings.UpscalerBackend, 0, 2)
-				: 0);
-			_env.SetUpscalerTuning(
-				Math.Clamp(_editorSettings.TaauBlendAlpha, 0.02f, 0.5f),
-				Math.Clamp(_editorSettings.FsrSharpness, 0f, 1f),
-				new[] { 0, 1, 2, 5 }[Math.Clamp(_editorSettings.DlssQuality, 0, 3)],
-				// Индекс комбо провайдера FSR -> мажор ветки: {Авто, FSR 2, FSR 3.1} = {0, 2, 3}.
-				new[] { 0, 2, 3 }[Math.Clamp(_editorSettings.FsrProvider, 0, 2)]);
+			ViewportSettingsPush.Upscaler(_env, _editorSettings);
 		}
 
 		/// <summary>?????????? ???? ? ????????? ??????? ??????????? ??????, ???? null.</summary>
@@ -1011,86 +1003,14 @@ namespace DecaEngine.Editor
 		/// <summary>Пуш живых ручек тумана (no-op когда он выключен - см. ModelViewportEnvironment.SetFogParams).
 		/// Направление солнца сюда НЕ входит: оно пушится покадрово вместе с базисом камеры
 		/// (см. SetCameraTransform), иначе в Scene View подсветка отставала бы от гизмо солнца.</summary>
-		/// <summary>Пуш живых ручек блума (no-op когда он выключен - см.
-		/// ModelViewportEnvironment.SetBloomParams).</summary>
-		private void ApplyBloomSettings()
-		{
-			_env.SetBloomParams(
-				Math.Max(_editorSettings.BloomThreshold, 0f),
-				Math.Max(_editorSettings.BloomKnee, 0.0001f),
-				Math.Max(_editorSettings.BloomRadius, 0f),
-				Math.Max(_editorSettings.BloomIntensity, 0f));
-		}
+		private void ApplyBloomSettings() => ViewportSettingsPush.Bloom(_env, _editorSettings);
 
 
-		/// <summary>Пуш живых ручек цветокоррекции и виньетки (no-op когда грейдинг выключен - см.
-		/// ModelViewportEnvironment.SetColorGrade).</summary>
-		private void ApplyColorGradeSettings()
-		{
-			_env.SetColorGrade(
-				Math.Max(_editorSettings.GradeSaturation, 0f),
-				Math.Max(_editorSettings.GradeContrast, 0f),
-				Math.Max(_editorSettings.GradeGamma, 0.001f),
-				Math.Clamp(_editorSettings.GradeTemperature, -1f, 1f),
-				Math.Clamp(_editorSettings.GradeTint, -1f, 1f),
-				new Vector3(_editorSettings.GradeShadowR, _editorSettings.GradeShadowG, _editorSettings.GradeShadowB),
-				new Vector3(_editorSettings.GradeHighlightR, _editorSettings.GradeHighlightG, _editorSettings.GradeHighlightB));
+		private void ApplyColorGradeSettings() => ViewportSettingsPush.ColorGrade(_env, _editorSettings);
 
-			_env.SetVignette(
-				Math.Clamp(_editorSettings.VignetteIntensity, 0f, 1f),
-				Math.Max(_editorSettings.VignetteRadius, 0.001f),
-				Math.Max(_editorSettings.VignetteSmoothness, 0.001f),
-				Math.Clamp(_editorSettings.VignetteRoundness, 0f, 1f));
-		}
+		private void ApplyFogSettings() => ViewportSettingsPush.Fog(_env, _editorSettings);
 
-		private void ApplyFogSettings()
-		{
-			_env.SetFogParams(
-				Math.Max(_editorSettings.FogDensity, 0f),
-				Math.Max(_editorSettings.FogHeightFalloff, 0f),
-				_editorSettings.FogHeightRef,
-				Math.Max(_editorSettings.FogStartDistance, 0f),
-				Math.Max(_editorSettings.FogMaxDistance, 1f),
-				Math.Clamp(_editorSettings.FogMaxOpacity, 0f, 1f));
-
-			_env.SetFogColors(
-				new Vector3(_editorSettings.FogColorR, _editorSettings.FogColorG, _editorSettings.FogColorB),
-				new Vector3(_editorSettings.FogSunColorR, _editorSettings.FogSunColorG, _editorSettings.FogSunColorB),
-				Math.Clamp(_editorSettings.FogSunStrength, 0f, 1f),
-				Math.Max(_editorSettings.FogSunSharpness, 0.001f));
-		}
-
-		/// <summary>Пуш живых ручек объёмного света (no-op когда он выключен - см.
-		/// ModelViewportEnvironment.SetVolumetricParams). Направление солнца сюда, как и у тумана,
-		/// НЕ входит: оно пушится покадрово вместе с базисом камеры (см. SetCameraTransform).</summary>
-		private void ApplyVolumetricSettings()
-		{
-			_env.SetVolumetricParams(
-				Math.Max(_editorSettings.VolumetricDensity, 0f),
-				Math.Max(_editorSettings.VolumetricHeightFalloff, 0f),
-				_editorSettings.VolumetricHeightRef,
-				Math.Max(_editorSettings.VolumetricStartDistance, 0f),
-				Math.Max(_editorSettings.VolumetricMaxDistance, 1f),
-				Math.Clamp(_editorSettings.VolumetricSteps, 4, 256),
-				Math.Clamp(_editorSettings.VolumetricMaxOpacity, 0f, 1f),
-				Math.Clamp(_editorSettings.VolumetricShadowStrength, 0f, 1f));
-
-			_env.SetVolumetricScattering(
-				Math.Max(_editorSettings.VolumetricScattering, 0f),
-				Math.Max(_editorSettings.VolumetricExtinction, 1e-4f),
-				Math.Clamp(_editorSettings.VolumetricAnisotropy, -0.95f, 0.95f));
-
-			_env.SetVolumetricColors(
-				new Vector3(_editorSettings.VolumetricSunColorR, _editorSettings.VolumetricSunColorG,
-					_editorSettings.VolumetricSunColorB),
-				Math.Max(_editorSettings.VolumetricSunIntensity, 0f),
-				new Vector3(_editorSettings.VolumetricAmbientColorR, _editorSettings.VolumetricAmbientColorG,
-					_editorSettings.VolumetricAmbientColorB),
-				Math.Max(_editorSettings.VolumetricAmbientIntensity, 0f),
-				Math.Clamp(_editorSettings.VolumetricAmbientShadowFloor, 0f, 1f));
-
-			_env.SetVolumetricPunctualScatter(Math.Max(_editorSettings.VolumetricPunctualScatter, 0f));
-		}
+		private void ApplyVolumetricSettings() => ViewportSettingsPush.Volumetric(_env, _editorSettings);
 		/// <summary>Мировой радиус влияния AO для текущей модели: явная ручка "AO radius (world)",
 		/// если она задана, иначе доля габаритного радиуса (см. EditorSettings.AoRadiusWorld -
 		/// на сценах-уровнях доля от баундов даёт метры, и контактная тень расползается в пятно).</summary>
@@ -1846,28 +1766,8 @@ namespace DecaEngine.Editor
 		/// снимок: MaxTextureSize/анизотропию пользователь меняет между загрузками. Кламп
 		/// MaxTextureSize - это ПИКОВАЯ память загрузки: все текстуры модели декодируются разом и
 		/// лежат несжатыми до самой заливки (см. EditorSettings.PreviewMaxTextureSize).</summary>
-		private ModelLoadOptions BuildLoadOptions() => new()
-		{
-			VertexShader = _editorSettings.DefaultVertexShader,
-			PixelShader = _editorSettings.DefaultPixelShader,
-			OptimizeMesh = false,
-			GenerateLods = false,
-			AnisotropicFiltering = _editorSettings.PreviewAnisotropicFiltering,
-			// log2 масштаба рендера: при апскейле мипы обязаны выбираться под ПОЛНОЕ разрешение,
-			// иначе аккумулятору нечего восстанавливать (см. ModelLoadOptions.MipLodBias). Уровня
-			// загрузки, как анизотропия: смена масштаба подхватится следующей загрузкой модели.
-			MipLodBias = MathF.Log2(Math.Clamp(_editorSettings.RenderScale, 0.25f, 1f)),
-			MaxTextureSize = ClampedMaxTextureSize(),
-			RtShadows = RtShadowsEnabled(),
-			// Кейворд записи G-buffer-а отражений - у окружения он теперь безусловный
-			// (см. ModelViewportEnvironment).
-			ReflectionGbuffer = true,
-			// Текстуры не декодируются в фоновой фазе загрузки вовсе - они приезжают из стола по
-			// приоритету от камеры (см. ModelStore). В кадр модель попадает уже с ними: показ ждёт
-			// ModelStore.ModelTexturesReady, иначе она появлялась бы на 1x1-филлерах и домигивала
-			// текстуры десятки кадров.
-			StreamTextures = true
-		};
+		private ModelLoadOptions BuildLoadOptions() =>
+			ViewportSettingsPush.BuildLoadOptions(_editorSettings, RtShadowsEnabled());
 
 		/// <summary>Строит TLAS RT-теней по резидентной модели и привязывает его её материалам.
 		/// No-op вне режима «Ray-traced» и без модели. Прежняя структура освобождается: смена
@@ -1925,7 +1825,7 @@ namespace DecaEngine.Editor
 		/// <summary>Потолок текстуры в том виде, в каком он уходит в загрузчик. Отдельным методом,
 		/// потому что то же значение сравнивает диф перезагрузки: сравнивать сырую настройку с
 		/// заклампленной - значит вечно видеть расхождение на значениях вне [128, 8192].</summary>
-		private int ClampedMaxTextureSize() => Math.Clamp(_editorSettings.PreviewMaxTextureSize, 128, 8192);
+		private int ClampedMaxTextureSize() => ViewportSettingsPush.ClampedMaxTextureSize(_editorSettings);
 
 		/// <summary>
 		/// Cancels and releases the in-flight background load, if any - the background Task.Run in
@@ -2157,8 +2057,7 @@ namespace DecaEngine.Editor
 		/// аналитического мирового света (ProbeGiParams.z в UnlitInstancedPS.hlsl) - иначе баунс не
 		/// сойдётся по яркости с прямым светом: ярче - тень заливается эмбиентом, тусклее - отскок
 		/// проваливается.</summary>
-		private Vector3 ProbeSunColor() =>
-			new Vector3(1f, 0.98f, 0.92f) * Math.Clamp(_editorSettings.ProbeGiSunIntensity, 0.1f, 16f);
+		private Vector3 ProbeSunColor() => ViewportSettingsPush.ProbeSunColor(_editorSettings);
 
 		/// <summary>Заводит сессию прогрессивного бейка probe-GI по резидентной модели. BVH строится в
 		/// ФОНЕ (см. _probeBakerTask): на сцене уровня Sponza это ~7.7 млн треугольников и
