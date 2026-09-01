@@ -330,6 +330,13 @@ public partial class GraphicsSettingsWindow
 		}
 		Tooltip("Потолок числа проб: ячейка укрупняется, пока сетка не влезет.\nБейк растёт линейно по числу проб (32k ~ 1.3 с на Sponza), плюс сетку сверху\nрежут потолок по оси (128) и предел размера атласа видимости.");
 
+		// Честная цифра рядом с комбо: бюджет x3 - наследство трёх каскадов, отданное единственному
+		// объёму (см. ProbeGiViewportShared.BuildOptions). Без неё подпись врала втрое: «8k» на деле
+		// разрешал сетке 24576 проб.
+		var effectiveProbes = Math.Min(_settings.ProbeGiMaxProbes * 3, ProbeGiBaker.MaxProbeBudget);
+		ImGui.SameLine();
+		ImGui.TextDisabled($"= {effectiveProbes:N0} эффективно (x3 за снятые каскады)");
+
 		ImGui.Spacing();
 		if (ImGui.Button("Rebake now", new Vector2(120 * _scale, 0)))
 		{

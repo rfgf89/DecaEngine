@@ -85,7 +85,9 @@ namespace DecaEngine.Editor
 				Ssao = _appliedSsao,
 				AoMode = _appliedAoMode,
 				Ssgi = _appliedSsgi,
-				EyeAdaptation = _appliedSceneHdr,
+				// Чекбокс «Auto exposure» действует и на сцену - раньше её автоэкспозиция ходила
+				// строго за HDR-тумблером, и снятая галка (по подписи - общая) молча игнорировалась.
+				EyeAdaptation = _appliedSceneHdr && _editorSettings.PreviewEyeAdaptation,
 				Fog = _appliedFog,
 				Volumetric = _appliedVolumetric,
 				Bloom = _appliedBloom,

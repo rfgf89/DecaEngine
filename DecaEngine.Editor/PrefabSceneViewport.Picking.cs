@@ -189,7 +189,11 @@ namespace DecaEngine.Editor
 
 		// --- Probe GI сцены -------------------------------------------------------------------------
 
-		private bool ProbesEnabled => _editorSettings.SceneViewHdr;
+		/// <summary>Гейт проб сцены: галка «Probe GI» окна Graphics - ТА ЖЕ, что у превью, - плюс
+		/// HDR-тумблер тулбара (поле проб питает HDR-путь освещения, в LDR ему некуда светить).
+		/// Раньше галка окна здесь игнорировалась вовсе: пробы сцены пеклись при снятой «Probe GI»,
+		/// и выключить их можно было только выключив весь HDR.</summary>
+		private bool ProbesEnabled => _editorSettings.PreviewProbeGi && _editorSettings.SceneViewHdr;
 
 		/// <summary>Статус проб СЦЕНЫ для окна Graphics - раньше окно показывало только превью
 		/// модели, и при работающем в сцене GI писало «нет проб».</summary>
