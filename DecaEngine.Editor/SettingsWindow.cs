@@ -621,6 +621,9 @@ public class SettingsWindow : ImGuiModalWindow
 	// ВРЕМЕННЫЙ хук для PreviewLoopProbe (диагностика NRE в DiligentCommandBuffer) - вызывает тот
 	// же событийный путь, что и "OK" в окне настроек, без реального ImGui-окна. Удалить вместе с
 	// PreviewLoopProbe.cs после диагностики.
-	internal static void RaisePreviewGraphicsAppliedForTest() => PreviewGraphicsApplied?.Invoke();
+	/// <summary>Ручной подъём <see cref="PreviewGraphicsApplied"/> для headless-пробников: окна
+	/// настроек в них нет, а событие - единственный способ сказать вьюпорту «настройки графики
+	/// применены заново».</summary>
+	public static void RaisePreviewGraphicsAppliedForTest() => PreviewGraphicsApplied?.Invoke();
 }
 

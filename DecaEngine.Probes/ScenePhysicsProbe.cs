@@ -12,8 +12,9 @@ using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Unsafe;
 using DecaEngine.Scene;
 using DecaEngine.Animation;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Прогон НАСТОЯЩЕЙ сцены с физикой, без окна (DECA_PROBE_SCENE=1).

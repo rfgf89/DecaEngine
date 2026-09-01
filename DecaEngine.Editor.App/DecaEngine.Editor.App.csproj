@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!--
+		Точка входа: разбор аргументов командной строки и запуск - либо редактора, либо одного из
+		headless-пробников.
+
+		Существует затем, чтобы DecaEngine.Editor мог быть БИБЛИОТЕКОЙ. Пока редактор сам был exe,
+		пробники были обязаны лежать внутри него: сослаться на редактор снаружи было нельзя, а Main
+		с их диспетчеризацией жил в нём же. Отсюда девять с половиной тысяч строк тестовой оснастки
+		посреди окон ImGui.
+
+		Теперь стрелки развязаны: Probes -> Editor (пробникам нужны вьюпорты), App -> оба (ему нужно
+		уметь запустить и то, и другое). Обратных стрелок нет.
+	-->
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\DecaEngine.Editor\DecaEngine.Editor.csproj" />
+		<ProjectReference Include="..\DecaEngine.Probes\DecaEngine.Probes.csproj" />
+	</ItemGroup>
+
+</Project>

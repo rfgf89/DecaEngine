@@ -15,6 +15,7 @@
 	<ItemGroup>
 		<ProjectReference Include="..\DecaEngine.Animation\DecaEngine.Animation.csproj" />
 		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+		<ProjectReference Include="..\DecaEngine.Editor\DecaEngine.Editor.csproj" />
 		<ProjectReference Include="..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
 		<ProjectReference Include="..\DecaEngine.Graphics.Diligent\DecaEngine.Graphics.Diligent.csproj" />
 		<ProjectReference Include="..\DecaEngine.Graphics.ProbeGi\DecaEngine.Graphics.ProbeGi.csproj" />

@@ -2769,7 +2769,7 @@ namespace DecaEngine.Editor
 		/// headless-прогона сцены (см. <see cref="ScenePhysicsProbe"/>). Вынесено, чтобы у пробника не
 		/// завелась вторая копия фильтра топологии и склейки трансформа инстанса: разойдясь с этой,
 		/// она проверяла бы не ту статику, которую строит редактор.</summary>
-		internal static unsafe void AppendModelGeometry(ModelLoader model, ReadOnlySpan<int> instanceIndices,
+		public static unsafe void AppendModelGeometry(ModelLoader model, ReadOnlySpan<int> instanceIndices,
 			Matrix4x4 world, List<Vector3> targetPositions, List<uint> targetIndices)
 		{
 			for (int i = 0; i < instanceIndices.Length; i++)
@@ -4308,7 +4308,7 @@ namespace DecaEngine.Editor
 
 		// --- TRS-иерархия префаба -------------------------------------------------------------------
 
-		internal static Matrix4x4 ComputeWorldMatrix(Entity entity)
+		public static Matrix4x4 ComputeWorldMatrix(Entity entity)
 		{
 			var local = LocalMatrix(entity);
 			var parent = entity.Parent;

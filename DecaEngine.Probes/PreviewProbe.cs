@@ -11,9 +11,9 @@ using DecaEngine.Sdl;
 using Friflo.Engine.ECS.Systems;
 using DecaEngine.Scene;
 using DecaEngine.Animation;
-using DecaEngine.Probes;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Отладочный CLI-рендер превью модели без UI: `DecaEngine.Editor.exe --preview-probe

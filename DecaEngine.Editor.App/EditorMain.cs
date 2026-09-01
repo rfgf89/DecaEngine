@@ -1,8 +1,11 @@
 ﻿using DecaEngine.Core.Diagnostics;
+using DecaEngine.Editor;
+using DecaEngine.Graphics.Diligent;
+using DecaEngine.Probes;
 using Diligent;
 using Microsoft.Build.Locator;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.App;
 
 public static class EditorMain
 {

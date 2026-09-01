@@ -4,8 +4,9 @@ using DecaEngine.Editor.ECS;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using DecaEngine.Scene;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Проверка геймплейных скриптов сцены (DECA_PROBE_GAMEPLAY=1, печатается из PreviewProbe).

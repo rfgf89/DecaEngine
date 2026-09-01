@@ -1,7 +1,11 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+    <!--
+        Библиотека, а не exe. Точка входа живёт в DecaEngine.Editor.App - только так на редактор
+        может сослаться проект пробников, которому нужны его вьюпорты.
+    -->
     <PropertyGroup>
-        <OutputType>Exe</OutputType>
+        <OutputType>Library</OutputType>
     </PropertyGroup>
 
     <ItemGroup>
@@ -16,7 +20,6 @@
       <ProjectReference Include="..\DecaEngine.Graphics.Diligent\DecaEngine.Graphics.Diligent.csproj" />
       <ProjectReference Include="..\DecaEngine.ImGui.DiligentRender\DecaEngine.ImGui.DiligentRender.csproj" />
       <ProjectReference Include="..\DecaEngine.Physics.Bepu\DecaEngine.Physics.Bepu.csproj" />
-      <ProjectReference Include="..\DecaEngine.Probes\DecaEngine.Probes.csproj" />
     </ItemGroup>
 
     <ItemGroup>

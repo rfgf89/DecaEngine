@@ -8,8 +8,9 @@ using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Unsafe;
 using DecaEngine.Scene;
 using DecaEngine.Animation;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Боковые стик-кадры ног персонажа на рельефе (DECA_PROBE_LEGSHOT=&lt;папка&gt;, работает внутри

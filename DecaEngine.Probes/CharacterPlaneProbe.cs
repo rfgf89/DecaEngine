@@ -6,8 +6,9 @@ using DecaEngine.Graphics;
 using Friflo.Engine.ECS;
 using DecaEngine.Scene;
 using DecaEngine.Animation;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// Воспроизведение ПОЛНОГО персонажа на плоскости (DECA_PROBE_CHARACTER=1): настоящие

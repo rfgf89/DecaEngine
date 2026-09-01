@@ -7,8 +7,9 @@ using DecaEngine.Sdl;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using DecaEngine.Scene;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// ВРЕМЕННЫЙ отладочный CLI-режим: `DecaEngine.Editor.exe --full-loop &lt;model.gltf&gt; [frames]

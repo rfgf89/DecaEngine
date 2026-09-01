@@ -3,8 +3,9 @@ using DecaEngine.Core;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
+using DecaEngine.Editor;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Probes;
 
 /// <summary>
 /// ВРЕМЕННЫЙ отладочный CLI-режим: `DecaEngine.Editor.exe --preview-loop &lt;model.gltf&gt;

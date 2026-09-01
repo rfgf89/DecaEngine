@@ -17,7 +17,7 @@ namespace DecaEngine.Editor;
 /// порядок с оверлеем) - у них разные источники моделей, поз и точек интереса; здесь живёт
 /// поведение, которое от вьюпорта не зависит. Новая фича раунда/каскада добавляется сюда ОДИН раз.
 /// </summary>
-internal static class ProbeGiViewportShared
+public static class ProbeGiViewportShared
 {
 
 	/// <summary>Выпускает порции ОДНОГО объёма в пределах кадрового бюджета - единственная
@@ -36,7 +36,7 @@ internal static class ProbeGiViewportShared
 	/// передаёт false СОЗНАТЕЛЬНО: он меряет худший случай, когда освещение всё время
 	/// «меняется» и раунды идут без остановки, - на сошедшейся сессии проверка обнулила бы
 	/// весь замер темпа.</param>
-	internal static int DriveChunks(ProbeRoundGpu gpu, ProbeGiBakeSession session,
+	public static int DriveChunks(ProbeRoundGpu gpu, ProbeGiBakeSession session,
 		ProbeGiBaker baker, int chunkBudget, bool stopOnConverged = true)
 	{
 		int rounds = 0;
@@ -77,7 +77,7 @@ internal static class ProbeGiViewportShared
 	/// <param name="viewBias">Доля ВЗГЛЯДА в направлении сдвига точки сэмпла, 0..1 (уходит в
 	/// свободную .w счётчиков сетки - см. ProbeGiSampleBody). 1 - сдвиг строго к камере, 0 - строго
 	/// по нормали.</param>
-	internal static void PushGrid(ref PreviewSettingsData data, ProbeGiTextures textures,
+	public static void PushGrid(ref PreviewSettingsData data, ProbeGiTextures textures,
 		float normalBias, float viewBias)
 	{
 		float bias = 0.75f * Math.Clamp(normalBias, 0f, 2f);

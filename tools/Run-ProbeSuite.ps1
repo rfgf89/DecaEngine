@@ -52,8 +52,11 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 # ЛОВУШКА ПУТИ: сборка с -p:Platform=x64 кладёт свежие DLL в bin\x64\..., а в bin\Debug\... лежит
 # СТАРЫЙ комплект - там обновляется exe, но не DecaEngine.Graphics.Diligent.dll. Запуск оттуда
 # тихо гоняет вчерашний код. Только bin\x64.
-$BinDir = Join-Path $RepoRoot 'DecaEngine.Editor\bin\x64\Debug\net10.0'
-$Exe = Join-Path $BinDir 'DecaEngine.Editor.exe'
+# Точка входа переехала в DecaEngine.Editor.App: сам редактор теперь библиотека, иначе на него не
+# мог бы сослаться проект пробников (см. DecaEngine.Editor.App.csproj). EditorAssets приезжают сюда
+# транзитивно из редактора - их 345, ровно столько же, сколько в исходниках.
+$BinDir = Join-Path $RepoRoot 'DecaEngine.Editor.App\bin\x64\Debug\net10.0'
+$Exe = Join-Path $BinDir 'DecaEngine.Editor.App.exe'
 # Не "probe-baseline": .gitignore выбрасывает probe-*/ на любом уровне (там ~150 каталогов
 # с выводом проб), и эталоны молча не попадали бы в коммит.
 $BaselineDir = Join-Path $PSScriptRoot 'baselines'
