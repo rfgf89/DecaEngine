@@ -680,18 +680,9 @@ public class EditorSettings
 	/// ячейка укрупняется, пока сетка не влезет. Ребейк.</summary>
 	public int ProbeGiMaxProbes { get; set; } = 8192;
 
-	/// <summary>Крутить раунды probe-GI на GPU (compute, см. ProbeRoundGpu) вместо CPU. Раунд
-	/// становится дешёвым настолько, что поле может обновляться каждый кадр - это и есть путь к
-	/// динамическому свету и геометрии. Откатывается на CPU, если шейдер или буферы не завелись.
-	/// Требует пересоздания сессии (атласы в этом режиме пишет GPU и заводятся с UAV).</summary>
-	/// <summary>МЁРТВАЯ ручка, оставлена только чтобы старые settings.json читались без ошибок:
-	/// привод раундов теперь всегда GPU (см. ModelPreviewViewport.PollProbeBake), CPU-раунд живёт
-	/// эталоном сверки в CLI.</summary>
-	public bool ProbeGiGpu { get; set; } = true;
-
 	/// <summary>Пускать лучи GPU-раунда через аппаратную трассировку (RayQuery по BLAS/TLAS) вместо
-	/// программного обхода собственного BVH. Действует только вместе с <see cref="ProbeGiGpu"/> и
-	/// только если устройство умеет inline-трассировку; иначе тихо игнорируется.</summary>
+	/// программного обхода собственного BVH. Действует только если устройство умеет
+	/// inline-трассировку; иначе тихо игнорируется.</summary>
 	public bool ProbeGiHardwareRayTracing { get; set; } = false;
 
 	/// <summary>Режим реального времени вместо запечки (см. <see cref="ProbeGiBakeOptions.Realtime"/>):
@@ -731,11 +722,6 @@ public class EditorSettings
 	/// останавливаются целиком, 0 = выключено (см.
 	/// <see cref="ProbeGiBakeOptions.RealtimeVariabilityThreshold"/>). Live.</summary>
 	public float ProbeGiVariabilityThreshold { get; set; } = 0.08f;
-
-	/// <summary>МЁРТВАЯ ручка, оставлена только чтобы старые settings.json читались без ошибок:
-	/// каскады probe-GI сняты вместе с прокруткой (артефакты въезжающих плоскостей), объём один и
-	/// статический, бюджет проб отдан ему целиком (см. ProbeGiViewportShared.BuildOptions).</summary>
-	public int ProbeGiCascades { get; set; } = 1;
 
 	/// <summary>Релокация проб: насколько проба вправе отойти от узла сетки, в долях шага сетки
 	/// (0 = выключено, см. <see cref="ProbeGiBakeOptions.RealtimeRelocation"/>). Лечит ПРИЧИНУ
