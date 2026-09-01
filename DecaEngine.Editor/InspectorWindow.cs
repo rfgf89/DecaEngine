@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Numerics;
+using DecaEngine.Core;
 using DecaEngine.Core.Diagnostics;
 using DecaEngine.Core.Prefabs;
 using DecaEngine.Editor.ECS;

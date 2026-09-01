@@ -136,11 +136,7 @@ namespace DecaEngine.Core.Entities
 			}
 		}
 
-		/// <summary>Same result as DecaEngine.Graphics.Diligent.MathUtils.CreateTrs (Core cannot
-		/// reference the graphics assembly): scale, then rotation, then translation.</summary>
-		private static Matrix4x4 CreateTrs(Vector3 translate, Quaternion rotation, Vector3 scale)
-		{
-			return Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translate);
-		}
+		private static Matrix4x4 CreateTrs(Vector3 translate, Quaternion rotation, Vector3 scale) =>
+			MathUtils.CreateTrs(translate, rotation, scale);
 	}
 }

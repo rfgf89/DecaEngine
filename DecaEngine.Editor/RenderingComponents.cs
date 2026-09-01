@@ -1,5 +1,6 @@
 using System;
 using System.Numerics;
+using DecaEngine.Core;
 using DecaEngine.Core.Assets;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
@@ -266,8 +267,8 @@ namespace DecaEngine.Editor.ECS
 			Matrix4x4 projectionT = Matrix4x4.Transpose(renderCamera.proj);
 			Vector4 frustumX = (projectionT[3] + projectionT[0]);
 			Vector4 frustumY = (projectionT[3] + projectionT[1]);
-			DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumX);
-			DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumY);
+			MathUtils.NormalizePlane(ref frustumX);
+			MathUtils.NormalizePlane(ref frustumY);
 
 			cullData.frustum = new Vector4(frustumX.X, frustumX.Z, frustumY.Y, frustumY.Z);
 			cullData.P00 = renderCamera.proj.M11;

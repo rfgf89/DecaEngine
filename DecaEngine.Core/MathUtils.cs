@@ -2,8 +2,18 @@
 using System.Collections.Generic;
 using System.Numerics;
 
-namespace DecaEngine.Graphics.Diligent;
+namespace DecaEngine.Core;
 
+/// <summary>
+/// Матрицы и плоскости на чистой System.Numerics.
+///
+/// Лежал в DecaEngine.Graphics.Diligent, хотя ничего от Diligent тут нет, и внутри самого бэкенда
+/// им не пользовался никто - звали его только из редактора, причём всегда с полным именем, потому
+/// что в редакторе был СВОЙ MathUtils с ToEulerAngles. Оба слились сюда.
+///
+/// Из-за прежнего места <see cref="TransformSystem"/> в Core не мог сослаться на CreateTrs и
+/// держал собственную копию с комментарием «то же самое, но Core не видит графику».
+/// </summary>
 public static class MathUtils
 {
 	public static Matrix4x4 CreateTrs(Vector3 translate, Quaternion rotation, Vector3 scale)
@@ -69,7 +79,33 @@ public static class MathUtils
 		corners[5] = Vector3.Transform(new Vector3(1, -1, far), invViewProj);
 		corners[6] = Vector3.Transform(new Vector3(1, 1, far), invViewProj);
 		corners[7] = Vector3.Transform(new Vector3(-1, 1, far), invViewProj);
-		
+
 		return corners;
+	}
+
+	/// <summary>Кватернион в углы Эйлера - для полей поворота в инспекторе: править кватернион
+	/// руками невозможно.</summary>
+	public static Vector3 ToEulerAngles(Quaternion q)
+	{
+		Vector3 angles = new();
+
+		// pitch (x-axis rotation)
+		double sinp = 2 * (q.W * q.Y - q.Z * q.X);
+		if (Math.Abs(sinp) >= 1)
+			angles.X = (float)Math.CopySign(Math.PI / 2, sinp);
+		else
+			angles.X = (float)Math.Asin(sinp);
+
+		// yaw (y-axis rotation)
+		double sinr_cosp = 2 * (q.W * q.X + q.Y * q.Z);
+		double cosr_cosp = 1 - 2 * (q.X * q.X + q.Y * q.Y);
+		angles.Y = (float)Math.Atan2(sinr_cosp, cosr_cosp);
+
+		// roll (z-axis rotation)
+		double siny_cosp = 2 * (q.W * q.Z + q.X * q.Y);
+		double cosy_cosp = 1 - 2 * (q.Y * q.Y + q.Z * q.Z);
+		angles.Z = (float)Math.Atan2(siny_cosp, cosy_cosp);
+
+		return angles;
 	}
 }

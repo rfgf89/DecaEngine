@@ -1,6 +1,7 @@
 using Friflo.Engine.ECS;
 using System;
 using System.Numerics;
+using DecaEngine.Core;
 using DecaEngine.Core.Entities;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS.Systems;
@@ -65,7 +66,7 @@ namespace DecaEngine.Editor.ECS
                 else
                 {
                     // No hierarchy involvement (root entity): own TRS is the world transform.
-                    modelMatrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(pos, rot, scale);
+                    modelMatrix = MathUtils.CreateTrs(pos, rot, scale);
                 }
 
                 var gpuData = new Transform()

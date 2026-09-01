@@ -2559,7 +2559,7 @@ namespace DecaEngine.Editor
 		private static DecaEngine.Graphics.Transform ComposeInstanceTransform(
 			DecaEngine.Graphics.Transform instanceLocal, Matrix4x4 world)
 		{
-			var combined = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(
+			var combined = MathUtils.CreateTrs(
 				instanceLocal.position, instanceLocal.rotation, instanceLocal.scale) * world;
 
 			if (!Matrix4x4.Decompose(combined, out var scale, out var rotation, out var translation))
@@ -2793,7 +2793,7 @@ namespace DecaEngine.Editor
 				}
 
 				var t = ComposeInstanceTransform(instance.transform, world);
-				var matrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(t.position, t.rotation, t.scale);
+				var matrix = MathUtils.CreateTrs(t.position, t.rotation, t.scale);
 
 				int vertexCount = UnsafeArray.GetLength(mesh.VertexData);
 				var vertices = new ReadOnlySpan<Vertex>(UnsafeArray.GetPtr<Vertex>(mesh.VertexData, 0), vertexCount);
@@ -2856,7 +2856,7 @@ namespace DecaEngine.Editor
 
 					var mesh = model.Meshes[instance.meshId];
 					var t = ComposeInstanceTransform(instance.transform, record.LastWorld);
-					var matrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(t.position, t.rotation, t.scale);
+					var matrix = MathUtils.CreateTrs(t.position, t.rotation, t.scale);
 
 					// Broadphase: сфера баундов меша в мире.
 					var center = Vector3.Transform(mesh.Center, matrix);
@@ -4327,7 +4327,7 @@ namespace DecaEngine.Editor
 			Vector3 pos = entity.HasPosition ? entity.Position.value : Vector3.Zero;
 			Quaternion rot = entity.HasRotation ? entity.Rotation.value : Quaternion.Identity;
 			Vector3 scale = entity.HasScale3 ? entity.Scale3.value : Vector3.One;
-			return DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(pos, rot, scale);
+			return MathUtils.CreateTrs(pos, rot, scale);
 		}
 
 		private static void ApplyWorldMatrix(Entity entity, Matrix4x4 world)

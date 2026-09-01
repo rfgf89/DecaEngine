@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using DecaEngine.Core;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Diligent;
@@ -800,7 +801,7 @@ public sealed class AnimationDriver : IDisposable
 		for (int j = joint; j >= 0; j = skeleton.Parents[j])
 		{
 			var bind = skeleton.BindLocals[j];
-			result *= DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(bind.position, bind.rotation, bind.scale);
+			result *= MathUtils.CreateTrs(bind.position, bind.rotation, bind.scale);
 		}
 
 		return result;
@@ -844,7 +845,7 @@ public sealed class AnimationDriver : IDisposable
 
 			var from = character.RecoveryFrom[i];
 
-			character.Models[i] = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(
+			character.Models[i] = MathUtils.CreateTrs(
 				Vector3.Lerp(from.position, translation, weight),
 				Quaternion.Slerp(from.rotation, rotation, weight),
 				Vector3.Lerp(from.scale, scale, weight));
@@ -2055,7 +2056,7 @@ public sealed class AnimationDriver : IDisposable
 				continue;
 			}
 
-			character.Models[i] = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(
+			character.Models[i] = MathUtils.CreateTrs(
 				Vector3.Lerp(animTranslation, translation, weight),
 				Quaternion.Slerp(animRotation, rotation, weight),
 				Vector3.Lerp(animScale, scale, weight));
@@ -2174,7 +2175,7 @@ public sealed class AnimationDriver : IDisposable
 			var local = character.Locals[i];
 			// Полным именем: MathUtils есть в нескольких пространствах имён движка, и короткое имя
 			// разрешается не в то.
-			var localMatrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(
+			var localMatrix = MathUtils.CreateTrs(
 				local.position, local.rotation, local.scale);
 
 			character.Models[i] = parents[i] >= 0
@@ -2427,7 +2428,7 @@ public sealed class AnimationDriver : IDisposable
 		for (int i = 0; i < count; i++)
 		{
 			var local = skeleton.BindLocals[i];
-			var matrix = DecaEngine.Graphics.Diligent.MathUtils.CreateTrs(
+			var matrix = MathUtils.CreateTrs(
 				local.position, local.rotation, local.scale);
 			bind[i] = skeleton.Parents[i] >= 0 ? matrix * bind[skeleton.Parents[i]] : matrix;
 		}

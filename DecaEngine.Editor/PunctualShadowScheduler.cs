@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using DecaEngine.Core;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
@@ -233,8 +234,8 @@ public static unsafe class PunctualShadowScheduler
         var projT = Matrix4x4.Transpose(proj);
         var frustumX = projT[3] + projT[0];
         var frustumY = projT[3] + projT[1];
-        DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumX);
-        DecaEngine.Graphics.Diligent.MathUtils.NormalizePlane(ref frustumY);
+        MathUtils.NormalizePlane(ref frustumX);
+        MathUtils.NormalizePlane(ref frustumY);
 
         var cullData = new CullData
         {
