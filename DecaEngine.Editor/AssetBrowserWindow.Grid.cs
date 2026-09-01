@@ -1,0 +1,539 @@
+﻿using System.Linq;
+using System.Numerics;
+using DecaEngine.Core.Prefabs;
+using Engine.ImGui.Core;
+using Friflo.Engine.ECS;
+using Hexa.NET.ImGui;
+
+namespace DecaEngine.Editor
+{
+	/// <summary>Сетка ассетов: обход каталога, отрисовка ячеек и подписей. Часть <see cref="AssetBrowserWindow"/> - файл на тему;
+	/// состояние, конструктор и OnRender живут в основном файле.</summary>
+	public partial class AssetBrowserWindow
+	{
+		private void RefreshEntries()
+		{
+			_entries.Clear();
+
+			if (_currentDirectory is null || !Directory.Exists(_currentDirectory))
+			{
+				return;
+			}
+
+			try
+			{
+				var directories = Directory.GetDirectories(_currentDirectory)
+					.OrderBy(d => Path.GetFileName(d), StringComparer.OrdinalIgnoreCase);
+
+				foreach (var dir in directories)
+				{
+					_entries.Add(new AssetEntry(dir, Path.GetFileName(dir), true, IsDirectoryEmpty(dir)));
+				}
+
+				var files = Directory.GetFiles(_currentDirectory)
+					.OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase);
+
+				var projectDirectory = _projectSession.ProjectDirectory;
+
+				foreach (var file in files)
+				{
+					// Skip .prefab.bin files - they are compiled prefabs and shouldn't be displayed
+					if (IsPrefabBinary(Path.GetFileName(file)))
+					{
+						continue;
+					}
+
+					var fileName = Path.GetFileName(file);
+					_entries.Add(new AssetEntry(file, fileName, false, false));
+
+					// Раскрытая модель: сразу за ней вкладываем её SubMesh-и как отдельные записи
+					// (по манифесту запечённых иконок, см. ModelIconBaker/ModelIconCache).
+					if (projectDirectory is null || !IsGltfModel(fileName) || !_expandedModels.Contains(file))
+					{
+						continue;
+					}
+
+					var manifest = _iconCache.GetManifest(projectDirectory, file);
+					if (manifest is null)
+					{
+						continue;
+					}
+
+					for (int i = 0; i < manifest.SubMeshNames.Count; i++)
+					{
+						_entries.Add(new AssetEntry(file, manifest.SubMeshNames[i], i));
+					}
+				}
+			}
+			catch
+			{
+				// ????? ????? ?????????/????? ??????????? ????? ??????? ? ?????? ??????? ?????? ??????.
+			}
+		}
+
+		private static bool IsDirectoryEmpty(string path)
+		{
+			try
+			{
+				return !Directory.EnumerateFileSystemEntries(path).Any();
+			}
+			catch
+			{
+				return true;
+			}
+		}
+
+		private void RenderGrid()
+		{
+			// ?????? "?????? ?? ??? ???? ???? ?????" ??????????? ??????? ???? ??? ? ?????? ????? -
+			// ??. ????????? ?????????? ? PopupContextMenu. ?? ?? ????????????, ????? ??? ????????
+			// ??????????? ???? ???? ?????? ???????? ???, ? ?? ???????? ????? ?? ? ?????? ?????, ?
+			// ????? ?? ?????? ?????? RefreshEntries() ? ?????? ???????? ??????? ??????.
+			bool popupOpenAtFrameStart = PopupContextMenu.IsAnyPopupOpen();
+
+			bool gridHovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.AllowWhenBlockedByPopup);
+			bool leftClicked = ImGui.IsMouseClicked(ImGuiMouseButton.Left);
+			bool rightClicked = ImGui.IsMouseClicked(ImGuiMouseButton.Right);
+
+			// ?????? "Refresh" ?????? - ?????? ??????? ??? ?????????????? ? ????? ??? ????? ?????
+			// ?? ??????? ????? (????? ??? ??????), ????? ???????, ????? ???? ?????????? ?? ????????
+			// ??? ????????? ?????? (??. ????).
+			if (gridHovered && (leftClicked || rightClicked) && !popupOpenAtFrameStart)
+			{
+				RefreshEntries();
+			}
+
+			bool itemConsumedRightClick = false;
+			bool itemConsumedLeftClick = false;
+
+			if (_entries.Count != 0)
+			{
+				var cellSize = CellSize * _scale;
+				var cellSpacing = CellSpacing * _scale;
+				var panelWidth = ImGui.GetContentRegionAvail().X;
+				var columns = Math.Max(1, (int)((panelWidth + cellSpacing) / (cellSize + cellSpacing)));
+
+				for (int i = 0; i < _entries.Count; i++)
+				{
+					RenderEntry(_entries[i], i, cellSize, rightClicked, !popupOpenAtFrameStart, out var consumedRight, out var consumedLeft);
+					itemConsumedRightClick |= consumedRight;
+					itemConsumedLeftClick |= consumedLeft;
+
+					if ((i + 1) % columns != 0 && i != _entries.Count - 1)
+					{
+						ImGui.SameLine(0, cellSpacing);
+					}
+				}
+			}
+
+			if (_entriesDirty)
+			{
+				_entriesDirty = false;
+				RefreshEntries();
+			}
+
+			// ???? ?? ?????? ??????? ????? ??????? ????????? - ?????? ??? ?????? ????? ??
+			// ????????????, ??-?? ???? "?????????" ??? ?????????? ????? ???? ????? ????? ? ??????
+			// ????? ??? ????? ???? ???? ?????????.
+			if (leftClicked && !itemConsumedLeftClick && gridHovered && !ImGui.IsAnyItemHovered())
+			{
+				_selectedPath = null;
+			}
+
+			// ???? ?????? ??????? ?????????, ?????? ???? ???? ?? "???????????" ??? ??????-??
+			// ?????? ? ?????? ?????? ?? ??? ????????? ????? (??????? ?????? ?? ???????????).
+			if (rightClicked && !itemConsumedRightClick && gridHovered && !ImGui.IsAnyItemHovered())
+			{
+				_contextPath = _currentDirectory;
+				_contextPathIsDirectory = true;
+				PopupContextMenu.TryOpen("AssetContextWindowBg", !popupOpenAtFrameStart);
+			}
+
+			if (PopupContextMenu.BeginPopup("AssetContextWindowBg"))
+			{
+				RenderContextMenuContent();
+				ImGui.EndPopup();
+			}
+		}
+
+		private void RenderEntry(AssetEntry entry, int index, float cellSize, bool rightClicked, bool allowOpenPopup, out bool consumedRightClick, out bool consumedLeftClick)
+		{
+			consumedRightClick = false;
+			consumedLeftClick = false;
+
+			bool isSelected = _selectedPath == entry.FullPath;
+
+			// ?????? ??? ?????? ?????????? ??????????? ?? ?????? ??????, ???? ??? ??????????
+			// ?????? - ??-?? ????? ????????? ??????? ??? ???? ??????????, ?? ?????????????? ????.
+			// ?????? ? ?????????? ???????? ??? ???????????? ?????????, ??? ?????????????
+			// ?????????? ?? ????????? ????? (??. WrapTextToLines); ??? ????????? ?????????
+			// ????????? ??????? - ???? ?????? ? ???????????, ????? ????? ?????????? ??????????.
+			var maxLabelWidth = cellSize - 4f * _scale;
+			var labelLines = isSelected
+				? WrapTextToLines(entry.Name, maxLabelWidth)
+				: new List<string> { TruncateToWidth(entry.Name, maxLabelWidth) };
+
+			var lineHeight = ImGui.GetTextLineHeight();
+			var labelAreaHeight = MathF.Max(LabelHeight * _scale, labelLines.Count * lineHeight + 8f * _scale);
+			var itemSize = new Vector2(cellSize, cellSize + labelAreaHeight);
+			var screenPos = ImGui.GetCursorScreenPos();
+
+			// Строка ушла за пределы видимой (проскроллленной) области окна - используется ниже,
+			// чтобы не ставить в очередь бейк иконок сабмешей, которые сейчас не видны (см.
+			// ModelIconBaker.CancelSubMeshIcon), а не только показывать/скрывать сам виджет.
+			bool isVisible = ImGui.IsRectVisible(screenPos, screenPos + itemSize);
+
+			ImGui.PushID(index);
+
+			EditorSelectionStyle.PushColors();
+			ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0f);
+
+			bool clicked = ImGui.Selectable("##asset-item", isSelected, ImGuiSelectableFlags.AllowDoubleClick, itemSize);
+			ImGui.PopStyleVar();
+			EditorSelectionStyle.PopColors();
+
+			// Drag source for AssetRef fields (see ComponentFieldEditor.DrawAssetRef): dragging a
+			// file entry exposes its path, relative to the Assets root and forward-slash separated
+			// so it stays portable, as an ImGui payload that inspector fields can accept.
+			// SubMesh-записи не тащатся: за ними нет реального файла (псевдопуть "::subN").
+			if (!entry.IsDirectory && !entry.IsSubMesh && ImGui.BeginDragDropSource())
+			{
+				var relativePath = GetAssetRelativePath(entry.FullPath);
+				var bytes = System.Text.Encoding.UTF8.GetBytes(relativePath);
+
+				// ImGui.SetDragDropPayload will copy the data, so we don't need to keep the array alive
+				unsafe
+				{
+					fixed (byte* p = bytes)
+					{
+						ImGui.SetDragDropPayload(
+							DecaEngine.Core.Assets.AssetRef.DragDropPayloadType,
+							p,
+							(nuint)bytes.Length
+						);
+					}
+				}
+
+				ImGui.TextUnformatted(entry.Name);
+				ImGui.EndDragDropSource();
+			}
+
+			bool doubleClicked = clicked && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left);
+
+			// Стрелочка раскрытия SubMesh-ей (как foldout ассета модели в Unity): рисуется только
+			// когда для модели уже есть запечённый манифест иконок. Клик по ней НЕ выделяет ассет
+			// и не открывает превью - только сворачивает/разворачивает вложенные записи.
+			var projectDirectory = _projectSession.ProjectDirectory;
+			bool hasExpandArrow = !entry.IsDirectory && !entry.IsSubMesh && projectDirectory is not null &&
+				IsGltfModel(entry.Name) &&
+				_iconCache.GetManifest(projectDirectory, entry.FullPath) is { SubMeshNames.Count: > 0 };
+
+			var arrowSize = 13f * _scale;
+			var arrowMin = new Vector2(screenPos.X + cellSize - arrowSize - 2f * _scale,
+				screenPos.Y + (cellSize - arrowSize) * 0.5f);
+			var arrowMax = arrowMin + new Vector2(arrowSize, arrowSize);
+
+			bool arrowClicked = false;
+			if (hasExpandArrow && clicked)
+			{
+				var mouse = ImGui.GetMousePos();
+				arrowClicked = mouse.X >= arrowMin.X && mouse.X <= arrowMax.X &&
+					mouse.Y >= arrowMin.Y && mouse.Y <= arrowMax.Y;
+			}
+
+			if (arrowClicked)
+			{
+				if (!_expandedModels.Remove(entry.FullPath))
+				{
+					_expandedModels.Add(entry.FullPath);
+				}
+
+				// Список нельзя перестраивать прямо здесь - мы внутри цикла по _entries (см. RenderGrid).
+				_entriesDirty = true;
+				clicked = false;
+				consumedLeftClick = true;
+			}
+
+			if (clicked)
+			{
+				// ??????? (?????????) ????? ???? ?? ?????? ?????? ?????? ???????? ??? - ??????
+				// _selectedPath ??????? ?????? ?????? ?????? (??. ???????? ???????????? ???? ????),
+				// ??-?? ???? ???? ????? ??????? ????????? ???????? "?????????"/??????????.
+				_selectedPath = entry.FullPath;
+				consumedLeftClick = true;
+			}
+
+			// ???????? ???????????? ???? ??????????? ??????: ?????????? ????? ?? ???? ???? ???????
+			// ????? (rightClicked), ? ?? ????????? ???????? IsMouseClicked - ????? ????? ?????????
+			// ? ????????? ? RenderGrid ? ????? ???????? ??????? ???????? ????.
+			if (rightClicked && ImGui.IsItemHovered())
+			{
+				_selectedPath = entry.FullPath;
+				consumedRightClick = true;
+
+				// У SubMesh-записей нет реального файла - файловое контекстное меню (Cut/Copy/
+				// Rename/Delete) для них бессмысленно и опасно, поэтому не открываем.
+				if (!entry.IsSubMesh)
+				{
+					_contextPath = entry.FullPath;
+					_contextPathIsDirectory = entry.IsDirectory;
+					PopupContextMenu.TryOpen("AssetContextItem", allowOpenPopup);
+				}
+			}
+
+			if (PopupContextMenu.BeginPopup("AssetContextItem"))
+			{
+				RenderContextMenuContent();
+				ImGui.EndPopup();
+			}
+
+			if (doubleClicked && entry.IsDirectory)
+			{
+				NavigateTo(entry.FullPath);
+			}
+			else if (clicked && entry.IsSubMesh)
+			{
+				// Клик по вложенному SubMesh-у - превью только этого сабмеша в Inspector-е.
+				_inspectorWindow.ShowModel(entry.ParentModelPath!, entry.SubMeshIndex, entry.Name);
+			}
+			else if (clicked && !entry.IsDirectory && IsPrefabJson(entry.Name))
+			{
+				// Single left click on a prefab opens it directly in the shared Inspector window.
+				_inspectorWindow.ShowPrefab(entry.FullPath);
+			}
+			else if (clicked && !entry.IsDirectory && IsGltfModel(entry.Name))
+			{
+				// Single left click on a .gltf/.glb model previews it in the shared Inspector
+				// window, using its own isolated render-graph (see ModelPreviewViewport) instead of
+				// the game/editor scene - mirrors the "click a prefab -> ShowPrefab" flow above.
+				_inspectorWindow.ShowModel(entry.FullPath);
+
+				// Преимпорт при ПЕРВОМ выборе: если иконки ещё не запечены (или протухли) - ставим
+				// модель в очередь бейка (см. ModelIconBaker); готовые иконки подхватятся кешем.
+				if (projectDirectory is not null &&
+				    _iconCache.GetManifest(projectDirectory, entry.FullPath) is null &&
+				    !_iconBaker.IsBakingOrQueued(entry.FullPath))
+				{
+					_iconBaker.Enqueue(entry.FullPath, projectDirectory);
+				}
+			}
+
+			var drawList = ImGui.GetWindowDrawList();
+
+			// ????? ?????? - ?????????? ??????? ??????? ?? EditorSelectionStyle
+
+			var iconPadding = IconPadding * _scale;
+			var iconTop = screenPos.Y + iconPadding;
+			var iconBottom = screenPos.Y + cellSize * 0.9f - iconPadding;
+
+			if (entry.IsDirectory)
+			{
+				var iconMin = screenPos + new Vector2(iconPadding, iconPadding);
+				var iconMax = new Vector2(screenPos.X + cellSize - iconPadding, iconBottom);
+				DrawFolderIcon(drawList, iconMin, iconMax, _scale, entry.IsEmptyDirectory);
+			}
+			else
+			{
+				// ?????? "?????????" ?? ?? ?????????? ????? ????? ????? (?????????? ?????????),
+				// ??????? ????? ?? ??????????? ??????????? ???????? ? ???????????? ?? ?????? ??????,
+				// ?????? ?????????????? ?? ?????? ??? ? ?????.
+				var fileIconHeight = iconBottom - iconTop;
+				var fileIconWidth = fileIconHeight * 0.9f;
+				var iconCenterX = screenPos.X + cellSize * 0.5f;
+				var iconMin = new Vector2(iconCenterX - fileIconWidth * 0.5f, iconTop);
+				var iconMax = new Vector2(iconCenterX + fileIconWidth * 0.5f, iconBottom);
+
+				// Модели (и их SubMesh-и) с запечённым превью показывают кешированную картинку
+				// (см. ModelIconCache) вместо векторного глифа; глиф - фолбэк, пока бейка нет.
+				bool drewCachedIcon = false;
+				if (projectDirectory is not null && (entry.IsSubMesh || IsGltfModel(entry.Name)))
+				{
+					var modelPath = entry.IsSubMesh ? entry.ParentModelPath! : entry.FullPath;
+					var iconIndex = entry.IsSubMesh ? entry.SubMeshIndex : ModelIconCache.WholeModelIndex;
+					if (_iconCache.TryGetIcon(projectDirectory, modelPath, iconIndex, out var iconTexture))
+					{
+						// Превью квадратное (128x128) - занимаем всю квадратную область иконки.
+						var previewMin = screenPos + new Vector2(iconPadding, iconPadding);
+						var previewMax = new Vector2(screenPos.X + cellSize - iconPadding, iconBottom);
+						drawList.AddImageRounded(iconTexture, previewMin, previewMax,
+							Vector2.Zero, Vector2.One, 0xFFFFFFFF, 4f * _scale);
+						drewCachedIcon = true;
+					}
+					else if (entry.IsSubMesh)
+					{
+						if (isVisible)
+						{
+							// Строка сабмеша реально видна (узел модели развёрнут И строка не
+							// проскроллена за пределы окна) - бейкаем именно эту иконку лениво по
+							// требованию, а не все сабмеши разом при выборе модели целиком (см.
+							// ModelIconBaker class-doc) - иначе модель с большим числом сабмешей
+							// фризила бы весь редактор одним кликом.
+							if (!_iconBaker.IsSubMeshIconBakingOrQueued(modelPath, iconIndex))
+							{
+								_iconBaker.EnqueueSubMeshIcon(modelPath, projectDirectory, iconIndex);
+							}
+						}
+						else
+						{
+							// Строка проскроллена за пределы видимой области - её иконка больше не
+							// нужна прямо сейчас; снимаем ещё не начатый бейк с очереди (см.
+							// ModelIconBaker.CancelSubMeshIcon), чтобы не тратить GPU-время на
+							// сабмеши, которые пользователь уже не видит.
+							_iconBaker.CancelSubMeshIcon(modelPath, iconIndex);
+						}
+					}
+				}
+
+				if (!drewCachedIcon)
+				{
+					DrawFileIcon(drawList, iconMin, iconMax,
+						entry.IsSubMesh ? FileIconKind.Model : GetFileIconKind(entry.Name), _scale);
+				}
+			}
+
+			if (hasExpandArrow)
+			{
+				var expanded = _expandedModels.Contains(entry.FullPath);
+				var arrowColor = ImGui.GetColorU32(ImGuiCol.Text);
+				var center = (arrowMin + arrowMax) * 0.5f;
+				var half = arrowSize * 0.35f;
+
+				// Лёгкая подложка, чтобы стрелка читалась и поверх кешированного превью.
+				drawList.AddCircleFilled(center, arrowSize * 0.62f,
+					ImGui.GetColorU32(EditorPalette.WithAlpha(EditorPalette.Background, 0.75f)));
+
+				if (expanded)
+				{
+					// ▾ - вниз
+					drawList.AddTriangleFilled(
+						new Vector2(center.X - half, center.Y - half * 0.6f),
+						new Vector2(center.X + half, center.Y - half * 0.6f),
+						new Vector2(center.X, center.Y + half),
+						arrowColor);
+				}
+				else
+				{
+					// ▸ - вправо
+					drawList.AddTriangleFilled(
+						new Vector2(center.X - half * 0.6f, center.Y - half),
+						new Vector2(center.X + half, center.Y),
+						new Vector2(center.X - half * 0.6f, center.Y + half),
+						arrowColor);
+				}
+			}
+
+			DrawLabel(drawList, labelLines, screenPos, cellSize);
+			ImGui.PopID();
+		}
+
+		private void DrawLabel(ImDrawListPtr drawList, IReadOnlyList<string> lines, Vector2 screenPos, float cellSize)
+		{
+			var textColor = ImGui.GetColorU32(ImGuiCol.Text);
+			var lineHeight = ImGui.GetTextLineHeight();
+			var y = screenPos.Y + cellSize;
+
+			foreach (var line in lines)
+			{
+				var textSize = ImGui.CalcTextSize(line);
+				var textPos = new Vector2(screenPos.X + (cellSize - textSize.X) * 0.5f, y);
+				drawList.AddText(textPos, textColor, line);
+				y += lineHeight;
+			}
+		}
+
+		private static string TruncateToWidth(string text, float maxWidth)
+		{
+			if (ImGui.CalcTextSize(text).X <= maxWidth)
+			{
+				return text;
+			}
+
+			const string ellipsis = "...";
+			var lo = 0;
+			var hi = text.Length;
+
+			while (lo < hi)
+			{
+				var mid = (lo + hi + 1) / 2;
+				var candidate = text[..mid] + ellipsis;
+				if (ImGui.CalcTextSize(candidate).X <= maxWidth)
+				{
+					lo = mid;
+				}
+				else
+				{
+					hi = mid - 1;
+				}
+			}
+
+			return lo <= 0 ? ellipsis : text[..lo] + ellipsis;
+		}
+
+		/// <summary>
+		/// ????????? ????? ?? ?????? ??????? ?? ????? <paramref name="maxWidth"/> ??? ???????
+		/// ??????????? - ???????????? ??? ?????????? ?????? (??. RenderEntry), ??? ??? ?????? ????
+		/// ????? ?????????. ??????? ????????? ?? ?????? (????????); ???? ????????? "?????" ???
+		/// ????? ???? maxWidth (????????, ??????? ??? ????? ??? ????????) - ????? ??? ???????????.
+		/// </summary>
+		private static List<string> WrapTextToLines(string text, float maxWidth)
+		{
+			var lines = new List<string>();
+
+			if (ImGui.CalcTextSize(text).X <= maxWidth)
+			{
+				lines.Add(text);
+				return lines;
+			}
+
+			var words = text.Split(' ');
+			var current = string.Empty;
+
+			foreach (var word in words)
+			{
+				var candidate = current.Length == 0 ? word : current + " " + word;
+				if (ImGui.CalcTextSize(candidate).X <= maxWidth)
+				{
+					current = candidate;
+					continue;
+				}
+
+				if (current.Length > 0)
+				{
+					lines.Add(current);
+				}
+
+				var remaining = word;
+				while (ImGui.CalcTextSize(remaining).X > maxWidth && remaining.Length > 1)
+				{
+					var lo = 1;
+					var hi = remaining.Length;
+					while (lo < hi)
+					{
+						var mid = (lo + hi + 1) / 2;
+						if (ImGui.CalcTextSize(remaining[..mid]).X <= maxWidth)
+						{
+							lo = mid;
+						}
+						else
+						{
+							hi = mid - 1;
+						}
+					}
+
+					lines.Add(remaining[..lo]);
+					remaining = remaining[lo..];
+				}
+
+				current = remaining;
+			}
+
+			if (current.Length > 0)
+			{
+				lines.Add(current);
+			}
+
+			return lines;
+		}
+
+	}
+}
