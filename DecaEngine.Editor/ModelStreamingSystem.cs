@@ -8,6 +8,7 @@ using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor.ECS
 {

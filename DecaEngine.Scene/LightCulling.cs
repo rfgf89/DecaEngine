@@ -5,7 +5,7 @@ using DecaEngine.Core.Entities;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 
-namespace DecaEngine.Editor.ECS;
+namespace DecaEngine.Scene;
 
 /// <summary>
 /// CPU-кулинг punctual-светов против фрустума камеры - у КАЖДОГО типа света свой метод со своей

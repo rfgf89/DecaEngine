@@ -4,6 +4,7 @@ using BepuPhysics;
 using BepuPhysics.Collidables;
 using DecaEngine.Graphics;
 using DecaEngine.Physics;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

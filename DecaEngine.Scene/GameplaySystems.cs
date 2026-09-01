@@ -2,7 +2,7 @@ using System.Numerics;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 
-namespace DecaEngine.Editor.ECS
+namespace DecaEngine.Scene
 {
 	/// <summary>
 	/// Play-Mode-only system that spins every entity with a <see cref="RotateComponent"/> around its

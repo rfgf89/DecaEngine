@@ -1,7 +1,7 @@
 using System.Numerics;
 using Friflo.Engine.ECS;
 
-namespace DecaEngine.Editor.ECS
+namespace DecaEngine.Scene
 {
 	/// <summary>
 	/// Spins the entity continuously around <see cref="Axis"/> while Play Mode is running (see

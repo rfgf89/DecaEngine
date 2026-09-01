@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using BepuPhysics;
 using DecaEngine.Physics;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

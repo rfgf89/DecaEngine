@@ -1,7 +1,7 @@
 using System.Numerics;
 using Friflo.Engine.ECS;
 
-namespace DecaEngine.Editor.ECS;
+namespace DecaEngine.Scene;
 
 public enum LightType
 {

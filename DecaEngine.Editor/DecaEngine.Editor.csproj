@@ -10,6 +10,7 @@
       <ProjectReference Include="..\DecaEngine.Generic\DecaEngine.Generic.csproj" />
       <ProjectReference Include="..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
       <ProjectReference Include="..\DecaEngine.Graphics.ProbeGi\DecaEngine.Graphics.ProbeGi.csproj" />
+      <ProjectReference Include="..\DecaEngine.Scene\DecaEngine.Scene.csproj" />
       <ProjectReference Include="..\DecaEngine.ImGui.Core\DecaEngine.ImGui.Core.csproj" />
       <ProjectReference Include="..\DecaEngine.Input.Sdl3\DecaEngine.Input.Sdl3.csproj" />
       <ProjectReference Include="..\DecaEngine\DecaEngine.csproj" />

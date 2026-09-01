@@ -1,7 +1,7 @@
 using System;
 using System.Numerics;
 
-namespace DecaEngine.Editor.ECS
+namespace DecaEngine.Scene
 {
 	/// <summary>
 	/// Геометрия и рулевое движения по кругу (см. <see cref="CircleMoveComponent"/>) - ОДНА копия на

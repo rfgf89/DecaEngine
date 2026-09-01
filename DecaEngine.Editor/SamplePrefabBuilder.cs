@@ -7,6 +7,7 @@ using DecaEngine.Core.Prefabs;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using Friflo.Engine.ECS;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

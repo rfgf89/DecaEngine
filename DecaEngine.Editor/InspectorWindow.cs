@@ -10,6 +10,7 @@ using Friflo.Engine.ECS.Serialize;
 using Friflo.Engine.ECS.Systems;
 using Friflo.Engine.ECS.Utils;
 using Hexa.NET.ImGui;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor
 {

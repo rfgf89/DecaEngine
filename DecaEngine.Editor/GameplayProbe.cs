@@ -3,6 +3,7 @@ using System.Numerics;
 using DecaEngine.Editor.ECS;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

@@ -6,6 +6,7 @@ using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

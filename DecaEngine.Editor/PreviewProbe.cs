@@ -9,6 +9,7 @@ using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.ProbeGi;
 using DecaEngine.Sdl;
 using Friflo.Engine.ECS.Systems;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

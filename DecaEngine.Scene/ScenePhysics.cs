@@ -7,7 +7,7 @@ using BepuPhysics.Collidables;
 using DecaEngine.Graphics;
 using DecaEngine.Physics;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Scene;
 
 /// <summary>
 /// Мир физики сцены префаба: обёртка над <see cref="PhysicsWorld"/>, которая знает про РЕДАКТОР -

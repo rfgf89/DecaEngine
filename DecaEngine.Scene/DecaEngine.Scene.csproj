@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!--
+		Сцена: ECS-компоненты и системы, из которых складывается кадр, - трансформы и рендер-данные,
+		кулинг, свет и планировщик теневых слайсов, анимационные и геймплейные компоненты, мост к
+		физике.
+
+		Жило в DecaEngine.Editor вперемешку с окнами. Разница видна по тому, ЧТО осталось: в
+		редакторе задержались ровно те системы, которые завязаны на редакторские сущности -
+		ModelStore, превью-окружение вьюпорта, настройки теней превью. Всё остальное к редактору
+		отношения не имело: те же самые компоненты и системы крутит headless-проба и будет крутить
+		игра.
+
+		Зависимость от Graphics.Diligent - на структуры кадра (DrawData, PerMeshData и прочее),
+		которые пока живут в бэкенде, а не в абстракциях. Уйдёт вместе с выделением
+		Graphics.Abstractions.
+	-->
+	<ItemGroup>
+		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />
+		<ProjectReference Include="..\DecaEngine.Graphics.Core\DecaEngine.Graphics.Core.csproj" />
+		<ProjectReference Include="..\DecaEngine.Graphics.Diligent\DecaEngine.Graphics.Diligent.csproj" />
+		<ProjectReference Include="..\DecaEngine.Physics.Bepu\DecaEngine.Physics.Bepu.csproj" />
+	</ItemGroup>
+
+</Project>

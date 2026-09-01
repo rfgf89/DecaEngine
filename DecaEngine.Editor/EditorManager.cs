@@ -13,6 +13,7 @@ using Friflo.Engine.ECS.Systems;
 using Hexa.NET.ImGui;
 using Vector2 = System.Numerics.Vector2;
 using Vector4 = System.Numerics.Vector4;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

@@ -1,11 +1,10 @@
 using System.Numerics;
-using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Native;
 using UnsafeCollections.Collections.Unsafe;
 
-namespace DecaEngine.Editor;
+namespace DecaEngine.Scene;
 
 public class RenderResourceManager
 {
@@ -34,8 +33,8 @@ public class RenderResourceManager
 	/// <summary>
 	/// Сколько первых слотов массива инстансов должен обойти culling-шейдер - см.
 	/// <see cref="_slotHighWaterMark"/>. Подставляется в CullData.drawCount
-	/// (<see cref="DecaEngine.Editor.ECS.SimpleCullingAndRenderSystem"/>,
-	/// <see cref="DecaEngine.Editor.ECS.CullingAndRenderSystem"/>).
+	/// (<see cref="CullingAndRenderSystem"/> и упрощённый SimpleCullingAndRenderSystem,
+	/// оставшийся на стороне редактора вместе с настройками теней превью).
 	/// </summary>
 	public int DrawInstanceCount => _slotHighWaterMark;
 

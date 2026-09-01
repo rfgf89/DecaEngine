@@ -11,6 +11,7 @@ using Friflo.Engine.ECS;
 // В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
 // имя разрешается неоднозначно.
 using Transform = DecaEngine.Graphics.Transform;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

@@ -7,7 +7,7 @@ using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Unsafe;
 
-namespace DecaEngine.Editor.ECS;
+namespace DecaEngine.Scene;
 
 /// <summary>
 /// Раздаёт кадровый бюджет теневых слайсов (<see cref="LightClusters.MaxShadowSlices"/> в texture

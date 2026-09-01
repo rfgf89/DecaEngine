@@ -6,7 +6,7 @@ using DecaEngine.Core.Entities;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS.Systems;
 
-namespace DecaEngine.Editor.ECS
+namespace DecaEngine.Scene
 {
     public class GpuInstanceBufferSystem() : QuerySystem<BatchRenderInfo, LinkDrawInfo>
     {

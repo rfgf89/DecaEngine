@@ -6,6 +6,7 @@ using BepuPhysics;
 using BepuPhysics.Collidables;
 using DecaEngine.Editor.ECS;
 using Friflo.Engine.ECS;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

@@ -7,7 +7,7 @@ using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using UnsafeCollections.Collections.Unsafe;
 
-namespace DecaEngine.Editor.ECS;
+namespace DecaEngine.Scene;
 
 /// <summary>
 /// Builds the per-frame list of views (every camera + every shadow-map cascade) and hands them

@@ -7,6 +7,7 @@ using DecaEngine.Graphics.ProbeGi;
 using Engine.ImGui.Core;
 using Friflo.Engine.ECS;
 using Hexa.NET.ImGui;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 

@@ -11,6 +11,7 @@ using DecaEngine.Graphics.ProbeGi;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
 using Hexa.NET.ImGui;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor
 {

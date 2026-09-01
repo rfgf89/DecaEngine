@@ -5,7 +5,7 @@ using DecaEngine.Core.Assets;
 using DecaEngine.Graphics.Diligent;
 using Friflo.Engine.ECS;
 
-namespace DecaEngine.Editor.ECS
+namespace DecaEngine.Scene
 {
 	[Flags]
 	public enum CullFlags

@@ -15,6 +15,7 @@ using Friflo.Engine.ECS;
 using Hexa.NET.ImGui;
 using Hexa.NET.ImGuizmo;
 using UnsafeCollections.Collections.Unsafe;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor
 {

@@ -7,6 +7,7 @@ using DecaEngine.Graphics.Diligent;
 using DecaEngine.Graphics.ProbeGi;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor
 {

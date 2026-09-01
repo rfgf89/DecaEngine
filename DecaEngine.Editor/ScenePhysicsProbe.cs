@@ -10,6 +10,7 @@ using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using Friflo.Engine.ECS;
 using UnsafeCollections.Collections.Unsafe;
+using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 
