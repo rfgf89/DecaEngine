@@ -2,6 +2,7 @@
 using System.Threading;
 using System.Threading.Tasks;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
@@ -772,7 +773,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"SSR: собственный accel модели не собрался: {ex.Message}");
 				_ssrOwnAccel?.Dispose();
 				_ssrOwnAccel = null;
@@ -1467,7 +1468,7 @@ namespace DecaEngine.Editor
 				_env.Pipeline.InvalidateGraph();
 
 				var stats = baker.GetStats();
-				EditorConsoleLog.Add(LogLevel.Info,
+				EngineLog.Add(LogLevel.Info,
 					$"Probe BVH debug: {drawn} of {boxes.Count} boxes ({(leavesOnly ? "leaves" : $"depth <= {maxDepth}")}), " +
 					$"tree: {stats.Nodes} nodes / {stats.Leaves} leaves / depth {stats.MaxDepth} / " +
 					$"{stats.AvgLeafTriangles:F1} tris per leaf" +
@@ -1475,7 +1476,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Error, $"Probe BVH debug: failed to build overlay: {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Probe BVH debug: failed to build overlay: {ex.Message}");
 				ClearBvhDebugOverlay();
 			}
 		}
@@ -1753,7 +1754,7 @@ namespace DecaEngine.Editor
 				{
 					_loadedPath = null;
 					_loadError = ex.Message;
-					EditorConsoleLog.Add(LogLevel.Error, $"Model preview: failed to switch sub-mesh for '{modelPath}': {ex.Message}");
+					EngineLog.Add(LogLevel.Error, $"Model preview: failed to switch sub-mesh for '{modelPath}': {ex.Message}");
 				}
 
 				return;
@@ -1765,7 +1766,7 @@ namespace DecaEngine.Editor
 			// штатный путь, а не потерянный кеш, о котором предупреждает диагностика ниже.
 			if (!_restoringAfterResume)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"Model preview: FULL reload for '{modelPath}' subMesh={subMeshIndex} " +
 					$"(resident was '{_residentPath}', model={(_residentModel is null ? "null" : "loaded")}) - " +
 					"resident path did not match, re-parsing from disk instead of reusing it.");
@@ -1967,7 +1968,7 @@ namespace DecaEngine.Editor
 				CancelPendingLoad();
 				_loadedPath = null;
 				_loadError = message;
-				EditorConsoleLog.Add(LogLevel.Error, $"Model preview: failed to load '{failedPath}': {message}");
+				EngineLog.Add(LogLevel.Error, $"Model preview: failed to load '{failedPath}': {message}");
 				return;
 			}
 
@@ -2057,7 +2058,7 @@ namespace DecaEngine.Editor
 			{
 				_loadedPath = null;
 				_loadError = ex.Message;
-				EditorConsoleLog.Add(LogLevel.Error, $"Model preview: failed to load '{modelPath}': {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Model preview: failed to load '{modelPath}': {ex.Message}");
 			}
 		}
 
@@ -2076,7 +2077,7 @@ namespace DecaEngine.Editor
 			// _residentModel сам. Чужая модель - нарушение жизненного цикла стриминга.
 			if (!ReferenceEquals(modelLoader, _residentModel))
 			{
-				EditorConsoleLog.Add(LogLevel.Error,
+				EngineLog.Add(LogLevel.Error,
 					"Model preview: PopulateFromScene called with a non-resident model - streaming lifecycle violated, skipping.");
 				return;
 			}
@@ -2125,7 +2126,7 @@ namespace DecaEngine.Editor
 			}
 
 			// ??????????? ??? ??????? ??????? ? ???????
-			EditorConsoleLog.Add(LogLevel.Info,
+			EngineLog.Add(LogLevel.Info,
 				$"Model preview bounds: min={boundsMin}, max={boundsMax}, instances={_instanceEntities.Count}");
 
 			FrameAll(boundsMin, boundsMax);
@@ -2319,7 +2320,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"Probe GI: GPU path unavailable, falling back to CPU: {ex.Message}");
 				_probeGpuDisabled = true;
 				ReleaseProbeGpu();
@@ -2386,7 +2387,7 @@ namespace DecaEngine.Editor
 					// крутим. Уже показанные пробы остаются на экране.
 					_probeSession = null;
 					_probeStatus = "ошибка бейка";
-					EditorConsoleLog.Add(LogLevel.Error, "Probe GI: bake round failed: " +
+					EngineLog.Add(LogLevel.Error, "Probe GI: bake round failed: " +
 						(finished.Exception?.GetBaseException().Message ?? "Unknown error"));
 				}
 			}
@@ -2402,7 +2403,7 @@ namespace DecaEngine.Editor
 
 				if (!task.IsCompletedSuccessfully)
 				{
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"Probe GI: failed to build BVH: {task.Exception?.GetBaseException().Message}");
 				}
 				else if (ReferenceEquals(builtFor, _residentModel))
@@ -2411,7 +2412,7 @@ namespace DecaEngine.Editor
 					(_probeBoundsMin, _probeBoundsMax) = _residentModel!.ComputeBounds();
 
 					var stats = _probeBaker.GetStats();
-					EditorConsoleLog.Add(LogLevel.Info,
+					EngineLog.Add(LogLevel.Info,
 						$"Probe BVH {(_probeBakerFromCache ? "loaded from cache" : "built")} in " +
 						$"{_probeBakerSw?.ElapsedMilliseconds ?? 0} ms: {stats.Triangles} tris, {stats.Nodes} nodes, " +
 						$"{stats.Leaves} leaves, depth {stats.MaxDepth}, avg {stats.AvgLeafTriangles:F1} tris/leaf" +
@@ -2494,7 +2495,7 @@ namespace DecaEngine.Editor
 				}
 				catch (Exception ex)
 				{
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"Probe GI: GPU round failed, probes disabled: {ex.Message}");
 					_probeGpuDisabled = true;
 					ReleaseProbeGpu();
@@ -2597,7 +2598,7 @@ namespace DecaEngine.Editor
 				// просто замирает в последней удавшейся позе - пробы остаются валидными, теряется
 				// только слежение за движением.
 				_probeAccelFrozen = true;
-				EditorConsoleLog.Add(LogLevel.Error,
+				EngineLog.Add(LogLevel.Error,
 					$"Probe GI: TLAS rebuild failed, scene frozen for tracing: {ex.Message}");
 			}
 		}
@@ -2659,7 +2660,7 @@ namespace DecaEngine.Editor
 			catch (Exception ex)
 			{
 				_probeTextures = null;
-				EditorConsoleLog.Add(LogLevel.Error, $"Probe GI: failed to upload atlases: {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Probe GI: failed to upload atlases: {ex.Message}");
 			}
 		}
 
@@ -2918,7 +2919,7 @@ namespace DecaEngine.Editor
 				// i.e. the editor would appear to freeze/stop presenting entirely instead of just
 				// losing this one preview.
 				_loadError = ex.Message;
-				EditorConsoleLog.Add(LogLevel.Error, $"Model preview: render failed for '{_loadedPath}': {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Model preview: render failed for '{_loadedPath}': {ex.Message}");
 				ClearInstances();
 			}
 		}

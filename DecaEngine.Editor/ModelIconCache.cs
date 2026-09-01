@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics.Core;
 using Hexa.NET.ImGui;
 using StbImageSharp;
@@ -179,7 +180,7 @@ public class ModelIconCache
 		catch (Exception ex)
 		{
 			entry.FailedIcons.Add(subMeshIndex);
-			EditorConsoleLog.Add(LogLevel.Warning, $"Asset preview: failed to load cached icon for '{modelPath}': {ex.Message}");
+			EngineLog.Add(LogLevel.Warning, $"Asset preview: failed to load cached icon for '{modelPath}': {ex.Message}");
 			return false;
 		}
 	}

@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Numerics;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Core.Prefabs;
 using DecaEngine.Editor.ECS;
 using Engine.ImGui.Core;
@@ -124,7 +125,7 @@ namespace DecaEngine.Editor
 			var error = TreeUtils.JsonArrayToDataEntities(jsonEntities.entities, snapshot);
 			if (error != null)
 			{
-				EditorConsoleLog.Add(LogLevel.Error, $"Play Mode: failed to snapshot prefab: {error}");
+				EngineLog.Add(LogLevel.Error, $"Play Mode: failed to snapshot prefab: {error}");
 				return;
 			}
 
@@ -158,7 +159,7 @@ namespace DecaEngine.Editor
 				var componentsJson = de.components.IsNull() ? "{}" : de.components.AsString();
 				if (!PrefabAsset.TryApplyComponentsJson(entity, componentsJson, out var applyError))
 				{
-					EditorConsoleLog.Add(LogLevel.Error, $"Play Mode: failed to restore entity {de.pid}: {applyError}");
+					EngineLog.Add(LogLevel.Error, $"Play Mode: failed to restore entity {de.pid}: {applyError}");
 				}
 			}
 

@@ -1,5 +1,6 @@
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
@@ -303,7 +304,7 @@ public static class FullLoopProbe
 		// редактора и в stdout НЕ попадают - без этой выжимки прогон выглядит успешным даже когда все
 		// текстуры до одной провалили декод.
 		var warnings = new Dictionary<string, int>();
-		foreach (var entry in EditorConsoleLog.Snapshot())
+		foreach (var entry in EngineLog.Snapshot())
 		{
 			if (entry.Level == LogLevel.Warning || entry.Level == LogLevel.Error)
 			{

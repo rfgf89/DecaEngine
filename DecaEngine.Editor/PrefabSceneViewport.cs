@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Core.Assets;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
@@ -346,14 +347,14 @@ namespace DecaEngine.Editor
 
 			_renderFailureLogged = true;
 
-			EditorConsoleLog.Add(LogLevel.Error,
+			EngineLog.Add(LogLevel.Error,
 				$"Prefab scene: render failed: {ex.GetType().Name}: {ex.Message}");
 
 			for (var inner = ex; inner != null; inner = inner.InnerException)
 			{
 				if (!ReferenceEquals(inner, ex))
 				{
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"  ---> {inner.GetType().Name}: {inner.Message}");
 				}
 
@@ -364,7 +365,7 @@ namespace DecaEngine.Editor
 
 				for (int i = 0; i < frames.Length && i < 20; i++)
 				{
-					EditorConsoleLog.Add(LogLevel.Error, "  " + frames[i].TrimEnd('\r').Trim());
+					EngineLog.Add(LogLevel.Error, "  " + frames[i].TrimEnd('\r').Trim());
 				}
 			}
 		}
@@ -796,7 +797,7 @@ namespace DecaEngine.Editor
 					// Один раз и больше не пробовать: не собравшийся шейдер не соберётся и на
 					// следующем кадре, а поток одинаковых ошибок в консоли скрыл бы настоящие.
 					_debugOverlayFailed = true;
-					EditorConsoleLog.Add(LogLevel.Error, $"Debug draw: overlay unavailable: {ex.Message}");
+					EngineLog.Add(LogLevel.Error, $"Debug draw: overlay unavailable: {ex.Message}");
 					return;
 				}
 			}
@@ -1429,7 +1430,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"SSR: собственный accel сцены не собрался: {ex.Message}");
 				_ssrOwnAccel?.Dispose();
 				_ssrOwnAccel = null;
@@ -2285,7 +2286,7 @@ namespace DecaEngine.Editor
 					record.ResolvedPath = ResolveAssetPath(assetPath);
 					if (record.ResolvedPath == null)
 					{
-						EditorConsoleLog.Add(LogLevel.Warning, $"Prefab scene: asset not found: '{assetPath}'");
+						EngineLog.Add(LogLevel.Warning, $"Prefab scene: asset not found: '{assetPath}'");
 						// Путь не зарезолвился - помечаем запись "пустой" моделью, чтобы не искать
 						// файл заново каждый кадр; смена Path в компоненте пересоздаст запись.
 						record.ResolvedPath = "";
@@ -3221,7 +3222,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"Scene probe GI: GPU path unavailable, CPU fallback: {ex.Message}");
 				_sceneGpuDisabled = true;
 				ReleaseSceneProbeGpu();
@@ -3337,7 +3338,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Error,
+				EngineLog.Add(LogLevel.Error,
 					$"Scene probe GI: TLAS rebuild failed, scene frozen for tracing: {ex.Message}");
 				_sceneGpuDisabled = true;
 			}
@@ -3370,7 +3371,7 @@ namespace DecaEngine.Editor
 				else
 				{
 					_probeSession = null;
-					EditorConsoleLog.Add(LogLevel.Error, "Scene probe GI: bake round failed: " +
+					EngineLog.Add(LogLevel.Error, "Scene probe GI: bake round failed: " +
 						(finished.Exception?.GetBaseException().Message ?? "Unknown error"));
 				}
 			}
@@ -3387,7 +3388,7 @@ namespace DecaEngine.Editor
 
 				if (!task.IsCompletedSuccessfully)
 				{
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"Scene probe GI: failed to build BVH: {task.Exception?.GetBaseException().Message}");
 				}
 				else
@@ -3495,7 +3496,7 @@ namespace DecaEngine.Editor
 				}
 				catch (Exception ex)
 				{
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"Scene probe GI: GPU round failed, probes disabled: {ex.Message}");
 					_sceneGpuDisabled = true;
 					ReleaseSceneProbeGpu();
@@ -3543,7 +3544,7 @@ namespace DecaEngine.Editor
 			catch (Exception ex)
 			{
 				_probeTextures = null;
-				EditorConsoleLog.Add(LogLevel.Error, $"Scene probe GI: failed to upload atlases: {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Scene probe GI: failed to upload atlases: {ex.Message}");
 			}
 		}
 

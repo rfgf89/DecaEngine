@@ -1,5 +1,6 @@
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics.Core;
 using StbImageSharp;
 
@@ -50,12 +51,12 @@ public static class PreviewEnvironmentMap
 					return hdr.Value;
 				}
 
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"Preview environment: '{hdrPath}' not found or not a readable .hdr - using procedural sky.");
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"Preview environment: failed to load '{hdrPath}' ({ex.Message}) - using procedural sky.");
 			}
 		}

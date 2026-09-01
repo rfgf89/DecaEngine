@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 
@@ -144,7 +145,7 @@ internal static class ProbeGiViewportShared
 			}
 
 			overlays.Clear();
-			EditorConsoleLog.Add(LogLevel.Error, $"Probe GI: debug overlay failed: {ex.Message}");
+			EngineLog.Add(LogLevel.Error, $"Probe GI: debug overlay failed: {ex.Message}");
 		}
 	}
 

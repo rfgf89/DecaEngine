@@ -1,4 +1,5 @@
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Core.Build;
 using DecaEngine.Graphics.Assets;
 using Friflo.Engine.ECS;
@@ -132,7 +133,7 @@ namespace DecaEngine.Editor
 				{
 					var error = task.Exception?.GetBaseException();
 					StatusMessage = $"Ошибка открытия проекта: {error?.Message}";
-					EditorConsoleLog.Add(LogLevel.Error, error?.ToString() ?? "Project load failed");
+					EngineLog.Add(LogLevel.Error, error?.ToString() ?? "Project load failed");
 					return true;
 				}
 
@@ -145,8 +146,8 @@ namespace DecaEngine.Editor
 				}
 
 				_assemblyApp = new AssemblyApp();
-				_assemblyApp.ThreadStarted += threadId => EditorConsoleLog.SetProjectThreadId(threadId);
-				_assemblyApp.ThreadStopped += () => EditorConsoleLog.SetProjectThreadId(null);
+				_assemblyApp.ThreadStarted += threadId => EngineLog.SetProjectThreadId(threadId);
+				_assemblyApp.ThreadStopped += () => EngineLog.SetProjectThreadId(null);
 				_assemblyApp.LoadFromPath(paths.DllPath);
 
 				_projectSlnPath = paths.SlnPath;
@@ -162,7 +163,7 @@ namespace DecaEngine.Editor
 			catch (Exception ex)
 			{
 				StatusMessage = $"Ошибка открытия проекта: {ex.Message}";
-				EditorConsoleLog.Add(LogLevel.Error, ex.ToString());
+				EngineLog.Add(LogLevel.Error, ex.ToString());
 			}
 			finally
 			{

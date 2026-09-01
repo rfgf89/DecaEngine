@@ -1,4 +1,5 @@
 using System.Numerics;
+using DecaEngine.Core.Diagnostics;
 using Engine.ImGui.Core;
 using Hexa.NET.ImGui;
 
@@ -26,7 +27,7 @@ namespace DecaEngine.Editor
 
 		public ConsoleWindow(string name, ImGuiRender imGuiRender) : base(name, imGuiRender)
 		{
-			EditorConsoleLog.Install();
+			EngineLog.Install();
 		}
 
 		protected override void OnRender(uint dockId)
@@ -37,7 +38,7 @@ namespace DecaEngine.Editor
 
 			if (ImGui.Button("Clear"))
 			{
-				EditorConsoleLog.Clear();
+				EngineLog.Clear();
 				_selectedEntry = null;
 			}
 
@@ -65,7 +66,7 @@ namespace DecaEngine.Editor
 
 			ImGui.Separator();
 
-			var entries = EditorConsoleLog.Snapshot();
+			var entries = EngineLog.Snapshot();
 			var filtered = new List<LogEntry>(entries.Count);
 			foreach (var entry in entries)
 			{

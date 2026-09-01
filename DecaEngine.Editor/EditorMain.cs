@@ -1,4 +1,5 @@
-﻿using Diligent;
+﻿using DecaEngine.Core.Diagnostics;
+using Diligent;
 using Microsoft.Build.Locator;
 
 namespace DecaEngine.Editor;
@@ -99,7 +100,7 @@ public static class EditorMain
 			return;
 		}
 
-		EditorConsoleLog.Install();
+		EngineLog.Install();
 
 		DiligentGraphicsApi.DebugMessage += OnDiligentDebugMessage;
 
@@ -127,6 +128,6 @@ public static class EditorMain
 			: $"{message} ({function}: {file}, {line})";
 
 		Console.WriteLine(formatted);
-		EditorConsoleLog.AddNative(level, formatted);
+		EngineLog.AddNative(level, formatted);
 	}
 }

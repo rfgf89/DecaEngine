@@ -152,7 +152,7 @@ public static class CsprojOutputResolver
     /// ожидании его завершения. Взаимная блокировка навсегда: снаружи это выглядит как «открытие
     /// проекта зависло».
     ///
-    /// Вывод пересылается в Console — редактор его перехватывает (см. EditorConsoleLog.Install), и
+    /// Вывод пересылается в Console — движок его перехватывает (см. EngineLog.Install), и
     /// ход сборки виден в окне Console вместо тишины на несколько минут.
     /// </summary>
     private static bool Build(string csprojPath, string configuration, string targetFramework, string platform)

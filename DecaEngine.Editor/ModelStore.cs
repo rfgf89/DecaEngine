@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Assets;
 using DecaEngine.Graphics.Core;
@@ -345,7 +346,7 @@ namespace DecaEngine.Editor.ECS
 					!string.Equals(extension, ".glb", StringComparison.OrdinalIgnoreCase))
 				{
 					entry.Error = $"Unsupported model format: {extension}";
-					EditorConsoleLog.Add(LogLevel.Warning, $"Model store: {entry.Error} ('{normalizedPath}')");
+					EngineLog.Add(LogLevel.Warning, $"Model store: {entry.Error} ('{normalizedPath}')");
 				}
 			}
 
@@ -528,7 +529,7 @@ namespace DecaEngine.Editor.ECS
 				{
 					entry.Error = ex.Message;
 					FinishRequest(entry);
-					EditorConsoleLog.Add(LogLevel.Error, $"Model store: failed to load '{entry.Path}': {ex.Message}");
+					EngineLog.Add(LogLevel.Error, $"Model store: failed to load '{entry.Path}': {ex.Message}");
 				}
 			}
 		}
@@ -565,7 +566,7 @@ namespace DecaEngine.Editor.ECS
 				{
 					entry.Error = entry.Request.PrepareTask.Exception?.GetBaseException().Message ?? "Unknown error";
 					FinishRequest(entry);
-					EditorConsoleLog.Add(LogLevel.Error, $"Model store: failed to load '{entry.Path}': {entry.Error}");
+					EngineLog.Add(LogLevel.Error, $"Model store: failed to load '{entry.Path}': {entry.Error}");
 					continue;
 				}
 
@@ -600,7 +601,7 @@ namespace DecaEngine.Editor.ECS
 			{
 				best.Error = ex.Message;
 				FinishRequest(best);
-				EditorConsoleLog.Add(LogLevel.Error, $"Model store: failed to finalize '{best.Path}': {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Model store: failed to finalize '{best.Path}': {ex.Message}");
 				return;
 			}
 
@@ -614,7 +615,7 @@ namespace DecaEngine.Editor.ECS
 			best.IdleSeconds = 0f;
 
 			var t = model.Timings;
-			EditorConsoleLog.Add(LogLevel.Info,
+			EngineLog.Add(LogLevel.Info,
 				$"Model load '{Path.GetFileName(best.Path)}': " +
 				$"parse {t.ParseMs} ms, materials {t.MaterialsMs} ms, meshes {t.MeshesMs} ms, " +
 				$"finalize {t.FinalizeMs} ms (shaders {t.ShaderMs} ms / {t.ShaderVariants} variants, " +
@@ -693,7 +694,7 @@ namespace DecaEngine.Editor.ECS
 					// консоли. Сводку по модели даёт AnnounceTextureReadiness.
 					if (job.Entry.TextureDecodeFailures++ == 0)
 					{
-						EditorConsoleLog.Add(LogLevel.Warning,
+						EngineLog.Add(LogLevel.Warning,
 							$"Model store: texture decode failed for '{job.Entry.Path}': " +
 							$"{job.DecodeTask.Exception?.GetBaseException().Message}");
 					}
@@ -883,7 +884,7 @@ namespace DecaEngine.Editor.ECS
 				catch (Exception ex)
 				{
 					ConsumeLevel(queued);
-					EditorConsoleLog.Add(LogLevel.Warning,
+					EngineLog.Add(LogLevel.Warning,
 						$"Model store: texture upgrade upload failed for '{queued.Entry.Path}': {ex.Message}");
 					return LevelUpload.Failed;
 				}
@@ -933,7 +934,7 @@ namespace DecaEngine.Editor.ECS
 			}
 
 			_budgetReported = true;
-			EditorConsoleLog.Add(LogLevel.Info,
+			EngineLog.Add(LogLevel.Info,
 				$"Model store: texture memory budget reached ({_textureBytes >> 20} MB) - quality upgrades paused.");
 		}
 
@@ -1247,13 +1248,13 @@ namespace DecaEngine.Editor.ECS
 				{
 					if (_upgradesStalled)
 					{
-						EditorConsoleLog.Add(LogLevel.Info,
+						EngineLog.Add(LogLevel.Info,
 							$"Model store: showing '{Path.GetFileName(entry.Path)}' at current texture quality - " +
 							"upgrades are paused by the memory budget.");
 					}
 					else if (entry.TextureWaitSeconds >= TextureWaitTimeoutSeconds)
 					{
-						EditorConsoleLog.Add(LogLevel.Warning,
+						EngineLog.Add(LogLevel.Warning,
 							$"Model store: texture streaming for '{Path.GetFileName(entry.Path)}' did not settle in " +
 							$"{TextureWaitTimeoutSeconds:0.#} s - showing it at current quality.");
 					}
@@ -1271,7 +1272,7 @@ namespace DecaEngine.Editor.ECS
 				// упаковка ассетов из движковых сэмплов) он не открывает вовсе.
 				if (entry.TextureDecodeFailures > 0)
 				{
-					EditorConsoleLog.Add(LogLevel.Warning,
+					EngineLog.Add(LogLevel.Warning,
 						$"Model store: {entry.TextureDecodeFailures} of {entry.Model.StreamedTextures.Count} textures " +
 						$"failed to decode for '{Path.GetFileName(entry.Path)}' - those materials stay untextured. " +
 						"Supported source formats are PNG and JPEG (DDS/KTX2 are not decoded).");
@@ -1437,7 +1438,7 @@ namespace DecaEngine.Editor.ECS
 				{
 					if (entry.Finalizing)
 					{
-						EditorConsoleLog.Add(LogLevel.Warning,
+						EngineLog.Add(LogLevel.Warning,
 							$"Model store: shutdown cancelled mid-finalize load of '{entry.Path}' - partial GPU resources leaked.");
 					}
 

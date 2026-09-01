@@ -2,6 +2,7 @@
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using DecaEngine.Core.Diagnostics;
 
 namespace DecaEngine.Editor
 {
@@ -122,7 +123,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning, $"Probe BVH cache: failed to write '{cachePath}': {ex.Message}");
+				EngineLog.Add(LogLevel.Warning, $"Probe BVH cache: failed to write '{cachePath}': {ex.Message}");
 
 				try
 				{
@@ -187,7 +188,7 @@ namespace DecaEngine.Editor
 			}
 			catch (Exception ex)
 			{
-				EditorConsoleLog.Add(LogLevel.Warning, $"Probe BVH cache: failed to read '{cachePath}': {ex.Message}");
+				EngineLog.Add(LogLevel.Warning, $"Probe BVH cache: failed to read '{cachePath}': {ex.Message}");
 				return null;
 			}
 		}

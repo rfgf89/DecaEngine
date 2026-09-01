@@ -1,4 +1,5 @@
 ﻿using System.Numerics;
+using DecaEngine.Core.Diagnostics;
 using Hexa.NET.ImGui;
 using Hexa.NET.ImGui.Widgets.Dialogs;
 using Engine.ImGui.Core;
@@ -24,7 +25,7 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 	/// кадры не шли, окно переставало отвечать, и снаружи это неотличимо от зависания.
 	///
 	/// Фоновый поток здесь безопасен: сборщик не трогает ни ImGui, ни сцену, а журнал редактора
-	/// потокобезопасен (см. EditorConsoleLog.AddInternal - запись под замком).
+	/// потокобезопасен (см. EngineLog.AddInternal - запись под замком).
 	/// </summary>
 	private Task<string>? _buildTask;
 
@@ -267,13 +268,13 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 		_buildingName = name;
 		_validationMessage = "";
 
-		EditorConsoleLog.Add(LogLevel.Info, $"Создание проекта '{name}' в {path} ...");
+		EngineLog.Add(LogLevel.Info, $"Создание проекта '{name}' в {path} ...");
 
 		// Ход генерации - в консоль РЕДАКТОРА: сборщик умеет сообщать о проблемах («модель не
 		// найдена», «площадка не собралась»), и в редакторе их читают там, а не в стандартном
 		// выводе процесса.
 		_buildTask = Task.Run(() => _editorBuilder.Build(name, path, template,
-			message => EditorConsoleLog.Add(LogLevel.Info, message)));
+			message => EngineLog.Add(LogLevel.Info, message)));
 	}
 
 	/// <summary>Проверяет, не закончилось ли создание. Результат разбирается ЗДЕСЬ, в потоке
@@ -295,11 +296,11 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			// повторить, не набирая всё заново.
 			var error = task.Exception?.GetBaseException();
 			_validationMessage = $"Не удалось создать проект: {error?.Message}";
-			EditorConsoleLog.Add(LogLevel.Error, error?.ToString() ?? "Project creation failed");
+			EngineLog.Add(LogLevel.Error, error?.ToString() ?? "Project creation failed");
 			return;
 		}
 
-		EditorConsoleLog.Add(LogLevel.Info, $"Проект создан: {task.Result}");
+		EngineLog.Add(LogLevel.Info, $"Проект создан: {task.Result}");
 
 		Close();
 		ResetFields();

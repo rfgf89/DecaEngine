@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
 using DecaEngine.Graphics.Diligent;
@@ -342,7 +343,7 @@ namespace DecaEngine.Editor.ECS
 				catch (Exception ex)
 				{
 					resident.Error = ex.Message;
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"Model streaming: failed to register '{resident.Path}': {ex.Message}");
 					return false;
 				}
@@ -531,7 +532,7 @@ namespace DecaEngine.Editor.ECS
 					resident.Error = ex.Message;
 					resident.Model = null;
 					resident.TexturesReady = false;
-					EditorConsoleLog.Add(LogLevel.Error,
+					EngineLog.Add(LogLevel.Error,
 						$"Model streaming: failed to re-register '{resident.Path}' after environment recreate: {ex.Message}");
 				}
 			}

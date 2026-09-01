@@ -1,6 +1,7 @@
 using System.Linq;
 using System.Numerics;
 using DecaEngine.Core;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Editor.ECS;
 using DecaEngine.Graphics;
 using DecaEngine.Graphics.Core;
@@ -212,7 +213,7 @@ namespace DecaEngine.Editor
 				}
 				catch (Exception ex)
 				{
-					EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed on '{_currentPath}' (stage {_currentStage}): {ex.Message}");
+					EngineLog.Add(LogLevel.Error, $"Icon bake: failed on '{_currentPath}' (stage {_currentStage}): {ex.Message}");
 					FinishCurrentJob();
 				}
 
@@ -247,7 +248,7 @@ namespace DecaEngine.Editor
 
 			_currentResident = null;
 
-			EditorConsoleLog.Add(LogLevel.Warning,
+			EngineLog.Add(LogLevel.Warning,
 				$"Icon bake: FULL reload for '{modelPath}' stage={stage} " +
 				$"(resident cache has {_residentModels.Count} model(s): [{string.Join(", ", _residentLru)}]) - " +
 				"not found in resident cache, re-parsing from disk.");
@@ -279,7 +280,7 @@ namespace DecaEngine.Editor
 			{
 				_pendingHandle = null;
 				_store.Release(handle);
-				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {error}");
+				EngineLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {error}");
 				FinishCurrentJob();
 				return;
 			}
@@ -310,7 +311,7 @@ namespace DecaEngine.Editor
 			catch (Exception ex)
 			{
 				_store.Release(handle);
-				EditorConsoleLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {ex.Message}");
+				EngineLog.Add(LogLevel.Error, $"Icon bake: failed to load '{_currentPath}': {ex.Message}");
 				_currentResident = null;
 				FinishCurrentJob();
 			}
@@ -359,7 +360,7 @@ namespace DecaEngine.Editor
 				// Нечего рендерить (сабмеш без треугольников, мёртвая ссылка meshId и т.п.) - PNG не
 				// сохраняем (браузер оставит векторный глиф) и помечаем этап пустым, чтобы браузер не
 				// ставил его в очередь заново каждый кадр (см. _emptyStages/EnqueueInternal).
-				EditorConsoleLog.Add(LogLevel.Warning,
+				EngineLog.Add(LogLevel.Warning,
 					$"Icon bake: stage {_currentStage} of '{_currentPath}' produced 0 renderable instances " +
 					$"(resident MeshIdMap has {_currentResident.MeshIdMap.Count} mesh(es), model has {model.instances.Count} instance(s)) - marked empty.");
 				_emptyStages.Add(MakeQueueKey(_currentPath!, _currentStage));
