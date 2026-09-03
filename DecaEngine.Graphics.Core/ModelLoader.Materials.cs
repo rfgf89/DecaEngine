@@ -15,16 +15,11 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Материалы и шейдеры: кейворды, прекомпиляция вариантов, дополнительные наборы материалов. Часть <see cref="ModelLoader"/> - файл на фазу; состояние,
-/// точки входа загрузки и Release живут в основном файле.</summary>
+/// <summary>Materials and shaders: keywords, variant precompilation, additional material sets.</summary>
 public partial class ModelLoader
 {
-	/// <summary>Shader-кейворды материала по сырому <see cref="PreparedMaterial"/> - единственный
-	/// источник истины и для финализации (локальный BuildMaterialKeywords внутри
-	/// <see cref="BuildFromPreparedIncremental"/>), и для фоновой прекомпиляции
-	/// (<see cref="PrecompileShaderVariants"/>): разойдись наборы, прекомпиляция грела бы не те
-	/// варианты, и финализация снова компилировала бы синхронно на GPU-потоке.
-	/// pm == null - встроенный дефолтный материал (без текстур/расширений).</summary>
+	// Single source of truth for both finalization and background precompilation: if the two sets
+	// diverge, precompilation warms the wrong variants. pm == null is the built-in default material.
 	private static List<string> BuildKeywordsFromPrepared(ModelLoadOptions options, PreparedMaterial pm)
 	{
 		var keywords = new List<string>();
@@ -36,14 +31,13 @@ public partial class ModelLoader
 			keywords.Add("FEATURE_SHADOWS");
 		}
 
-		// Теневые лучи по TLAS - вариант компилируется DXC/SM6.5 (см. DiligentShader) и требует
-		// привязанного TLAS; включается только на устройстве с inline-трассировкой.
+		// TLAS shadow rays: this variant needs DXC/SM6.5 and a bound TLAS, so inline RT only.
 		if (options.RtShadows)
 		{
 			keywords.Add("FEATURE_RT_SHADOWS");
 		}
 
-		// Тонкий G-buffer отражений вторым/третьим MRT-слотом (см. ModelLoadOptions.ReflectionGbuffer).
+		// Thin reflection G-buffer in the second and third MRT slots.
 		if (options.ReflectionGbuffer)
 		{
 			keywords.Add("FEATURE_REFLECTION_GBUFFER");
@@ -78,22 +72,17 @@ public partial class ModelLoader
 		{
 			keywords.Add("MATERIAL_SHEEN");
 		}
+		if (pm.EmissiveTexture != null)
+		{
+			keywords.Add("HAS_EMISSIVE_TEXTURE");
+		}
 
 		return keywords;
 	}
 
-	/// <summary>Компилирует шейдер-варианты модели ЕЩЁ В ФОНОВОЙ фазе загрузки (см.
-	/// ModelLoadRequest): наборы кейвордов известны сразу после парса материалов, а создание
-	/// ресурсов у IRenderDevice, в отличие от контекстов, потокобезопасно. Без этого компиляция
-	/// происходила лениво - из DiligentMaterial.SetShader во время финализации, то есть синхронно
-	/// на GPU-потоке: секунды фриза на КАЖДЫЙ ещё не виденный вариант UnlitInstancedPS (12+ с у
-	/// Sponza при холодном кеше байткода, см. DiligentShaderBytecodeCache). Здесь же варианты
-	/// компилируются параллельно, пока грузятся текстуры, и финализации остаётся готовый
-	/// нативный объект из общего кэша (CreateSharedShader выдаёт ТОТ ЖЕ экземпляр - ключ кэша
-	/// совпадает с ключом, который потом соберёт GetPixelShaderVariant).
-	///
-	/// Материалы-клоны не-треугольных топологий не греются: их вершинный шейдер зависит от
-	/// топологии (см. BuildTopologyClones), встречаются они редко и компилируются по-старому.</summary>
+	// Compiles shader variants during the BACKGROUND load phase: IRenderDevice resource creation is
+	// thread-safe, unlike contexts. Otherwise finalization compiles them synchronously on the GPU
+	// thread, freezing seconds per unseen variant. Non-triangle topology clones are not warmed.
 	private static void PrecompileShaderVariants(IGraphicsApi graphicsApi, ModelLoadOptions options,
 		PreparedModel prepared, CancellationToken cancellationToken)
 	{
@@ -102,7 +91,7 @@ public partial class ModelLoader
 
 		var shaders = new List<IShaderObject>
 		{
-			// Кейворды вершинника - как в финализации (DXC-паритет RT-варианта, см. там же).
+			// VS keywords must match finalization exactly (DXC parity for the RT variant).
 			graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
 				ShaderObjectType.Vertex,
 				keywords: options.RtShadows ? new[] { "FEATURE_RT_SHADOWS" } : null)
@@ -124,8 +113,7 @@ public partial class ModelLoader
 				psFactoryPath, psFileName, ShaderObjectType.Pixel, "Main", keywords.ToArray()));
 		}
 
-		// null-материалы модели получают встроенный дефолтный (см. BuildFromPreparedIncremental) -
-		// его вариант нужен всегда.
+		// Null materials fall back to the built-in default, so its variant is always needed.
 		AddVariant(null);
 		foreach (var pm in prepared.Materials)
 		{
@@ -135,18 +123,13 @@ public partial class ModelLoader
 			}
 		}
 
-		// Параллельно: вариантов единицы, но холодный стоит секунды - последовательный прогрев
-		// растягивал бы фоновую фазу почти на их сумму. Compile идемпотентен и сам держит замок
-		// экземпляра, отмена проверяется на входе в каждый элемент.
+		// Compile is idempotent and locks per instance, so parallel warming is safe.
 		Parallel.ForEach(shaders, new ParallelOptions { CancellationToken = cancellationToken },
 			shader => shader.Compile());
 	}
 
-	/// <summary>Те же shader-кейворды, что и <see cref="BuildKeywordsFromPrepared"/>, но выведенные
-	/// из уже посчитанных <see cref="MaterialPbrFactors"/> вместо сырого <see cref="PreparedMaterial"/>
-	/// (которого больше нет - PrepareModel-данные живут только до конца ПЕРВОЙ финализации, см.
-	/// ModelLoadRequest.FinalizeChunk).
-	/// pbr == null - встроенный дефолтный материал (материал-клон без источника), как и pm == null там.</summary>
+	// Same keywords as BuildKeywordsFromPrepared but derived from MaterialPbrFactors, because the
+	// PreparedMaterial data only lives until the FIRST finalization. pbr == null is the default.
 	private static List<string> BuildKeywordsFromFactors(ModelLoadOptions options, MaterialPbrFactors? pbr)
 	{
 		var keywords = new List<string>();
@@ -158,7 +141,7 @@ public partial class ModelLoader
 			keywords.Add("FEATURE_SHADOWS");
 		}
 
-		// Зеркало BuildKeywordsFromPrepared - наборы обязаны совпадать (см. комментарий там).
+		// Mirrors BuildKeywordsFromPrepared: the two sets must stay identical.
 		if (options.RtShadows)
 		{
 			keywords.Add("FEATURE_RT_SHADOWS");
@@ -199,43 +182,25 @@ public partial class ModelLoader
 		{
 			keywords.Add("MATERIAL_SHEEN");
 		}
+		if (f.HasEmissiveTexture)
+		{
+			keywords.Add("HAS_EMISSIVE_TEXTURE");
+		}
 
 		return keywords;
 	}
 
-	/// <summary>
-	/// Builds an ADDITIONAL, independent set of <see cref="IMaterialObject"/>s for an already-loaded
-	/// <paramref name="model"/> - for a second (or Nth) viewport/environment that needs its OWN
-	/// materials to register into its OWN batch renderer (see <see cref="DiligentBatchRenderer.Register"/>:
-	/// registering one material object into a second batch renderer silently steals it from the first -
-	/// and PSOs additionally bake per-environment SampleCount/RenderTargetFormats at registration time,
-	/// see DiligentBatchRenderer ~930-954).
-	///
-	/// Does NOT touch the GPU beyond creating small material/PSO objects: shaders come from the
-	/// device-wide shared cache (<see cref="IGraphicsApi.CreateSharedShader"/> - calling it again with
-	/// the same keys is a cache hit, no recompilation), and textures/samplers are the SAME already-
-	/// uploaded GPU objects <paramref name="model"/> owns (see <see cref="MaterialTextureBindings"/>,
-	/// <see cref="FallbackWhiteTexture"/> et al.) - nothing is re-decoded or re-uploaded.
-	///
-	/// A material bound to a texture that is still mid-<see cref="ModelLoadOptions.StreamTextures"/>
-	/// picks up whatever quality is CURRENT on the shared <see cref="StreamedTexture"/> entry (not the
-	/// stale filler captured when the first set was built - see <see cref="StreamedTexture.Texture"/>),
-	/// and registers itself into that entry's <see cref="StreamedTexture.Bindings"/> so future quality
-	/// upgrades hot-swap THIS set's SRBs too, exactly like the first one (see
-	/// DecaEngine.Editor.ECS.ModelStreamer.PumpTextureUpgrades / ModelStore's equivalent pump).
-	///
-	/// <paramref name="options"/> MUST have the same <see cref="ModelLoadOptions.Signature"/> the model
-	/// was originally loaded with - anisotropy/mip bias/keyword toggles are read here again rather than
-	/// re-derived from <paramref name="model"/>, and a mismatch would silently desync the second set
-	/// from what its textures/samplers actually are.
-	/// </summary>
+	/// <summary>Builds an ADDITIONAL, independent material set for an already-loaded model, so a second
+	/// viewport can register its own materials: registering one material into a second batch renderer
+	/// silently steals it from the first. Shaders and textures are shared, nothing is re-uploaded.
+	/// <paramref name="options"/> MUST carry the Signature the model was originally loaded with.</summary>
 	public static OrderedDictionary<int, IMaterialObject> BuildAdditionalMaterialSet(IGraphicsApi graphicsApi,
 		ModelLoadOptions options, ModelLoader model)
 	{
 		var (vsFactoryPath, vsFileName) = options.VertexShader.ToShaderFactoryParts();
 		var (psFactoryPath, psFileName) = options.PixelShader.ToShaderFactoryParts();
 
-		// Кейворды вершинника - как в финализации (DXC-паритет RT-варианта, см. там же).
+		// VS keywords must match finalization exactly (DXC parity for the RT variant).
 		var modelShaderVs = graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
 			ShaderObjectType.Vertex,
 			keywords: options.RtShadows ? new[] { "FEATURE_RT_SHADOWS" } : null);
@@ -258,10 +223,8 @@ public partial class ModelLoader
 
 		IShaderObject pointShaderVs = null;
 
-		// Биндит один слот из уже загруженных ресурсов модели: реальная привязка (см.
-		// MaterialTextureBindings) - тем же СЭМПЛЕРОМ (сэмплеры шарятся между окружениями, см. class-doc
-		// у ModelStore) и АКТУАЛЬНОЙ текстурой стрим-записи, если она есть; иначе - тот же общий филлер,
-		// каким пользуется первый набор (fallbackTexture параметр).
+		// Binds one slot from the model's already-loaded resources, using the shared sampler and the
+		// CURRENT streamed texture if one exists, otherwise the same filler the first set uses.
 		void BindShared(IMaterialObject materialObj, string slot, Dictionary<string, BaseColorBinding> slots,
 			IGpuTexture fallbackTexture)
 		{
@@ -294,8 +257,7 @@ public partial class ModelLoader
 			var vs = modelShaderVs;
 			if (pbr.Topology == MeshTopologyPoints)
 			{
-				// PSO с POINT_LIST обязан писать builtin PointSize из VS (см. тот же выбор в
-				// BuildFromPreparedIncremental) - тот же именной вариант вершинного шейдера.
+				// A POINT_LIST PSO must write the builtin PointSize from the VS.
 				if (pointShaderVs == null && vsFileName == "UnlitInstancedVS.hlsl")
 				{
 					pointShaderVs = graphicsApi.CreateSharedShader("Model Point Vertex Shader", vsFactoryPath,
@@ -307,9 +269,7 @@ public partial class ModelLoader
 
 			var materialObj = graphicsApi.CreateMaterial($"Model Material {key} (env clone)");
 
-			// Как и у первого набора: шейдеры - шарёные device-кэшем объекты, Release на них - no-op
-			// (см. DiligentShader.IsShared), поэтому этому набору не нужен собственный список owned-
-			// шейдеров - освобождать здесь нечего.
+			// Shaders come from the device-wide cache, so Release on them is a no-op.
 			materialObj.OwnsShaders = false;
 			materialObj.SetShader(GetPixelShaderVariant(BuildKeywordsFromFactors(options, pbr)), vs);
 
@@ -326,6 +286,10 @@ public partial class ModelLoader
 			}
 			BindShared(materialObj, "_NormalTex", slots, model.FallbackFlatNormalTexture);
 			BindShared(materialObj, "_OcclusionTex", slots, model.FallbackWhiteTexture);
+			if (pbr.HasEmissiveTexture)
+			{
+				BindShared(materialObj, "_EmissiveTex", slots, null);
+			}
 
 			result.Add(key, materialObj);
 		}
@@ -335,8 +299,8 @@ public partial class ModelLoader
 
 	private static readonly int VertexSizeBytes = System.Runtime.CompilerServices.Unsafe.SizeOf<Vertex>();
 
-	/// <summary>Вынесено из <see cref="BuildFromPreparedIncremental"/>: unsafe-блок в теле итератора
-	/// недопустим, а нативная копия LOD-таблицы обязана жить в неуправляемой памяти для SetLodGroup.</summary>
+	// Split out of the iterator body: unsafe blocks are illegal there, and SetLodGroup needs the
+	// LOD table in unmanaged memory.
 	private static void UploadLodGroup(IMeshObject meshObj, LodLevel[] lodLevels)
 	{
 		unsafe
@@ -350,8 +314,7 @@ public partial class ModelLoader
 		}
 	}
 
-	/// <summary>Домножает предвычисленную экспоненту Beer-Lambert (w) на масштаб узла-инстанса -
-	/// см. комментарий у materialScales в <see cref="BuildFromPreparedIncremental"/>.</summary>
+	// Scales the precomputed Beer-Lambert exponent (w) by the instance node's scale.
 	private static Vector4 ScaleVolumeAttenuation(PreparedMaterial material, Dictionary<int, float> materialScales, int scaleKey)
 	{
 		var volume = material.VolumeAttenuation;

@@ -46,7 +46,6 @@ public class Synchro
 
 	public void Signal()
 	{
-		//WaitForThreads();
 		lock (_sync)
 		{
 			var currEvt = _events[_nextEvtIdx];

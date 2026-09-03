@@ -14,17 +14,8 @@ using DecaEngine.Scene;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// ????????????? ????????? ?????????. ?? ?????? ?????? ????? ?????????? ? ????????????? ????
-	/// ???? ??????? (??. <see cref="DecaEngine.Core.Prefabs.PrefabAsset"/>): ????????? JSON-??????
-	/// ? ????????????? <see cref="EntityStore"/> (????? ?? ????????? ?? ?????? ?????????), ??????
-	/// ?????? ????????? ????? ? ????????? ??????????? ??????. ??????????? ?????
-	/// <see cref="ShowPrefab"/> - ????????, ????? ????? ?????? ?? .prefab.json ?
-	/// <see cref="AssetBrowserWindow"/>. ?????????? ????? ??????? ????????? ??????? ? ??? ??
-	/// JSON-????; "Cook to .bin" ????????????? ???????? ???????? (??. <see cref="PrefabAsset.Cook"/>)
-	/// ????? ? ??????????.
-	/// </summary>
-	public class InspectorWindow : ImGuiDockingWindow
+	/// <summary>Prefab/model inspector: edits a prefab instantiated into its own <see cref="EntityStore"/>, saves back to the same JSON file.</summary>
+	public partial class InspectorWindow : ImGuiDockingWindow
 	{
 		private enum InspectorMode
 		{
@@ -38,7 +29,7 @@ namespace DecaEngine.Editor
 		private readonly ModelPreviewViewport? _modelPreview;
 		private InspectorMode _mode = InspectorMode.None;
 
-		/// <summary>Имя показываемого SubMesh-а (для заголовка "file.glb > SubMesh"), null - целая модель.</summary>
+		// null = whole-model view (no sub-mesh isolated).
 		private string? _modelSubMeshLabel;
 
 		private string? _prefabPath;
@@ -61,16 +52,12 @@ namespace DecaEngine.Editor
 		private bool _dirty;
 		private bool _debugMode;
 
-		// --- Play Mode ---
-		// Snapshot/restore is purely ECS-side: on Play the current prefab subtree is captured as
-		// DataEntity JSON (same primitives PrefabAsset uses for save/load), and on Stop every
-		// pre-Play entity's components are written back from that snapshot while any entity created
-		// during Play (not present in the snapshot) is deleted - no file I/O involved either way.
+		// Play Mode snapshot/restore is pure ECS-side DataEntity JSON; no file I/O either way.
 		private SystemRoot? _playSystemRoot;
 		private List<DataEntity>? _playSnapshot;
 		private bool _isPlaying;
 
-		/// <summary>Width/height ratio the model preview viewport is fit to (1 = square).</summary>
+		// Width/height ratio the model preview viewport is fit to (1 = square).
 		private float _previewAspectRatio = 1f;
 
 		private static Vector4 PanelBackground => EditorPalette.Lighten(EditorPalette.Background, 0.04f);
@@ -87,16 +74,12 @@ namespace DecaEngine.Editor
 		}
 
 
-		/// <summary>???? ? ???????? ????????? .prefab.json, ???? null, ???? ?????? ?? ????????? (??? SceneViewWindow).</summary>
 		public string? PrefabPath => _prefabPath;
 
-		/// <summary>?????? ?????????????? ???????, ???? null, ???? ?????? ?? ????????? (??? SceneViewWindow).</summary>
 		public Entity? Root => _prefabPath is null ? (Entity?)null : _root;
 
-		/// <summary>??????? ????????? ? ???????? ???????? (??? ?????????/gizmo ? SceneViewWindow).</summary>
 		public Entity? Selected => _selected;
 
-		/// <summary>????????? SceneViewWindow ??????? ????????? (????????, ?????? ?? ???? ? 3D-????????).</summary>
 		public void SetSelected(Entity entity)
 		{
 			_selected = entity;
@@ -105,16 +88,10 @@ namespace DecaEngine.Editor
 		/// <summary>True while Play Mode is running (see <see cref="Play"/>/<see cref="Stop"/>).</summary>
 		public bool IsPlaying => _isPlaying;
 
-		/// <summary>Показывает ли Inspector сейчас превью модели (а не дерево префаба). По этому флагу
-		/// EditorManager решает, КТО из двух вьюпортов держит модель: превью или сцена префаба - обе
-		/// сразу её не грузят (см. <see cref="ModelPreviewViewport.SetActive"/>).</summary>
+		/// <summary>True while showing a model preview; only one viewport may hold the model (see <see cref="ModelPreviewViewport.SetActive"/>).</summary>
 		public bool IsModelPreviewMode => _mode == InspectorMode.Model;
 
-		/// <summary>
-		/// Starts Play Mode: snapshots the current prefab subtree (ECS-side, in memory - see
-		/// <see cref="_playSnapshot"/>) and starts ticking <see cref="RotateSystem"/> (and any future
-		/// Play-Mode-only systems) against <see cref="_store"/> every frame via <see cref="UpdatePlayMode"/>.
-		/// </summary>
+		/// <summary>Starts Play Mode: snapshots the prefab subtree in memory and ticks Play-only systems each frame.</summary>
 		public void Play()
 		{
 			if (_isPlaying || _store is null || _prefabPath is null)
@@ -137,11 +114,7 @@ namespace DecaEngine.Editor
 			_isPlaying = true;
 		}
 
-		/// <summary>
-		/// Stops Play Mode and reverts every change it made, entirely on the ECS side: restores each
-		/// pre-Play entity's components from the snapshot taken in <see cref="Play"/>, and deletes any
-		/// entity created while playing (i.e. absent from that snapshot).
-		/// </summary>
+		/// <summary>Stops Play Mode: restores the pre-Play snapshot ECS-side and deletes entities created while playing.</summary>
 		public void Stop()
 		{
 			if (!_isPlaying || _playSnapshot is null || _store is null)
@@ -171,11 +144,7 @@ namespace DecaEngine.Editor
 			_isPlaying = false;
 		}
 
-		/// <summary>
-		/// Deletes <paramref name="entity"/> and its whole subtree if it isn't in <paramref name="snapshotPids"/>
-		/// (i.e. it was created after <see cref="Play"/> ran); otherwise recurses into its children.
-		/// Deleting cascades to children, so a match is never recursed into after being deleted.
-		/// </summary>
+		// Delete cascades to the whole subtree, so a deleted match is never recursed into.
 		private static void DeleteEntitiesNotInSnapshot(Entity entity, HashSet<long> snapshotPids)
 		{
 			if (!snapshotPids.Contains(entity.Pid))
@@ -199,16 +168,14 @@ namespace DecaEngine.Editor
 			_playSystemRoot!.Update(new UpdateTick(deltaTime, time));
 		}
 
-		/// <summary>Снимает выделение (клик по пустоте в Scene View).</summary>
 		public void ClearSelection()
 		{
 			_selected = null;
 		}
 
-		/// <summary>?????????? SceneViewWindow ????? ?????? ?????????? ????? gizmo: ???????? asset ?????????? ? ?????????? ??? euler-????? Transform-??????.</summary>
 		public void NotifyTransformChangedExternally()
 		{
-			_dirty = true;
+			MarkChanged();
 			_eulerEntityId = -1;
 		}
 
@@ -220,11 +187,6 @@ namespace DecaEngine.Editor
 			Show();
 		}
 
-		/// <summary>
-		/// ?????????? 3D-?????? .gltf/.glb ?????? ?????? ?????? ??????? - ??????????, ????????, ???
-		/// ?????? ?????? ? <see cref="AssetBrowserWindow"/>. ?????????? ?????????, ????????????? ??
-		/// ??????? ????? render-graph (<see cref="ModelPreviewViewport"/>), ?????????? ? ???????????.
-		/// </summary>
 		public void ShowModel(string modelPath, int subMeshIndex = -1, string? subMeshLabel = null)
 		{
 			if (_modelPreview is null)
@@ -275,6 +237,10 @@ namespace DecaEngine.Editor
 			{
 				return;
 			}
+
+			// Frame snapshot must be captured before any edits this frame (see InspectorWindow.EditOps).
+			CaptureFrameSnapshot();
+			HandleEditShortcuts();
 
 			RenderToolbar();
 			ImGui.Separator();
@@ -335,10 +301,8 @@ namespace DecaEngine.Editor
 				RenderModelPreviewModeToolbar();
 			}
 
-			// Поворот мирового ключевого света (см. ModelPreviewViewport.SetLightRotation) -
-			// применяется live: яв вращает свет/тени вместе с небом и IBL-отражениями, высота
-			// поднимает/опускает солнце (только свет - equirect-панораму по высоте не повернуть).
-			// Оба значения - смещения от базового положения солнца энвайронмента (0 = как было).
+			// Yaw/height are offsets from the environment's base sun; height moves the light only
+			// (an equirect panorama cannot be rotated in elevation).
 			if (_modelPreview.HasModel)
 			{
 				float lightYaw = _modelPreview.LightYawDegrees;
@@ -376,11 +340,7 @@ namespace DecaEngine.Editor
 		private static readonly string[] ModelPreviewViewModeLabels = { "Highlight", "Channel", "Lighting" };
 		private static readonly string[] ModelPreviewChannelLabels = { "Normal", "UV", "Tangent" };
 
-		/// <summary>Sub-mesh-view-only "View Mode" / "Wireframe" / "Channel" controls (see
-		/// <see cref="ModelPreviewViewport.SetSubMeshViewMode"/>/<see cref="ModelPreviewViewport.SetWireframeEnabled"/>/
-		/// <see cref="ModelPreviewViewport.SetPreviewChannel"/>) - only shown while a single sub-mesh is
-		/// isolated (see <see cref="RenderModelPreview"/>); the whole-model view is always Lighting (PBR).
-		/// Wireframe is an independent toggle, combinable with either Highlight or Channel.</summary>
+		// Shown only while a single sub-mesh is isolated; the whole-model view is always Lighting (PBR).
 		private void RenderModelPreviewModeToolbar()
 		{
 			int modeIndex = (int)_modelPreview!.ViewMode;
@@ -459,22 +419,28 @@ namespace DecaEngine.Editor
 			ImGui.EndDisabled();
 
 			ImGui.SameLine();
-			// Play Mode runs Play-Mode-only systems (RotateSystem etc, see RenderNode's "Add
-			// Component > Gameplay/Rotate") against this prefab's live entities; Stop reverts every
-			// change purely on the ECS side (see Stop()) - edits made while playing don't persist.
+			// Edits made while playing do not persist - Stop() reverts everything ECS-side.
 			if (_isPlaying)
 			{
+				ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.48f, 0.20f, 0.17f, 1f));
+				ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.58f, 0.26f, 0.22f, 1f));
+				ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.68f, 0.30f, 0.25f, 1f));
 				if (ImGui.Button("Stop"))
 				{
 					Stop();
 				}
+				ImGui.PopStyleColor(3);
 			}
 			else
 			{
+				ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.20f, 0.42f, 0.24f, 1f));
+				ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.25f, 0.52f, 0.30f, 1f));
+				ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.30f, 0.60f, 0.35f, 1f));
 				if (ImGui.Button("Play"))
 				{
 					Play();
 				}
+				ImGui.PopStyleColor(3);
 			}
 
 			ImGui.SameLine();
@@ -509,11 +475,29 @@ namespace DecaEngine.Editor
 				var label = GetEntityLabel(entity);
 
 				EditorSelectionStyle.PushColors();
-				opened = ImGui.TreeNodeEx(label, flags);
+				// Three leading spaces reserve room for the marker dot drawn below via the drawlist.
+				opened = ImGui.TreeNodeEx("   " + label, flags);
 				EditorSelectionStyle.PopColors();
 				if (hadChildrenAtRenderStart)
 				{
 					_expandedState[entity.Id] = opened;
+				}
+
+				var nodeDrawList = ImGui.GetWindowDrawList();
+				var nodeMin = ImGui.GetItemRectMin();
+				var nodeMax = ImGui.GetItemRectMax();
+				float markerX = nodeMin.X + ImGui.GetTreeNodeToLabelSpacing() + 5f * _scale;
+				float markerY = (nodeMin.Y + nodeMax.Y) * 0.5f;
+				nodeDrawList.AddCircleFilled(new Vector2(markerX, markerY), 3.2f * _scale,
+					ImGui.GetColorU32(GetEntityMarkerColor(entity)));
+
+				if (hadChildrenAtRenderStart)
+				{
+					var countText = entity.ChildCount.ToString();
+					var countSize = ImGui.CalcTextSize(countText);
+					nodeDrawList.AddText(
+						new Vector2(nodeMax.X - countSize.X - 6f * _scale, (nodeMin.Y + nodeMax.Y - countSize.Y) * 0.5f),
+						ImGui.GetColorU32(EditorPalette.WithAlpha(EditorPalette.Text, 0.35f)), countText);
 				}
 
 				if (ImGui.IsItemClicked() && !ImGui.IsItemToggledOpen())
@@ -521,8 +505,7 @@ namespace DecaEngine.Editor
 					_selected = entity;
 				}
 
-				// Lets EntityRef fields (ComponentFieldEditor) accept an entity dropped from this
-				// hierarchy - payload is the entity's persistent id, which is what EntityRef stores.
+				// Drag payload is the persistent id - the value EntityRef fields store.
 				if (ImGui.BeginDragDropSource())
 				{
 					long pid = entity.Pid;
@@ -592,6 +575,29 @@ namespace DecaEngine.Editor
 		private static string GetEntityLabel(Entity entity) =>
 			entity.HasName && !string.IsNullOrEmpty(entity.Name.value) ? entity.Name.value : $"Entity {entity.Pid}";
 
+		// Branch order is by role rarity: light/camera outrank merely having a mesh.
+		private static Vector4 GetEntityMarkerColor(Entity entity)
+		{
+			if (entity.HasComponent<LightComponent>())
+			{
+				return new Vector4(1.0f, 0.78f, 0.35f, 1f);
+			}
+			if (entity.HasComponent<CameraComponent>())
+			{
+				return new Vector4(0.45f, 0.70f, 1.0f, 1f);
+			}
+			if (entity.HasComponent<ModelRenderer>())
+			{
+				return EditorPalette.IconAccent;
+			}
+			if (entity.Scripts.Length > 0)
+			{
+				return new Vector4(0.55f, 0.85f, 0.55f, 1f);
+			}
+
+			return EditorPalette.WithAlpha(EditorPalette.Text, 0.35f);
+		}
+
 		private void BeginRename(Entity entity)
 		{
 			_renamingEntityId = entity.Id;
@@ -612,7 +618,7 @@ namespace DecaEngine.Editor
 				entity.AddComponent<EntityName>();
 			}
 			entity.Name.value = _renameBuffer;
-			_dirty = true;
+			MarkChanged();
 			_renamingEntityId = -1;
 			_renameFocusPending = false;
 		}
@@ -628,34 +634,52 @@ namespace DecaEngine.Editor
 
 			PopupContextMenu.DrawBackdrop();
 
-			if (ImGui.MenuItem("Rename"))
+			if (ImGui.MenuItem("Rename", "F2"))
 			{
 				BeginRename(entity);
 			}
 
 			if (ImGui.MenuItem("Add Child"))
 			{
+				MarkChanged();
 				var child = _store!.CreateEntity(new Position(0, 0, 0));
 				entity.AddChild(child);
 				_selected = child;
-				_dirty = true;
 			}
 
 			ImGui.Separator();
 
-			bool canDelete = entity.Pid != _root.Pid;
-			ImGui.BeginDisabled(!canDelete);
-			if (ImGui.MenuItem("Delete"))
+			// These act on the clicked entity, not _selected: right-click must not change selection.
+			bool notRoot = entity.Pid != _root.Pid;
+
+			ImGui.BeginDisabled(!notRoot);
+			if (ImGui.MenuItem("Duplicate", "Ctrl+D"))
 			{
-				var parent = entity.Parent;
-				_selected = parent.IsNull ? _root : parent;
-				if (_renamingEntityId == entity.Id)
-				{
-					CancelRename();
-				}
-				entity.DeleteEntity();
-				_dirty = true;
-				deleted = true;
+				DuplicateEntity(entity);
+			}
+			ImGui.EndDisabled();
+
+			if (ImGui.MenuItem("Copy", "Ctrl+C"))
+			{
+				CopyEntity(entity);
+			}
+
+			if (ImGui.MenuItem("Paste As Child", "Ctrl+V"))
+			{
+				PasteInto(entity);
+			}
+
+			if (ImGui.MenuItem("Copy Name"))
+			{
+				CopyEntityName(entity);
+			}
+
+			ImGui.Separator();
+
+			ImGui.BeginDisabled(!notRoot);
+			if (ImGui.MenuItem("Delete", "Del"))
+			{
+				deleted = DeleteEntityWithUndo(entity);
 			}
 			ImGui.EndDisabled();
 
@@ -672,11 +696,14 @@ namespace DecaEngine.Editor
 			}
 
 			var entity = _selected.Value;
-			ImGui.Text($"Entity pid={entity.Pid}");
+
+			ImGui.TextUnformatted(GetEntityLabel(entity));
+			ImGui.SameLine();
+			ImGui.TextDisabled($"pid {entity.Pid}");
 			if (entity.Pid == _root.Pid)
 			{
 				ImGui.SameLine();
-				ImGui.TextDisabled("(root)");
+				ImGui.TextColored(EditorPalette.WithAlpha(EditorPalette.Selection, 0.8f), "root");
 			}
 			ImGui.Separator();
 
@@ -724,7 +751,7 @@ namespace DecaEngine.Editor
 				if (ImGui.DragFloat3("Position", ref pos, 0.05f))
 				{
 					entity.Position = new Position(pos.X, pos.Y, pos.Z);
-					_dirty = true;
+					MarkChanged();
 				}
 			}
 
@@ -739,7 +766,7 @@ namespace DecaEngine.Editor
 				{
 					var rad = _tempEuler * (MathF.PI / 180f);
 					entity.Rotation = new Rotation { value = Quaternion.CreateFromYawPitchRoll(rad.Y, rad.X, rad.Z) };
-					_dirty = true;
+					MarkChanged();
 				}
 			}
 
@@ -749,7 +776,7 @@ namespace DecaEngine.Editor
 				if (ImGui.DragFloat3("Scale", ref scale, 0.05f))
 				{
 					entity.Scale3 = new Scale3(scale.X, scale.Y, scale.Z);
-					_dirty = true;
+					MarkChanged();
 				}
 			}
 
@@ -773,7 +800,7 @@ namespace DecaEngine.Editor
 		{
 			if (ComponentFieldEditor.DrawComponents(entity, TransformComponentTypes))
 			{
-				_dirty = true;
+				MarkChanged();
 			}
 		}
 
@@ -797,6 +824,18 @@ namespace DecaEngine.Editor
 
 			ImGui.SetNextItemWidth(280f * _scale);
 			ImGui.InputTextWithHint("##AddComponentSearch", "Search...", ref _addComponentFilter, 128);
+
+			// Paste is offered here too: a fresh entity has no component headers, hence no Paste menu.
+			if (ComponentFieldEditor.ComponentClipboardKey is { } clipboardKey &&
+				ImGui.MenuItem($"Paste Component ({clipboardKey})"))
+			{
+				if (ComponentFieldEditor.TryPasteComponent(entity))
+				{
+					MarkChanged();
+				}
+				ImGui.CloseCurrentPopup();
+			}
+
 			ImGui.Separator();
 
 			if (ImGui.BeginTabBar("##AddComponentTabs"))
@@ -920,7 +959,7 @@ namespace DecaEngine.Editor
 					EntityUtils.AddNewEntityScript(entity, scriptType);
 				}
 			}
-			_dirty = true;
+			MarkChanged();
 			ImGui.CloseCurrentPopup();
 		}
 
@@ -943,7 +982,7 @@ namespace DecaEngine.Editor
 				if (ImGui.Selectable($"{scriptType.Name}  (script)"))
 				{
 					EntityUtils.AddNewEntityScript(entity, scriptType);
-					_dirty = true;
+					MarkChanged();
 					ImGui.CloseCurrentPopup();
 				}
 			}
@@ -992,7 +1031,7 @@ namespace DecaEngine.Editor
 				if (PrefabAsset.TryApplyComponentsJson(entity, _componentsBuffer, out var error))
 				{
 					_applyError = null;
-					_dirty = true;
+					MarkChanged();
 					_componentsBuffer = PrefabAsset.GetComponentsJson(entity);
 				}
 				else

@@ -1,6 +1,4 @@
-// Общие объявления SSR-пассов (см. SsrPass.cs): реконструкция вида, шум, кбуфер ручек.
-// Конвенции реконструкции - ровно те же, что в SsaoCommon/SsgiCommon: infinite reversed-Z
-// (z_view = near / depth), фиксированный FOV 45 (ModelViewportEnvironment.CameraFovDegrees).
+// Same reconstruction convention as SsaoCommon/SsgiCommon: reversed-Z, fixed 45 deg FOV.
 #ifndef SSR_COMMON_INCLUDED
 #define SSR_COMMON_INCLUDED
 
@@ -11,77 +9,57 @@ cbuffer View
     ViewData viewData;
 }
 
-// Живые ручки SSR. Заливается командой UpdateBuffer из пасса (см. SsrPassResources - тот же
-// приём живой CPU-памяти, что у MotionVectorConstants: SetConstant на замороженном графе
-// переустанавливал бы переменную SRB под летящим кадром). Паддинг скалярами - см. SsaoCommon.
+// Filled via UpdateBuffer, not SetConstant: rebinding an SRB variable mid-frame is unsafe.
+// Scalars are laid out to satisfy cbuffer packing; see SsaoCommon.
 cbuffer SsrConstants
 {
-    // Счётчик кадров - фаза шума стохастической выборки (голден-ратио сдвиг IGN).
     float ssrFrameIndex;
-    // Потолок perceptual roughness: выше отражения плавно гаснут (луч всё равно один на пиксель,
-    // и на матовых поверхностях остаточный шум дороже, чем недостающий спекуляр).
+    // Perceptual roughness ceiling: reflections fade out above it.
     float ssrMaxRoughness;
-    // Толщина поверхности при проверке пересечения, мировые единицы: луч, ушедший за глубину
-    // ГЛУБЖЕ этой толщины, считается прошедшим ПОЗАДИ тонкого объекта и продолжает марш.
+    // Surface thickness in world units for the intersection test.
     float ssrThickness;
-    // Дальность луча в мировых единицах.
+    // Ray range in world units.
     float ssrMaxDistance;
 
-    // Поворот энвайронмента вокруг Y (тот же PbrEnvYaw, что в UnlitInstancedPS) - композит
-    // обязан вычесть ровно тот env-цвет, который сложил форвард-пасс.
+    // Must match PbrEnvYaw in UnlitInstancedPS: composite subtracts the forward pass env color.
     float ssrEnvYaw;
-    // Вес истории темпоральной аккумуляции (0..0.97): один стохастический луч на пиксель без
-    // истории - это снег, а не отражение.
+    // Temporal history weight (0..0.97).
     float ssrHistoryWeight;
-    // 0 - обычный кадр, 1 - только отражения (rgb*conf), 2 - confidence, 3 - нормали G-buffer.
+    // 0 - normal, 1 - reflections only (rgb*conf), 2 - confidence, 3 - G-buffer normals.
     float ssrDebugView;
-    // Множитель заменяющего отражения (художественная ручка; 1 - энергетически честно).
+    // Artistic multiplier; 1 is energy-correct.
     float ssrIntensity;
 
-    // Направление НА солнце (мир) - шейдинг хитов RT-фолбэка.
+    // Direction TOWARDS the sun (world), for shading RT fallback hits.
     float4 ssrSunDirWorld;
-    // rgb - цвет*интенсивность солнца (те же константы, что у ключа превью - см.
-    // SimpleCullingAndRenderSystem), w - ambient-уровень RT-хитов: множитель диффузной
-    // env-иррадианса (SampleEnvironment по нормали хита, roughness 1) - тот же ambientLevel,
-    // что у форвард-пасса.
+    // rgb - sun color*intensity, w - ambient level applied to RT hits.
     float4 ssrSunColor;
 
-    // x - пар переиспользуемых лучей в резолве (1..4, кламп в шейдере): главный рычаг шум/цена.
-    // Остальное - паддинг (см. SsaoCommon про выравнивание).
+    // x - reused ray pairs in resolve (1..4, clamped in shader). Rest is padding.
     float ssrRaysPerPixel;
 
-    // ВСЕГО отскоков RT-луча (1..4): 1 - только первичный луч, 2+ - зеркальные продолжения
-    // с металлических хитов («зеркало в зеркале», см. цикл в SsrTracePS). Только RT-вариант.
+    // TOTAL RT ray bounces (1..4). RT variant only.
     float ssrBounces;
 
-    // Режим трассировки: 0 - экранный марш, затем RT для промахнувшихся лучей; 1 - СРАЗУ RT
-    // (марш пропускается целиком). Экранные ДАННЫЕ во втором режиме никуда не деваются -
-    // радианс в точке хита по-прежнему берётся с экрана репроекцией; уходит только сам марш
-    // с его артефактами (ложные хиты за тонкой геометрией, ошибки толщины, затухание у краёв
-    // кадра). Действует только в варианте с FEATURE_RT_REFLECTIONS.
+    // 0 - screen march then RT for missed rays; 1 - RT immediately. FEATURE_RT_REFLECTIONS only.
     float ssrTraceMode;
     float ssrQualityPad2;
 
-    // Сетка probe-поля для шейдинга RT-хитов (см. SsrSampleProbeField в SsrTracePS): те же
-    // origin/cell/counts, что материалы получают в ProbeGrid* (ProbeGiViewportShared.PushGrid).
-    // origin.w = 1 - поле привязано; 0 - атласы держат плейсхолдер, ветка мертва.
+    // Probe field grid for shading RT hits; same origin/cell/counts as ProbeGrid* materials get.
+    // origin.w = 1 means the field is bound; 0 means atlases hold a placeholder.
     float4 ssrProbeOrigin;
     float4 ssrProbeCell;
     float4 ssrProbeCounts;
 
-    // viewProj ПРОШЛОГО кадра - репроекция ВИРТУАЛЬНОГО образа отражения у зеркал (RTG гл.32,
-    // Reflection Motion Vectors; см. SsrResolvePS). До первой защёлки - единичная.
+    // PREVIOUS frame viewProj, for reprojecting the virtual mirror image. Identity until latched.
     float4x4 ssrPrevViewProj;
 }
 
-// Ниже этой шероховатости пиксель считается зеркальным: трейс берёт детерминированное
-// направление (стохастика на зеркале не сходится, а дрожит), резолв считает его pdf
-// аналитически (трейс у таких пикселей кладёт в rayHit.z ДЛИНУ луча - для репроекции
-// виртуального образа). Общая константа трейса и резолва.
+// Below this roughness the pixel is treated as a mirror: deterministic direction, analytic pdf,
+// and trace stores ray LENGTH in rayHit.z. Shared by trace and resolve.
 static const float SsrMirrorRoughness = 0.08;
 
-// PDF зеркального пути по пику лоба (H = N) - та же формула у трейса и резолва.
-// Литеральное пи: SsrPI объявлен ниже по файлу.
+// Mirror-path PDF at the lobe peak (H = N). Pi is literal: SsrPI is declared further down.
 float SsrMirrorPdf(float roughness)
 {
     float m = max(roughness * roughness, 1e-3);
@@ -89,8 +67,7 @@ float SsrMirrorPdf(float roughness)
     return m2 / (3.14159265359 * m2 * m2);
 }
 
-// Нелинейная реконструкция иррадианса из SH L1 - копия NonLinearIrradianceL1 из
-// UnlitInstancedPS.hlsl (обоснование смеси линейной и нелинейной форм - там же).
+// Copy of NonLinearIrradianceL1 from UnlitInstancedPS.hlsl; keep the two in sync.
 float SsrIrradianceL1(float R0, float3 R1v, float3 n)
 {
     float len = length(R1v);
@@ -138,7 +115,6 @@ float3 SsrViewPos(int2 pixel, float rawDepth, float2 viewportSize)
     return float3(ndc.x * SsrTanHalfFov * aspect * zView, ndc.y * SsrTanHalfFov * zView, zView);
 }
 
-// Проекция view-точки в UV экрана (обратная SsrViewPos).
 float2 SsrProjectUv(float3 viewPos, float2 viewportSize)
 {
     float aspect = viewportSize.x / max(viewportSize.y, 1.0);
@@ -147,28 +123,23 @@ float2 SsrProjectUv(float3 viewPos, float2 viewportSize)
         0.5 - viewPos.y / (viewPos.z * SsrTanHalfFov) * 0.5);
 }
 
-// Interleaved gradient noise (Jimenez) с покадровым сдвигом: соседние пиксели И соседние кадры
-// получают разные фазы - пространственный шум собирает резолв соседей, временной - история.
+// Interleaved gradient noise (Jimenez) with a per-frame phase shift.
 float SsrNoise(float2 pixel, float offset)
 {
     pixel += offset * 5.588238;
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
-// BRDF bias (Frostbite/Stachowiak, значение из референсной реализации Stochastic SSR):
-// выборка лоба поджимается к зеркальному направлению - лучи почти не разбредаются, а
-// корректная ФОРМА лоба восстанавливается в резолве весом BRDF/PDF (ratio estimator).
+// BRDF bias from the reference Stochastic SSR implementation (Frostbite/Stachowiak): the lobe
+// sampling is pulled towards the mirror direction; resolve restores lobe shape via BRDF/PDF.
 static const float SsrBrdfBias = 0.7;
 
-// Важностная выборка GGX-полусферы вокруг нормали (Karis, "Real Shading in UE4"): возвращает
-// половинный вектор, pdf - в w (в мере половинных векторов, D * cos(theta) - ровно то, чем
-// потом делится вес резолва, см. SsrBrdfWeight).
+// GGX importance sampling (Karis, "Real Shading in UE4"): half vector in xyz, pdf in w.
 float4 SsrSampleGgxHalfVector(float3 N, float roughness, float u1, float u2)
 {
     float m = max(roughness * roughness, 1e-3);
     float m2 = m * m;
 
-    // Поджатие к зеркалу - см. SsrBrdfBias.
     u1 = lerp(u1, 0.0, SsrBrdfBias);
 
     float cosTheta = sqrt((1.0 - u1) / (1.0 + (m2 - 1.0) * u1));
@@ -188,9 +159,8 @@ float4 SsrSampleGgxHalfVector(float3 N, float roughness, float u1, float u2)
                           + N * cosTheta), pdf);
 }
 
-// Вес переиспользования чужого луча (ratio estimator, Stachowiak "Stochastic SSR"): BRDF
-// ЭТОГО пикселя по НАПРАВЛЕНИЮ соседа, делённый на pdf соседа. D-GGX * G-Walter, без
-// френеля/нормировки - постоянные множители сокращаются при делении на сумму весов.
+// Ratio estimator weight for reusing a neighbour ray (Stachowiak, "Stochastic SSR").
+// D-GGX * G-Walter without Fresnel: constant factors cancel against the weight sum.
 float SsrBrdfWeight(float3 V, float3 L, float3 N, float roughness)
 {
     float3 H = normalize(L + V);
@@ -210,8 +180,7 @@ float SsrBrdfWeight(float3 V, float3 L, float3 N, float roughness)
     return D * gl * gv * (SsrPI / 4.0);
 }
 
-// Октаэдральная упаковка направления в [0..1]^2 - RT-хиты хранят в hit-буфере направление
-// луча вместо экранного UV (см. SsrTracePS/SsrResolvePS).
+// Octahedral direction packing into [0..1]^2: RT hits store a ray direction, not a screen UV.
 float2 SsrOctEncode(float3 v)
 {
     v /= abs(v.x) + abs(v.y) + abs(v.z);
@@ -232,8 +201,7 @@ float3 SsrOctDecode(float2 e)
     return normalize(v);
 }
 
-// Мировая equirect-карта окружения с GGX-префильтрованными мипами - тот же контракт, что у
-// SampleEnvironment в UnlitInstancedPS (EnvMipMax обязан совпадать с PreviewEnvironmentMap).
+// Equirect env map with GGX-prefiltered mips; must match PreviewEnvironmentMap's mip count.
 static const float SsrEnvMipMax = 6.0;
 
 float3 SsrSampleEnvironment(Texture2D envMap, SamplerState envSampler, float3 dir, float roughness)
@@ -243,27 +211,25 @@ float3 SsrSampleEnvironment(Texture2D envMap, SamplerState envSampler, float3 di
     return envMap.SampleLevel(envSampler, uv, roughness * SsrEnvMipMax).rgb;
 }
 
-// Затухание у кромок экрана: луч, чей хит уехал к границе, вот-вот потеряет данные - плавный
-// спад вместо мигающего обрыва на движении камеры.
+// Screen-edge falloff: hits near the border lose data, fade instead of popping.
 float SsrEdgeFade(float2 uv)
 {
     float2 fade = saturate((0.5 - abs(uv - 0.5)) / 0.08);
     return fade.x * fade.y;
 }
 
-// Спад по шероховатости к потолку ssrMaxRoughness.
 float SsrRoughnessFade(float roughness)
 {
     return 1.0 - smoothstep(ssrMaxRoughness * 0.7, ssrMaxRoughness, roughness);
 }
 
-// world -> view для направлений (view - ортонормальная ротация + перенос, строчная конвенция).
+// world -> view for directions; view is row-major orthonormal rotation plus translation.
 float3 SsrWorldDirToView(float3 dir)
 {
     return normalize(mul(float4(dir, 0.0), viewData.view).xyz);
 }
 
-// view -> world для направлений: v*M = u  =>  v = u*M^T.
+// view -> world for directions: v*M = u  =>  v = u*M^T.
 float3 SsrViewDirToWorld(float3 dir)
 {
     return normalize(mul(dir, transpose((float3x3)viewData.view)));

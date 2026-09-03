@@ -5,63 +5,47 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Бэкенд слота апскейлера, живущий В НАТИВНОЙ библиотеке (FSR через ffx-api, позже DLSS).
-/// Реализация лежит в графическом бэкенде (см. FsrUpscalerBackend в DecaEngine.Graphics.Diligent) и
-/// отдаётся конвейеру через <see cref="GraphicsPipelineSimple.SetNativeUpscaler"/> - Core о
-/// нативных деталях не знает. Контракт входов тот же, что у встроенного TAAU (см.
-/// <see cref="TemporalUpscalePassResources"/>): HDR-кадр сцены, глубина и векторы в
-/// рендер-разрешении, джиттер кадра, выход - display-RGBA16F, который читает тонемап.</summary>
+/// <summary>Upscaler slot backed by a native library (FSR via ffx-api, DLSS). Input contract matches
+/// the built-in TAAU: HDR scene, depth and motion at render resolution, output display RGBA16F.</summary>
 public interface INativeUpscalerBackend : IReleaseObject
 {
-	/// <summary>Имя для логов ("FSR 3.1.4" и т.п.).</summary>
+	/// <summary>Name for logs, e.g. "FSR 3.1.4".</summary>
 	string DebugName { get; }
 
-	/// <summary>Display-разрешение, RGBA16F с UAV - вход тонемапа при активном бэкенде.</summary>
+	/// <summary>Display-resolution RGBA16F with UAV; the tonemap input while this backend is active.</summary>
 	IRenderTarget OutputTarget { get; }
 
-	/// <summary>Нативный диспатч - вызывается ИЗ РЕПЛЕЯ заморожённого буфера (см.
-	/// ICommandBuffer.Callback), когда входы уже переведены в заявленные состояния. Обязан
-	/// вернуть Diligent-контекст в согласованное состояние после себя (InvalidateState).</summary>
+	/// <summary>Called from the frozen buffer replay; must leave the context consistent afterwards.</summary>
 	void Dispatch();
 
-	/// <summary>Покадровые параметры - зовётся из <see cref="GraphicsPipelineSimple.Execute"/>
-	/// ПОСЛЕ наложения джиттера (джиттер именно этого кадра).</summary>
+	/// <summary>Per-frame parameters; must be called AFTER this frame's jitter is applied.</summary>
 	void SetFrameParams(Vector2 jitterPixels);
 
-	/// <summary>Длительность кадра в секундах - апскейлер темпоральный, ему нужна скорость
-	/// (пуш из окружения, тем же путём, что dt авто-экспозиции).</summary>
+	/// <summary>Frame duration in seconds.</summary>
 	void SetDeltaTime(float seconds);
 
-	/// <summary>Ресайз входов/выхода (пересоздаёт нативный контекст). Историю рвёт.</summary>
+	/// <summary>Resizes inputs and output, recreating the native context. Breaks history.</summary>
 	void Resize(IGpuTexture sceneHdr, IGpuTexture depth, IGpuTexture motion,
 		uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight);
 
-	/// <summary>Следующий кадр пойдёт с флагом reset - там же, где рвётся история векторов.</summary>
+	/// <summary>Marks the next frame with the reset flag.</summary>
 	void ResetHistory();
 
-	/// <summary>Non-null - бэкенду нужна ТИПИЗИРОВАННАЯ копия глубины (Diligent создаёт депт как
-	/// R32_TYPELESS, и рантайм, строящий SRV по дескриптору ресурса, читал бы его нулями). Пасс
-	/// копирует депт сюда перед диспатчем; бэкенд подаёт рантайму копию вместо оригинала.</summary>
+	/// <summary>Non-null when the backend needs a TYPED depth copy: Diligent creates depth as
+	/// R32_TYPELESS and the native runtime would read it as zeros.</summary>
 	IGpuTexture? DepthProxy => null;
 
-	/// <summary>Non-null - нулевые маски reactive/transparency, которые пасс ЧИСТИТ и переводит в
-	/// ShaderResource в заморожённом буфере каждый кадр. Именно пасс, а не создание бэкенда:
-	/// внеполосные команды на immediate-контексте посреди кадра редактора роняли процесс.</summary>
+	/// <summary>Non-null reactive/transparency masks the pass clears every frame. It must be the
+	/// pass, not backend creation: out-of-band immediate-context commands crash mid-frame.</summary>
 	IGpuTexture? ReactiveMask => null;
 
-	/// <summary>См. <see cref="ReactiveMask"/>.</summary>
+	/// <summary>See <see cref="ReactiveMask"/>.</summary>
 	IGpuTexture? TransparencyMask => null;
 }
 
-/// <summary>
-/// Пасс-обёртка нативного апскейлера: объявляет графу входы/выход, переводит ресурсы в состояния,
-/// заявленные бэкендом ffx-api (входы - ShaderResource, выход - UnorderedAccess), и врезает
-/// нативный диспатч колбэк-командой. Сам ffx расставляет внутренние барьеры и ВОЗВРАЩАЕТ ресурсы
-/// в заявленные состояния, поэтому после пасса графу не требуется ничего чинить.
-///
-/// Место в кадре - то же, что у <see cref="TemporalUpscalePass"/>: после всей сценовой
-/// пост-обработки, перед тонемапом (аккумулировать надо линейный свет).
-/// </summary>
+/// <summary>Wraps a native upscaler: declares inputs/output to the graph, transitions resources to
+/// the states ffx-api expects, and injects the native dispatch as a callback command. Runs after
+/// scene post-processing and before tonemap, so accumulation happens on linear light.</summary>
 public sealed class NativeUpscalePass : RenderGraphPass<NativeUpscalePass.PassData>
 {
 	public override string Name => "Native Upscale Pass";
@@ -113,13 +97,12 @@ public sealed class NativeUpscalePass : RenderGraphPass<NativeUpscalePass.PassDa
 	{
 		var cmd = context.cmd;
 
-		// Состояния - ровно те, что бэкенд заявляет ffx-api (см. FsrUpscalerBackend.Dispatch).
-		// Глубина в ShaderResource, а не DepthRead: пасс D3D12-only (векторов при MSAA нет, а шим
-		// только под DX12), Vulkan-ограничение DEPTH_STENCIL_READ_ONLY сюда не дотягивается.
+		// Depth goes to ShaderResource, not DepthRead: this pass is D3D12-only, so Vulkan's
+		// DEPTH_STENCIL_READ_ONLY restriction does not apply.
 		cmd.SetRenderTarget(null, null);
 
-		// Типизированная копия глубины - ДО остальных переходов: CopyTexture сам гоняет депт через
-		// CopySource, а рантайм ждёт входы в ShaderResource (см. INativeUpscalerBackend.DepthProxy).
+		// The typed depth copy must precede the other transitions: CopyTexture moves depth through
+		// CopySource, while the runtime expects inputs in ShaderResource.
 		if (_backend.DepthProxy is { } proxy)
 		{
 			cmd.CopyTexture(_depthTarget, proxy);
@@ -131,8 +114,6 @@ public sealed class NativeUpscalePass : RenderGraphPass<NativeUpscalePass.PassDa
 		cmd.TransitionResource(_motionTarget, ResourceState.ShaderResource);
 		cmd.TransitionResource(_backend.OutputTarget, ResourceState.UnorderedAccess);
 
-		// Нулевые маски: чистятся В ГРАФЕ каждый кадр (копеечные клиры) - создание бэкенда не
-		// делает внеполосных GPU-команд вовсе (см. INativeUpscalerBackend.ReactiveMask).
 		if (_backend.ReactiveMask is { } reactiveMask)
 		{
 			cmd.ClearRenderTarget(reactiveMask, Vector4.Zero);

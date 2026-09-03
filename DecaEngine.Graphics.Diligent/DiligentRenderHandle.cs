@@ -5,8 +5,7 @@ using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;
 
-// IGpuTexture - чтобы хэндл можно было передавать в backend-независимые перегрузки ICommandBuffer
-// (SetRenderTarget/ClearRenderTarget) вместо сырого Diligent-ITextureView.
+// Implements IGpuTexture so the handle fits the backend-agnostic ICommandBuffer overloads.
 public class DiligentRenderHandle : IRenderHandle, IGpuTexture
 {
 	public Vector2 Size { get; private set; }
@@ -24,8 +23,7 @@ public class DiligentRenderHandle : IRenderHandle, IGpuTexture
 
 	public ITexture Texture => _texture;
 
-	/// <summary>Хэндл держит одну не-массивную RT-текстуру, поэтому slice всегда 0, а
-	/// единственный интересный вид - RenderTarget (см. <see cref="RTV"/>).</summary>
+	/// <summary>Backs a single non-array render target, so slice is ignored.</summary>
 	public ITextureView GetView(TextureViewType type, uint slice = 0)
 	{
 		return type == TextureViewType.RenderTarget ? _rtv : _texture.GetDefaultView(type);

@@ -15,9 +15,7 @@ public class DiligentMesh : IMeshObject
 	public int VertexCount { get; private set; }
 	public int IndexCount { get; private set; }
 
-	/// <summary>Размер вершины в байтах. Нужен построению BLAS: аппаратная трассировка читает
-	/// позиции прямо из вершинного буфера и требует шаг явно (позиция лежит первым полем -
-	/// см. ModelLoader.Vertex).</summary>
+	/// <summary>Vertex size in bytes; BLAS builds read positions straight from the vertex buffer.</summary>
 	public int VertexStride { get; private set; }
 
 	public Vector3 Center { get; private set; }
@@ -37,9 +35,7 @@ public class DiligentMesh : IMeshObject
 		_device = device;
 	}
 
-	/// <summary>Флаг RayTracing на геометрические буферы - без него из них нельзя построить BLAS.
-	/// Ставится ТОЛЬКО когда устройство фичу включило: на железе без трассировки этот флаг сделал бы
-	/// создание буфера невалидным, а мешей в сцене тысячи.</summary>
+	// Only valid when the device enabled ray tracing; otherwise buffer creation fails.
 	private BindFlags RayTracingBindFlag() =>
 		_device.GetDeviceInfo().Features.RayTracing == DeviceFeatureState.Enabled
 			? BindFlags.RayTracing
@@ -185,13 +181,7 @@ public class DiligentMesh : IMeshObject
 		VertexCount = 0;
 		IndexCount = 0;
 
-		// Указатели ОБЯЗАНЫ обнуляться, и по двум независимым причинам:
-		//
-		// 1. Повторный Release иначе освобождает уже освобождённую память - порча кучи.
-		// 2. Наружу VertexData/IndexData отдаются как признак «CPU-копия геометрии есть»: probe GI
-		//    строит по ним BVH и проверяет ровно на null (см. ProbeGiBaker и
-		//    PrefabSceneViewport.CollectSceneGeometry). Висячий ненулевой указатель прошёл бы эту
-		//    проверку и дал чтение освобождённой памяти вместо честного пропуска меша.
+		// Must null out: callers null-check these pointers to detect a CPU copy of the geometry.
 		if (VertexData != null)
 		{
 			UnsafeArray.Free(VertexData);

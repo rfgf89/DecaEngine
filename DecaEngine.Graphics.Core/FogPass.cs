@@ -5,45 +5,31 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Owns the GPU resources for the atmospheric fog post-process: one fullscreen material
-/// that reads scene depth plus a copy of the frame and writes the frame back with exponential
-/// height fog and sun inscattering applied (см. FogCommon.hlsl). Created once by
-/// <see cref="GraphicsPipelineSimple"/> when fog is enabled - тот же паттерн владения, что у
-/// <see cref="SsgiPassResources"/>: сам <see cref="FogPass"/> пересобирается каждый кадр, ресурсы
-/// живут здесь и принимают живые пуши ручек.
-///
-/// Своего рендер-таргета у тумана нет (в отличие от SSAO/SSGI): он не оценивает величину, которую
-/// потом надо размывать, а сразу пишет готовый кадр - источником служит копия сцены, которую пасс
-/// делает сам (см. <see cref="FogPass.WriteCommands"/>).</summary>
+/// <summary>GPU resources for the atmospheric fog post-process: one fullscreen material that reads
+/// scene depth plus a copy of the frame and writes the frame back with exponential height fog and
+/// sun inscattering applied.</summary>
 public sealed unsafe class FogPassResources : IReleaseObject
 {
 	internal IMaterialObject Material { get; }
 
-	// Кбуфер "FogConstants" со СВОЕЙ unmanaged-памятью, заливаемый командой UpdateBuffer из пасса, -
-	// ровно как в EyeAdaptationPassResources и по той же причине. Базис камеры меняется КАЖДЫЙ КАДР
-	// (орбита мыши), а IMaterialObject.SetConstant попутно переустанавливает переменную в SRB;
-	// обновление дескриптор-сета, пока предыдущий кадр ещё в полёте, роняет Vulkan-валидацию
-	// ("bound VkDescriptorSet was destroyed or updated"). Ручкам, которые человек двигает раз в
-	// сессию, это сходит с рук; покадровому базису - нет.
+	// Owns its unmanaged memory and is filled via UpdateBuffer: the camera basis changes every
+	// frame, and SetConstant would rewrite the SRB variable while a frame is still in flight
+	// ("bound VkDescriptorSet was destroyed or updated").
 	private readonly IBufferHandle _constantBuffer;
 	private readonly FogConstantsData* _constants;
 
-	/// <param name="adaptationTarget">1x1-таргет авто-экспозиции (см. EyeAdaptationPassResources).
-	/// null в LDR-конвейере - тогда цвет дымки трактуется как абсолютный, а в слот _AdaptTex всё
-	/// равно привязывается плейсхолдер: слот объявлен в шейдере безусловно, и пустой дескриптор
-	/// роняет валидацию Vulkan (VUID-08114).</param>
+	// adaptationTarget is null in the LDR pipeline; _AdaptTex still gets a placeholder because a
+	// declared slot must stay bound (Vulkan VUID-08114).
 	public FogPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, IGpuTexture depthTarget,
 		IGpuTexture sceneCopyTarget, TextureObjectFormat colorFormat,
 		IGpuTexture? adaptationTarget)
 	{
-		// Свой экземпляр VS - см. комментарий в SsaoPassResources (шареный шейдер освобождался бы
-		// дважды при пересоздании окружения).
+		// Own VS instance: a shared shader would be released twice.
 		var vs = graphicsApi.CreateShader("Fog Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl",
 			ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Fog PS", "EditorAssets/shader",
 			"FogPS.hlsl", ShaderObjectType.Pixel);
 
-		// Без депта: туман считается по готовому кадру и глубине.
 		var state = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Fog PSO",
@@ -72,8 +58,8 @@ public sealed unsafe class FogPassResources : IReleaseObject
 		Material.SetTexture("_DepthTex", depthTarget);
 		Material.SetTexture("_AdaptTex", adaptationTarget ?? sceneCopyTarget);
 
-		// dynamic = false: динамические буферы Diligent обновляет через Map, а нам нужен именно
-		// UpdateBuffer из командного буфера (USAGE_DEFAULT).
+		// dynamic = false: Diligent updates dynamic buffers via Map, but this one needs
+		// UpdateBuffer from the command buffer (USAGE_DEFAULT).
 		_constantBuffer = graphicsApi.CreateBuffer(new BufferInfo
 		{
 			name = "FogConstants",
@@ -87,9 +73,8 @@ public sealed unsafe class FogPassResources : IReleaseObject
 
 		_constants = (FogConstantsData*)NativeMemory.AllocZeroed(1, (nuint)sizeof(FogConstantsData));
 
-		// Дефолты - до первого пуша из окна Graphics: пасс рисует с первого кадра, и кбуфер иначе
-		// остался бы с мусором (та же причина, что в SsaoPassResources). Базис камеры без пуша -
-		// смотрящий вдоль +Z, чтобы первый кадр не выдал NaN на нулевом луче.
+		// The pass draws from frame one, so seed the cbuffer before the first knob push; the
+		// default basis looks along +Z so a zero ray cannot produce NaN.
 		SetParams(DefaultDensity, DefaultHeightFalloff, DefaultHeightRef, DefaultStartDistance,
 			DefaultMaxDistance, DefaultMaxOpacity);
 		SetColors(DefaultColor, DefaultSunColor, DefaultSunStrength, DefaultSunSharpness);
@@ -98,13 +83,8 @@ public sealed unsafe class FogPassResources : IReleaseObject
 		SetExposure(adaptationTarget is not null, 0.18f);
 	}
 
-	/// <summary>Дефолты ручек тумана - ими же инициализируется кбуфер до первого пуша и они же
-	/// служат стартовыми значениями в <see cref="DecaEngine.Editor.EditorSettings"/>.
-	///
-	/// Плотность подобрана «на глаз художника», а не физически: 0.012 на единицу мира даёт
-	/// заметную воздушную перспективу на сцене масштаба Sponza (десятки единиц) и почти незаметную
-	/// на превью одиночной модели (единицы) - то есть ручку не приходится крутить при каждой смене
-	/// содержимого.</summary>
+	/// <summary>Fog knob defaults, shared with EditorSettings. Density is per world unit and
+	/// tuned by eye rather than physically.</summary>
 	public const float DefaultDensity = 0.012f;
 	public const float DefaultHeightFalloff = 0.05f;
 	public const float DefaultHeightRef = 0f;
@@ -114,68 +94,54 @@ public sealed unsafe class FogPassResources : IReleaseObject
 	public const float DefaultSunStrength = 0.6f;
 	public const float DefaultSunSharpness = 8f;
 
-	/// <summary>Холодная сизая дымка и тёплая подсветка - классическая пара воздушной перспективы:
-	/// тень среды уходит в синеву неба, просвет в сторону солнца теплеет. Поканально, а не
-	/// Vector3: эти же значения - дефолты свойств EditorSettings, а те сериализуются в JSON скалярами
-	/// и требуют именно const, а не static readonly.</summary>
+	// Per channel rather than Vector3: EditorSettings serializes these as JSON scalars and needs
+	// const, not static readonly.
 	public const float DefaultColorR = 0.42f, DefaultColorG = 0.50f, DefaultColorB = 0.62f;
 	public const float DefaultSunColorR = 1.00f, DefaultSunColorG = 0.82f, DefaultSunColorB = 0.60f;
 
 	public static Vector3 DefaultColor => new(DefaultColorR, DefaultColorG, DefaultColorB);
 	public static Vector3 DefaultSunColor => new(DefaultSunColorR, DefaultSunColorG, DefaultSunColorB);
 
-	/// <summary>Layout кбуфера "FogConstants" в FogCommon.hlsl - семь float4 (112 байт). Каждая
-	/// строка ровно 16 байт: трёхкомпонентный вектор по невыровненному смещению SPIR-V отвергает
-	/// целиком (см. историю в SsaoCommon.hlsl), поэтому раскладка описана Vector4-строками, а не
-	/// Vector3 + скаляр.</summary>
+	// Mirrors the "FogConstants" cbuffer in FogCommon.hlsl. Every row is exactly 16 bytes:
+	// SPIR-V rejects a three-component vector at an unaligned offset outright.
 	private struct FogConstantsData
 	{
-		/// <summary>x - плотность, y - спад по высоте, z - опорная высота, w - ближняя отсечка.</summary>
+		// x density, y height falloff, z reference height, w start distance.
 		public Vector4 Params;
 
-		/// <summary>xyz - цвет среды, w - потолок непрозрачности.</summary>
+		// xyz medium colour, w opacity ceiling.
 		public Vector4 Color;
 
-		/// <summary>xyz - цвет подсветки солнцем, w - её сила.</summary>
+		// xyz sun inscattering colour, w its strength.
 		public Vector4 SunColor;
 
-		/// <summary>xyz - направление НА солнце в мире, w - резкость солнечного пятна.</summary>
+		// xyz world direction TOWARD the sun, w sun spot sharpness.
 		public Vector4 Sun;
 
-		/// <summary>xyz - мировой right камеры, w - предельная дальность тумана.</summary>
+		// xyz camera right in world space, w max fog distance.
 		public Vector4 Right;
 
-		/// <summary>xyz - мировой up камеры, w - резерв.</summary>
 		public Vector4 Up;
-
-		/// <summary>xyz - мировой forward камеры, w - резерв.</summary>
 		public Vector4 Forward;
 
-		/// <summary>x - цвет задан относительно экспозиции, y - key value, zw - резерв.</summary>
+		// x colour is exposure-relative, y key value.
 		public Vector4 Exposure;
 	}
 
-	/// <summary>Привязка яркости дымки к авто-экспозиции. Включена ровно тогда, когда жив
-	/// HDR-конвейер: цвет тумана задаётся в ОТОБРАЖАЕМЫХ единицах и домножается в шейдере на
-	/// adapted/key, поэтому дымка выглядит одинаково независимо от абсолютной яркости сцены.
-	///
-	/// <paramref name="key"/> обязан совпадать с тем, что уходит в
-	/// <see cref="EyeAdaptationPassResources.SetParams"/> и <see cref="TonemapPassResources.SetParams"/>,
-	/// иначе туман разъедется с кадром по яркости.</summary>
+	/// <summary>Ties fog brightness to auto-exposure; key must match the value given to the eye
+	/// adaptation and tonemap passes or the fog drifts from the frame.</summary>
 	public void SetExposure(bool exposureRelative, float key)
 	{
 		_constants->Exposure = new Vector4(exposureRelative ? 1f : 0f, MathF.Max(key, 1e-4f), 0f, 0f);
 	}
 
-	/// <summary>Переключает ТОЛЬКО режим (относительно экспозиции против абсолютных единиц),
-	/// сохраняя key. Тумблер авто-экспозиции живой - см. <see cref="PipelineFeatures.EyeAdaptation"/>.</summary>
+	/// <summary>Switches exposure-relative vs absolute units, keeping the key value.</summary>
 	public void SetExposureRelative(bool exposureRelative)
 	{
 		_constants->Exposure.X = exposureRelative ? 1f : 0f;
 	}
 
-	/// <summary>Геометрия среды: плотность, высотный профиль, ближняя отсечка и предельная
-	/// дальность (её же получает небо - см. FogCommon.hlsl).</summary>
+	/// <summary>Medium geometry: density, height profile, start and max distance.</summary>
 	public void SetParams(float density, float heightFalloff, float heightRef, float startDistance,
 		float maxDistance, float maxOpacity)
 	{
@@ -185,7 +151,7 @@ public sealed unsafe class FogPassResources : IReleaseObject
 		_constants->Color.W = Math.Clamp(maxOpacity, 0f, 1f);
 	}
 
-	/// <summary>Цвета среды и её солнечной подсветки - линейные.</summary>
+	/// <summary>Medium and sun inscattering colours, in linear space.</summary>
 	public void SetColors(Vector3 color, Vector3 sunColor, float sunStrength, float sunSharpness)
 	{
 		_constants->Color = new Vector4(color, _constants->Color.W);
@@ -193,18 +159,15 @@ public sealed unsafe class FogPassResources : IReleaseObject
 		_constants->Sun.W = MathF.Max(sunSharpness, 0.001f);
 	}
 
-	/// <summary>Направление НА солнце в мире. Приходит из того же источника, что и свет сцены
-	/// (см. ModelViewportEnvironment.ShadowSettings.LightDirection, указывающий ОТ солнца).</summary>
+	/// <summary>World direction TOWARD the sun (scene light direction points away from it).</summary>
 	public void SetSun(Vector3 sunDirection)
 	{
 		var dir = sunDirection.LengthSquared() > 1e-8f ? Vector3.Normalize(sunDirection) : Vector3.UnitY;
 		_constants->Sun = new Vector4(dir, _constants->Sun.W);
 	}
 
-	/// <summary>Мировой базис камеры - ЕДИНИЧНЫЕ векторы, посчитанные вызывающим прямо из eye/target
-	/// (см. ModelViewportEnvironment.SetCameraTransform), а не разбором матрицы вида: соглашение о
-	/// строках/столбцах легко перепутать, а ошибка в нём даёт туман, «приклеенный» к экрану.
-	/// Пушится каждый кадр - оттого кбуфер и заливается командой (см. <see cref="_constants"/>).</summary>
+	/// <summary>Camera world basis as UNIT vectors built from eye/target, not from the view
+	/// matrix: a row/column mix-up there glues the fog to the screen. Pushed every frame.</summary>
 	public void SetCamera(Vector3 right, Vector3 up, Vector3 forward)
 	{
 		_constants->Right = new Vector4(right, _constants->Right.W);
@@ -212,17 +175,16 @@ public sealed unsafe class FogPassResources : IReleaseObject
 		_constants->Forward = new Vector4(forward, 0f);
 	}
 
-	/// <summary>Перепривязывает депт и копию кадра ПОСЛЕ их Resize - Resize пересоздаёт нативные
-	/// текстуры, и SRB иначе держал бы уничтоженные (см. ModelPreviewViewport.ResizeTargets).</summary>
+	/// <summary>Rebinds depth and scene copy after a resize, which recreates the native
+	/// textures; without this the SRB would keep the destroyed ones.</summary>
 	public void RebindTargets(IGpuTexture depthTarget, IGpuTexture sceneCopyTarget)
 	{
 		Material.SetTexture("_DepthTex", depthTarget);
 		Material.SetTexture("_SceneTex", sceneCopyTarget);
 	}
 
-	/// <summary>Заливает кбуфер в командный буфер - зовётся пассом перед дроу. Команда перечитывает
-	/// CPU-память при КАЖДОМ реплее заморожённого буфера, поэтому покадровый базис камеры доезжает
-	/// без пересборки графа (см. EyeAdaptationPassResources - тот же приём).</summary>
+	// The recorded command re-reads CPU memory on every replay of a frozen buffer, so the
+	// per-frame camera basis arrives without rebuilding the graph.
 	internal void WriteConstants(ICommandBuffer cmd) => cmd.UpdateBuffer(_constantBuffer, 0, _constants);
 
 	public void Release()
@@ -233,14 +195,8 @@ public sealed unsafe class FogPassResources : IReleaseObject
 	}
 }
 
-/// <summary>
-/// Render-graph pass that applies atmospheric fog (aerial perspective) to the finished frame.
-///
-/// Порядок в кадре не случаен: ПОСЛЕ <see cref="SsgiPass"/> - туман обязан лечь и на непрямой
-/// свет, иначе дальний bounce остался бы неразмытым и выдал бы плоскость, - и ДО
-/// <see cref="EyeAdaptationPass"/>, потому что рассеянный средой свет входит в яркость кадра
-/// наравне с остальным и обязан участвовать в экспозиции.
-/// </summary>
+/// <summary>Render-graph pass that applies atmospheric fog (aerial perspective) to the finished
+/// frame. Must run after <see cref="SsgiPass"/> and before <see cref="EyeAdaptationPass"/>.</summary>
 public sealed class FogPass : RenderGraphPass<FogPass.PassData>
 {
 	public override string Name => "Fog Pass";
@@ -265,7 +221,6 @@ public sealed class FogPass : RenderGraphPass<FogPass.PassData>
 		_viewPortRef = viewPortRef;
 	}
 
-	/// <summary>Объявляет графу таргеты пасса - см. <see cref="ForwardPass.Setup"/>.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		var color = builder.ImportTexture(_colorTarget);
@@ -286,13 +241,11 @@ public sealed class FogPass : RenderGraphPass<FogPass.PassData>
 
 		_resources.WriteConstants(cmd);
 
-		// Именно DepthRead, а не ShaderResource - см. комментарий в SsaoPassResources
-		// (лейаут DEPTH_STENCIL_READ_ONLY_OPTIMAL на Vulkan).
+		// DepthRead, not ShaderResource: Vulkan needs DEPTH_STENCIL_READ_ONLY_OPTIMAL here.
 		cmd.TransitionResource(_renderDepth, ResourceState.DepthRead);
 
-		// Читать и писать один таргет нельзя - берём копию кадра, как это делает SSGI. Копия
-		// снимается ЗДЕСЬ, а не переиспользуется от SSGI: между ними тот успел дописать в кадр
-		// свой bounce, и старый снимок вернул бы кадр без него.
+		// A target cannot be read and written at once. The copy is taken here rather than reused
+		// from SSGI, which has since written its bounce into the frame.
 		cmd.SetRenderTarget(null, null);
 		cmd.CopyTexture(_colorTarget, _sceneCopy);
 		cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);

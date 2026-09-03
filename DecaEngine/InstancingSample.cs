@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 using DecaEngine;
 using DecaEngine.Core;
 using Diligent;
-// Сэмпл работает с нативным контекстом напрямую - состояния Diligent-овские, не из ICommandBuffer.
+// Sample drives the native context directly, so state enums are Diligent's, not ICommandBuffer's.
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
 using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;

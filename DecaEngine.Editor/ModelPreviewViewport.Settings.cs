@@ -15,45 +15,36 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>Применение окна Graphics к превью: фичи конвейера, живые ручки, пересоздание окружения. Часть <see cref="ModelPreviewViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Applies the Graphics window to the preview: pipeline features, live knobs, environment recreation.</summary>
 	public partial class ModelPreviewViewport
 	{
-		/// <summary>Режим RT-теней запрошен и устройство его умеет. Уровня ЗАГРУЗКИ (кейворд в
-		/// вариантах шейдера, см. ModelLoadOptions.RtShadows) - смена гоняется через пересоздание
-		/// окружения (см. needsRecreate).</summary>
+		// Load-level option (shader-variant keyword); changes go through environment recreation.
 		private bool RtShadowsEnabled() =>
 			_editorSettings.ShadowFilterMode == 4 && RayTracingSupported;
 		private bool _appliedRtShadows;
 
-		// GPU-путь один раз сорвался - больше не пробуем до перезапуска редактора. Иначе каждая
-		// пересборка сессии повторяла бы отказ, а если он роняет драйвер - в цикле.
+		// Once the GPU path fails, never retry until editor restart (a driver crash would loop).
 		private bool _probeGpuDisabled;
 
-		// Параметры, под которыми заведена ТЕКУЩАЯ сессия: диф с настройками в ApplyGraphicsSettings
-		// решает, нужно ли её пересоздавать. Интенсивность солнца сюда НЕ входит - она подтягивается
-		// в живую сессию каждым раундом, как и поворот света (live-ручки шейдера тем более: они
-		// пушатся кбуфером и бейка не касаются).
+		// Options the CURRENT session was created with; sun intensity is excluded - it flows into
+		// the live session every round.
 		private (bool On, float Sky, int Rays, int Bounces, float BounceSaturation,
 			float Density, int MaxProbes, bool HardwareTrace, int VisRes) _probeSessionOptions;
 
-		// Снимок live-ручек шейдера: Update пушит кбуфер при любом их изменении напрямую, не
-		// полагаясь на событие PreviewGraphicsApplied - слайдеры окна Graphics обязаны работать,
-		// даже если событийную проводку кто-то сломает.
+		// Snapshot of live shader knobs; Update pushes the cbuffer on any change directly.
 		private (float ShadowFloor, float SkyFloor, float SpecFloor, float Sun, float Boost, float Bias, bool On, bool Debug) _lastLiveProbeParams;
 		private readonly System.Diagnostics.Stopwatch _probeRoundSw = new();
 		private long _probeRoundMs;
-		private string _probeStatus = "нет проб";
+		private string _probeStatus = "no probes";
 
-		/// <summary>Статус probe-GI для окна Graphics (см. GraphicsSettingsWindow): пока поле не
-		/// сошлось, показывает номер раунда - бейк больше не «чёрный ящик на секунду».</summary>
+		/// <summary>Probe-GI status line for the Graphics window.</summary>
 		public string ProbeGiStatus
 		{
 			get
 			{
 				if (!_editorSettings.PreviewProbeGi)
 				{
-					return "выключен";
+					return "disabled";
 				}
 
 				var session = _probeSession;
@@ -62,44 +53,34 @@ namespace DecaEngine.Editor
 					return _probeStatus;
 				}
 
-				var grid = $"{session.CountX}x{session.CountY}x{session.CountZ} проб";
+				var grid = $"{session.CountX}x{session.CountY}x{session.CountZ} probes";
 
-				// Какой путь трассировки ЖИВОЙ. Снаружи это было невидимо: галка в окне Graphics
-				// показывает ЖЕЛАНИЕ, а путь выбирается при подъёме сессии и законно может с ним не
-				// совпадать: устройство не умеет inline-трассировки либо сессию ещё не перезавели.
-				// Без этой строки одно от другого отличалось только под профайлером.
-				grid += _probeGpu == null ? ", GPU-путь не поднялся"
-					: _probeGpu.Hardware ? ", трассировка аппаратная"
-					: ", трассировка программная";
+				// The Graphics checkbox shows intent; the live path is chosen at session start and
+				// may legitimately differ (no inline RT, or session not yet recreated).
+				grid += _probeGpu == null ? ", GPU path did not come up"
+					: _probeGpu.Hardware ? ", hardware tracing"
+					: ", software tracing";
 
 				if (session.Realtime)
 				{
-					// Номер раунда в реальном времени ничего не значит - он растёт вечно. Значение
-					// имеет только темп: он и есть время отклика поля на изменение света.
-					return $"{grid}, реальное время ({_probeRoundMs} мс/раунд)";
+					// Round number is meaningless in realtime; only the pace matters.
+					return $"{grid}, realtime ({_probeRoundMs} ms/round)";
 				}
 
 				return session.Converged
-					? $"{grid}, готово ({_probeRoundMs} мс/раунд)"
-					: $"{grid}, раунд {session.Round}/{session.TargetRounds}";
+					? $"{grid}, done ({_probeRoundMs} ms/round)"
+					: $"{grid}, round {session.Round}/{session.TargetRounds}";
 			}
 		}
 
-		/// <summary>Дебаунс ПЕРЕСОЗДАНИЯ сессии проб: ползунки качества/плотности окна Graphics шлют
-		/// изменение каждый кадр драга, а новая сессия выбрасывает всё накопленное поле. Поворот
-		/// света через этот дебаунс больше не ходит - он применяется к живой сессии сразу.</summary>
+		// Session-recreate debounce: sliders fire every drag frame and recreation drops the field.
 		private const float ProbeRebakeDebounceSeconds = 0.25f;
 		private readonly Dictionary<int, MeshId> _meshIdMap = new();
 		private readonly Dictionary<int, MaterialId> _materialIdMap = new();
 		private readonly Dictionary<(int, int), BatchId> _batchCache = new();
 
-		// Wireframe overlay toggle (see WireframeEnabled/SetWireframeEnabled): a second material
-		// (wireframe-filled PSO, see DiligentBatchRenderer.GetWireframeState) drawing the exact same
-		// geometry as the currently isolated sub-mesh's instances, added/removed on top of
-		// _instanceEntities independently of SubMeshPreviewMode - the batch renderer has no notion of
-		// "redraw this batch again with a different PSO", so a second material/batch/instance set is how
-		// a second draw pass over the same geometry happens here (see
-		// ModelViewportGeometry.CreateInstanceEntity for the pattern this mirrors).
+		// Wireframe overlay: the batch renderer cannot redraw a batch with another PSO, so a second
+		// material/batch/instance set draws the same geometry again.
 		private IMaterialObject? _wireframeMaterial;
 		private MaterialId? _wireframeMaterialId;
 		private readonly Dictionary<int, BatchId> _wireframeBatchCache = new();
@@ -109,15 +90,12 @@ namespace DecaEngine.Editor
 		private SubMeshPreviewMode _viewMode = SubMeshPreviewMode.Highlight;
 		private PreviewChannel _previewChannel = PreviewChannel.Normal;
 
-		/// <summary>Глобальные тумблеры фич Lighting-превью (см. <see cref="PreviewFeatureFlags"/>) -
-		/// задел под настройки графики. Меняются через <see cref="SetFeatureFlags"/>.</summary>
 		private PreviewFeatureFlags _featureFlags = PreviewFeatureFlags.All;
 
-		/// <summary>Текущие тумблеры фич - см. <see cref="SetFeatureFlags"/>.</summary>
+		/// <summary>Current Lighting-preview feature toggles.</summary>
 		public PreviewFeatureFlags FeatureFlags => _featureFlags;
 
-		/// <summary>Включает/выключает фичи Lighting-превью (нормал-мапы, AO и т.д.) - применяется к
-		/// текущей резидентной модели немедленно.</summary>
+		/// <summary>Toggles Lighting-preview features; applied to the resident model immediately.</summary>
 		public void SetFeatureFlags(PreviewFeatureFlags flags)
 		{
 			if (_featureFlags == flags)
@@ -129,27 +107,21 @@ namespace DecaEngine.Editor
 			ApplyPreviewSettingsToMaterials();
 		}
 
-		/// <summary>Смещения ползунков света в градусах ОТ базового положения солнца энвайронмента
-		/// (яв вокруг Y / высота над горизонтом, см. <see cref="SetLightRotation"/>). Хранятся здесь,
-		/// а не в ShadowSettings, чтобы переживать пересоздание окружения (см.
-		/// <see cref="RecreateEnvironment"/>).</summary>
+		// Light slider offsets in degrees FROM the environment's base sun position; stored here,
+		// not in ShadowSettings, to survive environment recreation.
 		private float _lightYawOffsetDegrees;
 		private float _lightElevationOffsetDegrees;
 
-		/// <summary>Абсолютная высота солнца клампится в эти пределы: у горизонта/зенита ортокамера
-		/// каскада вырождается (см. BuildLightData - up-вектор, растянутая проекция).</summary>
+		// Absolute sun elevation clamp: at horizon/zenith the cascade ortho camera degenerates.
 		private const float LightElevationMinDegrees = -85f;
 		private const float LightElevationMaxDegrees = 85f;
 
-		/// <summary>Текущие смещения ползунков света - см. <see cref="SetLightRotation"/>.</summary>
+		/// <summary>Current light slider offsets - see <see cref="SetLightRotation"/>.</summary>
 		public float LightYawDegrees => _lightYawOffsetDegrees;
 		public float LightElevationDegrees => _lightElevationOffsetDegrees;
 
-		/// <summary>Поворачивает мировой ключевой свет («солнце» энвайронмента): яв вокруг Y + высота
-		/// над горизонтом, оба - смещения от базового положения солнца. Применяется live: направление
-		/// читается системой рендера каждый кадр (см. SimpleCullingAndRenderSystem.BuildLightData), а
-		/// поворот по яву дополнительно уходит в шейдеры неба/IBL (см. <see cref="ApplyLightRotation"/>),
-		/// чтобы фон и отражения вращались вместе со светом.</summary>
+		/// <summary>Rotates the world key light: yaw around Y plus elevation, both offsets from the
+		/// environment's base sun position; applied live, and yaw also feeds sky/IBL shaders.</summary>
 		public void SetLightRotation(float yawOffsetDegrees, float elevationOffsetDegrees)
 		{
 			_lightYawOffsetDegrees = yawOffsetDegrees;
@@ -157,10 +129,7 @@ namespace DecaEngine.Editor
 			ApplyLightRotation();
 		}
 
-		/// <summary>Применяет текущие смещения ползунков к окружению: направление света/теней
-		/// (ShadowSettings), поворот фонового неба (SkyPassResources) и IBL-отражений материалов
-		/// (PreviewSettings-кбуфер, см. <see cref="ApplyPreviewSettingsToMaterials"/>). Высота на
-		/// equirect-карту не переносится - вращать панораму дёшево только вокруг Y.</summary>
+		// Elevation is not applied to the equirect map: rotating a panorama is cheap only around Y.
 		private void ApplyLightRotation()
 		{
 			var shadowSettings = _env.ShadowSettings;
@@ -178,10 +147,8 @@ namespace DecaEngine.Editor
 			PushSsrEnvironment();
 			ApplyPreviewSettingsToMaterials();
 
-			// Пробы под новое направление солнца ничего перезапускать не требуют: PollProbeBake
-			// подтягивает свет в живую сессию каждым раундом, и поле само перетекает к новому
-			// решению за единицы раундов, сохранив накопленную геометрию (см.
-			// ProbeGiBakeSession.SetLighting). Прежний код здесь ставил дебаунс полного ребейка.
+			// No probe rebake needed: PollProbeBake pulls the light into the live session each
+			// round and the field flows to the new solution.
 		}
 
 		private Vector3 _orbitTarget = Vector3.Zero;
@@ -197,18 +164,14 @@ namespace DecaEngine.Editor
 		private Vector2 _pendingSize;
 		private float _resizeIdleSeconds;
 
-		/// <summary>Масштаб рендера, увиденный последним TrackAndApplyResize, - смена сбрасывает
-		/// дебаунс-таймер, как смена размера окна (см. там же).</summary>
+		// Render scale seen by the last TrackAndApplyResize; a change resets the debounce timer.
 		private float _pendingRenderScale = 1f;
 
-		/// <summary>Заявка на применение бэкенда апскейлера и его настроек - исполняется в начале
-		/// Update (см. ApplyPendingUpscalerSettings): смена бэкенда ждёт GPU и создаёт NGX-фичу,
-		/// посреди ImGui-кадра это роняло редактор.</summary>
+		// Deferred to start of Update: backend switch waits for the GPU and creates an NGX feature,
+		// which cannot happen mid-ImGui-frame.
 		private bool _pendingUpscalerApply;
 
-		/// <summary>Отложенное применение бэкенда апскейлера (см. <see cref="_pendingUpscalerApply"/>).
-		/// Индекс комбо DLSS переводится в NVSDK_NGX_PerfQuality_Value: {Perf, Balanced, Quality,
-		/// DLAA} = {0, 1, 2, 5}.</summary>
+		// DLSS combo index maps to NVSDK_NGX_PerfQuality_Value: {Perf, Balanced, Quality, DLAA} = {0, 1, 2, 5}.
 		private void ApplyPendingUpscalerSettings()
 		{
 			if (!_pendingUpscalerApply || _env is null)
@@ -220,10 +183,8 @@ namespace DecaEngine.Editor
 			ViewportSettingsPush.Upscaler(_env, _editorSettings);
 		}
 
-		/// <summary>?????????? ???? ? ????????? ??????? ??????????? ??????, ???? null.</summary>
 		public string? LoadedPath => _loadedPath;
 
-		/// <summary>????????? ?? ?????? ????????? ??????? ????????, ???? null ???? ??? ??????.</summary>
 		public string? LoadError => _loadError;
 
 		public bool HasModel => _instanceEntities.Count > 0;
@@ -248,47 +209,35 @@ namespace DecaEngine.Editor
 			_loadedSubMesh >= 0 && _residentModel != null &&
 			_loadedSubMesh < _residentModel.MeshHasUv.Count && _residentModel.MeshHasUv[_loadedSubMesh];
 
-		/// <summary>Обработчик "OK" окна настроек: env-level опции (скай/HDR/анизотропия)
-		/// при изменении применяются пересозданием окружения с перезагрузкой текущей модели,
-		/// live-биты - как обычно. Ничего не изменилось - ничего и не пересоздаётся.</summary>
 		private void OnGraphicsSettingsChanged()
 		{
-			// Пересоздания окружения требуют только те опции, что запечены НЕ в конвейер:
-			// HDRI энвайронмента (пересчёт IBL),
-			// анизотропия (в сэмплеры материалов) и потолок текстур (в декодер загрузчика). Всё
-			// остальное - фичи конвейера, применяются на живом окружении без единой перезагрузки
-			// модели (см. GraphicsPipelineSimple.SetFeatures). Ровно этот список и стоит за кнопкой
-			// "Применить" в окне Graphics - см. GraphicsSettingsWindow.DrawApplyBar.
+			// Only options baked outside the pipeline need environment recreation: environment HDRI
+			// (IBL rebuild), anisotropy (material samplers), texture size cap (loader decoder).
 			bool needsRecreate =
 				_appliedHdrPath != (ResolveEnvironmentHdrPath(_editorSettings.PreviewEnvironmentHdr) ?? "") ||
 				_appliedAniso != _editorSettings.PreviewAnisotropicFiltering ||
 				_appliedMaxTextureSize != ClampedMaxTextureSize() ||
-				// RT-тени - кейворд в вариантах шейдера модели (см. ModelLoadOptions.RtShadows):
-				// пересечение границы «Ray-traced» перечитывает модель, остальные режимы живые.
+				// RT shadows are a model shader keyword (ModelLoadOptions.RtShadows): crossing
+				// the "Ray-traced" boundary reloads the model, other modes stay live.
 				_appliedRtShadows != RtShadowsEnabled();
 
-			// Пересоздание ОТКЛАДЫВАЕТСЯ до начала следующего Update: "OK" настроек срабатывает
-			// посреди ImGui-кадра, когда превью-картинка со старым биндингом уже может лежать в
-			// draw list-е - освобождение таргета здесь обратилось бы к нему из ImGui-рендера.
+			// Deferred to the start of the next Update: settings "OK" lands mid-ImGui-frame, when the
+			// preview image with the old binding may already sit in a draw list.
 			_pendingEnvironmentRecreate |= needsRecreate;
 
 			if (!needsRecreate)
 			{
-				// При пересоздании фичи всё равно перечитает CreateEnvironment - применять их
-				// дважды незачем.
+				// On recreate CreateEnvironment re-reads the features anyway.
 				ApplyPipelineFeatures();
 			}
 
 			ApplyGraphicsSettings();
 		}
 
-		/// <summary>Применяет фичи конвейера к ЖИВОМУ окружению - см.
-		/// <see cref="GraphicsPipelineSimple.SetFeatures"/>: ресурсы включённой впервые фичи
-		/// создаются на месте, выключенной - остаются лежать до следующего включения, граф
-		/// пересобирается (дёшево). Сцена, батч-рендерер и загруженная модель не трогаются.</summary>
+		// Applies features to the live environment; scene, batch renderer and model are untouched.
 		private void ApplyPipelineFeatures()
 		{
-			// ДО SetFeatures: предикат RT-фолбэка смотрит на живой accel (см. EnsureSsrOwnRayScene).
+			// BEFORE SetFeatures: the RT fallback predicate looks at the live accel structure.
 			EnsureSsrOwnRayScene();
 
 			_appliedSsao = _editorSettings.PreviewSsao;
@@ -313,7 +262,7 @@ namespace DecaEngine.Editor
 				Volumetric = _appliedVolumetric,
 				Bloom = _appliedBloom,
 				ColorGrade = _appliedColorGrade,
-				// SSR тянет векторы за собой - см. CreateEnvironment.
+				// SSR pulls motion vectors in with it - see CreateEnvironment.
 				MotionVectors = _appliedMotionVectors || _editorSettings.PreviewSsr,
 				TemporalUpscale = _appliedMotionVectors && _editorSettings.TemporalUpscale,
 				Ssr = _editorSettings.PreviewSsr,
@@ -321,44 +270,41 @@ namespace DecaEngine.Editor
 				SsrHitTextures = _editorSettings.SsrHitTextures,
 			});
 
-			// RT-вариант трейса обязан получить TLAS ДО первого кадра (см. SsrPassResources.SetRayScene);
-			// probe-поле для света RT-хитов - по той же причине здесь же.
+			// The RT trace variant must get its TLAS before the first frame
+			// (SsrPassResources.SetRayScene); the probe field for RT hit lighting likewise.
 			UpdateSsrRayScene();
 			_env.SetSsrProbeField(_probeTextures);
 
-			// Смена RT-фолбэка пересоздала SSR-ресурсы - живые ручки откатились в дефолты.
+			// Switching the RT fallback recreated SSR resources, so live knobs fell back to defaults.
 			ApplySsrSettings();
 		}
 
 
-		/// <summary>Зеркало PrefabSceneViewport.SsrRayTracedBlockReason - для строки статуса окна
-		/// Graphics (см. комментарий там: тихий даунгрейд неотличим от поломки).</summary>
+		/// <summary>Why ray-traced SSR is unavailable, for the Graphics window status line.</summary>
 		public string? SsrRayTracedBlockReason
 		{
 			get
 			{
 				if (_graphicsApi.RayTracing < RayTracingSupport.Inline)
 				{
-					return "нет inline-трассировки (нужен D3D12)";
+					return "no inline tracing (D3D12 required)";
 				}
 				if (_probeAccel == null && _ssrOwnAccel == null)
 				{
 					return _residentModel == null
-						? "в превью не открыта модель (RT-фолбэк превью ждёт её; Scene View - независим)"
-						: "accel модели ещё не собран (модель грузится)";
+						? "no model open in the preview (the preview RT fallback waits for one; Scene View is independent)"
+						: "the model's accel is not built yet (model is loading)";
 				}
 				if (_env.Pipeline.SsrResources is not { RayTraced: true })
 				{
-					return "ресурсы SSR ещё не пересобраны под RT-вариант";
+					return "SSR resources have not been rebuilt for the RT variant yet";
 				}
 				return null;
 			}
 		}
 
-		/// <summary>Пересоздаёт превью-окружение под новые env-level опции и перезагружает текущую
-		/// модель. Порядок обязателен: дождаться GPU -> отвязать ImGui-биндинг таргета -> освободить
-		/// окружение -> создать новое -> сбросить резидентный кеш (он ссылался на старый батч-рендерер)
-		/// -> перезагрузить модель с диска.</summary>
+		// Order is mandatory: wait for the GPU -> unbind the ImGui target -> release the environment
+		// -> create a new one -> drop the resident cache -> reload the model from disk.
 		private void RecreateEnvironment()
 		{
 			var reloadPath = _loadedPath ?? _loadingPath;
@@ -366,13 +312,13 @@ namespace DecaEngine.Editor
 
 			CancelPendingLoad();
 
-			// Кадры с ресурсами старого окружения могут быть в полёте - без ожидания GPU
-			// освобождение роняет драйвер (та же дисциплина, что в ResizeTargets).
+			// Frames using the old environment's resources may still be in flight; releasing
+			// without waiting for the GPU crashes the driver (same rule as in ResizeTargets).
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
 
-			// Атласы проб принадлежат этому вьюпорту, а не окружению - освобождаем сами (за барьером
-			// выше); новое окружение перепечёт их при перезагрузке модели ниже.
+			// Probe atlases belong to this viewport, not to the environment, so release them here
+			// (behind the barrier above); the new environment rebakes them on model reload.
 			ResetProbeGi();
 
 			if (_textureBound && _lastImGuiRender != null)
@@ -383,16 +329,14 @@ namespace DecaEngine.Editor
 
 			_env.Release();
 
-			// Резидентный кеш и вся геометрия жили в старом батч-рендерере/EntityStore - обнуляем
-			// ссылки, новое окружение наполнится перезагрузкой модели.
+			// The resident cache and all geometry lived in the old batch renderer / EntityStore.
 			_instanceEntities.Clear();
 			_wireframeEntities.Clear();
 			_wireframeMaterial = null;
 			_wireframeMaterialId = null;
 			_wireframeBatchCache.Clear();
 
-			// Окружение (вместе с батч-рендерером и стором) освобождается целиком - ссылки
-			// отладочного оверлея BVH умирают вместе с ним.
+			// The environment is released whole, so the BVH debug overlay references die with it.
 			ReleaseBvhDebugResources();
 			_rtShadowScene?.Release();
 			_rtShadowScene = null;
@@ -409,8 +353,7 @@ namespace DecaEngine.Editor
 			_env = CreateEnvironment();
 			_env.Root.Add(new ModelStreamingSystem(_streamer));
 
-			// Модели стримера жили под старые сэмплеры/шейдеры - выбрасываются (dropModels), барьер
-			// GPU уже был выше; перезагрузка ниже стартует с чистого листа.
+			// Streamer models were built against the old samplers/shaders, so they are dropped.
 			_streamer.MigrateEnvironment(_env, dropModels: true);
 			ApplyLightRotation();
 
@@ -420,9 +363,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Применяет live-настройки графики превью из <see cref="EditorSettings"/> (см.
-		/// SettingsWindow): биты фич и рантайм-тумблер теней. Вызывается при создании и после "OK"
-		/// в окне настроек; рестарт-левел опции (скай/HDR) считываются конструктором.</summary>
+		/// <summary>Applies the live preview graphics settings from <see cref="EditorSettings"/>.</summary>
 		public void ApplyGraphicsSettings()
 		{
 			var flags = PreviewFeatureFlags.None;
@@ -439,8 +380,8 @@ namespace DecaEngine.Editor
 				flags |= PreviewFeatureFlags.Shadows;
 			}
 
-			// Не из настроек напрямую, а от РЕАЛЬНО созданного окружения: тумблер авто-экспозиции -
-			// рестарт-левел, и до пересоздания шейдер обязан продолжать писать display-space.
+			// Taken from the created environment, not the settings: auto-exposure is restart-level,
+			// and until recreation the shader must keep writing display-space color.
 			if (_env.HdrOutput)
 			{
 				flags |= PreviewFeatureFlags.HdrOutput;
@@ -453,37 +394,29 @@ namespace DecaEngine.Editor
 				_env.ShadowSettings.Enabled = _editorSettings.PreviewShadows;
 			}
 
-			// Live-ручки probe-GI/солнца (флоры глушения, буст, интенсивность) уходят кбуфером
-			// сразу, без ребейка.
+			// Live probe-GI/sun knobs go straight into the cbuffer, no rebake.
 			ApplyPreviewSettingsToMaterials();
 
-			// Ручки AO (сила/предел/радиус) - в кбуфер AO-пасса, тоже живьём.
+			// AO knobs go live into the AO pass cbuffer.
 			_env.SetAoStrength(Math.Clamp(_editorSettings.AoStrength, 0.1f, 4f),
 				Math.Clamp(_editorSettings.AoFloor, 0f, 1f));
 			_env.SetAoDebugView(_editorSettings.AoDebugView);
 
-			// Отладочный вид векторов движения - тоже живая ручка кбуфера, и, в отличие от самой галки
-			// векторов, он не пересобирает граф (см. MotionVectorDebugPassResources).
+			// Motion vector debug view is a live cbuffer knob and, unlike the vectors checkbox,
+			// does not rebuild the graph (see MotionVectorDebugPassResources).
 			_env.SetMotionVectorDebug(_editorSettings.MotionVectorDebugView,
 				Math.Clamp(_editorSettings.MotionVectorDebugRange, 0.25f, 256f));
 			_env.SetTemporalJitter(_editorSettings.TemporalJitter);
 
-			// Бэкенд апскейлера и его настройки НЕ применяются здесь: применение настроек срабатывает
-			// посреди ImGui-кадра, а смена бэкенда/качества DLSS ждёт GPU и пишет init-команды NGX -
-			// делать это на полусобранном кадре нельзя (ровно тот класс бага, что был у render scale).
-			// Отложено до начала Update - см. ApplyPendingUpscalerSettings.
+			// Upscaler backend/quality is NOT applied here: it waits for the GPU and issues NGX
+			// init commands, which cannot happen mid-ImGui-frame. See ApplyPendingUpscalerSettings.
 			_pendingUpscalerApply = true;
 
-			// Масштаб рендера здесь НЕ применяется - только в TrackAndApplyResize (см. его
-			// комментарий): применение настроек срабатывает посреди ImGui-кадра, когда картинка
-			// превью со старым биндингом уже может лежать в draw list-е, и синхронный ResizeTargets
-			// отсюда ломал кадр - ровно та же причина, по которой откладывается пересоздание
-			// окружения (_pendingEnvironmentRecreate). TrackAndApplyResize перечитывает настройку
-			// сам, каждый кадр - это же чинит и потерю масштаба при пересоздании окружения.
+			// Render scale is applied only in TrackAndApplyResize: a synchronous ResizeTargets
+			// mid-ImGui-frame breaks the frame, same reason the environment recreate is deferred.
 
-			// Ручки авто-экспозиции - тоже живьём (сам тумблер рестарт-левел, см. CreateEnvironment).
-			// Границы измеренной яркости держим упорядоченными: перевёрнутый диапазон дал бы clamp в
-			// нижнюю границу и намертво зафиксировал экспозицию.
+			// Auto-exposure knobs are live (the toggle itself is restart-level). Keep the measured
+			// luminance bounds ordered: an inverted range clamps and freezes the exposure.
 			var eaMin = Math.Clamp(_editorSettings.EyeAdaptationMinLuminance, 0.0001f, 100f);
 			var eaMax = Math.Max(Math.Clamp(_editorSettings.EyeAdaptationMaxLuminance, 0.0001f, 100f), eaMin);
 			_env.SetEyeAdaptationParams(
@@ -495,15 +428,14 @@ namespace DecaEngine.Editor
 				Math.Clamp(_editorSettings.EyeAdaptationSpeedUp, 0.05f, 20f),
 				Math.Clamp(_editorSettings.EyeAdaptationSpeedDown, 0.05f, 20f));
 
-			// Мировая ручка работает и до кадрирования модели; доля баундов - только после него
-			// (_framedRadius == 0 означало бы нулевой радиус, то есть AO без эффекта).
+			// The world knob works before framing; the bounds fraction only after it
+			// (_framedRadius == 0 would mean a zero radius, i.e. AO with no effect).
 			if (_framedRadius > 0f || _editorSettings.AoRadiusWorld > 0f)
 			{
 				_env.SetAoWorldRange(AoWorldRange());
 			}
 
-			// Ручки SSGI (интенсивность/тапы/клампы/размытие) - тоже живьём; радиус, как и у AO,
-			// имеет смысл только когда есть от чего его считать.
+			// SSGI knobs are live; the radius, as with AO, only means something once framed.
 			ApplyGiSettings(pushRange: _framedRadius > 0f || _editorSettings.SsgiRadiusWorld > 0f);
 			ApplyFogSettings();
 			ApplyVolumetricSettings();
@@ -511,8 +443,7 @@ namespace DecaEngine.Editor
 			ApplyColorGradeSettings();
 			_env.SetToneCurve(_editorSettings.ToneCurve);
 
-			// Параметры сетки/качества сменились (окно Graphics) - заводим сессию заново, с
-			// дебаунсом: слайдер шлёт изменение каждый тик драга.
+			// Grid/quality changes restart the session, debounced: sliders fire every drag tick.
 			var wanted = (_editorSettings.PreviewProbeGi,
 				_editorSettings.ProbeGiSkyIntensity,
 				_editorSettings.ProbeGiRaysPerProbe,
@@ -520,17 +451,11 @@ namespace DecaEngine.Editor
 				_editorSettings.ProbeGiBounceSaturation,
 				_editorSettings.ProbeGiGridDensity,
 				_editorSettings.ProbeGiMaxProbes,
-				// Число каскадов - раскладка, а не live-ручка.
-				//
-				// АППАРАТНАЯ ТРАССИРОВКА тоже здесь, и это не украшение: путь трассировки выбирается
-				// ОДИН РАЗ, когда поднимается GPU-комплект сессии (кейворд шейдера плюс структуры
-				// ускорения, см. TryBeginProbeGpu). Без этого слота галка в окне Graphics меняла только
-				// EditorSettings и не трогала живую сессию вовсе: пробы продолжали ехать на том пути,
-				// с которым сессию завели (по умолчанию - программном), и включение аппаратной не давало
-				// РОВНО НИЧЕГО до следующего ребейка по другой ручке.
+				// Hardware tracing belongs in this tuple: the trace path is chosen once, when the
+				// session's GPU set comes up (see TryBeginProbeGpu), so it needs a session restart.
 				_editorSettings.ProbeGiHardwareRayTracing,
-				// Сторона окто-карты видимости - раскладка атласов, применяется только пересозданием
-				// сессии (см. ProbeGiBakeResult.VisRes).
+				// Visibility octahedral map size is atlas layout, applied only on session recreate
+				// (see ProbeGiBakeResult.VisRes).
 				_editorSettings.ProbeGiVisRes);
 			if (wanted.Item1 && wanted != _probeSessionOptions)
 			{
@@ -539,9 +464,6 @@ namespace DecaEngine.Editor
 		}
 
 
-		/// <summary>Пуш живых ручек тумана (no-op когда он выключен - см. ModelViewportEnvironment.SetFogParams).
-		/// Направление солнца сюда НЕ входит: оно пушится покадрово вместе с базисом камеры
-		/// (см. SetCameraTransform), иначе в Scene View подсветка отставала бы от гизмо солнца.</summary>
 		private void ApplyBloomSettings() => ViewportSettingsPush.Bloom(_env, _editorSettings);
 
 
@@ -550,9 +472,7 @@ namespace DecaEngine.Editor
 		private void ApplyFogSettings() => ViewportSettingsPush.Fog(_env, _editorSettings);
 
 		private void ApplyVolumetricSettings() => ViewportSettingsPush.Volumetric(_env, _editorSettings);
-		/// <summary>Мировой радиус влияния AO для текущей модели: явная ручка "AO radius (world)",
-		/// если она задана, иначе доля габаритного радиуса (см. EditorSettings.AoRadiusWorld -
-		/// на сценах-уровнях доля от баундов даёт метры, и контактная тень расползается в пятно).</summary>
+		// Explicit "AO radius (world)" knob when set, otherwise a fraction of the model radius.
 		private float AoWorldRange()
 		{
 			var world = _editorSettings.AoRadiusWorld;
@@ -561,8 +481,7 @@ namespace DecaEngine.Editor
 				: _framedRadius * Math.Clamp(_editorSettings.AoRadiusFraction, 0.01f, 1f);
 		}
 
-		/// <summary>Мировой радиус сбора SSGI - та же логика, что у <see cref="AoWorldRange"/>:
-		/// явная ручка, если задана, иначе доля габаритного радиуса модели.</summary>
+		// SSGI gather radius; same rule as AoWorldRange.
 		private float GiWorldRange()
 		{
 			var world = _editorSettings.SsgiRadiusWorld;
@@ -571,11 +490,7 @@ namespace DecaEngine.Editor
 				: _framedRadius * Math.Clamp(_editorSettings.SsgiRadiusFraction, 0.01f, 2f);
 		}
 
-		/// <summary>Пуш живых ручек SSGI в кбуферы пасса (no-op при выключенном SSGI - см.
-		/// ModelViewportEnvironment.SetGiParams). Радиус пушится отдельным флагом: до кадрирования
-		/// модели доля баундов даёт ноль, то есть GI без эффекта.</summary>
-		/// <summary>Зеркало PrefabSceneViewport.PushSsrEnvironment: покадровые данные SSR (yaw
-		/// env-карты и солнце RT-фолбэка).</summary>
+		// Per-frame SSR data: env map yaw and the RT fallback sun.
 		private void PushSsrEnvironment()
 		{
 			var shadowSettings = _env.ShadowSettings;
@@ -584,13 +499,12 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Те же константы света, что у PrefabSceneViewport.PushSsrEnvironment - см. комментарий там.
+			// Same light constants as PrefabSceneViewport.PushSsrEnvironment.
 			_env.SetSsrEnvironment(shadowSettings.EnvYawRadians,
 				-Vector3.Normalize(shadowSettings.LightDirection),
 				new Vector3(1f, 0.97f, 0.9f), 0.55f);
 		}
 
-		/// <summary>Пуш живых ручек SSR - вместе с SSGI (см. ApplyGiSettings ниже).</summary>
 		private void ApplySsrSettings()
 		{
 			_env.SetSsrParams(
@@ -624,8 +538,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Резолвит путь HDR-окружения из настроек: абсолютный - как есть, относительный -
-		/// от "EditorAssets/", пусто/не найден - null (процедурное небо).</summary>
+		// Relative paths resolve against "EditorAssets/"; empty means procedural sky.
 		private static string ResolveEnvironmentHdrPath(string configured)
 		{
 			if (string.IsNullOrWhiteSpace(configured))

@@ -4,33 +4,20 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Animation;
 
-/// <summary>
-/// Поза скелета в трёх представлениях сразу: локальные TRS, модельные матрицы и палитра
-/// скиннинг-матриц. Все три нужны одновременно и намеренно живут в одном объекте:
-///
-/// - <see cref="Locals"/> - то, что пишет семплер клипов и правит процедурный слой (IK, spring
-///   bones работают именно в локальном пространстве родителя);
-/// - <see cref="ModelMatrices"/> - то, что читают IK и рэгдолл, чтобы узнать, ГДЕ кость в мире
-///   модели, и куда физика пишет результат;
-/// - <see cref="SkinMatrices"/> - то, что уезжает в GPU.
-///
-/// Массивы переиспользуются между кадрами: поза персонажа считается каждый кадр, и аллокация трёх
-/// массивов на 200 костей в кадре - это мусор, который потом собирают ровно в тот момент, когда
-/// кадр не должен подтормаживать.
-/// </summary>
+/// <summary>Skeleton pose in three forms at once: local TRS, model matrices, skinning palette.</summary>
+// Arrays are reused across frames: a per-frame allocation for 200 joints is garbage generated
+// exactly where the frame must not stall.
 public sealed class SkeletonPose
 {
 	public readonly PreparedSkeleton Skeleton;
 
-	/// <summary>Локальные TRS относительно родителя. Стартуют с bind-позы.</summary>
+	/// <summary>Local TRS relative to the parent; starts at the bind pose.</summary>
 	public readonly Transform[] Locals;
 
-	/// <summary>Матрицы джойнтов в пространстве модели (не мира: мировое размещение добавляет
-	/// трансформ сущности). Валидны после <see cref="ComputeModelMatrices"/>.</summary>
+	/// <summary>Joint matrices in model space, not world; valid after <see cref="ComputeModelMatrices"/>.</summary>
 	public readonly Matrix4x4[] ModelMatrices;
 
-	/// <summary>Палитра для скиннинга: <c>InverseBind * Model</c>. Валидна после
-	/// <see cref="ComputeSkinMatrices"/>.</summary>
+	/// <summary>Skinning palette <c>InverseBind * Model</c>; valid after <see cref="ComputeSkinMatrices"/>.</summary>
 	public readonly Matrix4x4[] SkinMatrices;
 
 	public SkeletonPose(PreparedSkeleton skeleton)
@@ -47,12 +34,8 @@ public sealed class SkeletonPose
 
 	public void ResetToBind() => Skeleton.BindLocals.AsSpan().CopyTo(Locals);
 
-	/// <summary>
-	/// Локальные TRS -> модельные матрицы, одним проходом по массиву БЕЗ рекурсии: джойнты
-	/// топологически упорядочены (см. <see cref="PreparedSkeleton"/>), поэтому к моменту обработки
-	/// ребёнка родитель уже посчитан. Это и есть главная причина, по которой порядок джойнтов -
-	/// контракт формата, а не деталь импорта.
-	/// </summary>
+	/// <summary>Local TRS to model matrices.</summary>
+	// Single non-recursive pass: joints are topologically ordered, so parents are done first.
 	public void ComputeModelMatrices()
 	{
 		var parents = Skeleton.Parents;
@@ -69,9 +52,8 @@ public sealed class SkeletonPose
 		}
 	}
 
-	/// <summary>Палитра скиннинга. Порядок множителей - под строчную конвенцию движка (вершина
-	/// умножается СЛЕВА: <c>mul(pos, matrix)</c> в HLSL, см. UnlitInstancedVS.hlsl): вершина сначала
-	/// уходит из bind-позы в пространство джойнта, потом - в анимированное пространство модели.</summary>
+	/// <summary>Builds the skinning palette.</summary>
+	// Factor order follows the engine's row-vector convention: mul(pos, matrix) in HLSL.
 	public void ComputeSkinMatrices()
 	{
 		var inverseBind = Skeleton.InverseBind;
@@ -82,8 +64,7 @@ public sealed class SkeletonPose
 		}
 	}
 
-	/// <summary>Обе стадии разом - обычный порядок вызова, когда процедурному слою между ними
-	/// вклиниваться не нужно.</summary>
+	/// <summary>Runs both stages, for callers with no procedural layer in between.</summary>
 	public void Finish()
 	{
 		ComputeModelMatrices();
@@ -91,15 +72,8 @@ public sealed class SkeletonPose
 	}
 }
 
-/// <summary>
-/// Позиция «читающей головки» по ключам одной дорожки: индекс ключа, слева от которого шло время в
-/// прошлом кадре. Без него каждый канал каждой кости каждый кадр делает бинарный поиск по своим
-/// ключам - на риге в 200 костей с тремя каналами это 600 поисков в кадре на персонажа, при том что
-/// воспроизведение почти всегда идёт ВПЕРЁД и нужный ключ - тот же или следующий.
-///
-/// Курсор - подсказка, а не состояние: неверный курсор даёт лишний бинарный поиск, но не неверную
-/// позу, поэтому его можно свободно ронять при перемотке, смене клипа и переиспользовании плеера.
-/// </summary>
+/// <summary>Last-frame key index per channel of one track, saving a binary search each frame.</summary>
+// A hint, not state: a wrong cursor costs one binary search, never a wrong pose.
 public struct ClipCursor
 {
 	public int Translation;
@@ -109,17 +83,11 @@ public struct ClipCursor
 	public void Reset() => Translation = Rotation = Scale = 0;
 }
 
-/// <summary>Семплер клипов: клип + время -> локальные TRS. Без состояния - всё, что живёт между
-/// кадрами, лежит в <see cref="AnimationPlayer"/>.</summary>
+/// <summary>Stateless clip sampler: clip plus time to local TRS.</summary>
 public static class ClipSampler
 {
-	/// <summary>
-	/// Семплирует клип в локальные TRS позы. Каналы независимы: дорожка, не трогающая, скажем,
-	/// масштаб, оставляет его из bind-позы - именно поэтому bind-поза здесь ОБЯЗАТЕЛЬНА как
-	/// источник значений по умолчанию, а не просто «начальное состояние».
-	/// </summary>
-	/// <param name="cursors">Подсказки по каждой дорожке, длиной со скелет; можно передать пустой
-	/// спан - тогда каждый канал ищет ключ бинарным поиском (см. <see cref="ClipCursor"/>).</param>
+	/// <summary>Samples a clip into the pose's local TRS; cursors may be an empty span.</summary>
+	// Channels are independent: an untouched channel falls back to the bind pose value.
 	public static void Sample(PreparedAnimation clip, float time, SkeletonPose pose, Span<ClipCursor> cursors)
 	{
 		var skeleton = pose.Skeleton;
@@ -152,26 +120,18 @@ public static class ClipSampler
 				: bind.scale;
 		}
 
-		// Джойнты за пределами дорожек клипа (клип из другого рига, скелет длиннее) остаются в
-		// bind-позе, а не в позе прошлого кадра: иначе смена клипа оставляла бы хвост скелета
-		// висеть в позе предыдущего.
+		// Joints past the clip's tracks reset to bind, else a clip switch strands them last frame.
 		for (int i = jointCount; i < skeleton.JointCount; i++)
 		{
 			pose.Locals[i] = skeleton.BindLocals[i];
 		}
 	}
 
-	/// <summary>Свалка для курсора джойнта, которому вызывающий его не выделил. Существует ради
-	/// <c>ref</c>-тернарника выше: ветка без курсора обязана вернуть ЧТО-ТО по ссылке, а заводить
-	/// локальную переменную в цикле нельзя - ref на неё живёт дольше витка.</summary>
+	// Scratch cursor for joints the caller did not allocate one for; the ref ternary above needs it.
 	[ThreadStatic]
 	private static ClipCursor Unused;
 
-	/// <summary>
-	/// Линейная интерполяция между соседними ключами. Время за пределами дорожки зажимается к
-	/// крайнему ключу, а не заворачивается: заворачивать - дело плеера, который один знает, зациклен
-	/// клип или нет, и дорожки внутри клипа кончаются в разное время.
-	/// </summary>
+	// Time outside the track clamps to the edge key; wrapping is the player's job, not the sampler's.
 	private static Vector3 SampleVector(float[] times, Vector3[] values, float time, ref int cursor)
 	{
 		int index = FindKey(times, time, ref cursor);
@@ -205,9 +165,7 @@ public static class ClipSampler
 		var from = values[index];
 		var to = values[index + 1];
 
-		// Кратчайшая дуга: q и -q - один поворот, но Slerp между ними пойдёт «длинным путём» через
-		// пол-оборота. Экспортёры знак не нормализуют, и без этой проверки кости раз в несколько
-		// кадров прокручиваются вокруг себя - характерный «дёрг» на середине клипа.
+		// Shortest arc: q and -q are the same rotation, but Slerp between them takes the long way.
 		if (Quaternion.Dot(from, to) < 0f)
 		{
 			to = -to;
@@ -220,16 +178,11 @@ public static class ClipSampler
 	private static float Fraction(float from, float to, float time)
 	{
 		float span = to - from;
-		// Ключи с совпадающим временем экспортёры ставят намеренно - это ступенька (мгновенная
-		// смена позы). Деление на ноль дало бы NaN, который расползётся по всей цепочке костей.
+		// Coincident key times are intentional step keys; dividing by zero would spread NaN.
 		return span > 1e-6f ? Math.Clamp((time - from) / span, 0f, 1f) : 0f;
 	}
 
-	/// <summary>
-	/// Индекс ключа, слева от которого лежит <paramref name="time"/>; -1, если время раньше первого
-	/// ключа. Начинает от курсора и проверяет соседей - при обычном воспроизведении вперёд это
-	/// одно-два сравнения; на промахе падает на бинарный поиск.
-	/// </summary>
+	// Index of the key at or before time, -1 before the first key; cursor hint, else binary search.
 	private static int FindKey(float[] times, float time, ref int cursor)
 	{
 		if (time < times[0])
@@ -248,7 +201,7 @@ public static class ClipSampler
 				return hint;
 			}
 
-			// Следующий интервал - самый частый случай при воспроизведении вперёд.
+			// Next interval: the common case when playing forward.
 			if (hint + 1 == times.Length - 1 || (hint + 2 < times.Length && time < times[hint + 2]))
 			{
 				cursor = hint + 1;
@@ -276,11 +229,7 @@ public static class ClipSampler
 	}
 }
 
-/// <summary>
-/// Проигрыватель одного клипа: время, скорость, зацикливание плюс курсоры дорожек. Один плеер на
-/// сущность; блендинг двух клипов появится вместе с ozz (см. задачу шима) - здесь намеренно один
-/// клип, чтобы фундамент можно было проверить до нативной части.
-/// </summary>
+/// <summary>Single-clip player: time, speed, looping and the per-track cursors.</summary>
 public sealed class AnimationPlayer
 {
 	private ClipCursor[] _cursors = [];
@@ -299,9 +248,6 @@ public sealed class AnimationPlayer
 			_clip = value;
 			Time = 0f;
 
-			// Курсоры прошлого клипа указывают в чужие дорожки. Формально это безопасно (курсор -
-			// лишь подсказка, см. ClipCursor), но первый кадр нового клипа тогда весь уходит в
-			// промахи, а обнулить массив дешевле, чем ловить их.
 			ResetCursors();
 		}
 	}
@@ -310,8 +256,7 @@ public sealed class AnimationPlayer
 	public float Speed = 1f;
 	public bool Loop = true;
 
-	/// <summary>Клип доиграл до конца и не зациклен. Потребитель (стейт-машина, скрипт) читает флаг
-	/// и решает, что дальше; сам плеер просто замирает на последнем кадре.</summary>
+	/// <summary>Non-looping clip reached its end; the player holds the last frame.</summary>
 	public bool Finished { get; private set; }
 
 	public void Advance(float deltaSeconds)
@@ -325,8 +270,7 @@ public sealed class AnimationPlayer
 
 		if (Loop)
 		{
-			// Заворот через floor, а не через %: у отрицательной скорости остаток в C# отрицательный,
-			// и время уходило бы в минус вместо заворота к концу клипа.
+			// Wrap via floor, not %: C# remainder is negative for negative speed.
 			Time -= _clip.Duration * MathF.Floor(Time / _clip.Duration);
 			Finished = false;
 		}
@@ -342,8 +286,7 @@ public sealed class AnimationPlayer
 		}
 	}
 
-	/// <summary>Семплирует текущий клип в позу и досчитывает модельные матрицы и палитру. Если клипа
-	/// нет - поза остаётся bind-позой: скиннед-меш без анимации обязан рисоваться, а не схлопываться.</summary>
+	/// <summary>Samples the clip into the pose and finishes matrices; falls back to the bind pose.</summary>
 	public void Apply(SkeletonPose pose)
 	{
 		if (_clip == null)
@@ -362,8 +305,7 @@ public sealed class AnimationPlayer
 		pose.Finish();
 	}
 
-	/// <summary>Перемотка: время ставится напрямую, курсоры сбрасываются - прыжок назад по времени
-	/// как раз тот случай, где подсказка вперёд бесполезна.</summary>
+	/// <summary>Sets the time directly and resets the cursors.</summary>
 	public void Seek(float time)
 	{
 		Time = time;

@@ -3,12 +3,7 @@ using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>
-/// CPU-считывание пикселей из <see cref="DiligentRenderTarget"/> (например, для сохранения
-/// превью-иконок ассетов на диск, см. DecaEngine.Editor.ModelIconBaker). Синхронно: делает
-/// Flush + WaitForIdle, поэтому предназначено для редких оффлайн-операций (бейк иконок),
-/// а не для per-frame чтения.
-/// </summary>
+/// <summary>Synchronous CPU readback of a render target; stalls the GPU, not for per-frame use.</summary>
 public static class DiligentTextureReadback
 {
 	public static unsafe byte[] ReadRgba8(DiligentGraphicsApi api, DiligentRenderTarget target, out int width, out int height)
@@ -19,8 +14,7 @@ public static class DiligentTextureReadback
 		var device = api.Device;
 		var ctx = api.ImmediateContext;
 
-		// Формат staging-текстуры должен байт-в-байт совпадать с исходной (CopyTexture не умеет
-		// конвертировать) - берём его из описания реальной GPU-текстуры, а не предполагаем RGBA8.
+		// Staging format must match the source byte for byte: CopyTexture cannot convert.
 		var sourceDesc = target.Texture.GetDesc();
 
 		var stagingDesc = new TextureDesc
@@ -47,9 +41,7 @@ public static class DiligentTextureReadback
 		};
 		ctx.CopyTexture(copyAttribs);
 
-		// Flush обязан идти перед WaitForIdle - см. аналогичную пару в DiligentGraphicsUtility
-		// (буферный readback): без него записанные, но не отправленные команды ещё не начаты GPU
-		// к моменту возврата WaitForIdle, и Map прочитал бы недокопированные данные.
+		// Flush must precede WaitForIdle, else the copy is still unsubmitted when Map reads.
 		ctx.Flush();
 		ctx.WaitForIdle();
 
@@ -80,11 +72,7 @@ public static class DiligentTextureReadback
 		}
 	}
 
-	/// <summary>
-	/// CPU-считывание всех слайсов 32-битной однокомпонентной текстуры (D32Float/R32Float массива -
-	/// например shadow map каскадов) как float[слайс][y * width + x]. Тот же синхронный
-	/// Flush + WaitForIdle путь, что и <see cref="ReadRgba8"/> - только для отладочных дампов.
-	/// </summary>
+	/// <summary>Reads every slice of a D32/R32 float texture array as float[slice][y * width + x].</summary>
 	public static unsafe float[][] ReadFloatSlices(DiligentGraphicsApi api, DiligentRenderTarget target,
 		out int width, out int height)
 	{
@@ -96,14 +84,8 @@ public static class DiligentTextureReadback
 		height = (int)sourceDesc.Height;
 		int sliceCount = (int)Math.Max(1u, sourceDesc.ArraySizeOrDepth);
 
-		// Депт-формат staging-текстурой быть не может (D3D12 не даёт Staging+D32) - берём
-		// байт-совместимый R32Float, CopyTexture копирует субресурсы побайтно.
-		//
-		// Staging НЕ массив, а одиночный Tex2d, слайсы гоняются по одному (копия -> Flush +
-		// WaitForIdle -> Map): на D3D12 array-staging с Map по субресурсам возвращал данные не тех
-		// слайсов (слайс 1 читался как 0, 3 - как 2; на Vulkan тот же код работал). Плюс Map
-		// staging-текстуры на D3D12 без синхронизации ругается валидацией "must use fences" -
-		// WaitForIdle перед КАЖДЫМ Map закрывает и это.
+		// D3D12 rejects Staging + D32, so read through the byte-compatible R32Float.
+		// Staging is a single Tex2d copied slice by slice: D3D12 array staging maps the wrong slice.
 		var stagingDesc = new TextureDesc
 		{
 			Name = "Depth Readback Staging",

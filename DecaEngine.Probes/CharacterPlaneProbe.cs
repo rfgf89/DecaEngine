@@ -10,27 +10,12 @@ using DecaEngine.Editor;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Воспроизведение ПОЛНОГО персонажа на плоскости (DECA_PROBE_CHARACTER=1): настоящие
-/// AnimationDriver и CharacterMotionDriver, плоскость со стеной, матрица состояний - стоит, шаг,
-/// бег, тёрка о стену на шаге, тёрка на бегу, дёрганые переключения аллюра. Это ответ на класс
-/// багов «ноги упираются в тело», которые до этого ловились только скриншотами из редактора: у
-/// каждого состояния меряется МИНИМАЛЬНАЯ дистанция лап и предплечий до оси корпуса в
-/// пространстве модели - лапа внутри корпуса даёт число ниже толщины корпуса, и виден не только
-/// факт, но и В КАКОМ ИМЕННО состоянии персонаж складывается.
-///
-/// Тёрки о стену здесь главные: свободный шаг и бег чисты почти при любой поломке бленда, а
-/// паркующаяся у стены скорость - ровно то состояние, в котором пользователь трижды ловил
-/// сложенные ноги.
-/// </summary>
+/// <summary>Full-character probe on a plane (DECA_PROBE_CHARACTER=1).</summary>
 public static class CharacterPlaneProbe
 {
 	private const float Step = 1f / 60f;
 
-	/// <summary>Порог «лапа в корпусе», единицы модели. Толщина корпуса лисы ~8.5 единиц; в чистом
-	/// шаге лапы ходят в 20+ единицах от оси, в честном подборе галопа - в 12-15, а предплечье
-	/// галопа С ФРОНТ-IK стабильно на 7.7 (подбор лап, ужатый IK на единицу, колено при этом
-	/// чистое). 7.5 отделяет это от настоящего «внутри мяса» (провалы давали 4).</summary>
+	// "Paw inside body" threshold in model units; fox torso is ~8.5 thick.
 	private const float InsideThreshold = 7.5f;
 
 	public static void Run(DecaEngine.Graphics.Diligent.DiligentSkinningPass skinning, ModelLoader model,
@@ -38,7 +23,7 @@ public static class CharacterPlaneProbe
 	{
 		if (model.Skeleton == null)
 		{
-			Console.WriteLine("[probe] character: модель без скелета - воспроизводить некого");
+			Console.WriteLine("[probe] character: model has no skeleton - nobody to reproduce");
 			return;
 		}
 
@@ -68,9 +53,7 @@ public static class CharacterPlaneProbe
 
 		var motion = new CharacterMotionDriver();
 
-		// Точки замера: передние лапы и предплечья, задние лапы и скакательные суставы. Ось
-		// корпуса - таз..шея. Всё по именам костей Khronos Fox: пробник воспроизводит конкретного
-		// персонажа, и абстрагировать риг здесь значило бы проверять не его.
+		// Bone names are hardcoded to the Khronos Fox rig this probe reproduces.
 		int hips = model.Skeleton.FindJoint("b_Hip_01");
 		int neck = model.Skeleton.FindJoint("b_Neck_04");
 		int[] probes =
@@ -85,9 +68,7 @@ public static class CharacterPlaneProbe
 			model.Skeleton.FindJoint("b_RightFoot01_021"),
 		];
 
-		// Цепочки задних ног для метрики ВЫВОРОТА: скакательный сустав лисы в любой честной позе
-		// согнут НАЗАД (+Z модели при морде в -Z). Метрика «в теле» выворот наружу не видит вовсе -
-		// вывернутое колено торчит ОТ корпуса, дистанция до оси при этом растёт.
+		// Hind chains measure knee inversion; a healthy hock bends toward +Z (muzzle at -Z).
 		int[][] hindChains =
 		[
 			[model.Skeleton.FindJoint("b_LeftLeg01_015"), model.Skeleton.FindJoint("b_LeftLeg02_016"),
@@ -99,21 +80,19 @@ public static class CharacterPlaneProbe
 		if (hips < 0 || neck < 0 || Array.IndexOf(probes, -1) >= 0 ||
 			Array.IndexOf(hindChains[0], -1) >= 0 || Array.IndexOf(hindChains[1], -1) >= 0)
 		{
-			Console.WriteLine("[probe] character: кости лисы не нашлись - метрике не к чему цепляться");
+			Console.WriteLine("[probe] character: fox bones not found - the metric has nothing to hold on to");
 			return;
 		}
 
-		// Матрица состояний. Направления подобраны под стену на x=2.5: тёрки скользят вдоль неё,
-		// свободные фазы идут параллельно. Каждая фаза начинается там, где закончилась прошлая, -
-		// как в живой игре, без телепортов между состояниями.
+		// Directions are tuned to the wall at x=2.5; phases chain without teleporting.
 		(string Name, float Seconds, Func<float, PlayerInput> Input)[] phases =
 		[
-			("стоит", 2f, _ => default),
-			("шаг", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ }),
-			("бег", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ, Run = true }),
-			("тёрка на шаге", 4f, _ => new PlayerInput { MoveWorld = new Vector3(2f, 0f, 1f) }),
-			("тёрка на бегу", 4f, _ => new PlayerInput { MoveWorld = new Vector3(2f, 0f, 1f), Run = true }),
-			("дёрганый аллюр", 4f, t => new PlayerInput
+			("standing", 2f, _ => default),
+			("walk", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ }),
+			("run", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ, Run = true }),
+			("wall rub while walking", 4f, _ => new PlayerInput { MoveWorld = new Vector3(2f, 0f, 1f) }),
+			("wall rub while running", 4f, _ => new PlayerInput { MoveWorld = new Vector3(2f, 0f, 1f), Run = true }),
+			("jerky gait", 4f, t => new PlayerInput
 			{
 				MoveWorld = new Vector3(-1f, 0f, 0.3f),
 				Run = (int)(t / 0.6f) % 2 == 0,
@@ -125,27 +104,22 @@ public static class CharacterPlaneProbe
 
 		foreach (var phase in phases)
 		{
-			// Фаза «бег без foot IK» - диагностическая ветка: чистый клип от процедурки отличается
-			// только этим тумблером, и красный бег с зелёным «бегом без IK» означает вину солвера,
-			// два красных - вину самого клипа (или его темпа).
-			if (string.Equals(phase.Name, "бег", StringComparison.Ordinal))
+			// Diagnostic split: separates a bad IK solver from a bad clip.
+			if (string.Equals(phase.Name, "run", StringComparison.Ordinal))
 			{
-				RunPhase(("бег без foot IK", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ, Run = true }),
+				RunPhase(("run without foot IK", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ, Run = true }),
 					footIkEnabled: false, lockFeet: false);
-				RunPhase(("бег без локинга", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ, Run = true }),
+				RunPhase(("run without locking", 3f, _ => new PlayerInput { MoveWorld = Vector3.UnitZ, Run = true }),
 					footIkEnabled: true, lockFeet: false);
 			}
 
 			RunPhase(phase, footIkEnabled: true, lockFeet: true);
 		}
 
-		// Свип веса foot IK - жалоба «тянешь Weight с 0 на 1, и лапы выворачивает назад» приходит
-		// именно с ползунка: частичный вес - отдельный путь солвера (ozz лерпит коррекции), и
-		// единичный вес его не проверяет. Двумя средами: играющей (dt=1/60) и редакторской
-		// (нулевой шаг - ровно то, что происходит под курсором на ползунке).
+		// Partial foot-IK weight is a separate solver path (ozz lerps corrections).
 		foreach (float weight in new[] { 0.25f, 0.5f, 0.75f })
 		{
-			RunPhase(($"вес {weight:0.00}", 1.5f, _ => default), footIkEnabled: true, lockFeet: true,
+			RunPhase(($"weight {weight:0.00}", 1.5f, _ => default), footIkEnabled: true, lockFeet: true,
 				weight);
 		}
 
@@ -213,15 +187,12 @@ public static class CharacterPlaneProbe
 			bool broken = worstDistance < InsideThreshold || worstKnee > 0.3f;
 			anyInside |= broken;
 
-			Console.WriteLine($"[probe] character: свип веса в редакторе (dt=0) - худшая дистанция " +
-				$"{worstDistance:0.#} ед. (вес {worstWeight:0.0}), худший изгиб {worstKnee:0.00} " +
-				$"{(broken ? "ЛОМАЕТ ПОЗУ" : "OK")}");
+			Console.WriteLine($"[probe] character: weight sweep in the editor (dt=0) - worst distance " +
+				$"{worstDistance:0.#} units (weight {worstWeight:0.0}), worst bend {worstKnee:0.00} " +
+				$"{(broken ? "BREAKS THE POSE" : "OK")}");
 		}
 
-		// Тот же редакторский свип НА ПЕРЕПАДЕ: лиса краем на приступке, левые лапы выше правых -
-		// IK работает по-настоящему, и частичный вес лерпит НАСТОЯЩИЕ коррекции. Поза - Walk на
-		// ЗАМОРОЖЕННОМ времени (локомоушен выключен), как у лестничной лисы демо-сцены в режиме
-		// редактирования - жалобы на вывернутые ползунком лапы приходят именно с неё.
+		// Same sweep on a step edge: uneven ground makes the IK corrections non-trivial.
 		{
 			ref var locomotion = ref fox.GetComponent<LocomotionComponent>();
 			locomotion.Enabled = false;
@@ -286,9 +257,7 @@ public static class CharacterPlaneProbe
 					}
 				}
 
-				// «Задом наперёд» - направление СТУПНИ: горизонтальная проекция «скакательный
-				// сустав → кончик лапы» у здоровой позы смотрит к морде (-Z модели), у вывернутой
-				// ползунком - назад.
+				// Healthy hock->toe direction points at the muzzle (-Z model).
 				foreach (var (hock, toe) in new[]
 					{ (probes[6], probes[4]), (probes[7], probes[5]) })
 				{
@@ -302,8 +271,8 @@ public static class CharacterPlaneProbe
 					}
 				}
 
-				Console.WriteLine($"[probe] character: перепад, вес {weight:0.0} - изгиб {weightKnee:0.00}, " +
-					$"ступня к морде {weightPaw:0.00}");
+				Console.WriteLine($"[probe] character: step edge, weight {weight:0.0} - bend {weightKnee:0.00}, " +
+					$"foot toward the muzzle {weightPaw:0.00}");
 
 				if (weightKnee > worstKnee)
 				{
@@ -314,21 +283,17 @@ public static class CharacterPlaneProbe
 
 			footIk.Weight = 1f;
 
-			// Порог здесь МЯГЧЕ общего (7, не 8): перепад 0.35 - боковая цель на пределе клампов
-			// для ЧЕТЫРЁХ ног, и предплечье дальней стороны законно подходит к оси корпуса на 7.6
-			// при чистом колене. «В теле» на этой позе начинается ниже.
+			// Looser than InsideThreshold: a 0.35 step legitimately pulls a forearm to 7.6.
 			bool broken = worstDistance < 7f || worstKnee > 0.3f;
 			anyInside |= broken;
 
-			Console.WriteLine($"[probe] character: свип веса на перепаде (dt=0) - худшая дистанция " +
-				$"{worstDistance:0.#} ед. (вес {worstWeight:0.0}), худший изгиб {worstKnee:0.00} " +
-				$"(вес {worstKneeWeight:0.0}) {(broken ? "ЛОМАЕТ ПОЗУ" : "OK")}");
+			Console.WriteLine($"[probe] character: weight sweep on the step edge (dt=0) - worst distance " +
+				$"{worstDistance:0.#} units (weight {worstWeight:0.0}), worst bend {worstKnee:0.00} " +
+				$"(weight {worstKneeWeight:0.0}) {(broken ? "BREAKS THE POSE" : "OK")}");
 		}
 
-		// Свип веса на УТОПЛЕННОЙ сущности - сценарий гизмо: автор перетащил персонажа чуть ниже
-		// пола (в живом кадре это выглядит как «стоит по брюхо»). Земля под всеми лапами тогда ВЫШЕ
-		// плоскости опоры клипа, и IK, умеющий только опускать таз, поджимает лапы в корпус при
-		// любом весе - ровно жалоба «ноги задом наперёд, когда Weight выше нуля».
+		// Entity sunk below the floor: ground sits above the clip's support plane, so a
+		// pelvis-only-down IK would tuck the paws instead of floating the pose up.
 		{
 			fox.GetComponent<Position>() = new Position(0f, -0.12f, -12f);
 
@@ -354,10 +319,7 @@ public static class CharacterPlaneProbe
 				var axisA = models[hips].Translation;
 				var axisB = models[neck].Translation;
 
-				// БЕЗ носков (probes[4], probes[5]): поджатие - это ДОСЯГАЕМОСТЬ при поднятом тазе,
-				// её меряют суставы цепочек. Носок после восстановления ориентации стопы (AlignFeet)
-				// в глубоком сгибе легитимно уходит под корпус - он мерил бы ориентацию, не поджатие,
-				// и честная поза давала 12.4 против калибровочных 22.
+				// Toes excluded: after AlignFeet they legitimately tuck under in deep bends.
 				for (int p = 0; p < probes.Length; p++)
 				{
 					if (p == 4 || p == 5)
@@ -393,21 +355,17 @@ public static class CharacterPlaneProbe
 
 			footIk.Weight = 1f;
 
-			// Порог здесь СВОЙ, теснее общего «в теле»: без подъёма таза лапы поджимались на треть
-			// ноги (дистанция 16 против 22 у всплывшей позой) - глазами это «ноги задом», хотя до
-			// «внутри мяса» не дотягивает. Утопленная сущность обязана ВСПЛЫТЬ позой на пол.
+			// Tighter than InsideThreshold: a floated pose measures 22, a tucked one 16.
 			bool broken = worstDistance < 19f || worstKnee > 0.3f;
 			anyInside |= broken;
 
-			Console.WriteLine($"[probe] character: свип веса УТОПЛЕННОЙ (dt=0) - худшая дистанция " +
-				$"{worstDistance:0.#} ед., худший изгиб {worstKnee:0.00} " +
-				$"{(broken ? "ПОДЖИМАЕТ ЛАПЫ" : "ВСПЛЫВАЕТ ПОЗОЙ OK")}");
+			Console.WriteLine($"[probe] character: weight sweep while SUNK (dt=0) - worst distance " +
+				$"{worstDistance:0.#} units, worst bend {worstKnee:0.00} " +
+				$"{(broken ? "TUCKS THE PAWS" : "FLOATS THE POSE UP OK")}");
 		}
 
-		// Доворот по нормали НА СКЛОНЕ - пара «доворот включён/выключен» на одной позе: на склоне
-		// ~15° правильный доворот меняет ориентацию ступни на те же ~15°, и повороты ступней при
-		// включении обязаны остаться МАЛЫМИ. Большая разница - сломанная композиция кватернионов
-		// в AlignFeet, зона, где путаются все конвенции; горизонтальные свипы выше к ней слепы.
+		// On a ~15 degree slope, normal alignment must turn the foot by ~15 degrees, no more:
+		// a large delta means AlignFeet composes its quaternions in the wrong order.
 		{
 			fox.GetComponent<Position>() = new Position(0f, 0.47f, -19f);
 
@@ -456,18 +414,13 @@ public static class CharacterPlaneProbe
 			bool alignBroken = worstTurn > 40f;
 			anyInside |= alignBroken;
 
-			Console.WriteLine($"[probe] character: доворот по нормали на склоне - поворот ступни " +
-				$"{worstTurn:0.#}° {(alignBroken ? "ВЫВОРАЧИВАЕТ СТУПНЮ" : "OK")}");
+			Console.WriteLine($"[probe] character: normal alignment on a slope - foot turn " +
+				$"{worstTurn:0.#}° {(alignBroken ? "TWISTS THE FOOT OUT" : "OK")}");
 		}
 
-		// Наклон корпуса на склоне ВДОЛЬ ТЕЛА (склон растёт по Z, тело лисы вдоль Z) - парой
-		// вкл/выкл: разница углов оси корпуса (таз→шея) обязана быть ~углом склона. Плюс контакт
-		// ПЕРЕДНИХ лап: без четвёртой пары ног и наклона лиса стояла горизонтально, зависнув
-		// передними над рельефом, - жалоба со ступеней.
-		// Поза - BIND, поворот - ЕДИНИЧНЫЙ: у замороженного кадра клипа корпус стоит диагонально, а
-		// после фаз движения сущность остаётся ПОВЁРНУТОЙ приводом (FaceMotion пишет Rotation) - и
-		// любые ожидания «склон вдоль тела» в мировых осях ложь. Оси скелета в bind (замерено):
-		// тело вдоль Z, перед в -Z, бока по X.
+		// Bind pose and identity rotation are required: after motion phases FaceMotion leaves
+		// Rotation turned, and "slope along the body" in world axes would be a lie.
+		// Measured bind axes: body along Z, front at -Z, sides along X.
 		fox.GetComponent<Animator>().ClipName = string.Empty;
 		fox.GetComponent<Rotation>() = new Rotation(0f, 0f, 0f, 1f);
 
@@ -502,7 +455,7 @@ public static class CharacterPlaneProbe
 				{
 					pitchWith = pitch;
 
-					// Контакт передних лап с ПОВЕРХНОСТЬЮ СКЛОНА: y(z) = 0.2 + (z + 24) * 0.27.
+					// Slope surface: y(z) = 0.2 + (z + 24) * 0.27.
 					var world = PrefabSceneViewport.ComputeWorldMatrix(fox);
 					foreach (int paw in new[] { probes[0], probes[1] })
 					{
@@ -519,24 +472,19 @@ public static class CharacterPlaneProbe
 
 			footIk.AlignBodyToSlope = true;
 
-			// Зазор лапы меряется ПО СУСТАВУ КИСТИ, а не по подошве: его природная высота в клипе
-			// ~8 единиц (0.08 м), плюс недолёт на пределе цепочки. 0.25 - это «рядом со склоном»
-			// против прежних «висят в воздухе»; главное утверждение здесь - дельта наклона.
-			// ЗНАК обязателен: склон поднимается к ХВОСТУ (+Z), и нос обязан ОПУСТИТЬСЯ - угол оси
-			// таз→шея упасть. Гейт по |дельте| был слеп к знаку, и инвертированный наклон (морда
-			// задиралась В склон) годился ему так же, как правильный, - ровно он и жил в коде.
+			// Gap is measured at the wrist joint, ~0.08 m above the sole in the clip.
+			// The sign matters: the slope rises toward +Z, so the muzzle must go down.
 			float pitchDelta = MathF.Abs(pitchWith - pitchWithout);
 			bool tiltBroken = pitchDelta < 6f || pitchDelta > 30f || worstPawGap > 0.25f ||
 				pitchWith > pitchWithout;
 			anyInside |= tiltBroken;
 
-			Console.WriteLine($"[probe] character: наклон корпуса на склоне - {pitchWithout:0.#}° -> " +
-				$"{pitchWith:0.#}° (дельта {pitchDelta:0.#}°), зазор передних лап {worstPawGap:0.###} м " +
-				$"{(tiltBroken ? "КОРПУС НЕ ЛОЖИТСЯ/ЛАПЫ В ВОЗДУХЕ" : "OK")}");
+			Console.WriteLine($"[probe] character: body pitch on a slope - {pitchWithout:0.#}° -> " +
+				$"{pitchWith:0.#}° (delta {pitchDelta:0.#}°), front paw gap {worstPawGap:0.###} m " +
+				$"{(tiltBroken ? "BODY DOES NOT FOLLOW/PAWS IN THE AIR" : "OK")}");
 		}
 
-		// КРЕН на поперечном склоне (подъём вдоль X = поперёк тела-Z) - парой вкл/выкл: твист таза
-		// вокруг оси тела обязан стать ~углом склона.
+		// Roll on a cross slope (rise along X, body along Z): pelvis twist must match it.
 		{
 			fox.GetComponent<Position>() = new Position(0f, 0.47f, -19f);
 
@@ -559,9 +507,8 @@ public static class CharacterPlaneProbe
 					continue;
 				}
 
-				// Ориентация таза целиком: линии суставов у этого рига лежат не по анатомическим
-				// осям (бедренные суставы разнесены вдоль ТЕЛА), и любая метрика «по двум точкам»
-				// лжёт. Крен - это твист-компонента разницы поворотов таза вокруг оси тела.
+				// Whole-pelvis orientation: this rig's joint lines are not anatomical axes,
+				// so any two-point metric lies.
 				var m = models[hips];
 				var x = Vector3.Normalize(new Vector3(m.M11, m.M12, m.M13));
 				var y = Vector3.Normalize(new Vector3(m.M21, m.M22, m.M23));
@@ -570,18 +517,14 @@ public static class CharacterPlaneProbe
 				pelvisRotations[tilt ? 1 : 0] = Quaternion.CreateFromRotationMatrix(new Matrix4x4(
 					x.X, x.Y, x.Z, 0f, y.X, y.Y, y.Z, 0f, z.X, z.Y, z.Z, 0f, 0f, 0f, 0f, 1f));
 
-				// Наклон верха таза К СКЛОНУ - для ЗНАКА крена: склон поднимается к +X (левый бок
-				// выше), корпус обязан лечь левым боком вверх, то есть верхняя ось таза - отклониться
-				// К НИЗУ склона (-X). Дельта dot(up, +X) при включении обязана уйти в минус.
+				// Sign of the roll: slope rises toward +X, so pelvis up must lean to -X.
 				pelvisLeans[tilt ? 1 : 0] = Vector3.Dot(y, Vector3.UnitX);
 			}
 
 			footIk.AlignBodyToSlope = true;
 
-			// ПОЛНЫЙ угол дельты поворотов таза, не проекция на ось: при построчной конвенции
-			// дельта сопрягается bind-ориентацией таза (в ней сидят корневые 90°), и ось твиста
-			// уезжает с мировой Z куда угодно. Склон здесь поперёк тела - наклон нулевой, и весь
-			// угол дельты по построению и есть крен.
+			// Full delta angle, not a projection: the bind pelvis orientation moves the twist
+			// axis off world Z. The slope is across the body, so the whole delta is roll.
 			var deltaRotation = Quaternion.Normalize(
 				pelvisRotations[1] * Quaternion.Inverse(pelvisRotations[0]));
 			float rollDelta = 2f * MathF.Acos(Math.Clamp(MathF.Abs(deltaRotation.W), 0f, 1f)) *
@@ -591,16 +534,12 @@ public static class CharacterPlaneProbe
 			bool rollBroken = rollDelta < 6f || rollDelta > 30f || leanDelta >= -0.05f;
 			anyInside |= rollBroken;
 
-			Console.WriteLine($"[probe] character: крен на поперечном склоне - твист таза {rollDelta:0.#}°, " +
-				$"наклон верха таза к склону {leanDelta:0.00} " +
-				$"{(rollBroken ? "КРЕНА НЕТ/НЕ ТУДА" : "OK")}");
+			Console.WriteLine($"[probe] character: roll on a cross slope - pelvis twist {rollDelta:0.#}°, " +
+				$"pelvis top lean toward the slope {leanDelta:0.00} " +
+				$"{(rollBroken ? "NO ROLL/WRONG WAY" : "OK")}");
 		}
 
-		// Частичный бленд (OverlayClipComponent): шея играет Survey, ноги остаются в Walk. Пара
-		// «без наложения / с наложением» на одном замороженном кадре: суставы ног обязаны совпасть
-		// ТОЧНО - комплементарные посуставные веса не трогают базу вне поддерева, и любой сдвиг
-		// лап означает, что маска протекает (или rest-поза подмешивается). Голова обязана УЙТИ -
-		// мёртвое наложение неотличимо от протекающей маски только по ногам.
+		// Partial blend: legs must match exactly (mask leak) and the head must move (dead overlay).
 		{
 			fox.GetComponent<Position>() = new Position(0f, 0f, -8f);
 			fox.GetComponent<Animator>().ClipName = "Walk";
@@ -656,19 +595,14 @@ public static class CharacterPlaneProbe
 					bool overlayBroken = worstLeg > 0.01f || headMoved < 0.5f;
 					anyInside |= overlayBroken;
 
-					Console.WriteLine($"[probe] character: частичный бленд (Survey на шее) - " +
-						$"лапы сдвинулись на {worstLeg:0.####} ед., голова на {headMoved:0.#} ед. " +
-						$"{(overlayBroken ? "МАСКА ПРОТЕКАЕТ/НАЛОЖЕНИЕ МЕРТВО" : "OK")}");
+					Console.WriteLine($"[probe] character: partial blend (Survey on the neck) - " +
+						$"paws moved by {worstLeg:0.####} units, head by {headMoved:0.#} units " +
+						$"{(overlayBroken ? "MASK LEAKS/OVERLAY IS DEAD" : "OK")}");
 				}
 			}
 		}
 
-		// Root motion (Animator.RootMotion): СИНТЕТИЧЕСКИЙ клип - корень рига едет на 100 единиц
-		// по +Z модели за 2 секунды, остальные кости молчат. Клипы Fox шагают на месте, и движения
-		// корня в них нет по построению - настоящий путь проверяется только подложенным клипом.
-		// Три утверждения: сущность прошла путь клипа (включая ЗАВОРОТ лупа - прогон 3 с на клипе
-		// 2 с), путь без рывка на завороте (максимальный шаг за кадр ~ скорость клипа), а поза
-		// осталась НА МЕСТЕ (компенсация: корень в пространстве модели не уехал).
+		// Root motion needs a synthetic clip: Fox clips walk in place, so they carry no root track.
 		{
 			int motionRoot = 0;
 			while (model.Skeleton.Parents[motionRoot] >= 0)
@@ -729,22 +663,17 @@ public static class CharacterPlaneProbe
 				rootDrift = new Vector3(rootNow.X - rootBind.X, 0f, rootNow.Z - rootBind.Z).Length();
 			}
 
-			// 3 с на клипе 0.5 м/с = 1.5 м; шаг кадра ~8.3 мм. Дрейф корня - в ЕДИНИЦАХ МОДЕЛИ.
+			// 3 s at 0.5 m/s = 1.5 m; frame step ~8.3 mm. Root drift is in model units.
 			bool motionBroken = MathF.Abs(travelled - 1.5f) > 0.03f || maxFrameStep > 0.05f ||
 				rootDrift > 1f;
 			anyInside |= motionBroken;
 
-			Console.WriteLine($"[probe] character: root motion - путь {travelled:0.###} м (ожидалось 1.5), " +
-				$"худший шаг кадра {maxFrameStep * 1000f:0.#} мм, дрейф корня в модели {rootDrift:0.###} ед. " +
-				$"{(motionBroken ? "ПУТЬ/КОМПЕНСАЦИЯ СЛОМАНЫ" : "OK")}");
+			Console.WriteLine($"[probe] character: root motion - path {travelled:0.###} m (expected 1.5), " +
+				$"worst frame step {maxFrameStep * 1000f:0.#} mm, root drift in model {rootDrift:0.###} units " +
+				$"{(motionBroken ? "PATH/COMPENSATION BROKEN" : "OK")}");
 		}
 
-		// Аддитив (AdditiveClipComponent): РАУНД-ТРИП дельты. База - Survey, замороженный на своём
-		// ОПОРНОМ кадре (t=0), поверх - аддитивная дельта того же Survey полным весом на времени t.
-		// По построению «опора + дельта(t)» обязана дать Survey@t: сверка с честно семплированным
-		// Survey@t проверяет насквозь и конвертер (Conjugate(опора)×значение - зона конвенций
-		// кватернионов, дважды стрелявшая в этом стеке), и досев каналов единицей, и additive-путь
-		// шима. Заодно живость: результат обязан УЙТИ от опорного кадра.
+		// Additive round trip: reference@0 plus delta(t) of the same clip must equal Survey@t.
 		{
 			var basePlus = store.CreateEntity();
 			basePlus.AddComponent(new EntityName("additive fox"));
@@ -784,19 +713,15 @@ public static class CharacterPlaneProbe
 				}
 			}
 
-			// «Мёртвый» аддитив ловится тем же сравнением: без дельты результат остался бы опорным
-			// кадром и разошёлся бы с Survey@0.5 на весь размах осмотра. Допуск щедрее побитового:
-			// и дельта, и оригинал прошли квантование ozz НЕЗАВИСИМО, плюс композиция двух
-			// квантованных поворотов. 0.5 единицы (5 мм) - на порядок ниже видимого, «не та
-			// конвенция» даёт десятки единиц.
+			// Tolerance is loose because delta and original are ozz-quantized independently.
 			bool additiveBroken = worstJoint > 0.5f;
 			anyInside |= additiveBroken;
 
-			Console.WriteLine($"[probe] character: аддитив (раунд-трип дельты Survey) - худшее " +
-				$"расхождение сустава {worstJoint:0.###} ед. {(additiveBroken ? "ДЕЛЬТА ВРЁТ" : "OK")}");
+			Console.WriteLine($"[probe] character: additive (round-trip of the Survey delta) - worst " +
+				$"joint mismatch {worstJoint:0.###} units {(additiveBroken ? "DELTA LIES" : "OK")}");
 		}
 
-		Console.WriteLine($"[probe] character: ИТОГ - {(anyInside ? "ЕСТЬ СОСТОЯНИЯ С НОГАМИ В ТЕЛЕ" : "все состояния чистые OK")}");
+		Console.WriteLine($"[probe] character: TOTAL - {(anyInside ? "THERE ARE STATES WITH LEGS INSIDE THE BODY" : "all states clean OK")}");
 
 		void RunPhase((string Name, float Seconds, Func<float, PlayerInput> Input) phase, bool footIkEnabled,
 			bool lockFeet, float weight = 1f)
@@ -826,8 +751,7 @@ public static class CharacterPlaneProbe
 				animation.BeginFrame();
 				animation.Update(fox, PrefabSceneViewport.ComputeWorldMatrix(fox), Step);
 
-				// Первые полсекунды фазы не меряются: переходное (кроссфейд аллюра, разгон,
-				// подход к стене) - законно смешанное, вопрос пробника - УСТАНОВИВШЕЕСЯ состояние.
+				// First half second is the transient (crossfade, acceleration); measure steady state.
 				if (t < 0.5f || !animation.TryGetPose(fox.Id, out var models, out _))
 				{
 					continue;
@@ -836,11 +760,8 @@ public static class CharacterPlaneProbe
 				var axisA = models[hips].Translation;
 				var axisB = models[neck].Translation;
 
-				// Выворот: проекция изгиба КОЛЕНА (средний сустав цепочки) на +Z модели. Колено
-				// лисы гнётся вперёд, к морде (-Z): у честной позы проекция около -1 (замерено -1.0
-				// во всех фазах, включая стойку и бег без IK); уверенно ПОЛОЖИТЕЛЬНАЯ - колено
-				// защёлкнулось в обратную сторону. Совсем прямая нога (изгиб меньше 2% длины) не
-				// меряется: знак шума - не выворот.
+				// Knee bend projected on +Z model: healthy is about -1, positive means inverted.
+				// A near-straight leg (bend under 2% of reach) is skipped as noise.
 				foreach (var chain in hindChains)
 				{
 					var hip = models[chain[0]].Translation;
@@ -885,8 +806,7 @@ public static class CharacterPlaneProbe
 				}
 			}
 
-			// Допуск +0.3, а не ноль: изгиб честной позы может уходить вбок (проекция мала), а
-			// выворот - это уверенно ПОЛОЖИТЕЛЬНАЯ проекция, колено согнуто назад.
+			// +0.3, not zero: a healthy bend can drift sideways and project near zero.
 			bool inverted = worstKneeDot > 0.3f;
 			bool inside = worst < InsideThreshold || inverted;
 			anyInside |= inside;
@@ -900,18 +820,18 @@ public static class CharacterPlaneProbe
 				{
 					if (info.EntityId == fox.Id && info.Locomotion)
 					{
-						Console.WriteLine($"[probe] character: природные скорости клипов - " +
-							$"walk {info.LocoWalkStride:0.#} ед/с, run {info.LocoRunStride:0.#} ед/с " +
-							$"(тело 1 м/с = {1f / 0.01f:0} ед/с)");
+						Console.WriteLine($"[probe] character: natural clip speeds - " +
+							$"walk {info.LocoWalkStride:0.#} units/s, run {info.LocoRunStride:0.#} units/s " +
+							$"(body 1 m/s = {1f / 0.01f:0} units/s)");
 						strideReported = true;
 					}
 				}
 			}
 
-			Console.WriteLine($"[probe] character: фаза '{phase.Name}' - мин. дистанция лапа-корпус " +
-				$"{worst:0.#} ед. ({worstName}, t={worstAt:0.0}, скорость {speedAtWorst:0.00} м/с), " +
-				$"изгиб колена {worstKneeDot:0.00} " +
-				$"{(inverted ? "КОЛЕНО ВЫВЕРНУТО" : worst < InsideThreshold ? "НОГА В ТЕЛЕ" : "OK")}");
+			Console.WriteLine($"[probe] character: phase '{phase.Name}' - min paw-to-body distance " +
+				$"{worst:0.#} units ({worstName}, t={worstAt:0.0}, speed {speedAtWorst:0.00} m/s), " +
+				$"knee bend {worstKneeDot:0.00} " +
+				$"{(inverted ? "KNEE INVERTED" : worst < InsideThreshold ? "LEG INSIDE THE BODY" : "OK")}");
 		}
 	}
 
@@ -924,14 +844,12 @@ public static class CharacterPlaneProbe
 			new Vector3(-25f, 0f, -25f), new Vector3(-25f, 0f, 25f),
 			new Vector3(25f, 0f, 25f), new Vector3(25f, 0f, -25f));
 
-		// Стена вдоль z - в неё упираются обе тёрки. Высокая: step-up не должен её взять.
+		// Wall along z, tall enough that step-up cannot climb it.
 		AddQuad(vertices, indices,
 			new Vector3(2.5f, 0f, -25f), new Vector3(2.5f, 2f, -25f),
 			new Vector3(2.5f, 2f, 25f), new Vector3(2.5f, 0f, 25f));
 
-		// Приступок для свипа веса на ПЕРЕПАДЕ (в стороне от маршрутов фаз): лиса встаёт на его
-		// край, левые лапы на 0.16 выше правых, и foot IK реально работает - на ровном полу он
-		// тождественный, и свип веса там ничего не проверяет.
+		// Step for the weight sweep: on flat ground foot IK is identity and proves nothing.
 		AddQuad(vertices, indices,
 			new Vector3(0f, 0.16f, -15.4f), new Vector3(0f, 0.16f, -14.6f),
 			new Vector3(0.4f, 0.16f, -14.6f), new Vector3(0.4f, 0.16f, -15.4f));
@@ -939,8 +857,7 @@ public static class CharacterPlaneProbe
 			new Vector3(0f, 0f, -15.4f), new Vector3(0f, 0.16f, -15.4f),
 			new Vector3(0f, 0.16f, -14.6f), new Vector3(0f, 0f, -14.6f));
 
-		// Высокий приступок (0.35, как перепад лестничной лисы демо-сцены) - глубокая цель на
-		// пределе кламповки, где нога вытягивается почти в струну.
+		// Tall step (0.35): target at the clamp limit, leg stretched nearly straight.
 		AddQuad(vertices, indices,
 			new Vector3(0f, 0.35f, -17.4f), new Vector3(0f, 0.35f, -16.6f),
 			new Vector3(0.4f, 0.35f, -16.6f), new Vector3(0.4f, 0.35f, -17.4f));
@@ -948,16 +865,13 @@ public static class CharacterPlaneProbe
 			new Vector3(0f, 0f, -17.4f), new Vector3(0f, 0.35f, -17.4f),
 			new Vector3(0f, 0.35f, -16.6f), new Vector3(0f, 0f, -16.6f));
 
-		// Наклонная площадка ~15° для доворота по нормали и НАКЛОНА КОРПУСА. Подъём - ВДОЛЬ ОСИ
-		// СКЕЛЕТА лисы: в пространстве модели её перед-зад лежит по X (замерено лучами: лапы
-		// раскинуты по X на ±42 единицы), и склон поперёк этой оси для наклона корпуса неотличим
-		// от горизонтали - первая версия склона вдоль Z намерила ровно проекцию, 4.4° из 15.
+		// ~15 degree ramp rising ALONG the skeleton axis (model X); a cross-axis slope is
+		// indistinguishable from flat for body pitch.
 		AddQuad(vertices, indices,
 			new Vector3(-1f, 0.2f, -20f), new Vector3(-1f, 0.2f, -18f),
 			new Vector3(1f, 0.74f, -18f), new Vector3(1f, 0.74f, -20f));
 
-		// Поперечный склон (подъём вдоль Z = поперёк оси скелета) - для КРЕНА корпуса: персонаж
-		// боком к лестнице без roll держит корпус горизонтальным.
+		// Cross slope (rise along Z) for body roll.
 		AddQuad(vertices, indices,
 			new Vector3(-1f, 0.2f, -24f), new Vector3(-1f, 0.74f, -22f),
 			new Vector3(1f, 0.74f, -22f), new Vector3(1f, 0.2f, -24f));

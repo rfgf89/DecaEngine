@@ -33,16 +33,13 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 	private readonly Func<TDesc, TDesc, bool> descEquals;
 	private readonly Func<TViewDesc, TViewDesc, bool> viewDescEquals;
 
-	/// <summary>Одна физическая аллокация: нативный ресурс, дескриптор, под который он создан, и все
-	/// вьюхи, когда-либо на него сделанные. Живёт ДОЛЬШЕ одной компиляции графа - см. <see cref="_pool"/>.</summary>
+	// One physical allocation; outlives a single graph compilation via _pool.
 	private sealed class Entry
 	{
 		public TDesc Desc;
 		public T Target;
 
-		/// <summary>false - ресурс создан ВНЕ графа и лишь объявлен ему для учёта зависимостей и
-		/// времён жизни (см. <see cref="RegisterExternal"/>): граф его не создаёт, не пулит и не
-		/// освобождает.</summary>
+		// false: declared from outside, so the graph never creates, pools or releases it.
 		public bool Owned = true;
 
 		public readonly List<KeyValuePair<TViewDesc, TView>> Views = new(4);
@@ -65,38 +62,27 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 		}
 	}
 
-	/// <summary>Внешние ресурсы, объявленные графу на текущей компиляции - см. <see cref="Entry.Owned"/>.
-	/// Чистится вместе с остальным в <see cref="Clean"/>: объявления живут ровно одну компиляцию.</summary>
+	// Externally owned resources; declarations live for exactly one compilation.
 	private readonly Dictionary<string, T> _external = new(16);
 
-	/// <summary>Объявляет графу уже существующий ресурс: он попадёт в зависимости и в отладочную
-	/// раскладку времён жизни, но остаётся во владении того, кто его создал.</summary>
+	/// <summary>Declares an existing resource to the graph without transferring ownership.</summary>
 	public void RegisterExternal(string name, T target)
 	{
 		_external[name] = target;
 	}
 
-	/// <summary>Ресурсы, отданные ТЕКУЩЕЙ компиляции (по имени пина).</summary>
 	private readonly Dictionary<string, Entry> _live = new(32);
 
-	/// <summary>Ресурсы прошлых компиляций, ещё не востребованные текущей. Именно они делают
-	/// пересборку графа дешёвой: тумблер фичи или смена сцены пересобирают СПИСОК пассов, но не
-	/// пересоздают ни текстур, ни вьюх - пин с тем же именем и тем же дескриптором забирает
-	/// готовый ресурс отсюда. Пин с тем же именем, но ДРУГИМ дескриптором (ресайз вьюпорта, смена
-	/// формата) освобождает старый и создаёт новый, поэтому пул не растёт от ресайзов.</summary>
+	// Resources from earlier compilations, keyed by pin name: a pin with a matching descriptor
+	// reclaims one instead of recreating it; a mismatching descriptor frees it, so no growth.
 	private readonly Dictionary<string, Entry> _pool = new(32);
 
-	/// <summary>Entry для каждого элемента <see cref="RenderTargetsDesc"/> - заполняется в
-	/// <see cref="Allocate"/> параллельно с <see cref="RenderTargets"/>.</summary>
 	private Entry[] _entries = [];
 
 #if DEBUG
 	private readonly Func<TDesc, ulong> getTargetDescSizeInBytes;
 	private readonly Dictionary<string, int> _firstUsage = new(32);
-	// Separate from _lastUsage: PostSetup() clears _lastUsage right after SetupPass finishes (before
-	// Compile() even returns), so by the time the debug window reads it in Execute() it's always
-	// empty and every resource's LastPassIndex silently defaults to 0. This copy is only ever
-	// cleared in Clean(), so it survives until ExportLifetimes() actually needs it.
+	// Separate from _lastUsage, which PostSetup() clears before ExportLifetimes() can read it.
 	private readonly Dictionary<string, int> _debugLastUsage = new(32);
 #endif
 
@@ -125,23 +111,19 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 #endif
 	}
 
-	/// <param name="recycle">true - нативные ресурсы уходят в пул и переживут пересборку графа
-	/// (см. <see cref="_pool"/>); false - освобождаются вместе с пулом (полный снос графа).
-	/// Вызывающий обязан гарантировать, что кадры со старыми ресурсами уже не в полёте.</param>
+	/// <summary>Releases the compilation; caller must ensure no frame using these resources is in flight.</summary>
 	public void Clean(bool recycle = false)
 	{
 		foreach (var entry in _live.Values)
 		{
 			if (!entry.Owned)
 			{
-				// Объявленный внешний ресурс - не наш: ни в пул, ни на освобождение.
 				continue;
 			}
 
 			if (recycle)
 			{
-				// Имя уникально в пределах компиляции (PinTexture дедуплицирует), так что затирания
-				// живого пулового ресурса здесь быть не может.
+				// Names are unique within a compilation (PinTexture dedups), so no pool entry is lost.
 				_pool[getTargetDescName(entry.Desc)] = entry;
 			}
 			else
@@ -185,8 +167,7 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 #endif
 	}
 
-	/// <summary>Освобождает всё, что лежит в пуле и не востребовано текущей компиляцией - точка, где
-	/// реально возвращается VRAM выключенных фич. Живые ресурсы не трогает.</summary>
+	/// <summary>Frees pooled resources not claimed by the current compilation; live ones are kept.</summary>
 	public void TrimPool()
 	{
 		foreach (var entry in _pool.Values)
@@ -313,11 +294,7 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 		return depends;
 	}
 
-	/// <summary>
-	/// Returns the native resource (texture/buffer) allocated for the pinned resource named <paramref name="name"/>.
-	/// Must be called after <see cref="Allocate"/> has run for the pass that owns it (i.e. from within a
-	/// pass's Execute), otherwise the resource may not have been created yet.
-	/// </summary>
+	/// <summary>Native resource for a pinned name; only valid from within a pass's Execute.</summary>
 	public T GetTarget(string name)
 	{
 		var index = RenderTargetsDesc.FindIndex(desc => getTargetDescName(desc) == name);
@@ -367,8 +344,6 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 		}
 	}
 
-	/// <summary>Ресурс под дескриптор: из пула, если там лежит одноимённый и СОВМЕСТИМЫЙ (иначе
-	/// пуловый освобождается - см. <see cref="_pool"/>), иначе создаётся заново.</summary>
 	private Entry AcquireEntry(TDesc desc)
 	{
 		var name = getTargetDescName(desc);
@@ -401,14 +376,12 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 		return entry;
 	}
 
-	/// <summary>Вьюха на ресурс: переиспользуется, пока жив сам ресурс, - иначе каждая пересборка
-	/// графа создавала бы RTV/DSV/SRV заново поверх тех же текстур.</summary>
+	// Views are cached per resource; otherwise every recompile would recreate RTV/DSV/SRVs.
 	private TView AcquireView(Entry entry, TViewDesc viewDesc)
 	{
 		if (!entry.Owned)
 		{
-			// Внешний ресурс объявлен графу только ради зависимостей: свои вьюхи ему делает владелец,
-			// а угадывать по формату, какая нужна графу, значило бы создавать заведомо лишние.
+			// External resources are declared for dependencies only; their owner makes the views.
 			return null;
 		}
 
@@ -427,8 +400,7 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 
 	public void Release(int pass)
 	{
-		// Frozen command buffers keep native resource views alive between frames.
-		// Resources are released together by Clean() when the graph is recompiled.
+		// Frozen command buffers hold the views across frames; Clean() releases them on recompile.
 	}
 
 #if DEBUG
@@ -460,11 +432,10 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 		return result;
 	}
 
-	/// <summary>Debug-only: сколько нативных ресурсов сейчас лежит в пуле (выключенные фичи, старые
-	/// размеры до <see cref="TrimPool"/>) - показывается в окне отладки графа.</summary>
+	/// <summary>Debug-only: number of native resources currently held in the pool.</summary>
 	public int PooledCount => _pool.Count;
 
-	/// <summary>Debug-only: суммарный вес пула - см. <see cref="PooledCount"/>.</summary>
+	/// <summary>Debug-only: total size of the pooled resources.</summary>
 	public ulong PooledSizeInBytes
 	{
 		get
@@ -479,11 +450,7 @@ public class RenderGraphNode<TView, TViewDesc, TDesc, T>
 		}
 	}
 
-	/// <summary>
-	/// Debug-only export of resource lifetime/allocation info for every pinned resource in this
-	/// container. Must be called after <see cref="SetupPass"/> has run for all passes (i.e. after
-	/// <see cref="DecaEngine.Graphics.Diligent.DiligentRenderGraph.Compile"/>).
-	/// </summary>
+	/// <summary>Debug-only lifetime info; valid only after SetupPass has run for every pass.</summary>
 	public IEnumerable<DecaEngine.Graphics.ResourceDebugInfo> ExportLifetimes(bool isBuffer)
 	{
 		foreach (var desc in RenderTargetsDesc)

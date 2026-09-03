@@ -15,31 +15,25 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>SSR превью: собственная RT-сцена лучей и текстуры хитов. Часть <see cref="ModelPreviewViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Preview SSR: its own ray-tracing scene and hit textures.</summary>
 	public partial class ModelPreviewViewport
 	{
-		/// <summary>Зеркало PrefabSceneViewport.SsrRayTracedEnabled: RT-фолбэку нужен ЛЮБОЙ живой
-		/// accel - проб (предпочтителен) или собственный (см. EnsureSsrOwnRayScene).</summary>
+		// The RT fallback needs ANY live accel: the probe one (preferred) or its own.
 		private bool SsrRayTracedEnabled() =>
 			_editorSettings.SsrRayTraced &&
 			_graphicsApi.RayTracing >= RayTracingSupport.Inline &&
 			(_probeAccel != null || _ssrOwnAccel != null);
 
-		// Собственный accel SSR превью - RT-фолбэк отражений без probe GI (зеркало
-		// PrefabSceneViewport._ssrOwnAccel, но проще: модель одна и статичная).
+		// Preview's own accel: RT reflection fallback when probe GI is off.
 		private ProbeSceneAccel? _ssrOwnAccel;
 		private ModelLoader? _ssrOwnBuiltFor;
 		private float _ssrOwnRetryDelay;
 
-		// Наборы текстур RT-хитов (текстурное альбедо отражений) - по одному на accel, живут
-		// вместе с ним (зеркало PrefabSceneViewport).
+		// One hit-texture set per accel, living as long as it does.
 		private SsrHitTextures? _probeAccelHitTextures;
 		private SsrHitTextures? _ssrOwnHitTextures;
 
-		/// <summary>Покадровый привод собственного accel-а SSR: хуки на события загрузки ловили не
-		/// все пути (кук-кеш, смена суб-меша), и статус «accel не собран» висел вечно. Опрос дешёвый
-		/// (сравнение ссылок), сборка - с дебаунсом; смена доступности accel-а перечитывает фичи.</summary>
+		// Polled rather than hooked to load events: the hooks missed the cook-cache and sub-mesh paths.
 		private void PollSsrOwnRayScene(float deltaTime)
 		{
 			_ssrOwnRetryDelay -= deltaTime;
@@ -57,7 +51,7 @@ namespace DecaEngine.Editor
 				ApplyPipelineFeatures();
 			}
 
-			// Стриминг дорастил текстуру - bindless-привязка указывает на старую, перепушиваем.
+			// Streaming grew a texture: the bindless binding still points at the old one.
 			if (_ssrOwnHitTextures?.RefreshStreams() == true ||
 				_probeAccelHitTextures?.RefreshStreams() == true)
 			{
@@ -65,9 +59,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Собирает/освобождает собственный accel SSR под текущую модель. Зовётся из
-		/// ApplyPipelineFeatures ДО SetFeatures (предикат RT смотрит на accel) и после загрузки
-		/// модели.</summary>
+		// Must be called BEFORE SetFeatures: the RT feature predicate reads the accel.
 		private void EnsureSsrOwnRayScene()
 		{
 			bool wanted = _editorSettings.PreviewSsr && _editorSettings.SsrRayTraced
@@ -104,15 +96,14 @@ namespace DecaEngine.Editor
 				var geometry = new ProbeGiBaker(_residentModel!).InstancedGeometry;
 				if (geometry.Instances.Length == 0)
 				{
-					// Геометрии нет (CPU-копии мешей недоступны/модель пустая) - тихий пропуск,
-					// а не исключение каждые 0.3 с.
+					// No geometry: skip quietly instead of throwing every 0.3 s.
 					return;
 				}
 
 				_ssrOwnAccel = new ProbeSceneAccel(_env.DilApi, geometry);
 				_ssrOwnBuiltFor = _residentModel;
 
-				// Набор текстур хитов сшит с индексами ЭТОЙ геометрии.
+				// The hit-texture set is indexed against THIS geometry.
 				_ssrOwnHitTextures?.Dispose();
 				_ssrOwnHitTextures = SsrHitTextures.Build(_graphicsApi, geometry,
 					new[] { _residentModel! });
@@ -120,17 +111,16 @@ namespace DecaEngine.Editor
 			catch (Exception ex)
 			{
 				EngineLog.Add(LogLevel.Warning,
-					$"SSR: собственный accel модели не собрался: {ex.Message}");
+					$"SSR: the model's own accel failed to build: {ex.Message}");
 				_ssrOwnAccel?.Dispose();
 				_ssrOwnAccel = null;
 				_ssrOwnBuiltFor = null;
 
-				// Бэкофф: причина (нет CPU-копий и т.п.) не исчезнет через кадр - не молотим.
+				// Back off: the cause will not disappear within a frame.
 				_ssrOwnRetryDelay = 5f;
 			}
 		}
 
-		/// <summary>Зеркало PrefabSceneViewport.UpdateSsrRayScene.</summary>
 		private void UpdateSsrRayScene()
 		{
 			var accel = _probeAccel ?? _ssrOwnAccel;
@@ -142,8 +132,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Зеркало PrefabSceneViewport.PushSsrHitTextures: набор ТОГО accel-а, что ушёл в
-		/// SetRayScene.</summary>
+		// Pushes the hit-texture set of the accel that was handed to SetRayScene.
 		private void PushSsrHitTextures()
 		{
 			var ssr = _env.Pipeline.SsrResources;

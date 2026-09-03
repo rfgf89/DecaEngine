@@ -3,84 +3,40 @@ using Friflo.Engine.ECS;
 
 namespace DecaEngine.Scene
 {
-	/// <summary>
-	/// Spins the entity continuously around <see cref="Axis"/> while Play Mode is running (see
-	/// <see cref="InspectorWindow.Play"/>/<see cref="InspectorWindow.Stop"/> and <see cref="RotateSystem"/>).
-	/// First test component for the Play Mode pipeline - purely a data component, driven by
-	/// <see cref="RotateSystem"/> only while playing; edits made to <see cref="Rotation"/> while
-	/// playing are reverted on Stop like every other component.
-	/// </summary>
+	/// <summary>Spins the entity around <see cref="Axis"/> while Play Mode is running.</summary>
 	public struct RotateComponent : IComponent
 	{
 		public Vector3 Axis;
 		public float DegreesPerSecond;
 	}
 
-	/// <summary>
-	/// Движение сущности по окружности в плоскости XZ - первый «геймплейный» скрипт демо-сцены (см.
-	/// <see cref="CircleMoveSystem"/>, работает только в Play Mode).
-	///
-	/// Это ПОВЕДЕНИЕ, и только оно. Чем персонаж является физически - капсулой с массой или ничем -
-	/// решает ОТДЕЛЬНЫЙ компонент <see cref="CharacterBodyComponent"/>, ровно как Rigidbody отделён
-	/// от скрипта в любом движке. Есть тело - скрипт задаёт ему скорость, и персонаж упирается в
-	/// стены; нет тела - скрипт пишет позицию напрямую, и персонаж проходит сквозь них.
-	///
-	/// Скорость задана в единицах ДЛИНЫ в секунду, а не в градусах: у угловой скорости при смене
-	/// радиуса молча меняется скорость шага, и связать её с анимационным клипом (шаг в секунду -
-	/// величина линейная) было бы нечем. Знак задаёт направление обхода.
-	///
-	/// <see cref="Angle"/> - это СОСТОЯНИЕ, живущее прямо в компоненте, а не выведенное из текущей
-	/// позиции. Вывод из позиции ломается ровно там, где положение сущности правит кто-то ещё (гизмо,
-	/// физика, второй скрипт): персонаж не «продолжил бы круг», а прыгнул бы на ближайшую его точку.
-	/// Play Mode откатывает поле вместе со всеми остальными (см. <see cref="InspectorWindow.Stop"/>).
-	///
-	/// <see cref="Center"/> - в том же пространстве, что и <see cref="Friflo.Engine.ECS.Position"/>,
-	/// то есть в РОДИТЕЛЬСКОМ, а не в мировом: иначе у сущности внутри сдвинутого поддерева круг
-	/// уезжал бы относительно неё самой.
-	/// </summary>
+	/// <summary>Moves the entity around a circle in the XZ plane during Play Mode.</summary>
+	/// <remarks>Behaviour only; physical shape lives in <see cref="CharacterBodyComponent"/>.</remarks>
 	public struct CircleMoveComponent : IComponent
 	{
 		public bool Enabled;
 
-		/// <summary>Центр окружности. Высота берётся отсюда же: движение плоское.</summary>
+		/// <summary>Circle centre, in parent space like <see cref="Friflo.Engine.ECS.Position"/>.</summary>
 		public Vector3 Center;
 
 		public float Radius;
 
-		/// <summary>Единиц в секунду вдоль окружности. Знак - направление обхода.</summary>
+		/// <summary>Units per second along the circle; the sign picks the direction.</summary>
 		public float Speed;
 
-		/// <summary>Текущая фаза, радианы. Отсчёт от +X в сторону +Z.</summary>
+		/// <summary>Current phase in radians, measured from +X towards +Z.</summary>
 		public float Angle;
 
-		/// <summary>Разворачивать ли сущность по касательной.</summary>
 		public bool FaceMotion;
 
-		/// <summary>Предел скорости доворота, градусы/с. Ноль - мгновенно (старые сцены приезжают с
-		/// нулём - прежнее поведение): без предела смена направления разворачивает персонажа за один
-		/// кадр, что читается как телепорт корпуса.</summary>
+		/// <summary>Turn rate cap in degrees/s. Zero means instant (legacy scenes).</summary>
 		public float TurnSpeed;
 
-		/// <summary>
-		/// Куда смотрит САМА МОДЕЛЬ в своём пространстве. По умолчанию +Z - договорённость движка
-		/// (направление света выводится из поворота ровно так же, см. CullingAndRenderSystem), но
-		/// модель ей не обязана: у Khronos Fox морда смотрит в -Z, и та же самая формула разворота
-		/// даёт лису, идущую задом наперёд по совершенно правильному кругу.
-		///
-		/// Поле здесь, а не разворот на 180° в сцене, потому что систему разворота нельзя обойти
-		/// авторским поворотом: она перезаписывает <see cref="Friflo.Engine.ECS.Rotation"/> целиком
-		/// каждый кадр, и «повёрнутая на месте» сущность вернулась бы в исходное на первом же кадре
-		/// Play. Тот же приём, что у <see cref="LookAtComponent.Forward"/>.
-		///
-		/// Учитывается только горизонтальная составляющая: движение плоское, и вертикальный «вперёд»
-		/// (модель, смотрящая в потолок) вырождается в отсутствие доворота, а не в NaN.
-		/// </summary>
+		/// <summary>Model-space forward axis; engine convention is +Z, but Khronos Fox faces -Z.
+		/// Only the horizontal component is used, so a vertical forward yields no turn, not NaN.</summary>
 		public Vector3 Forward;
 
-		/// <summary>Редактор создаёт компоненты через <c>new T()</c>, поэтому дефолты - здесь, а не в
-		/// инициализаторах у вызывающего: при <c>default(T)</c> радиус и скорость были бы нулевыми, и
-		/// свежедобавленный компонент выглядел бы сломанным (та же причина, что у
-		/// <see cref="Animator"/> и прочих, см. AnimationComponents.cs).</summary>
+		// The editor creates components via new T(), so defaults live here, not at call sites.
 		public CircleMoveComponent()
 		{
 			Enabled = true;
@@ -93,40 +49,28 @@ namespace DecaEngine.Scene
 		}
 	}
 
-	/// <summary>
-	/// Персонаж под управлением ИГРОКА: WASD/стрелки в Play двигают его капсулу, Shift - бег.
-	///
-	/// Компонент - только НАСТРОЙКИ. Сам ввод в него не пишется: ввод - это состояние кадра, а не
-	/// сущности, он живёт в <see cref="PlayerInput"/> и передаётся приводу вьюпортом (в пробнике -
-	/// руками, поэтому управление проверяется headless). Направление приходит уже В МИРЕ,
-	/// относительно камеры: «W - от камеры» знает только тот, у кого есть камера.
-	///
-	/// Требует <see cref="CharacterBodyComponent"/>: игрок управляет именно телом, и персонаж без
-	/// тела на ввод не отвечает (ровно как скрипт круга без тела не упирается в стены).
-	/// </summary>
+	/// <summary>Player-driven character: WASD/arrows move the capsule in Play, Shift runs.</summary>
+	/// <remarks>Settings only; per-frame input lives in <see cref="PlayerInput"/>. Requires
+	/// <see cref="CharacterBodyComponent"/>.</remarks>
 	public struct PlayerMoveComponent : IComponent
 	{
 		public bool Enabled;
 
-		/// <summary>Скорость без Shift, м/с.</summary>
+		/// <summary>Speed without Shift, m/s.</summary>
 		public float WalkSpeed;
 
-		/// <summary>Скорость с Shift, м/с.</summary>
+		/// <summary>Speed with Shift, m/s.</summary>
 		public float RunSpeed;
 
-		/// <summary>Разворачивать ли сущность по направлению движения.</summary>
 		public bool FaceMotion;
 
-		/// <summary>Куда смотрит сама модель в своём пространстве - см.
-		/// <see cref="CircleMoveComponent.Forward"/>, причина та же (у Khronos Fox морда в -Z).</summary>
+		/// <summary>Model-space forward axis - see <see cref="CircleMoveComponent.Forward"/>.</summary>
 		public Vector3 Forward;
 
-		/// <summary>Вертикальная скорость прыжка (Space), м/с. Ноль - прыжок выключен; старые сцены
-		/// приезжают с нулём, то есть с прежним поведением.</summary>
+		/// <summary>Jump velocity, m/s. Zero disables jumping (legacy scenes).</summary>
 		public float JumpSpeed;
 
-		/// <summary>Предел скорости доворота, градусы/с - см. <see cref="CircleMoveComponent.TurnSpeed"/>.
-		/// Ноль (старые сцены) - мгновенно, прежнее поведение.</summary>
+		/// <summary>Turn rate cap in degrees/s. Zero means instant (legacy scenes).</summary>
 		public float TurnSpeed;
 
 		public PlayerMoveComponent()
@@ -141,99 +85,61 @@ namespace DecaEngine.Scene
 		}
 	}
 
-	/// <summary>
-	/// Ввод игрока на ОДИН КАДР - то, что вьюпорт собрал с клавиатуры и перевёл в мир. Отдельная
-	/// структура, а не поля компонента: ввод общий для всех управляемых сущностей и не должен
-	/// попадать ни в сериализацию сцены, ни в снимок Play Mode.
-	/// </summary>
+	/// <summary>One frame of player input, already converted to world space by the viewport.</summary>
+	/// <remarks>Deliberately not a component: it must not reach scene serialization or Play snapshots.</remarks>
 	public struct PlayerInput
 	{
-		/// <summary>Направление движения В МИРЕ, плоскость XZ. Ноль - стоять.</summary>
+		/// <summary>World-space move direction in the XZ plane; zero means stand still.</summary>
 		public Vector3 MoveWorld;
 
-		/// <summary>Бег (Shift).</summary>
 		public bool Run;
 
-		/// <summary>Прыжок - ФРОНТ клавиши (нажатие, не удержание): зажатый Space не должен
-		/// превращаться в автоскок на каждом приземлении.</summary>
+		/// <summary>Jump key edge, not hold: a held Space must not autohop on every landing.</summary>
 		public bool Jump;
 	}
 
-	/// <summary>Что персонаж делает прямо сейчас (см. <see cref="FallRecoverComponent"/>).</summary>
+	/// <summary>What the character is doing right now.</summary>
 	public enum CharacterMotionState
 	{
-		/// <summary>Идёт по своему маршруту, поза от анимации.</summary>
+		/// <summary>Following its route, pose driven by animation.</summary>
 		Moving,
 
-		/// <summary>Падает: поза от физики, тело скрипта снято.</summary>
+		/// <summary>Falling: pose driven by physics, script body detached.</summary>
 		Falling,
 
-		/// <summary>Встаёт: поза переходит от лежачей к анимационной.</summary>
+		/// <summary>Getting up: pose blends from the lying snapshot back to animation.</summary>
 		Recovering,
 	}
 
-	/// <summary>
-	/// Падение и подъём: персонаж роняется рэгдоллом, дожидается покоя, встаёт и продолжает путь.
-	///
-	/// Отдельным компонентом от <see cref="CircleMoveComponent"/> по той же причине, по которой от
-	/// него отделено тело: «как персонаж ходит» и «что с ним происходит» - разные вопросы. Падать и
-	/// вставать одинаково умеет и ходящий по кругу, и любой другой скрипт движения.
-	///
-	/// Требует <see cref="RagdollComponent"/> (нечем падать) и <see cref="CharacterBodyComponent"/>
-	/// (нечем ходить) - без любого из них компонент ничего не делает.
-	///
-	/// ПОДЪЁМА КАК АНИМАЦИИ ЗДЕСЬ НЕТ, и это осознанно: у произвольной модели клипа «встать» не
-	/// существует (у Khronos Fox их три - Survey, Walk, Run). Подъём сделан ПЕРЕХОДОМ позы: от той,
-	/// в которой персонаж лежит, к первому кадру его обычного клипа. На четвероногом это читается
-	/// естественно; двуногому, лежащему навзничь, понадобится настоящий клип, и тогда это поле
-	/// станет его именем.
-	/// </summary>
+	/// <summary>Drops the character as a ragdoll, waits for it to settle, then gets it back up.</summary>
+	/// <remarks>Requires <see cref="RagdollComponent"/> and <see cref="CharacterBodyComponent"/>.</remarks>
 	public struct FallRecoverComponent : IComponent
 	{
-		/// <summary>Через сколько секунд движения персонаж падает. Ноль - не падать по времени
-		/// (падение тогда наступает только внешним толчком).</summary>
+		/// <summary>Seconds of motion before falling. Zero disables timed falls.</summary>
 		public float FallEvery;
 
-		/// <summary>
-		/// Сколько секунд лежать, ПРЕЖДЕ ЧЕМ вообще спрашивать про покой.
-		///
-		/// Не косметика. Тела рэгдолла заводятся по позе анимации с НУЛЕВОЙ скоростью, то есть в
-		/// первом же кадре после падения они формально «уже успокоились» - и персонаж встаёт, не
-		/// успев упасть (замерено: падение и подъём в одном кадре, t=6.0 → t=6.0). Порог по времени
-		/// проще и предсказуемее, чем «сначала дождись, пока разгонится»: у падения с малой высоты
-		/// скорость может и не превысить порог покоя ни разу.
-		/// </summary>
+		/// <summary>Seconds to lie down before the settle check runs at all. Ragdoll bodies start
+		/// from the animated pose at zero velocity, so they read as settled on the first frame.</summary>
 		public float MinFallTime;
 
-		/// <summary>Сколько секунд ждать покоя, прежде чем вставать в любом случае. Потолок, а не
-		/// длительность: обычно покой наступает раньше, но рэгдолл, зацепившийся за геометрию, может
-		/// подрагивать бесконечно, и без потолка персонаж не встал бы никогда.</summary>
+		/// <summary>Ceiling on the settle wait: a snagged ragdoll can jitter forever.</summary>
 		public float SettleTimeout;
 
-		/// <summary>Порог покоя - скорость кости в ДОЛЯХ характерного размера скелета в секунду.
-		/// Доля, а не абсолют: у лисы габарит 160 единиц модели, у метрового персонажа 1.8, и любое
-		/// абсолютное число осмысленно ровно для одного из них.</summary>
+		/// <summary>Settle threshold as bone speed in fractions of skeleton size per second, since
+		/// any absolute number only suits one model scale.</summary>
 		public float SettleSpeed;
 
-		/// <summary>Длительность перехода позы при подъёме, секунды. Без клипов подъёма - весь
-		/// процедурный морф целиком; с клипами - окно вливания лежачего снимка в НАЧАЛЬНУЮ позу
-		/// клипа (как быстро лежащий перетекает в сидячую стартовую позу; клампится половиной
-		/// длительности клипа).</summary>
+		/// <summary>Get-up pose blend duration in seconds; clamped to half the clip length.</summary>
 		public float GetUpDuration;
 
-		/// <summary>Авторские клипы подъёма: со спины и с живота. Выбор - по фактической позе лёжки
-		/// (куда смотрит спина таза); заданный лишь один используется для обеих. Пусто - морф.
-		/// Клип ведёт позу ЦЕЛИКОМ на всю свою длительность, снимок лёжки вливается коротким окном
-		/// в его начало.</summary>
+		/// <summary>Authored get-up clips, picked by actual lying pose; empty means procedural morph.</summary>
 		public string GetUpBackClip;
 		public string GetUpBellyClip;
 
-		/// <summary>Текущее состояние - РАНТАЙМ, а не настройка. Живёт в компоненте, чтобы Play Mode
-		/// откатывал его вместе со всем остальным и чтобы состояние было видно в инспекторе: «почему
-		/// персонаж лежит» - первый вопрос, который к этому компоненту задают.</summary>
+		/// <summary>Runtime state; kept in the component so Play Mode reverts it and the inspector shows it.</summary>
 		public CharacterMotionState State;
 
-		/// <summary>Сколько секунд персонаж в текущем состоянии.</summary>
+		/// <summary>Seconds spent in the current state.</summary>
 		public float StateTime;
 
 		public FallRecoverComponent()
@@ -250,53 +156,36 @@ namespace DecaEngine.Scene
 		}
 	}
 
-	/// <summary>
-	/// Физическое тело персонажа: капсула в мире сцены, горизонтальную скорость которой задаёт
-	/// скрипт (см. <see cref="CircleMoveComponent"/> и CharacterMotionDriver).
-	///
-	/// Отдельный компонент, а не флаг внутри скрипта, - и это не косметика. «Чем персонаж является»
-	/// и «как он себя ведёт» - разные вопросы с разными ответами: тело у персонажа одно, а скриптов
-	/// на нём может быть сколько угодно, и каждый из них не должен носить с собой копию его габарита.
-	/// Ровно так же разделены Rigidbody и скрипт в любом движке. САМО ПРИСУТСТВИЕ компонента и
-	/// означает «этот персонаж физический» - отдельного тумблера нет, потому что компонент, который
-	/// добавили и выключили, ничем не отличается от компонента, которого нет.
-	///
-	/// Тело ведут СКОРОСТЬЮ, а не позой: заданная поза - это телепорт, между кадрами персонаж
-	/// оказывается по другую сторону ступени, и решатель контактов не участвует вовсе.
-	///
-	/// Габарита в скрипте больше нет намеренно: он свойство персонажа, а не круга, по которому тот
-	/// ходит.
-	/// </summary>
+	/// <summary>Physical body of a character: a scene-space capsule whose horizontal velocity is
+	/// set by a motion script. Presence of this component is what makes a character physical.</summary>
+	/// <remarks>Driven by velocity, not by pose: setting a pose teleports past the contact solver.</remarks>
 	public struct CharacterBodyComponent : IComponent
 	{
-		/// <summary>Радиус капсулы, МЕТРЫ (мировые единицы сцены, а не единицы модели, как у
-		/// <see cref="RagdollComponent.BoneRadius"/>: тот выводится из костей и потому живёт в их
-		/// масштабе, а этот задаётся под габарит персонажа целиком).</summary>
+		/// <summary>Capsule radius in METRES (world units, unlike <see cref="RagdollComponent.BoneRadius"/>).</summary>
 		public float Radius;
 
-		/// <summary>Полная высота вместе с полусферами, МЕТРЫ. Меньше двух радиусов вырождается в
-		/// сферу - это допустимо и означает именно её.</summary>
+		/// <summary>Total height including the caps, metres. Below two radii it degenerates to a sphere.</summary>
 		public float Height;
 
-		/// <summary>Масса, кг. На собственное движение не влияет (скорость задаётся напрямую), но
-		/// определяет, что случится при столкновении с другими телами.</summary>
+		/// <summary>Mass in kg. Does not affect self-motion, only collisions with other bodies.</summary>
 		public float Mass;
 
-		/// <summary>Максимальная высота ступени, МЕТРЫ. Капсула сама по себе ступени не берёт
-		/// (вертикальная стенка глушит горизонтальную скорость), поэтому препятствие ниже этого
-		/// порога преодолевается вертикальным подскоком (см. CharacterMotionDriver.ApplyStepUp).
-		/// Ноль - step-up выключен; старые сцены приезжают с нулём, то есть с прежним поведением.</summary>
+		/// <summary>Max step height in metres; obstacles below it are cleared by a vertical hop.
+		/// Zero disables step-up (legacy scenes).</summary>
 		public float StepHeight;
 
-		/// <summary>Габарит по умолчанию - человеческий персонаж (0.3 м в поперечнике, 1.8 м ростом):
-		/// под него подойдёт большинство сцен. Дефолты в конструкторе по той же причине, что и у
-		/// остальных компонентов: при <c>default(T)</c> капсула была бы нулевой.</summary>
+		/// <summary>Length of the capsule's cylindrical part, metres. Zero means a vertical capsule
+		/// sized by <see cref="Height"/>; above zero the capsule lies HORIZONTAL along the facing
+		/// direction with height of two radii, which is what quadrupeds need.</summary>
+		public float Length;
+
 		public CharacterBodyComponent()
 		{
 			Radius = 0.3f;
 			Height = 1.8f;
 			Mass = 70f;
 			StepHeight = 0.25f;
+			Length = 0f;
 		}
 	}
 }

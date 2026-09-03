@@ -33,8 +33,7 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 			);
 	}
 
-	// Совместимость дескрипторов для пула ресурсов графа (см. RenderGraphNode): сравниваются ровно те
-	// поля, которые заполняет PinTexture/PinBuffer, - остальные остаются дефолтными у обеих сторон.
+	// Pool compatibility: compares exactly the fields PinTexture/PinBuffer fill in, no others.
 	private static bool TextureDescEquals(TextureDesc a, TextureDesc b)
 	{
 		return a.Name == b.Name &&
@@ -82,8 +81,7 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 #if DEBUG
 	private static ulong GetTextureDescSizeInBytes(TextureDesc desc)
 	{
-		// Rough VRAM footprint estimate: width * height * depth/array * approx bytes-per-pixel * mip count.
-		// Good enough for debug display purposes, not meant to be byte-exact.
+		// Rough VRAM estimate for debug display only, not byte-exact.
 		var bpp = DiligentResourceFormats.GetApproxBytesPerPixel(desc.Format);
 		ulong texels = (ulong)desc.Width * desc.Height * Math.Max(1u, desc.ArraySizeOrDepth);
 		return texels * (ulong)bpp * Math.Max(1u, desc.MipLevels);
@@ -125,9 +123,7 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		return arg.Name;
 	}
 
-	/// <param name="recycle">true - нативные текстуры/буферы уходят в пул и переживают пересборку
-	/// графа (см. <see cref="RenderGraphNode{TView,TViewDesc,TDesc,T}"/>), false - освобождаются
-	/// вместе с пулом.</param>
+	/// <summary>Tears down the graph; recycle keeps native resources pooled across a rebuild.</summary>
 	public void Clean(bool recycle = false)
 	{
 		renderContainer.Clean(recycle);
@@ -136,7 +132,7 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		_bufferInfos.Clear();
 	}
 
-	/// <summary>Освобождает пул - см. <see cref="IRenderGraph.TrimResourcePool"/>.</summary>
+	/// <summary>Releases the recycled resource pool.</summary>
 	public void TrimPool()
 	{
 		renderContainer.TrimPool();
@@ -239,10 +235,8 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 	{
 		var (dilFormat, bindFlags) = DiligentResourceFormats.ToRenderTargetFormat(info.format);
 
-		// Unlike a persistent IRenderTarget, the graph only knows whether a color target will be
-		// sampled *after* every pass has been set up (see PostSetup), so ShaderResource is added
-		// lazily for color formats. Depth formats always keep it since they are commonly sampled
-		// for shadow mapping etc. and DepthStencil-only textures are otherwise rare in this engine.
+		// Color targets only learn they are sampled in PostSetup, so ShaderResource is added there;
+		// depth keeps it up front because depth is almost always sampled.
 		if ((bindFlags & BindFlags.DepthStencil) == 0)
 		{
 			bindFlags &= ~BindFlags.ShaderResource;
@@ -284,7 +278,6 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		return new TextureResource(info.name, -1);
 	}
 
-	/// <summary>См. <see cref="IRenderGraphBuilder.ImportTexture"/>.</summary>
 	public TextureResource ImportTexture(IGpuTexture texture)
 	{
 		var info = texture.Info;
@@ -303,8 +296,7 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 				$"Texture '{name}' has an unexpected implementation ({texture.GetType().Name}) and cannot be imported into the render graph."),
 		};
 
-		// Дескриптор строится из ФАКТИЧЕСКОГО ресурса, а не из TextureInfo: важны только те поля, по
-		// которым дальше принимаются решения (RTV против DSV в WriteTarget и вес в отладке).
+		// Desc comes from the actual resource, not TextureInfo: WriteTarget picks RTV vs DSV from it.
 		var desc = native.GetDesc();
 
 		renderContainer.RenderTargetsDesc.Add(desc);
@@ -373,19 +365,12 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 		bufferContainer.Release(pass);
 	}
 
-	/// <summary>
-	/// Returns the native texture allocated for a pinned resource, so it can be wrapped as an
-	/// <see cref="IGpuTexture"/> (see <see cref="DiligentRenderGraphContext.GetTexture"/>) and bound
-	/// into materials/command buffer calls the same way any other engine texture is.
-	/// Must be called after <see cref="Allocate"/> ran for the owning pass (i.e. from a pass's Execute).
-	/// </summary>
+	/// <summary>Native texture of a pinned resource; valid only after <see cref="Allocate"/> ran for
+	/// the owning pass.</summary>
 	public ITexture GetTexture(GraphId id) => renderContainer.GetTarget(id.name);
 
-	/// <summary>
-	/// Returns the native buffer allocated for a pinned resource, so it can be wrapped as an
-	/// <see cref="IBufferHandle"/> (see <see cref="DiligentRenderGraphContext.GetBuffer"/>).
-	/// Must be called after <see cref="Allocate"/> ran for the owning pass (i.e. from a pass's Execute).
-	/// </summary>
+	/// <summary>Native buffer of a pinned resource; valid only after <see cref="Allocate"/> ran for
+	/// the owning pass.</summary>
 	public IBuffer GetBuffer(GraphId id) => bufferContainer.GetTarget(id.name);
 
 	public TextureInfo GetTextureInfo(GraphId id)
@@ -429,10 +414,8 @@ public class DiligentRenderGraphBuilder : IRenderGraphBuilder
 	}
 
 #if DEBUG
-	/// <summary>
-	/// Debug-only export of resource lifetime info for every pinned texture and buffer.
-	/// Must be called after <see cref="PostSetup"/> and all <see cref="SetupPass"/> calls.
-	/// </summary>
+	/// <summary>Resource lifetimes; call after <see cref="PostSetup"/> and all
+	/// <see cref="SetupPass"/> calls.</summary>
 	public List<ResourceDebugInfo> ExportResourceDebugInfo()
 	{
 		var list = new List<ResourceDebugInfo>();

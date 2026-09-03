@@ -1,4 +1,2 @@
-// Главный пасс GTAO - см. GtaoCommon.hlsl. Пары обёрток под одиночный/мультисемпловый депт у
-// него больше нет: глубину он читает из префильтрованной цепочки, а MSAA заканчивается на её
-// первом звене (GtaoDepthPrefilterMsaaPS.hlsl).
+// GTAO main pass: depth comes from the prefiltered chain, so MSAA never reaches here.
 #include "GtaoCommon.hlsl"

@@ -1,55 +1,34 @@
-// Общее тело пасса объёмного света - god rays и объёмный туман (см. VolumetricPS.hlsl /
-// VolumetricMsaaPS.hlsl: обёртки определяют макрос DEPTH_FETCH под одиночный или мультисемпловый
-// депт, ровно как у Fog*/Ssgi*/Ssao*).
-//
-// Чем это отличается от FogPass, который уже есть. Тот считает воздушную перспективу АНАЛИТИЧЕСКИ:
-// один замкнутый интеграл на пиксель, солнечная подсветка - степень косинуса. Он ничего не знает о
-// геометрии и потому не умеет главного - ТЕНЕЙ В СРЕДЕ. А световые столбы (god rays) - это ровно
-// они: свет виден там, куда он дошёл, и не виден в тени колонны. Поэтому здесь марш вдоль луча с
-// выборкой каскадного shadow map в каждой точке - другого способа получить столбы, согласованные с
-// геометрией сцены, нет.
-//
-// Оба пасса живут одновременно и не мешают друг другу по построению: дальнюю дымку (потерю
-// контраста с расстоянием) дешевле и стабильнее делать аналитикой, а марш отвечает только за
-// РАССЕЯННЫЙ СВЕТ - то, что аналитика не берёт. Если включены оба, туман логично ставить мягче
-// (см. порядок в GraphicsPipelineSimple.SignalGraph: марш идёт ДО тумана, и дымка ложится и на
-// столбы тоже - как и должна, она ближе к камере).
-//
-// Как и туман, читает КОПИЮ кадра (_SceneTex) и пишет кадр целиком: PSO-абстракция движка
-// блендинг не описывает (см. GraphicsStateInfo), а читать и писать один таргет нельзя.
-//
-// Работает в ЛИНЕЙНОМ пространстве, до тонемапа: рассеянный средой свет складывается с остальным
-// светом кадра, а складывать свет можно только линейно.
+// Shared body of the volumetric light pass (god rays + volumetric fog). Wrappers
+// VolumetricPS/VolumetricMsaaPS define DEPTH_FETCH for single- vs multi-sampled depth.
+// Unlike FogPass (analytic aerial perspective), this pass ray-marches the sun cascade
+// shadow map to get shafts consistent with scene geometry. Runs BEFORE FogPass.
+// Reads a copy of the frame (_SceneTex) and rewrites it whole: the engine PSO
+// abstraction has no blend state, and a target cannot be read and written at once.
+// Operates in linear space, before tonemap.
 #include "Instancing.hlsl"
 
 Texture2D    _SceneTex;
 SamplerState _SceneTex_sampler;
 
-// 1x1 адаптированная яркость кадра (см. EyeAdaptationPS.hlsl) - та же, по которой делит тонемап.
-// В LDR-режиме адаптации нет, сюда привязан плейсхолдер и он НЕ ЧИТАЕТСЯ (см. volExposureRelative):
-// слот объявлен безусловно, а пустой дескриптор роняет валидацию Vulkan (VUID-08114).
+// 1x1 adapted luminance (EyeAdaptationPS). In LDR mode a placeholder is bound and NOT read
+// (see volExposureRelative); the slot must exist: an empty descriptor fails Vulkan VUID-08114.
 Texture2D    _AdaptTex;
 
-// Каскадный shadow map мирового света - тот же массив и тот же сэмплер, что у геометрии (см.
-// UnlitInstancedPS.SampleWorldLightShadow); привязывается через IBatchRenderer.BindShadowResources.
-// Обычный Z (clear 1.0 + Less при записи), сравнение LessEqual: SampleCmp возвращает 1 = освещено.
+// Sun cascade shadow map, same array/sampler as geometry (UnlitInstancedPS).
+// Standard Z (clear 1.0, Less on write), LessEqual compare: SampleCmp 1 = lit.
 Texture2DArray         ShadowMaps;
 SamplerComparisonState ShadowMaps_sampler;
 
-// Punctual-света и их тени: среда рассеивает и свет ламп (см. петлю в Main), иначе спот в дымке
-// «сухой» - геометрию освещает, а конуса в воздухе нет. Пул, матрицы и выбор грани куба зеркалят
-// UnlitInstancedPS (кластерная петля); привязка - BindShadowResources, который для фуллскрин-
-// пассов кладёт и карты, и оба буфера. Кластерная сетка здесь НЕ используется: она экранная
-// по фрустуму поверхностей, а точка марша ей не принадлежит - светов сегмента камеры единицы,
-// линейный проход дешевле ошибки адресации.
+// Punctual lights and their shadows; bound via BindShadowResources. The screen-space light
+// cluster grid is NOT used here: march points do not belong to the surface frustum clusters,
+// and a linear loop over the camera's light segment is cheaper than mis-addressing.
 StructuredBuffer<PunctualLight> PunctualLights;
 StructuredBuffer<float4> PunctualShadowMatrices;
 Texture2DArray         PunctualShadowMaps;
 SamplerComparisonState PunctualShadowMaps_sampler;
 
-// viewProj слайса как row-major матрица - зеркало UnlitInstancedPS.LoadPunctualShadowMatrix
-// (кбуферная передача матриц из структурного буфера транспонируется по-разному у бэкендов,
-// см. разбор там же).
+// Row-major matrix load, mirroring UnlitInstancedPS.LoadPunctualShadowMatrix (cbuffer matrix
+// transposition differs between backends).
 float4x4 LoadPunctualShadowMatrix(uint slice)
 {
     uint row = slice * 4;
@@ -62,106 +41,83 @@ cbuffer View
     ViewData viewData;
 }
 
-// Матрицы каскадов приходят ТЕМ ЖЕ кбуфером Light, что и геометрии. Он переписывается по нескольку
-// раз за кадр (ShadowPass льёт в него данные каждого каскада отдельно), но к моменту этого пасса в
-// нём лежит основной набор - его положил ForwardPass, а пасс идёт строго после него.
+// Cascade matrices arrive in the same Light cbuffer as geometry; ForwardPass fills it last
+// and this pass runs strictly after it.
 cbuffer Light
 {
     LightData lightData;
 }
 
-// Живые ручки объёмного света (окно Graphics -> VolumetricLightPassResources). Паддинг СКАЛЯРАМИ,
-// не float3: трёхкомпонентный вектор по невыровненному смещению SPIR-V отвергает целиком (см.
-// историю в SsaoCommon.hlsl). Зеркалит VolumetricConstantsData (VolumetricLightPass.cs).
+// Mirrors VolumetricConstantsData (VolumetricLightPass.cs). Padding uses SCALARS, not float3:
+// SPIR-V rejects a float3 at an unaligned offset (see SsaoCommon.hlsl).
 cbuffer VolumetricConstants
 {
-    // Плотность среды на опорной высоте, 1/единица_мира.
+    // Medium density at reference height, 1/world-unit.
     float volDensity;
-    // Скорость спада плотности по высоте, 1/единица_мира. 0 - однородная среда без высоты.
+    // Density falloff rate with height, 1/world-unit. 0 = uniform medium.
     float volHeightFalloff;
-    // Высота, на которой плотность равна volDensity.
+    // Height at which density equals volDensity.
     float volHeightRef;
-    // Дистанция, с которой начинается марш - у самой камеры среда даёт только шум.
+    // Distance at which the march starts; near the camera the medium is only noise.
     float volStartDistance;
 
-    // Предельная дальность марша. Прямо определяет ЦЕНУ пасса: шагов фиксированное число, и чем
-    // дальше конец, тем крупнее шаг и грубее столбы.
+    // Max march distance. Step count is fixed, so larger distance = coarser shafts.
     float volMaxDistance;
-    // Число шагов марша. Главная ручка «качество против цены».
+    // Number of march steps: the main quality/cost knob.
     float volSteps;
-    // Общий коэффициент рассеяния среды: во сколько раз плотность превращается в свет.
+    // Overall scattering coefficient.
     float volScatter;
-    // Анизотропия фазовой функции Хеньи-Гринштейна, -1..1. >0 - рассеяние ВПЕРЁД: столбы видны в
-    // основном при взгляде против солнца, как в реальной дымке. 0 - изотропная среда.
+    // Henyey-Greenstein anisotropy, -1..1; >0 = forward scattering.
     float volAnisotropy;
 
-    // Цвет солнечного рассеяния (линейный) и его сила - это и есть god rays.
+    // Sun scattering color (linear) and intensity: the god rays themselves.
     float volSunColorR, volSunColorG, volSunColorB;
     float volSunIntensity;
 
-    // Цвет и сила НЕБЕСНОГО рассеяния - свет, приходящий в среду отовсюду. Тени его не режут,
-    // поэтому именно он отвечает за «объёмный туман» в тени, а не за столбы. Без него среда в тени
-    // становится абсолютно чёрной, и столбы читаются как вырезанные ножницами.
+    // Sky (ambient) scattering; not cut by shadows, keeps shafts from reading as cutouts.
     float volAmbientColorR, volAmbientColorG, volAmbientColorB;
     float volAmbientIntensity;
 
-    // Направление НА солнце в мире (нормализовано на CPU).
+    // Direction TOWARD the sun in world space (normalized on CPU).
     float volSunDirX, volSunDirY, volSunDirZ;
-    // Насколько тень режет солнечное рассеяние: 1 - полностью (настоящие столбы), 0 - тень
-    // игнорируется. Ноль приходит и принудительно - когда теневого пасса в конвейере нет вовсе и
-    // содержимое shadow map не определено (см. VolumetricLightPassResources.SetShadow).
+    // How much shadow cuts sun scattering: 1 = fully. Forced to 0 when there is no shadow
+    // pass and shadow map contents are undefined (VolumetricLightPassResources.SetShadow).
     float volShadowStrength;
 
-    // Мировой базис камеры - ЕДИНИЧНЫЕ right/up/forward, посчитанные на CPU прямо из eye/target
-    // (см. VolumetricLightPassResources.SetCamera). Ровно та же схема и та же причина, что в
-    // FogCommon.hlsl: разбор матрицы вида легко перепутать по строкам/столбцам, а ошибка даёт
-    // объём, «приклеенный» к экрану.
+    // World camera basis: UNIT right/up/forward built on CPU from eye/target (same scheme
+    // and reason as FogCommon.hlsl: decomposing the view matrix is row/column error-prone).
     float volRightX, volRightY, volRightZ;
-    // Потолок непрозрачности среды 0..1: сколько марш вправе съесть от исходного кадра.
+    // Opacity ceiling 0..1: how much the march may eat of the source frame.
     float volMaxOpacity;
 
     float volUpX, volUpY, volUpZ;
-    // Коэффициент ЭКСТИНКЦИИ относительно плотности: насколько среда гасит свет, идущий сквозь неё.
-    // Отдельно от volScatter - так среду можно сделать светящейся, но почти прозрачной (частый
-    // художественный запрос: столбы есть, а кадр не мутнеет).
+    // Extinction coefficient relative to density; separate from volScatter so the medium
+    // can glow while staying nearly transparent.
     float volExtinction;
 
     float volForwardX, volForwardY, volForwardZ;
-    // Флор глушения НЕБЕСНОЙ доли рассеяния затенением: во сколько раз она слабее там, куда солнце
-    // не дошло. 1 - не глушится вовсе (прежнее поведение), 0.1..0.2 - глубокий интерьер почти без
-    // небесного свечения.
-    //
-    // Зачем это нужно, замерено на Sponza: небесная доля неглушёная ложится РОВНЫМ слоем на весь
-    // кадр, включая крытую аркаду в двух метрах от камеры, куда неба не видно вовсе. Результат -
-    // молочная пелена по всему кадру, поднятые чёрные и съеденная насыщенность: интерьер теряет
-    // тот самый плотный контраст, ради которого сцену и ставят. Свечение обязано жить ТАМ, ГДЕ
-    // СВЕТ, а не везде.
-    //
-    // Глушится именно тенью ключа, а не настоящей видимостью неба (её в объёме взять неоткуда), -
-    // ровно тот же компромисс и та же формула, что у поверхностей в UnlitInstancedPS (skyDamp по
-    // ProbeGiParams2.x). В интерьере эти две величины совпадают почти всегда: куда не дошло
-    // солнце, туда обычно не дошло и небо.
+    // Floor for shadow-damping of the SKY term: keyed off the sun shadow as a proxy for sky
+    // visibility (same compromise as skyDamp in UnlitInstancedPS); without it the ambient
+    // term lays a milky film over covered interiors.
     float volAmbientShadowFloor;
 
-    // >0.5 - цвета заданы ОТНОСИТЕЛЬНО экспозиции (см. VolumetricExposureScale).
+    // >0.5: colors are exposure-relative (see VolumetricExposureScale).
     float volExposureRelative;
-    // Тот же key value, что уходит в авто-экспозицию и тонемап (TonemapConstants.x).
+    // Same key value as auto-exposure/tonemap (TonemapConstants.x).
     float volExposureKey;
-    // Множитель рассеяния punctual-светов (0 = среда ламп не видит). В отличие от volSunIntensity
-    // это не цвет источника, а ручка ДОЛИ: сами света приходят из пула в сценовых линейных
-    // единицах и экспозиционным множителем НЕ домножаются (см. сборку result в Main).
+    // Punctual scattering share (0 = medium ignores lamps). Lights come from the pool in
+    // scene-linear units and are NOT exposure-scaled.
     float volPunctualIntensity;
     float volPad2;
 }
 
-// CameraData near/fov в ModelViewportEnvironment - тот же реверсивный-Z и тот же фиксированный
-// FOV, что в FogCommon.hlsl и SkyBackgroundPS.hlsl.
+// Same reversed-Z near plane and fixed FOV as FogCommon.hlsl / SkyBackgroundPS.hlsl.
 static const float VolNearPlane = 0.05;
 static const float VolTanHalfFov = 0.41421356; // tan(45deg / 2)
 
 static const float VolPi = 3.14159265359;
 
-// Сторона shadow map - обязана совпадать с ShadowRenderer.ShadowMapSize.
+// Must match ShadowRenderer.ShadowMapSize.
 static const float VolShadowMapSize = 4096.0;
 
 struct VSOutput
@@ -175,15 +131,13 @@ struct PSOutput
     float4 color : SV_TARGET;
 };
 
-// Множитель яркости объёма - ровно тот же приём и та же причина, что в FogCommon.FogExposureScale:
-// цвета рассеяния задаются в ОТОБРАЖАЕМЫХ единицах, а тонемап потом делит кадр на adapted и
-// умножает на key. Без обратного домножения ручка цвета была бы бесполезна - абсолютный масштаб
-// яркости сцены произволен и художнику неизвестен.
+// Scatter colors are authored in display-referred units; undo the tonemap's adapted/key
+// division (same scheme as FogCommon.FogExposureScale).
 float VolumetricExposureScale()
 {
     if (volExposureRelative < 0.5)
     {
-        // LDR-конвейер: кадр уже display-referred, пересчитывать нечего.
+        // LDR pipeline: frame is already display-referred.
         return 1.0;
     }
 
@@ -191,10 +145,8 @@ float VolumetricExposureScale()
     return adapted / max(volExposureKey, 1e-4);
 }
 
-// Фазовая функция Хеньи-Гринштейна, НОРМИРОВАННАЯ на изотропный случай (домножена на 4pi, так что
-// при g = 0 возвращает ровно 1). Так ручка силы остаётся прямой: смена анизотропии перераспределяет
-// свет по направлениям, но не меняет общую яркость эффекта - иначе художнику приходилось бы
-// подкручивать интенсивность после каждого движения ползунка g.
+// Henyey-Greenstein phase NORMALIZED to the isotropic case (x 4pi, so g = 0 returns 1):
+// changing anisotropy redistributes light without changing overall brightness.
 float VolumetricPhase(float cosTheta, float g)
 {
     float g2 = g * g;
@@ -202,9 +154,7 @@ float VolumetricPhase(float cosTheta, float g)
     return (1.0 - g2) / max(pow(max(denom, 1e-4), 1.5), 1e-4);
 }
 
-// Плотность среды на высоте h - экспоненциальный профиль, тот же, что интегрирует аналитически
-// FogCommon.FogAverageDensity. Здесь он берётся ПОТОЧЕЧНО, потому что марш всё равно идёт по
-// шагам ради теней: замкнутая форма ничего бы не сэкономила.
+// Exponential height density profile, same as FogCommon.FogAverageDensity but pointwise.
 float VolumetricDensityAt(float height)
 {
     if (volHeightFalloff < 1e-5)
@@ -212,27 +162,20 @@ float VolumetricDensityAt(float height)
         return 1.0;
     }
 
-    // Клампится СВЕРХУ: под опорной высотой экспонента растёт неограниченно, и камера, опущенная
-    // на несколько десятков единиц ниже пола сцены, иначе упирается в непрозрачную белую стену.
+    // Clamp from above: below the reference height the exponential grows without bound and
+    // a camera below the scene floor would hit an opaque white wall.
     return min(exp(-volHeightFalloff * (height - volHeightRef)), 64.0);
 }
 
-// Тень мирового света в ТОЧКЕ ОБЪЁМА. Отличий от UnlitInstancedPS.SampleWorldLightShadow два, и
-// оба вынужденные:
-//
-//  * нет normal-offset bias - у точки среды нет нормали. Вместо него чуть более крупная
-//    константная добивка: acne на поверхности виден как рябь, а в объёме - лишь как небольшой
-//    сдвиг границы столба, так что цена завышенного байеса здесь несопоставимо ниже;
-//  * одна выборка вместо PCF 3x3 - на 32-64 шагах марша это 32-64 выборки на пиксель против
-//    300-600. Мягкость границы столба берётся не из PCF, а из джиттера шага (см. Main): он
-//    размазывает ступеньку по пикселям, и фильтровать каждую точку отдельно нет смысла.
+// Sun shadow at a VOLUME point. Differs from UnlitInstancedPS.SampleWorldLightShadow by
+// design: no normal-offset bias (no normal in a medium; slightly larger constant bias
+// instead) and one sample instead of PCF 3x3 (step jitter hides the banding far cheaper).
 float VolumetricShadow(float3 worldPos)
 {
     [unroll]
     for (int c = 0; c < 4; c++)
     {
-        // Ненулевая ширина = каскад заполнен (см. SimpleCullingAndRenderSystem.BuildLightData):
-        // превью одиночной модели по-прежнему заполняет один, и цикл вырождается.
+        // Nonzero width = cascade populated (SimpleCullingAndRenderSystem.BuildLightData).
         if (lightData.CascadeSizes[c] <= 0.0)
         {
             continue;
@@ -242,18 +185,15 @@ float VolumetricShadow(float3 worldPos)
         float3 lightNdc = lightClip.xyz / max(lightClip.w, 1e-6);
         float2 shadowUv = float2(lightNdc.x * 0.5 + 0.5, 0.5 - lightNdc.y * 0.5);
 
-        // Отступ от края карты - тот же, что у поверхностей (см.
-        // UnlitInstancedPS.SUN_CASCADE_MARGIN_TEXELS), только уже: PCF здесь нет, за край тянет
-        // лишь собственная фильтрация сравнивающего сэмплера (полтекселя). Без отступа краевые
-        // выборки читают глубину чужого места сцены, и столб света получает прямую границу на
-        // стыке каскадов. Полосы перехода здесь НЕТ сознательно: она стоила бы второй выборки на
-        // каждом из 32-64 шагов марша, а ступенька резкости в объёме не читается - её съедает
-        // джиттер шага.
+        // Edge margin like SUN_CASCADE_MARGIN_TEXELS but narrower (no PCF here, only the
+        // half-texel comparison filter); without it edge samples read another cascade's
+        // depth and shafts get a hard seam. No blend band on purpose: it would cost a
+        // second sample per march step and step jitter hides the transition anyway.
         const float volMargin = 1.0 / VolShadowMapSize;
         if (any(shadowUv < volMargin) || any(shadowUv > 1.0 - volMargin)
             || lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
         {
-            // Точка вне этого каскада - пробуем следующий, крупнее.
+            // Outside this cascade: try the next, coarser one.
             continue;
         }
 
@@ -261,20 +201,17 @@ float VolumetricShadow(float3 worldPos)
             float3(shadowUv, (float)c), lightNdc.z - 0.0015);
     }
 
-    // За пределами всех каскадов - освещено. Именно поэтому предельная дальность марша обычно
-    // держится в пределах последнего каскада: дальше столбы «выключаются» разом.
+    // Beyond all cascades: lit. Keep march distance within the last cascade or shafts
+    // switch off abruptly.
     return 1.0;
 }
 
-// Сторона слайса punctual-теней - обязана совпадать с LightClusters.ShadowMapSize (1024, не 4096
-// солнечных каскадов).
+// Must match LightClusters.ShadowMapSize (1024, not the 4096 sun cascades).
 static const float VolPunctualShadowMapSize = 1024.0;
 
-// Тень punctual-света в точке объёма - зеркало кластерной петли UnlitInstancedPS (выбор грани
-// куба по доминирующей оси, мировой байас с переводом локальной производной d(ndc)/dz), с теми же
-// двумя вольностями, что у VolumetricShadow: без normal-offset (у точки среды нет нормали, байас
-// втрое крупнее поверхностного) и одна выборка вместо PCF - ступеньку съедает джиттер шага.
-// toFrag - вектор СВЕТ -> точка (для выбора грани куба).
+// Punctual shadow at a volume point; mirrors the UnlitInstancedPS cluster loop (cube face
+// by dominant axis, world-space bias) with the same two volume liberties as
+// VolumetricShadow. toFrag = light -> point vector (for cube face selection).
 float VolumetricPunctualShadow(PunctualLight l, float3 samplePos, float3 toFrag)
 {
     if (l.ShadowParams.x < 0.0)
@@ -318,11 +255,8 @@ float VolumetricPunctualShadow(PunctualLight l, float3 samplePos, float3 toFrag)
         float3(uv, (float)slice), ndc.z - bias);
 }
 
-// Interleaved gradient noise - псевдослучайное смещение первого шага, разное у соседних пикселей.
-// Без него марш выдаёт КОЛЬЦА: у всех пикселей шаги попадают на одни и те же дистанции, и граница
-// шага становится видимой дугой поперёк кадра. Джиттер меняет эту дугу на мелкое зерно, которое
-// глаз читает как плёночный шум, а не как артефакт. Дёшево и не требует ни текстуры, ни истории
-// кадров (temporal-фильтра в конвейере нет).
+// Interleaved gradient noise jitter for the first step; without it all pixels step at the
+// same distances and the march shows visible rings. No texture or history needed.
 float VolumetricDither(float2 pixel)
 {
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
@@ -338,17 +272,15 @@ PSOutput Main(in VSOutput input)
 
     float4 scene = _SceneTex.Sample(_SceneTex_sampler, uv);
 
-    // Луч пикселя в МИРЕ. НЕ нормализуется намеренно - см. подробный разбор в FogCommon.hlsl:
-    // проекция такого луча на ось камеры равна единице, и мировая точка получается как
-    // camPos + ray * zView без единого деления.
+    // Pixel ray in WORLD space, intentionally NOT normalized (see FogCommon.hlsl): its
+    // projection on the camera axis is 1, so world pos = camPos + ray * zView.
     float aspect = viewData.viewport.z / max(viewData.viewport.w, 1.0);
     float3 ray = float3(volForwardX, volForwardY, volForwardZ)
         + float3(volRightX, volRightY, volRightZ) * (input.ndc.x * VolTanHalfFov * aspect)
         + float3(volUpX, volUpY, volUpZ) * (input.ndc.y * VolTanHalfFov);
 
-    // Реверсивный-Z: ноль - это ФОН (таргет очищается нулём), а не нулевая глубина. Небу отдаём
-    // предельную дальность: столбы обязаны быть видны и на фоне неба - там они, собственно, и
-    // читаются лучше всего.
+    // Reversed-Z: zero is background. Sky gets the max distance so shafts stay visible
+    // against it.
     float depth = DEPTH_FETCH(pixel);
     float zView = depth < 1e-6 ? volMaxDistance : VolNearPlane / depth;
 
@@ -368,8 +300,7 @@ PSOutput Main(in VSOutput input)
     int steps = clamp((int)volSteps, 4, 256);
     float stepLength = marchLength / (float)steps;
 
-    // Фазовая функция от направления взгляда и направления НА солнце: при g > 0 максимум приходится
-    // на взгляд против света - ровно то положение, в котором столбы видны в жизни.
+    // With g > 0 the phase peaks when looking against the sun, where shafts are visible.
     float3 sunDir = float3(volSunDirX, volSunDirY, volSunDirZ);
     float phase = VolumetricPhase(dot(viewDir, sunDir), clamp(volAnisotropy, -0.95, 0.95));
 
@@ -380,16 +311,15 @@ PSOutput Main(in VSOutput input)
     float3 camPos = viewData.CameraWorldPos;
     float jitter = VolumetricDither(input.pos.xy);
 
-    // Сегмент punctual-светов этой камеры в общем пуле (см. LightData.ClusterParams). Фазовая
-    // функция ламп считается НА ШАГЕ: в отличие от солнца направление на свет меняется вдоль луча,
-    // и при рассеянии вперёд конус спота, глядящий на камеру, вспыхивает - как фара в тумане.
+    // Camera's punctual segment in the shared pool (LightData.ClusterParams). Lamp phase is
+    // evaluated PER STEP: unlike the sun, the light direction changes along the ray.
     uint punctualOffset = (uint)lightData.ClusterParams.x;
     uint punctualCount = volPunctualIntensity > 0.0 ? (uint)lightData.ClusterParams.y : 0u;
     float anisotropy = clamp(volAnisotropy, -0.95, 0.95);
 
     float3 scattered = float3(0.0, 0.0, 0.0);
-    // Рассеяние ламп копится ОТДЕЛЬНО: света пула лежат в сценовых линейных единицах, как сам
-    // кадр, и экспозиционного домножения (в отличие от художественных цветов солнца/неба) не ждут.
+    // Lamp scattering accumulates SEPARATELY: pool lights are scene-linear like the frame
+    // and get no exposure scaling.
     float3 scatteredScene = float3(0.0, 0.0, 0.0);
     float transmittance = 1.0;
 
@@ -406,15 +336,12 @@ PSOutput Main(in VSOutput input)
 
         float shadow = lerp(1.0, VolumetricShadow(samplePos), saturate(volShadowStrength));
 
-        // Свет, рассеиваемый ЕДИНИЦЕЙ ДЛИНЫ отрезка в сторону камеры. Солнечную долю тень режет
-        // насухо, небесную - лишь ослабляет до флора (см. volAmbientShadowFloor): в тени колонны
-        // небо всё ещё что-то даёт, а вот в крытой аркаде - почти ничего.
+        // Sun term cut fully by shadow; sky term only damped down to the floor.
         float3 inScatter = (sunRadiance * shadow
             + ambientRadiance * lerp(saturate(volAmbientShadowFloor), 1.0, shadow))
             * density * volScatter;
 
-        // Рассеяние punctual-светов - формулы затухания и конуса зеркалят кластерный шейдинг
-        // UnlitInstancedPS, тень - VolumetricPunctualShadow выше.
+        // Punctual scattering; attenuation/cone mirror UnlitInstancedPS cluster shading.
         float3 punctualRadiance = float3(0.0, 0.0, 0.0);
         [loop]
         for (uint li = 0; li < punctualCount; li++)
@@ -431,9 +358,8 @@ PSOutput Main(in VSOutput input)
             float dist = sqrt(max(distSq, 1e-6));
             float3 dirToLight = toLight / dist;
 
-            // Пол знаменателя КРУПНЕЕ поверхностного (+0.25 против +1e-2): шаг марша, легший
-            // вплотную к лампе, с чистым 1/d^2 даёт одинокий пиксель-фаервол, который джиттер
-            // превращает в мерцающее зерно вокруг источника.
+            // Denominator floor larger than the surface one (+0.25 vs +1e-2): a march step
+            // landing next to a lamp with pure 1/d^2 makes a flickering hot pixel.
             float distRatio2 = distSq / (range * range);
             float distFactor = saturate(1.0 - distRatio2 * distRatio2);
             float atten = distFactor * distFactor / (distSq + 0.25);
@@ -461,14 +387,8 @@ PSOutput Main(in VSOutput input)
 
         float3 inScatterScene = punctualRadiance * volPunctualIntensity * density * volScatter;
 
-        // Аналитическое интегрирование рассеяния ПО ОТРЕЗКУ, а не «в точке × длину шага»:
-        //
-        //   S(x) = S0 * exp(-sigma * x)  =>  integral[0..dx] = S0 * (1 - exp(-sigma*dx)) / sigma
-        //
-        // Разница не косметическая. Наивная сумма зависит от числа шагов: художник крутит качество -
-        // и вместе с ним меняется ЯРКОСТЬ эффекта, то есть ручка качества перестаёт быть ручкой
-        // качества. Здесь же 16 и 128 шагов дают одну и ту же яркость, отличаясь только гладкостью
-        // границ.
+        // Analytic per-segment integration: S0 * (1 - exp(-sigma*dx)) / sigma. Keeps
+        // brightness independent of step count, so the quality knob stays a quality knob.
         float sigma = max(density * volExtinction, 1e-6);
         float stepTransmittance = exp(-sigma * stepLength);
         float segment = transmittance * (1.0 - stepTransmittance) / sigma;
@@ -477,26 +397,23 @@ PSOutput Main(in VSOutput input)
 
         transmittance *= stepTransmittance;
 
-        // Луч уже почти непрозрачен - остаток вклада ниже кванта таргета. Ранний выход экономит
-        // основное время именно на плотной среде, где марш дороже всего.
+        // Early out once remaining contribution is below the target quantum.
         if (transmittance < 1e-3)
         {
             break;
         }
     }
 
-    // Потолок непрозрачности - художественная ручка без физического смысла, та же, что у тумана:
-    // сквозь среду всегда что-то видно, как бы плотно её ни задали.
+    // Artistic opacity ceiling, same as fog: something always stays visible through the medium.
     float minTransmittance = 1.0 - saturate(volMaxOpacity);
     transmittance = max(transmittance, minTransmittance);
 
-    // Экспозиционный множитель - ТОЛЬКО на солнечно-небесное рассеяние: его цвета заданы в
-    // отображаемых единицах. Рассеяние ламп (scatteredScene) уже в сценовых линейных, как кадр.
+    // Exposure scale applies ONLY to sun/sky scattering; lamp scattering is already scene-linear.
     float3 result = scene.rgb * transmittance + scattered * VolumetricExposureScale()
         + scatteredScene;
 
-    // Альфа берётся ОТ СЦЕНЫ: пасс рисует поверх кадра, и своя альфа выбила бы прозрачный фон
-    // бейкера иконок (та же причина, что в FogCommon.hlsl).
+    // Alpha taken from the scene: own alpha would break the icon baker's transparent
+    // background (same reason as FogCommon.hlsl).
     output.color = float4(result, scene.a);
     return output;
 }

@@ -1,29 +1,16 @@
-// Визуализация буфера векторов движения (см. MotionVectorDebugPass.cs) - единственный способ вообще
-// увидеть результат MotionVectorPass, потому что сам буфер кадр не меняет и до появления апскейлера
-// его никто не читает.
-//
-// Ставится ПОСЛЕ тонемапа и грейдинга, прямо в отображаемый RGBA8-таргет, и это принципиально:
-// попади отладочный цвет в линейный HDR-кадр, его бы прожевали экспозиция, кривая тонемапа и
-// цветокоррекция, и «серый» перестал бы означать ноль. Здесь же 0.5 остаётся ровно 0.5.
-//
-// Кодировка намеренно тупая и проверяемая глазами:
-//   R = смещение по X, G = смещение по Y, обе вокруг 0.5;
-//   РОВНЫЙ СЕРЫЙ (0.5, 0.5, 0.5) = нулевой вектор.
-// Отсюда главный тест ступени 1: на неподвижной камере кадр обязан быть равномерно серым при ЛЮБОМ
-// диапазоне. Любое пятно - это либо дрожь матрицы камеры, либо разъезд viewProj на кадр.
+// Motion vector visualization (see MotionVectorDebugPass.cs).
+// Runs after tonemap/grading into the display RGBA8 target so 0.5 stays exactly 0.5.
+// Encoding: R/G = XY offset around 0.5; flat grey (0.5, 0.5, 0.5) = zero vector.
 
 Texture2D _MotionTex;
 
-// Зеркалит MotionVectorDebugConstantsData (MotionVectorDebugPass.cs).
+// Mirrors MotionVectorDebugConstantsData (MotionVectorDebugPass.cs).
 cbuffer MotionVectorDebugConstants
 {
-    // xy - размер БУФЕРА ВЕКТОРОВ в пикселях (рендер-разрешение), z - 1/диапазон (в пикселях),
-    // w - включённость (0 -> discard).
+    // xy = motion buffer size in pixels (render res), z = 1/range in pixels, w = enabled (0 -> discard).
     float4 motionDebugParams;
 
-    // xy - отношение рендер-размера к отображаемому: пасс рисует в display-кадр, а Load из буфера
-    // векторов требует рендер-координату. При масштабе 1 это (1,1) и маппинг вырождается в
-    // пиксель-в-пиксель.
+    // xy = render-to-display size ratio; Load needs render-res coordinates.
     float4 motionDebugParams2;
 };
 
@@ -42,9 +29,7 @@ PSOutput Main(in VSOutput input)
 {
     PSOutput output;
 
-    // Выключенный пасс не пишет НИ ОДНОГО пикселя, а не рисует прозрачное поверх кадра. Благодаря
-    // этому галку можно держать в кбуфере, а не в наборе фич: граф не пересобирается на каждое
-    // нажатие, и переключение мгновенное - ценой одного фуллскрин-дроу, который весь уходит в discard.
+    // Disabled pass discards every pixel: toggle lives in the cbuffer, no graph rebuild.
     if (motionDebugParams.w < 0.5)
     {
         discard;
@@ -52,19 +37,15 @@ PSOutput Main(in VSOutput input)
         return output;
     }
 
-    // Display-пиксель -> пиксель буфера векторов. Нарочно Load ближайшего, а не билинейный сэмпл:
-    // фильтрация усреднила бы векторы поперёк силуэтов и нарисовала бы движение там, где его нет.
+    // Nearest Load, not bilinear: filtering would average vectors across silhouettes.
     int2 pixel = int2(input.pos.xy * motionDebugParams2.xy);
     float2 motionUv = _MotionTex.Load(int3(pixel, 0)).rg;
 
-    // Буфер хранит вектор в долях экрана (см. MotionVectorPS), а разбираться удобнее в ПИКСЕЛЯХ -
-    // РЕНДЕР-разрешения: именно их потребляет апскейлер, и именно их считает MotionVectorPS.
+    // Buffer stores screen-fraction vectors (see MotionVectorPS); convert to render-res pixels.
     float2 motionPixels = motionUv * motionDebugParams.xy;
     float2 n = motionPixels * motionDebugParams.z;
 
-    // Ушедшее за диапазон гасит синий канал: перегруженная область становится ядовито-жёлтой вместо
-    // того, чтобы молча упереться в край шкалы и притвориться «просто быстрым» движением. Без этого
-    // невозможно понять, мал ли выбранный диапазон.
+    // Out-of-range kills the blue channel (yellow) so range overflow is visible, not clamped away.
     float clipped = (abs(n.x) > 1.0 || abs(n.y) > 1.0) ? 1.0 : 0.0;
     n = clamp(n, -1.0, 1.0);
 

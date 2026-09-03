@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core;
@@ -19,21 +19,20 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>SSR сцены: RT-сцена лучей, G-buffer отражений и пуш настроек/энвайронмента. Часть <see cref="PrefabSceneViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Scene SSR: ray scene, reflection G-buffer and settings/environment push. Part of
+	/// <see cref="PrefabSceneViewport"/>; state and per-frame Update/Render live in the main file.</summary>
 	public partial class PrefabSceneViewport
 	{
-		/// <summary>Доступен ли RT-фолбэк SSR прямо сейчас: галка настроек + inline-трассировка +
-		/// СУЩЕСТВУЮЩИЙ accel сцены (ProbeSceneAccel живёт при аппаратном probe GI - его TLAS и
-		/// таблицы атрибутов и питают лучи отражений). Без accel-а фича молча остаётся экранной.</summary>
+		/// <summary>RT fallback availability: settings flag + inline tracing + an EXISTING scene accel
+		/// (probe GI's TLAS and attribute tables feed reflection rays). Without one, SSR stays screen-space.</summary>
 		private bool SsrRayTracedEnabled() =>
 			_editorSettings.SsrRayTraced &&
 			_graphicsApi.RayTracing >= RayTracingSupport.Inline &&
 			(_sceneAccel != null || _ssrOwnAccel != null);
 
-		/// <summary>Привязывает TLAS и таблицы атрибутов сцены RT-варианту SSR-трейса. Зовётся после
-		/// каждого создания/пересоздания <see cref="_sceneAccel"/> и после смены фич: дескриптор
-		/// указывает на сам объект TLAS, но ПЕРЕСОЗДАНИЕ объекта привязку протухает.</summary>
+		/// <summary>Binds the scene TLAS and attribute tables to the RT SSR trace. Must be re-called
+		/// after every accel recreation: the descriptor points at the TLAS object, and recreating
+		/// the object stales the binding.</summary>
 		private void UpdateSsrRayScene()
 		{
 			var accel = _sceneAccel ?? _ssrOwnAccel;
@@ -45,9 +44,9 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Привязывает трейсу набор текстур RT-хитов ТОГО accel-а, что ушёл в SetRayScene
-		/// (индексы текстур в его таблице инстансов указывают именно в этот набор). Зовётся вместе
-		/// с каждым SetRayScene и при апгрейдах стриминга (см. PollSsrOwnRayScene).</summary>
+		/// <summary>Pushes the RT-hit texture set of the SAME accel passed to SetRayScene (its
+		/// instance table indexes into this set). Called with every SetRayScene and on streaming
+		/// upgrades (see PollSsrOwnRayScene).</summary>
 		private void PushSsrHitTextures()
 		{
 			var ssr = _env.Pipeline.SsrResources;
@@ -71,9 +70,9 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Ведёт собственный accel SSR (см. поля у _ssrOwnAccel): нужен, только когда
-		/// RT-фолбэк включён, а accel-а проб нет. Пересборка синхронная и дорогая (BLAS всей
-		/// сцены) - с дебаунсом по сменам состава/поз. Зовётся каждый кадр из Update.</summary>
+		/// <summary>Maintains SSR's own accel, needed only when the RT fallback is on but the probe
+		/// accel is absent. Rebuild is synchronous and expensive (whole-scene BLAS), so it is
+		/// debounced on composition/pose changes. Called every frame from Update.</summary>
 		private void PollSsrOwnRayScene(float deltaTime)
 		{
 			bool wanted = _editorSettings.PreviewSsr && _editorSettings.SsrRayTraced
@@ -93,8 +92,7 @@ namespace DecaEngine.Editor
 				}
 			}
 
-			// Стриминг дорастил текстуру - bindless-привязка указывает на старую, перепушиваем
-			// (наборы обоих accel-ов; проверка - сравнение счётчиков, копейки).
+			// Streaming grew a texture: the bindless binding still points at the old one, re-push.
 			if (_ssrOwnHitTextures?.RefreshStreams() == true ||
 				_sceneAccelHitTextures?.RefreshStreams() == true)
 			{
@@ -105,8 +103,7 @@ namespace DecaEngine.Editor
 			{
 				if (_ssrOwnAccel != null)
 				{
-					// Возврат на accel проб / выключение / опустевшая сцена: трейс-материал не
-					// должен держать умирающий TLAS (и отражать призрак старой сцены).
+					// The trace material must not hold a dying TLAS (or reflect the old scene).
 					_env.Pipeline.SsrResources?.SetHitTextures(null, null);
 					_env.DilApi.ImmediateContext.Flush();
 					_env.DilApi.ImmediateContext.WaitForIdle();
@@ -128,7 +125,7 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Дебаунс: драг гизмо меняет позы каждый кадр, а пересборка - BLAS всей сцены.
+			// Debounce: gizmo drags change poses every frame, and a rebuild is a whole-scene BLAS.
 			if (_ssrOwnRebuildDelay < 0f)
 			{
 				_ssrOwnRebuildDelay = 0.4f;
@@ -148,7 +145,7 @@ namespace DecaEngine.Editor
 				var geometry = new ProbeGiBaker(sceneModels).InstancedGeometry;
 				if (geometry.Instances.Length == 0)
 				{
-					// Геометрии нет (CPU-копии мешей недоступны) - тихий пропуск с бэкоффом.
+					// No geometry (CPU mesh copies unavailable): silent skip with backoff.
 					_ssrOwnRebuildDelay = 5f;
 					return;
 				}
@@ -159,7 +156,7 @@ namespace DecaEngine.Editor
 				_ssrOwnAccel = new ProbeSceneAccel(_env.DilApi, geometry);
 				_ssrOwnBuiltFor = sceneModels;
 
-				// Набор текстур хитов сшит с индексами ЭТОЙ геометрии - пересобирается вместе с ней.
+				// Hit texture set is tied to THIS geometry's indices - rebuilt with it.
 				_ssrOwnHitTextures?.Dispose();
 				var hitModels = new List<ModelLoader>(sceneModels.Count);
 				foreach (var (m, _) in sceneModels)
@@ -168,27 +165,25 @@ namespace DecaEngine.Editor
 				}
 				_ssrOwnHitTextures = SsrHitTextures.Build(_graphicsApi, geometry, hitModels);
 
-				// Фича могла ждать появления accel-а (SsrRayTracedEnabled), ресурсы -
-				// пересборки под RT-вариант; привязка внутри ApplyPipelineFeatures.
+				// Features may have been waiting for the accel; binding happens inside.
 				ApplyPipelineFeatures();
 			}
 			catch (Exception ex)
 			{
 				EngineLog.Add(LogLevel.Warning,
-					$"SSR: собственный accel сцены не собрался: {ex.Message}");
+					$"SSR: the scene's own accel failed to build: {ex.Message}");
 				_ssrOwnAccel?.Dispose();
 				_ssrOwnAccel = null;
 				_ssrOwnBuiltFor = null;
 
-				// Бэкофф: причина не исчезнет через кадр - не молотим пересборкой.
+				// Backoff: the cause will not vanish next frame.
 				_ssrOwnRebuildDelay = 5f;
 			}
 		}
 
-		/// <summary>Живые ручки SSR из настроек. Отдельным методом, потому что зовётся из ДВУХ мест:
-		/// применения настроек и <see cref="ApplyPipelineFeatures"/> - смена RT-фолбэка пересоздаёт
-		/// SSR-ресурсы (в трейс запечён вариант шейдера), и без повторного пуша ручки откатывались бы
-		/// в дефолты.</summary>
+		/// <summary>Live SSR knobs. Separate method because it is called from TWO places: settings
+		/// apply and <see cref="ApplyPipelineFeatures"/> - toggling the RT fallback recreates SSR
+		/// resources (shader variant is baked in), which would reset the knobs to defaults.</summary>
 		private void PushSsrSettings()
 		{
 			_env.SetSsrParams(
@@ -204,10 +199,9 @@ namespace DecaEngine.Editor
 			PushSsrEnvironment();
 		}
 
-		/// <summary>Покадровые данные SSR: поворот env-карты (композит вычитает ровно тот env-цвет,
-		/// что вложил форвард) и солнце RT-фолбэка. Цвет солнца - константа дневного света: точный
-		/// вклад ключа в RT-хиты не воспроизвести без полного шейдинга, а для отражений вне экрана
-		/// достаточно правдоподобной яркости.</summary>
+		/// <summary>Per-frame SSR data: env-map yaw (the composite subtracts exactly the env color
+		/// forward added) and the RT-fallback sun. Sun color is a daylight constant: exact key
+		/// contribution to RT hits is not reproducible without full shading.</summary>
 		private void PushSsrEnvironment()
 		{
 			var shadowSettings = _env.ShadowSettings;
@@ -216,12 +210,10 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Цвет ключа - тот же, что у прямого света превью (SimpleCullingAndRenderSystem,
-			// LightColor (1, 0.97, 0.9) x intensity 1); ambient-вес - ambientLevel форвард-пасса
-			// при мировом свете (0.55, см. UnlitInstancedPS) - RT-хиты и экранные пиксели теперь
-			// освещаются одной и той же моделью.
-			// Угловой размер солнца (та же ручка, что у PCSS прямого вида) - мягкость края тени
-			// у RT-хитов: без неё теневой луч бинарный, и в отражении край тени рвался в чёрное.
+			// Key color matches the preview direct light (SimpleCullingAndRenderSystem); ambient
+			// weight matches the forward pass ambientLevel under world light (0.55, UnlitInstancedPS)
+			// so RT hits and screen pixels share one lighting model. Sun angular size (same knob as
+			// PCSS) softens RT-hit shadow edges - a binary shadow ray tears to black otherwise.
 			float sunTanHalfAngle = MathF.Tan(
 				Math.Clamp(_editorSettings.SunAngularSize, 0.01f, 20f) * 0.5f * MathF.PI / 180f);
 

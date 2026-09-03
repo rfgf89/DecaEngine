@@ -52,7 +52,6 @@ namespace UnsafeCollections.Collections.Unsafe
         {
             int _index;
 
-            // current entry and collection
             public Entry* Current;
             public UnsafeHashCollection* Collection;
 
@@ -60,7 +59,6 @@ namespace UnsafeCollections.Collections.Unsafe
             {
                 _index = -1;
 
-                //
                 Current = null;
                 Collection = collection;
             }
@@ -125,21 +123,18 @@ namespace UnsafeCollections.Collections.Unsafe
         public Entry** Buckets;
         public Entry* FreeHead;
 
-        // buffer for our entries
         public UnsafeBuffer Entries;
 
         public int UsedCount;
         public int FreeCount;
         public int KeyOffset;
 
-        /// <summary>
-        /// Returns the next prime number, unless this number is a prime.
-        /// </summary>
+        /// <summary>Returns the next prime number, unless this number is a prime.</summary>
         public static int GetNextPrime(int value)
         {
             value--;
 
-            // Start at index 0 so the minimum size is 3.
+            // Table starts at 3, which is the minimum size.
             for (int i = 0; i < _primeTable.Length; i++)
             {
                 var prime = _primeTable[i];
@@ -208,14 +203,10 @@ namespace UnsafeCollections.Collections.Unsafe
             {
                 if (bucketHead->Hash == valueHash && key.Equals(*(T*)((byte*)bucketHead + collection->KeyOffset)))
                 {
-                    // if previous was null, this means we're at the head of the list
                     if (bucketPrev == null)
                     {
                         collection->Buckets[bucketHash] = bucketHead->Next;
                     }
-
-                    // previous was not null, it means we're in the middle
-                    // of the list so stitch the elements together
                     else
                     {
                         bucketPrev->Next = bucketHead->Next;
@@ -223,11 +214,9 @@ namespace UnsafeCollections.Collections.Unsafe
 
                     UDebug.Assert(bucketHead->State == EntryState.Used);
 
-                    // next for the node we removed becomes current free list head
                     bucketHead->Next = collection->FreeHead;
                     bucketHead->State = EntryState.Free;
 
-                    // set it as free list head, and increment count
                     collection->FreeHead = bucketHead;
                     collection->FreeCount = collection->FreeCount + 1;
                     return true;
@@ -250,59 +239,43 @@ namespace UnsafeCollections.Collections.Unsafe
             {
                 UDebug.Assert(collection->FreeCount > 0);
 
-                // entry we're adding
                 entry = collection->FreeHead;
 
-                // update free list
                 collection->FreeHead = entry->Next;
                 collection->FreeCount = collection->FreeCount - 1;
 
-                // this HAS to be a FREE state entry, or something is seriously wrong
                 UDebug.Assert(entry->State == EntryState.Free);
             }
             else
             {
                 if (collection->UsedCount == collection->Entries.Length)
                 {
-                    // Cannot expand fixed-size HashCollection
                     if (collection->Entries.Dynamic == 0)
                     {
                         throw new InvalidOperationException(ThrowHelper.InvalidOperation_CollectionFull);
                     }
 
-                    // !! IMPORTANT !!
-                    // when this happens, it's very important to be
-                    // aware of the fact that all pointers to to buckets
-                    // or entries etc. are not valid anymore as we have
-                    // re-allocated all of the memory
+                    // Expand reallocates everything: all bucket/entry pointers are invalid after this.
                     Expand(collection);
                 }
 
-                // grab 'next' element maintained by _count
                 entry = collection->Entries.Element<Entry>(collection->UsedCount);
 
-                // step up used count
                 collection->UsedCount = collection->UsedCount + 1;
 
-                // this HAS to be a NONE state entry, or something is seriously wrong
                 UDebug.Assert(entry->State == EntryState.None);
             }
 
-            // compute bucket hash
             var bucketHash = valueHash % collection->Entries.Length;
 
-            // hook up entry
             entry->Hash = valueHash;
             entry->Next = collection->Buckets[bucketHash];
             entry->State = EntryState.Used;
 
-            // store value
             *(T*)((byte*)entry + collection->KeyOffset) = key;
 
-            // store as head on bucket
             collection->Buckets[bucketHash] = entry;
 
-            // done!
             return entry;
         }
 
@@ -322,7 +295,6 @@ namespace UnsafeCollections.Collections.Unsafe
         {
             UDebug.Assert(collection->Entries.Dynamic == 1);
 
-            // We need to grab the pext prime, so at least current length + 1
             var capacity = GetNextPrime(collection->Entries.Length + 1);
 
             UDebug.Assert(capacity >= collection->Entries.Length);
@@ -343,30 +315,22 @@ namespace UnsafeCollections.Collections.Unsafe
                 {
                     var bucketHash = entry->Hash % capacity;
 
-                    // assign current entry in buckets as next
                     entry->Next = newBuckets[bucketHash];
 
-                    // assign entry as new bucket head
                     newBuckets[bucketHash] = entry;
                 }
-
-                // entry is in free list
                 else if (entry->State == EntryState.Free)
                 {
-                    // assign free list as next
                     entry->Next = collection->FreeHead;
 
-                    // re-assign free list to entry
                     collection->FreeHead = entry;
                     collection->FreeCount = collection->FreeCount + 1;
                 }
             }
 
-            // free old memory
             Memory.Free(collection->Buckets);
             UnsafeBuffer.Free(&collection->Entries);
 
-            // new storage
             collection->Buckets = newBuckets;
             collection->Entries = newEntries;
         }

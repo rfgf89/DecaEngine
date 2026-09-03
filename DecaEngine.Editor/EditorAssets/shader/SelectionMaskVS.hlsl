@@ -1,7 +1,6 @@
-// Маска выделения Scene View (см. SelectionOutlineOverlay): силуэт выделенного объекта в отдельный
-// таргет. Вершины приходят УЖЕ в мировом пространстве - CPU перезапекает буфер при смене
-// выделения/трансформа (см. PrefabSceneViewport.SyncSelectionHighlight), поэтому ни матриц
-// инстансов, ни инстансинга здесь нет. Пара - SelectionMaskPS.hlsl.
+// Scene View selection mask (see SelectionOutlineOverlay): silhouette into its own target.
+// Vertices arrive ALREADY in world space (CPU rebakes the buffer on selection/transform change),
+// so no instance matrices or instancing here. Pixel half: SelectionMaskPS.hlsl.
 #include "Instancing.hlsl"
 
 cbuffer View

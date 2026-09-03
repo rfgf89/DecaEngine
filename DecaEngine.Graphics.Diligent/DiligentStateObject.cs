@@ -6,20 +6,12 @@ using ValueType = Diligent.ValueType;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>
-/// Diligent-реализация Graphics Pipeline State. Инициализируется backend-независимым
-/// описанием <see cref="GraphicsStateInfo"/> (топология примитивов, растеризация,
-/// depth/stencil, input layout, форматы render target'ов), которое конвертируется
-/// в нативную <see cref="GraphicsPipelineStateCreateInfo"/> Diligent'а внутри этого класса.
-/// Взаимодействие с другими Diligent-объектами (например, <see cref="DiligentMaterial"/>)
-/// происходит через приведение типов <c>IStateObject</c> -&gt; <see cref="DiligentGraphicsStateObject"/>.
-/// </summary>
+/// <summary>Diligent implementation of a graphics PSO built from backend-independent <see cref="GraphicsStateInfo"/>.</summary>
 internal sealed class DiligentGraphicsStateObject : IStateObject
 {
 	public string Name { get; }
 	public PipelineStateType StateType => PipelineStateType.Graphics;
 
-	/// <summary>Нативное Diligent-описание PSO, собранное из <see cref="GraphicsStateInfo"/>.</summary>
 	internal GraphicsPipelineStateCreateInfo CreateInfo { get; }
 
 	public DiligentGraphicsStateObject(string name, GraphicsStateInfo info)
@@ -28,10 +20,7 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 		CreateInfo = ToNativeCreateInfo(name, info);
 	}
 
-	/// <summary>
-	/// Прямая инициализация нативным Diligent-описанием, минуя абстракцию. Используется
-	/// только внутри backend'а (например, менеджерами, которым нужен полный контроль над PSO).
-	/// </summary>
+	/// <summary>Backend-internal: initialize directly from a native Diligent description.</summary>
 	internal DiligentGraphicsStateObject(string name, GraphicsPipelineStateCreateInfo createInfo)
 	{
 		Name = name ?? throw new ArgumentNullException(nameof(name));
@@ -61,6 +50,7 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 				PrimitiveTopology = ToNativeTopology(info.PrimitiveTopology),
 				RasterizerDesc = ToNativeRasterizerDesc(info.RasterizerState),
 				DepthStencilDesc = ToNativeDepthStencilDesc(info.DepthStencilState),
+				BlendDesc = ToNativeBlendDesc(info.BlendState),
 				InputLayout = ToNativeInputLayout(info.InputLayout),
 				SmplDesc = new SampleDesc { Count = (byte)Math.Max(1, info.SampleCount), Quality = 0 },
 			}
@@ -134,6 +124,67 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 		DepthFunc = ToNativeComparisonFunction(info.DepthFunc)
 	};
 
+	private static BlendFactor ToNativeBlendFactor(BlendFactorType factor) => factor switch
+	{
+		BlendFactorType.Zero => BlendFactor.Zero,
+		BlendFactorType.One => BlendFactor.One,
+		BlendFactorType.SrcColor => BlendFactor.SrcColor,
+		BlendFactorType.InvSrcColor => BlendFactor.InvSrcColor,
+		BlendFactorType.SrcAlpha => BlendFactor.SrcAlpha,
+		BlendFactorType.InvSrcAlpha => BlendFactor.InvSrcAlpha,
+		BlendFactorType.DestColor => BlendFactor.DestColor,
+		BlendFactorType.InvDestColor => BlendFactor.InvDestColor,
+		BlendFactorType.DestAlpha => BlendFactor.DestAlpha,
+		BlendFactorType.InvDestAlpha => BlendFactor.InvDestAlpha,
+		_ => BlendFactor.One
+	};
+
+	private static BlendOperation ToNativeBlendOperation(BlendOperationType op) => op switch
+	{
+		BlendOperationType.Add => BlendOperation.Add,
+		BlendOperationType.Subtract => BlendOperation.Subtract,
+		BlendOperationType.RevSubtract => BlendOperation.RevSubtract,
+		BlendOperationType.Min => BlendOperation.Min,
+		BlendOperationType.Max => BlendOperation.Max,
+		_ => BlendOperation.Add
+	};
+
+	// Disabled blending maps to one default RenderTargetBlendDesc, byte-identical to pre-field
+	// PSOs so existing disk caches stay valid. Enabled blending affects slot 0 only; slots 1+
+	// get ColorMask.None so transparent draws under the reflection MRT don't corrupt G-buffer normals.
+	private static BlendStateDesc ToNativeBlendDesc(BlendStateInfo info)
+	{
+		var rt0 = new RenderTargetBlendDesc
+		{
+			BlendEnable = info.BlendEnable,
+			SrcBlend = ToNativeBlendFactor(info.SrcBlend),
+			DestBlend = ToNativeBlendFactor(info.DestBlend),
+			BlendOp = ToNativeBlendOperation(info.BlendOp),
+			SrcBlendAlpha = ToNativeBlendFactor(info.SrcBlendAlpha),
+			DestBlendAlpha = ToNativeBlendFactor(info.DestBlendAlpha),
+			BlendOpAlpha = ToNativeBlendOperation(info.BlendOpAlpha),
+			RenderTargetWriteMask = ColorMask.All
+		};
+
+		if (!info.BlendEnable)
+		{
+			return new BlendStateDesc { RenderTargets = [rt0] };
+		}
+
+		var targets = new RenderTargetBlendDesc[8];
+		targets[0] = rt0;
+		for (int i = 1; i < targets.Length; i++)
+		{
+			targets[i] = new RenderTargetBlendDesc { RenderTargetWriteMask = ColorMask.None };
+		}
+
+		return new BlendStateDesc
+		{
+			IndependentBlendEnable = true,
+			RenderTargets = targets
+		};
+	}
+
 	private static InputLayoutDesc ToNativeInputLayout(InputLayoutElementInfo[] elements)
 	{
 		if (elements == null || elements.Length == 0)
@@ -160,11 +211,7 @@ internal sealed class DiligentGraphicsStateObject : IStateObject
 	}
 }
 
-/// <summary>
-/// Diligent-реализация Compute Pipeline State. Инициализируется backend-независимым
-/// описанием <see cref="ComputeStateInfo"/>, конвертируемым в нативное
-/// <see cref="ComputePipelineStateCreateInfo"/> внутри этого класса.
-/// </summary>
+/// <summary>Diligent implementation of a compute PSO built from backend-independent <see cref="ComputeStateInfo"/>.</summary>
 internal sealed class DiligentComputeStateObject : IStateObject
 {
 	public string Name { get; }
@@ -188,10 +235,7 @@ internal sealed class DiligentComputeStateObject : IStateObject
 		};
 	}
 
-	/// <summary>
-	/// Прямая инициализация нативным Diligent-описанием, минуя абстракцию. Используется
-	/// только внутри backend'а.
-	/// </summary>
+	/// <summary>Backend-internal: initialize directly from a native Diligent description.</summary>
 	internal DiligentComputeStateObject(string name, ComputePipelineStateCreateInfo createInfo)
 	{
 		Name = name ?? throw new ArgumentNullException(nameof(name));

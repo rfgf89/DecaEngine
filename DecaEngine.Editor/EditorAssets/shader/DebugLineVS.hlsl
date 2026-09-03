@@ -1,6 +1,4 @@
-// Дебаг-линии (скелет, коллайдеры, контакты, лучи - см. DebugDraw/DebugLineOverlay). Вершины
-// приходят УЖЕ мировыми: дебаг-геометрия собирается на CPU из систем с разными пространствами, и
-// приводить их к общему знаменателю здесь было бы поздно. Пара - DebugLinePS.hlsl.
+// Debug lines; vertices arrive already in world space. Paired with DebugLinePS.hlsl.
 #include "Instancing.hlsl"
 
 cbuffer View
@@ -10,7 +8,7 @@ cbuffer View
 
 cbuffer DebugLineParams
 {
-    // x - множитель яркости (см. DebugLinePS: линии пишутся в HDR-таргет ДО тонемапа), yzw - запас.
+    // x - brightness multiplier (lines are written to the HDR target before tonemap), yzw spare.
     float4 debugLineParams;
 }
 
@@ -30,10 +28,8 @@ VSOutput Main(in VSInput input)
 {
     VSOutput output;
 
-    // Альфа - НЕ прозрачность (блендинга в PSO нет), а признак живой вершины. Хвост буфера,
-    // оставшийся от кадра с бОльшим числом линий, гасится нулевой альфой, и убрать его надо именно
-    // здесь: число вершин в дроу зашито в замороженную команду графа и меняться каждый кадр не
-    // может. Позиция за пределами клип-пространства - вершина отсекается целиком.
+    // Alpha is a live-vertex flag, not opacity: the draw's vertex count is baked into the frozen
+    // graph command, so leftover vertices are killed here by pushing them outside clip space.
     if (input.color.a <= 0.0)
     {
         output.pos = float4(2.0, 2.0, 2.0, 1.0);

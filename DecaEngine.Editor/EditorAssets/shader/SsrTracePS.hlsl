@@ -1,25 +1,7 @@
-// Стохастическая трассировка экранных отражений (см. SsrPass.cs) - архитектура Stachowiak
-// "Stochastic Screen-Space Reflections" (референс: Xerxes1138/StochasticScreenSpaceReflection):
-// ОДИН GGX-важностный луч на пиксель с BRDF bias (выборка поджата к зеркалу), выход двумя MRT:
-//   RT0 - цвет хита + confidence (вход AABB темпорального клампа и фолбэк резолва);
-//   RT1 - hit-буфер: экранный UV хита (или октаэдральное направление RT-хита) + PDF луча +
-//         маска (1 - экранный хит, 0.5 - RT-хит, 0 - промах).
-// Резолв (SsrResolvePS) переиспользует лучи соседей с весом BRDF/PDF - форма glossy-лоба
-// восстанавливается физикой, а не ручным радиусом размытия.
-//
-// Маршрутизация по шероховатости (Eto et al., SIGGRAPH Asia 2023):
-//   - выше SsrDiffuseRoughness лоб GGX почти косинусный - отражение берётся ПРЯМО из probe-поля
-//     (иррадианса в точке поверхности), без единого луча: ноль шума и интерьерно-корректный
-//     цвет вместо env-карты;
-//   - ниже SsrMirrorRoughness направление детерминированно зеркальное (стохастика на зеркале не
-//     сходится, а дрожит);
-//   - между ними - стохастический GGX-луч.
-//
-// Вариант с FEATURE_RT_REFLECTIONS (DXC/SM6.5, см. DiligentShader): лучи, промахнувшиеся мимо
-// экрана, добираются inline RayQuery по TLAS сцены (SceneTrace.hlsl - та же геометрия, что у
-// probe GI). Хит, видимый на экране, берёт ГОТОВЫЙ пиксель кадра (репроекция, там же у AMD);
-// внеэкранный шейдится аналитически: альбедо * (солнце с теневым лучом + probe-поле + лампы),
-// с одним дополнительным зеркальным отскоком для металлических хитов (см. SsrMetalAlbedoLum).
+// Stochastic SSR (Stachowiak): one GGX importance ray per pixel.
+// RT0 = hit color + confidence; RT1 = hit UV (or oct-encoded RT dir) + ray pdf +
+// mask (1 = screen hit, 0.5 = RT hit, 0 = miss).
+// FEATURE_RT_REFLECTIONS (DXC/SM6.5) continues off-screen rays via inline RayQuery.
 #include "SsrCommon.hlsl"
 
 Texture2D<float> _DepthTex;
@@ -28,49 +10,37 @@ Texture2D _EnvFactorTex;
 Texture2D _SceneTex;
 SamplerState _SceneTex_sampler;
 
-// Полукадровая размытая копия снимка сцены (см. SsrSceneBlurPS) - «cone tracing для бедных»:
-// шероховатый луч читает заранее размытый кадр вместо усреднения резких сэмплов резолвом.
+// Half-res pre-blurred scene copy: rough rays read it instead of averaging sharp taps.
 Texture2D _SceneBlurTex;
 SamplerState _SceneBlurTex_sampler;
 
 Texture2D _EnvMap;
 SamplerState _EnvMap_sampler;
 
-// Атласы probe-поля (SH L1) - свет RT-хитов и маршрут шероховатых поверхностей. Объявлены
-// безусловно (Vulkan требует привязки объявленных слотов - см. VUID-08114 в памяти проекта),
-// без поля держат плейсхолдер и мертвы по ssrProbeOrigin.w.
+// SH L1 probe atlases, declared unconditionally: Vulkan requires declared slots to be
+// bound; without a field they hold placeholders, gated off by ssrProbeOrigin.w.
 Texture2D _ProbeSh0;
 Texture2D _ProbeSh1;
 Texture2D _ProbeSh2;
 Texture2D _ProbeSh3;
 
-// Потолки циклов - статические (FXC/DXC не разворачивают неограниченный [loop]).
+// Static caps: FXC/DXC cannot handle an unbounded [loop].
 static const int SsrMaxSteps = 48;
 static const int SsrRefineSteps = 6;
 
-// Порог зеркального пути (SsrMirrorRoughness) переехал в SsrCommon.hlsl - он общий с резолвом
-// (там по нему выбирается аналитический pdf и репроекция виртуального образа).
-
-// Выше этой шероховатости отражение идёт из probe-поля (см. шапку). Порог сшит с плавным
-// переходом веса в композите через RoughnessFade - резкой границы техник в кадре нет.
+// Above this roughness the reflection comes from the probe field; matched to the
+// composite's RoughnessFade so there is no seam between techniques.
 static const float SsrDiffuseRoughness = 0.75;
 
-// (Эвристика «металл по тёмному альбедо» удалена: металличность запечена у каждого
-// треугольника - см. BvhTriangle.metalness; темнота альбедо металлом больше не считается.)
-
-// Смещение старта луча от самопересечения - ОТ МАСШТАБА (доля дистанции), а не константа:
-// мировые 0.02 на сцене, где весь зал - три юнита, толще её стен, и теневые лучи с отскоками
-// стартовали ПО ТУ СТОРОНУ тонкой геометрии - сквозь стены просвечивало небо.
+// Scale-relative self-intersection bias: a constant world bias exceeds wall
+// thickness on small scenes and starts rays on the far side.
 float SsrRayEpsilon(float dist)
 {
     return clamp(0.005 * dist, 5e-4, 0.05);
 }
 
-// Упрощённый сэмпл probe-поля: трилинейная интерполяция восьми угловых проб плотной сетки с
-// DDGI wrap-весом по нормали и валидностью из альфы Sh1. БЕЗ теста Чебышёва и релокации
-// (полный вариант - ProbeGiSampleBody.hlsl): отражение шероховатостью и без того фильтруется,
-// редкая протечка в нём дешевле шести дополнительных Load-ов на угол.
-// Возвращает E/PI - готовый ламбертов множитель альбедо; valid = 0 - поля нет/точка вне объёма.
+// Trilinear 8-corner probe sample, no Chebyshev test (full version: ProbeGiSampleBody.hlsl).
+// Returns E/PI; valid = 0 when there is no field or the point is outside the volume.
 float3 SsrSampleProbeField(float3 worldPos, float3 N, out float valid)
 {
     valid = 0.0;
@@ -100,11 +70,9 @@ float3 SsrSampleProbeField(float3 worldPos, float3 N, out float valid)
         int3 offset = int3(corner & 1, (corner >> 1) & 1, corner >> 2);
         int3 lp = localCell + offset;
 
-        // Узел -> тексель: плоскости Z столбиком (зеркало ProbeGiBaker.ProbeTexel; прокрутка
-        // с плотной сеткой снята, заворота нет).
+        // Node -> texel: Z planes stacked along Y (mirrors ProbeGiBaker.ProbeTexel).
         int3 texel = int3(lp.x, lp.z * counts.y + lp.y, 0);
 
-        // Валидность (пробы в стенах не интерполируются) - первой, чтобы не тянуть Load-ы зря.
         float4 sh1 = _ProbeSh1.Load(texel);
         float w = sh1.a;
         if (w < 1e-3)
@@ -112,8 +80,7 @@ float3 SsrSampleProbeField(float3 worldPos, float3 N, out float valid)
             continue;
         }
 
-        // Мягкий backface-вес (DDGI wrap shading) - проба позади поверхности хита не тянет своё
-        // поле сквозь стену; константы - как в ProbeGiSampleBody.
+        // DDGI wrap shading weight; constants match ProbeGiSampleBody.
         float3 probeWorld = ssrProbeOrigin.xyz + (float3)lp * ssrProbeCell.xyz;
         float3 toProbe = probeWorld - worldPos;
         float wrap = (dot(toProbe / max(length(toProbe), 1e-4), N) + 1.0) * 0.5;
@@ -148,9 +115,7 @@ float3 SsrSampleProbeField(float3 worldPos, float3 N, out float valid)
         SsrIrradianceL1(sum0.b * inv, float3(sumX.b, sumY.b, sumZ.b) * inv, N));
 }
 
-// Цвет кадра в точке экранного хита: резкий снимок и его размытая полукадровая копия смешиваются
-// по шероховатости ОТРАЖАЮЩЕЙ поверхности - шероховатый луч видит уже размытую сцену, и резолву
-// остаётся меньше дисперсии на усреднение (см. mip-цепочку у Stachowiak - здесь один уровень).
+// Blends by the REFLECTOR's roughness; single-level stand-in for Stachowiak's mip chain.
 float3 SsrSceneColor(float2 uv, float roughness)
 {
     float3 sharp = _SceneTex.SampleLevel(_SceneTex_sampler, uv, 0.0).rgb;
@@ -164,13 +129,9 @@ float3 SsrSceneColor(float2 uv, float roughness)
     return lerp(sharp, blurred, blurAmount);
 }
 
-// Видна ли мировая точка на экране ЭТОГО кадра: проекция + сверка глубины (допуск - доля
-// глубины: хит и пиксель обязаны быть одной поверхностью, а не совпадением вдоль луча взгляда)
-// + сверка НОРМАЛИ хита с G-buffer-ом пикселя: одна глубина вдоль луча взгляда законно
-// принадлежит РАЗНЫМ поверхностям (кромки, параллельные стены), и репроекция без нормали
-// подсовывала отражению цвет чужой стены - «текстуры уехали». Несовпавший хит честно уходит
-// в аналитический шейдинг со СВОИМИ текстурами. abs() - хит может быть изнанкой двусторонней
-// плоскости, чей экранный пиксель показывает лицо.
+// Is a world point visible on THIS frame's screen. The normal test is required: equal
+// depth along the view ray can belong to a different surface. abs() because the hit may
+// be the back side of a two-sided plane whose screen pixel shows the front.
 bool SsrTryScreenHit(float3 worldPos, float3 hitNormal, float2 viewportSize, out float2 uv)
 {
     uv = float2(0.0, 0.0);
@@ -197,8 +158,7 @@ bool SsrTryScreenHit(float3 worldPos, float3 hitNormal, float2 viewportSize, out
     float sceneZ = SsrViewDepth(raw);
     float pointZ = mul(float4(worldPos, 1.0), viewData.view).z;
 
-    // Допуск - доля глубины с МАЛЫМ полом: абсолютные 0.05 на мелкомасштабной сцене «сшивали»
-    // хит с чужой поверхностью в полкомнаты от него.
+    // Depth-relative tolerance with a small floor; absolute values fail on small scenes.
     if (abs(sceneZ - pointZ) >= max(0.025 * sceneZ, 0.005))
     {
         return false;
@@ -212,8 +172,7 @@ bool SsrTryScreenHit(float3 worldPos, float3 hitNormal, float2 viewportSize, out
 #define SCENE_TRACE_HARDWARE 1
 #include "SceneTrace.hlsl"
 
-// Свет камерного сегмента punctual-пула - лампы в шейдинге RT-хитов (привязка -
-// IBatchRenderer.BindShadowResources, как у объёмника; см. VolumetricCommon.hlsl).
+// Punctual lights bound via IBatchRenderer.BindShadowResources, as VolumetricCommon.hlsl.
 cbuffer Light
 {
     LightData lightData;
@@ -222,24 +181,19 @@ cbuffer Light
 StructuredBuffer<PunctualLight> PunctualLights;
 
 #if FEATURE_RT_HIT_ATLAS
-// Текстуры хитов, ДЕШЁВЫЙ режим: атлас-массив со слоем 128^2 на base color текстуру сцены
-// (даунсемпл CPU-плиток либо плитка среднего цвета - см. SsrHitTextures). Слой - индекс из
-// таблицы инстансов; Wrap-сэмплер отрабатывает заворот UV сам, слои независимы.
+// Cheap hit-texture mode: one 128^2 atlas layer per scene base-color texture.
 Texture2DArray _SceneHitAtlas;
 SamplerState _SceneHitAtlas_sampler;
 #endif
 
 #if FEATURE_RT_HIT_BINDLESS
-// Текстуры хитов, ДОРОГОЙ режим: полноразмерные base color текстуры сцены фиксированным
-// массивом (= ProbeInstancedGeometry.MaxHitTextures; свободные слоты добиты плейсхолдером).
-// Выборка через Load без сэмплера: combined-sampler режиму Diligent не нужна пара
-// _sampler на чисто Load-текстуру, а заворот и выбор мипа делаются вручную ниже.
+// Full-size base-color textures, array size = ProbeInstancedGeometry.MaxHitTextures.
+// Load-only, so Diligent's combined-sampler mode needs no _sampler pair.
 Texture2D _SceneHitTex[64];
 #endif
 
-// Альбедо RT-хита: настоящая текстура по UV хита, когда режим текстур включён и у инстанса
-// она есть; иначе - потриугольное усреднённое альбедо из TLAS-таблиц. Кламп 0.85 и линейный
-// BaseColorFactor - те же, что у потриугольного пути (единый баланс энергии мультибаунса).
+// Textured hit albedo when available, else the per-triangle average from the TLAS tables.
+// The 0.85 clamp matches the per-triangle path for a single multibounce energy balance.
 float3 SsrHitAlbedo(SceneHit hit, float roughness)
 {
 #if FEATURE_RT_HIT_ATLAS
@@ -247,7 +201,7 @@ float3 SsrHitAlbedo(SceneHit hit, float roughness)
     {
         float3 texel = _SceneHitAtlas.SampleLevel(_SceneHitAtlas_sampler,
             float3(hit.uv, (float)hit.textureIndex), 0.0).rgb;
-        // Текстуры движка без sRGB-формата - линеаризация вручную (2.2, как всюду).
+        // Engine textures are not sRGB formats: linearize manually.
         return min(pow(max(texel, 0.0), 2.2) * hit.baseColorFactor, 0.85);
     }
 #elif FEATURE_RT_HIT_BINDLESS
@@ -257,12 +211,8 @@ float3 SsrHitAlbedo(SceneHit hit, float roughness)
         uint w, h, mips;
         _SceneHitTex[index].GetDimensions(0, w, h, mips);
 
-        // Мип по ФУТПРИНТУ луча: мировое пятно = дистанция хита * угловой размер пикселя;
-        // плотность текселей у хита неизвестна (производных UV нет), берётся эвристика
-        // «текстура растянута на ~4 мировых юнита» - для архитектуры даёт мип в +-1 от
-        // честного, а ошибка в СТОРОНУ мелкого мипа безопасна: билинейная выборка ниже всё
-        // равно фильтрует. Прежний фикс-мип «~256px» точечным Load-ом рассыпал вышитую ткань
-        // в близком зеркале конфетти. Шероховатость расширяет конус лоба.
+        // Mip from ray footprint. No UV derivatives here, so texel density is assumed
+        // at one texture per ~4 world units; erring finer is covered by the bilinear.
         float pixelAngle = 2.0 / max(viewData.viewport.w, 1.0);
         float texelsAcross = hit.t * pixelAngle * (float)max(w, h) * 0.25;
         float mipF = log2(max(texelsAcross, 1.0)) + roughness * 2.0;
@@ -270,7 +220,7 @@ float3 SsrHitAlbedo(SceneHit hit, float roughness)
         uint mipW = max(w >> mip, 1u);
         uint mipH = max(h >> mip, 1u);
 
-        // Билинейная выборка вручную (Load не фильтрует) с заворотом соседей как у Wrap.
+        // Manual bilinear with Wrap-style neighbor wrapping (Load does not filter).
         float2 texelPos = frac(hit.uv) * float2(mipW, mipH) - 0.5;
         float2 baseFloor = floor(texelPos);
         float2 blend = texelPos - baseFloor;
@@ -289,10 +239,8 @@ float3 SsrHitAlbedo(SceneHit hit, float roughness)
     return hit.albedo;
 }
 
-// Аналитический свет в точке внеэкранного хита (без альбедо): солнце с теневым лучом по TLAS +
-// probe-поле (фолбэк - диффузная env-иррадианса с ambientLevel) + punctual-света сегмента камеры
-// (линейный проход - кластерная сетка экранная, точке хита не принадлежит; формулы затухания и
-// конуса - как в VolumetricCommon.hlsl, тень - теневым лучом вместо карт).
+// Analytic light at an off-screen hit, albedo excluded: sun + probe field + punctual.
+// The light loop is linear because the cluster grid is screen-space and misses the hit.
 float3 SsrAnalyticHitLight(float3 pos, float3 hitN, float eps, int2 noisePixel)
 {
     float3 sunDir = normalize(ssrSunDirWorld.xyz);
@@ -300,11 +248,7 @@ float3 SsrAnalyticHitLight(float3 pos, float3 hitN, float eps, int2 noisePixel)
     float sunLit = 1.0;
     if (ndl > 0.0)
     {
-        // Теневой луч рассеивается в конусе УГЛОВОГО РАЗМЕРА СОЛНЦА (ssrSunDirWorld.w - тангенс
-        // половинного угла, та же ручка, что у PCSS прямого вида). Один луч на пиксель остаётся
-        // бинарным, но направление джиттерится по пикселю и кадру, и темпоральная аккумуляция
-        // собирает из этого полутень. Без конуса край тени в отражении был ступенькой в чёрное:
-        // прямой вид даёт мягкую границу, отражение - жёсткую, и глаз читал это как ошибку.
+        // Shadow ray jittered in the sun cone; ssrSunDirWorld.w = tan of the half-angle.
         float tanHalf = ssrSunDirWorld.w;
         if (tanHalf > 1e-5)
         {
@@ -377,33 +321,24 @@ float3 SsrAnalyticHitLight(float3 pos, float3 hitN, float eps, int2 noisePixel)
     return ssrSunColor.rgb * ndl * sunLit + ambient + punctual;
 }
 
-// Дешёвая зеркальная замена для МЕТАЛЛИЧЕСКОГО хита, которому не досталось честной цепочки
-// отскоков (шероховатый пиксель, лимит ssrBounces, частичная металличность): env-карта по
-// отражённому направлению, тонированная альбедо (F0 металла - его base color). Без неё металл
-// с погашенным ламбертом рендерился ЧЁРНЫМ (см. кадр RT0 в RenderDoc - чёрные сферы в
-// отражениях); шероховатость поднята к 0.35 - это заведомо приближение, резкость ему не идёт.
+// Env-map stand-in for a metallic hit with no bounce chain (metal F0 = base color);
+// without it such metal renders black, its Lambert term killed by metalness.
 float3 SsrMetalEnvSpec(SceneHit hit, float3 rayDir, float3 hitN, float roughness)
 {
-    // Та же маска ЯВНОГО металла, что и в основном блоке: сырая потриугольная металличность
-    // шумит и давала пятна по треугольникам (см. комментарий там).
+    // Smooth mask, not a threshold: raw per-triangle metalness is noisy.
     float metalMask = smoothstep(0.5, 0.9, hit.metalness);
     if (metalMask <= 0.0)
     {
         return float3(0.0, 0.0, 0.0);
     }
 
-    // Размытие env-выборки - по ЗАПЕЧЁННОЙ шероховатости САМОГО хита (не по фиксированным
-    // 0.35 и не по шероховатости отражающего пикселя): зеркальный хром отражал небо так же
-    // мутно, как матовое железо, и на глянце это читалось как «шероховатость перемножается».
-    // Шероховатость смотрящего пикселя лишь ДОБАВЛЯЕТ размытия (свёртка двух лобов).
+    // Blur by the HIT's baked roughness; the viewer's roughness only ADDS blur.
     float envRough = saturate(max(hit.roughness, roughness * 0.5));
     return SsrHitAlbedo(hit, roughness) * metalMask
         * SsrSampleEnvironment(_EnvMap, _EnvMap_sampler, reflect(rayDir, hitN), envRough);
 }
 
-// Радианс из точки RT-хита по направлению луча: репроекция в кадр (полный пиксель со всеми
-// термами - см. шапку), иначе аналитический шейдинг двусторонней нормалью (backface = изнанка
-// односторонней плоскости, а не «внутри монолита» - см. историю чёрных дыр от панелей).
+// Radiance leaving an RT hit: screen reprojection when visible, else analytic shading.
 float3 SsrRtHitRadiance(SceneHit hit, float3 rayDir, float roughness, float2 viewportSize,
     int2 noisePixel)
 {
@@ -413,10 +348,7 @@ float3 SsrRtHitRadiance(SceneHit hit, float3 rayDir, float roughness, float2 vie
         return SsrSceneColor(seenUv, roughness);
     }
 
-    // Сглаженная нормаль (вершинная интерполяция) - геометрическая на плотных сферах давала
-    // фасетки («нет смешивания между вершинами»); диффуз гасится металличностью - у металла
-    // энергия в зеркальном отражении, и её место занимает env-замена ниже (честная цепочка
-    // отскоков живёт только в основном блоке, сюда приходят её окончания и вторые отскоки).
+    // Diffuse is scaled by metalness: metal energy lives in the env stand-in below.
     float3 hitN = hit.backface ? -hit.smoothNormal : hit.smoothNormal;
     return SsrHitAlbedo(hit, roughness) * (1.0 - smoothstep(0.5, 0.9, hit.metalness))
         * SsrAnalyticHitLight(hit.position, hitN, SsrRayEpsilon(hit.t), noisePixel)
@@ -439,8 +371,7 @@ PSOutput Main(in VSOutput input)
     float2 viewportSize = viewData.viewport.zw;
     int2 pixel = int2(input.pos.xy);
 
-    // Фон (reversed-Z чистится нулём) не отражает; маска lit-пути - нормаль G-buffer-а
-    // (нули у неба/не-PBR режимов, см. очистку в ForwardPass).
+    // Reversed-Z clears to 0; a zero G-buffer normal masks sky and non-PBR paths.
     float centerRaw = _DepthTex.Load(int3(pixel, 0));
     if (centerRaw < 1e-6)
     {
@@ -461,15 +392,12 @@ PSOutput Main(in VSOutput input)
     float3 V = -normalize(P);
     if (dot(N, V) <= 0.0)
     {
-        // Two-sided шейдинг форварда уже флипал нормаль к камере - сюда попадают только
-        // артефакты интерполяции на силуэтах.
         return output;
     }
 
     float confBase = SsrRoughnessFade(roughness);
 
-    // МАРШРУТ ШЕРОХОВАТЫХ: лоб почти косинусный - иррадианса probe-поля в самой точке, без
-    // единого луча (см. шапку). Поля нет/точка вне объёма - обычный трейс ниже.
+    // Near-cosine lobe: read probe irradiance directly, no ray. Falls through if no field.
     if (roughness > SsrDiffuseRoughness)
     {
         float3 worldPos = viewData.CameraWorldPos + mul(P, transpose((float3x3)viewData.view));
@@ -478,8 +406,7 @@ PSOutput Main(in VSOutput input)
         if (probeValid > 0.5)
         {
             output.rayColor = float4(irr, confBase);
-            // pdf = 1 и зеркальное направление: соседи того же маршрута согласованы, а вес
-            // BRDF у широкого лба и так почти изотропный.
+            // pdf = 1 and mirror direction keep neighbor resolve weights consistent.
             output.rayHit = float4(SsrOctEncode(reflect(-V, N)), 1.0, 0.5);
             return output;
         }
@@ -489,8 +416,8 @@ PSOutput Main(in VSOutput input)
     float pdf;
     if (roughness < SsrMirrorRoughness)
     {
-        // Зеркальный путь - детерминированное направление; pdf считается по H = N (это и есть
-        // пик лоба), чтобы вес ratio estimator-а у соседей-зеркал оставался согласованным.
+        // pdf evaluated at H = N (lobe peak) so the ratio estimator's weights stay
+        // consistent across neighboring mirror pixels.
         R = reflect(-V, N);
         float m = max(roughness * roughness, 1e-3);
         float m2 = m * m;
@@ -505,24 +432,19 @@ PSOutput Main(in VSOutput input)
         R = reflect(-V, H.xyz);
         if (dot(R, N) < 0.02)
         {
-            // Сэмпл лоба ушёл под поверхность (крайние углы обзора) - откат на зеркальный луч,
-            // выкидывать сэмпл целиком дороже: пиксель мигал бы дырой.
+            // Sample fell below the surface; dropping it instead would flicker.
             R = reflect(-V, N);
         }
     }
 
-    // Режим «сразу RT» (ssrTraceMode = 1, только в RT-варианте): экранный марш пропускается
-    // целиком, луч уходит в RayQuery, а радианс в точке хита всё равно берётся с экрана
-    // репроекцией (см. блок RT ниже). Уходят артефакты марша - ложные хиты за тонкой
-    // геометрией, ошибки ssrThickness, затухание у краёв кадра, - и 48 выборок глубины на луч
-    // меняются на один обход BVH.
+    // ssrTraceMode = 1: skip the screen march and go straight to RayQuery.
 #if FEATURE_RT_REFLECTIONS
     bool rtOnly = ssrTraceMode > 0.5;
 #else
     bool rtOnly = false;
 #endif
 
-    // Отрезок марша: до дальности либо до плоскости у камеры (за неё экран ничего не знает).
+    // March stops at the near plane: the screen holds nothing beyond it.
     float maxT = ssrMaxDistance;
     if (P.z + R.z * maxT < SsrNearPlane * 1.5)
     {
@@ -531,7 +453,7 @@ PSOutput Main(in VSOutput input)
 
     float3 P1 = P + R * maxT;
 
-    // Марш перспективно-корректный: UV и 1/z интерполируются линейно по экрану.
+    // Perspective-correct march: UV and 1/z interpolate linearly in screen space.
     float2 uv0 = SsrProjectUv(P, viewportSize);
     float2 uv1 = SsrProjectUv(P1, viewportSize);
     float q0 = 1.0 / P.z;
@@ -558,8 +480,7 @@ PSOutput Main(in VSOutput input)
         {
             float sceneZ = SsrViewDepth(tapRaw);
 
-            // Байас от самопересечения - доля глубины точки (суб-пиксельные ступени глубины
-            // на скользящих углах дают ложные хиты у самой поверхности).
+            // Depth-relative bias against false self-hits at grazing angles.
             if (rayZ > sceneZ + max(0.005 * sceneZ, 1e-3))
             {
                 if (rayZ - sceneZ < ssrThickness + 0.02 * sceneZ)
@@ -567,7 +488,6 @@ PSOutput Main(in VSOutput input)
                     hitS = s;
                     break;
                 }
-                // Луч глубже толщины - прошёл ПОЗАДИ тонкого объекта, марш продолжается.
             }
         }
 
@@ -576,8 +496,7 @@ PSOutput Main(in VSOutput input)
 
     if (hitS > 0.0)
     {
-        // Бинарное уточнение между последним свободным шагом и хитом - край отражения
-        // прилипает к геометрии, а не к сетке шагов.
+        // Binary refinement so the reflection edge sticks to geometry, not the step grid.
         float lo = prevS;
         float hi = hitS;
         [unroll]
@@ -602,15 +521,12 @@ PSOutput Main(in VSOutput input)
         float2 hitUv = lerp(uv0, uv1, hi);
         int2 hitPixel = clamp(int2(hitUv * viewportSize), int2(0, 0), int2(viewportSize) - 1);
 
-        // Хит по поверхности, обращённой ОТ луча (задник геометрии, сквозь которую луч прошёл
-        // марш-байасом), - не отражение, а протечка: отбрасываем.
+        // A hit on a surface facing away from the ray is a leak through geometry: reject.
         float3 hitNWorld = _NormalRoughTex.Load(int3(hitPixel, 0)).xyz;
         float3 rWorld = SsrViewDirToWorld(R);
         if (dot(hitNWorld, hitNWorld) < 0.5 || dot(hitNWorld, rWorld) < 0.1)
         {
-            // Билинейная выборка по СУБ-ПИКСЕЛЬНОМУ UV уточнённого хита, а не Load по целому
-            // пикселю: квантование до текселя заставляло цвет хита прыгать между соседями на
-            // каждый кадр (джиттер марша сдвигает hitS чуть-чуть) - мерцание глянца.
+            // Bilinear at the refined SUB-PIXEL UV; a whole-pixel Load flickers under jitter.
             output.rayColor = float4(SsrSceneColor(hitUv, roughness), confBase * SsrEdgeFade(hitUv));
             output.rayHit = float4(hitUv, pdf, 1.0);
             return output;
@@ -618,43 +534,31 @@ PSOutput Main(in VSOutput input)
     }
 
 #if FEATURE_RT_REFLECTIONS
-    // Экран промахнулся - добираем луч по TLAS сцены (см. шапку про репроекцию/аналитику).
     {
         float3 originWorld = viewData.CameraWorldPos + mul(P, transpose((float3x3)viewData.view));
         float3 dirWorld = SsrViewDirToWorld(R);
 
-        // БЕЗ капа ssrMaxDistance: дальность экранного марша ограничивает ЦЕНУ шагов, а RayQuery
-        // стоит одинаково при любом tMax. С капом луч в противоположную стену зала «промахивался»
-        // и падал в нижнюю полусферу env-карты - тёмную землю неба: RT-отражения дальних стен
-        // выглядели чёрными при яркой сцене.
+        // No ssrMaxDistance cap: RayQuery costs the same at any tMax, and capping made
+        // far-wall reflections fall into the dark lower env hemisphere.
         SceneHit hit = SceneTraceClosest(originWorld + nWorld * SsrRayEpsilon(P.z), dirWorld, 1e4);
 
-        // У ЗЕРКАЛЬНЫХ пикселей rayHit.z несёт ДЛИНУ луча, а не pdf: она нужна резолву для
-        // репроекции виртуального образа (RTG гл.32), а pdf зеркала резолв считает сам
-        // (SsrMirrorPdf - детерминированное направление, стохастики нет). Промах = «хит» на
-        // бесконечности: 1e4 репроецируется практически как направление.
+        // For MIRROR pixels rayHit.z carries the RAY LENGTH, not pdf: resolve needs it
+        // to reproject the virtual image (RTG ch.32) and derives the mirror pdf itself.
         bool mirrorPath = roughness < SsrMirrorRoughness;
 
         if (!hit.hit)
         {
-            // Луч не встретил геометрию - он ДОКАЗАЛ видимость неба по этому направлению:
-            // env-карта сэмплируется с ПОЛНЫМ весом, минуя запечённую окклюзию неба поверхности
-            // (композит вычитает env * envOcclusion, а добавляет цвет трейса как есть).
+            // The ray proved sky visibility, so bypass the surface's baked sky occlusion.
             float3 sky = SsrSampleEnvironment(_EnvMap, _EnvMap_sampler, dirWorld, roughness);
             output.rayColor = float4(sky, confBase);
             output.rayHit = float4(SsrOctEncode(R), mirrorPath ? 1e4 : pdf, 0.5);
             return output;
         }
 
-        // Отладочный вид 5: КАРТА ЦЕПОЧКИ отскоков - почему ручка «RT bounces» что-то делает
-        // или не делает. Красный - цепочка пошла (внеэкранный металлический хит на зеркальном
-        // пикселе), зелёный - металл БЕЗ цепочки (env-заглушка: не зеркальный пиксель либо
-        // bounces=1), синий - обычный диффузный хит. Чёрный - сюда вообще не дошли (экранный
-        // хит/промах в небо/шероховатый маршрут).
+        // Debug view 5, bounce-chain map: red = chain weight, green = metal without a
+        // chain, blue = diffuse hit, yellow = untextured hit, black = not reached.
         if (ssrDebugView > 4.5)
         {
-            // Красный - ВЕС цепочки (плавный, см. chainBlend), зелёный - металл без неё,
-            // синий - диффузный хит.
             float metalHere = smoothstep(0.5, 0.9, hit.metalness);
             float blendHere = metalHere * (1.0 - smoothstep(0.15, 0.4, hit.roughness))
                 * (ssrBounces > 1.5 ? 1.0 : 0.0);
@@ -662,9 +566,6 @@ PSOutput Main(in VSOutput input)
                 ? float3(blendHere, 0.0, 0.0)
                 : (metalHere > 0.5 ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0));
 
-            // ЖЁЛТЫЙ - у хита НЕТ текстуры (не попал в набор/меш без UV): такой хит красится
-            // ПОТРИУГОЛЬНЫМ альбедо, то есть плоским цветом на треугольник, и в отражении это
-            // и есть мозаика по рёбрам. Отдельный цвет, чтобы отличать её от шейдинга.
             if (hit.textureIndex < 0)
             {
                 flag = float3(1.0, 1.0, 0.0);
@@ -674,8 +575,7 @@ PSOutput Main(in VSOutput input)
             return output;
         }
 
-        // Отладочный вид 4: ЧИСТОЕ альбедо хита вместо шейдинга - диагностика текстур RT-хитов
-        // (какой текстурой и по каким UV красится точка, без света и репроекции).
+        // Debug view 4: raw hit albedo, no lighting or reprojection.
         if (ssrDebugView > 3.5)
         {
             output.rayColor = float4(SsrHitAlbedo(hit, roughness), confBase);
@@ -683,31 +583,15 @@ PSOutput Main(in VSOutput input)
             return output;
         }
 
-        // Гладкий металлический хит - кандидат на ЦЕПОЧКУ отскоков (ниже). Решение принимается
-        // ДО репроекции в кадр: снимок сцены делается ПЕРЕД композитом SSR, поэтому у зеркала
-        // на экране есть только env-спекуляр форварда, а СВОИХ отражений ещё нет. Брать такой
-        // пиксель - значит навсегда остаться на одном отскоке, и ручка «RT bounces» не меняла
-        // ничего в кадрах, где отражённое зеркало видно на экране (типовой случай: две сферы
-        // друг напротив друга). Диффузным и матовым хитам экранный пиксель по-прежнему лучший
-        // источник - там он полный, со всем светом (приём AMD SA2023).
-        // Вес цепочки - ПЛАВНЫЙ по свойствам хита, а не бинарный порог: металличность и
-        // шероховатость запекаются КОНСТАНТОЙ НА ТРЕУГОЛЬНИК (выборка в центроиде UV), и
-        // жёсткое условие «металл > 0.5 И шероховатость < 0.35» щёлкало режимом шейдинга от
-        // треугольника к треугольнику - в отражении это читалось мозаикой по рёбрам. Теперь
-        // вклад цепочки и env-заглушки СМЕШИВАЕТСЯ этим весом, и переход между соседними
-        // треугольниками непрерывен.
-        // Маска ЯВНОГО металла. Металличность запечена одним текселем в центроиде UV, а в
-        // MR-текстурах реальных ассетов канал шумит: у неметаллической ткани Sponza соседние
-        // треугольники получают 0.0 и 0.1-0.2 вперемешку. Брать её как есть нельзя - она
-        // множит диффуз хита ((1 - metalness) ниже), и шум читался ПЯТНАМИ ПО ТРЕУГОЛЬНИКАМ.
-        // smoothstep отсекает шум у нуля и оставляет металлом только то, что автор пометил
-        // металлом (0.9+ у хрома, 1.0 у MetalRoughSpheres).
+        // Decided BEFORE screen reprojection: the scene snapshot predates the SSR
+        // composite, so reprojecting a mirror pixel would lock it to one bounce.
+        // The weight is smooth because metalness/roughness are baked per triangle and a
+        // hard threshold flips shading mode per triangle, reading as an edge mosaic.
         float hitMetal = smoothstep(0.5, 0.9, hit.metalness);
         float chainBlend = hitMetal * (1.0 - smoothstep(0.15, 0.4, hit.roughness));
         bool chainTaken = chainBlend > 0.02 && ssrBounces > 1.5;
 
-        // Репроекция хита в кадр - внутри SsrRtHitRadiance; маска экранного хита ниже нужна
-        // резолву для честного L из view-позиции.
+        // Resolve needs the screen-hit mask to get an exact L from the view position.
         float2 seenUv;
         if (!chainTaken && SsrTryScreenHit(hit.position, hit.smoothNormal, viewportSize, seenUv))
         {
@@ -716,38 +600,23 @@ PSOutput Main(in VSOutput input)
             return output;
         }
 
-        // Сглаженная нормаль - и в шейдинге, и в зеркальных продолжениях ниже (фасетки
-        // геометрической на плотных мешах = «мозаика» в отражениях цепочки).
+        // Smooth normal here and in the continuations: the geometric normal facets on
+        // dense meshes and shows as a mosaic in chained reflections.
         float3 hitN = hit.backface ? -hit.smoothNormal : hit.smoothNormal;
         float hitEps = SsrRayEpsilon(hit.t);
 
-        // Диффуз гасится ЗАПЕЧЁННОЙ металличностью: у металла энергия в зеркальном продолжении
-        // (цепочка ниже), и ламберт поверх неё двоил картинку («каша накладывается» при росте
-        // числа отскоков). При ssrBounces = 1 хром честно тёмный - продолжений не заказывали.
+        // Diffuse scaled by (1 - metal): metal energy lives in the mirror continuation.
         float3 lit = SsrHitAlbedo(hit, roughness) * (1.0 - hitMetal)
             * SsrAnalyticHitLight(hit.position, hitN, hitEps, pixel);
 
-        // ЗЕРКАЛЬНЫЕ ПРОДОЛЖЕНИЯ для «зеркала в зеркале» - до ssrBounces отскоков ВСЕГО
-        // (ручка «RT bounces»; 1 - только первичный луч).
-        //
-        // Условие - свойства САМОГО ХИТА: он металлический (запечённая металличность; прежняя
-        // эвристика «металл по тёмному альбедо» ЗАПРЕЩЕНА - честно-тёмные диффузные своды
-        // получали фантомные наложения) И достаточно гладкий, чтобы его отражение было
-        // осмысленным. Шероховатость СМОТРЯЩЕГО пикселя здесь не при чём: раньше гейт требовал
-        // roughness < 0.08 у зеркала, и на чуть глянцевых сферах ручка «RT bounces» не делала
-        // РОВНО НИЧЕГО (диагностика: вид «RT bounce chain» был сплошь зелёный - металл без
-        // цепочки). Матовый металл честно остаётся на env-заглушке: его лоб размывает всё
-        // равно, а цена трассировки та же. (hitMetal/chainTaken посчитаны ВЫШЕ - решение
-        // принимается до репроекции в кадр, см. комментарий там.)
-
-        // Зеркальный терм металла собирается ОТДЕЛЬНО и подмешивается в конце: env-заглушка и
-        // цепочка отскоков смешиваются по chainBlend (см. выше про мозаику по треугольникам).
+        // Mirror-in-mirror continuations up to ssrBounces. Gated on the HIT's baked
+        // metalness, never on the viewer pixel's roughness.
         float3 metalEnv = SsrMetalEnvSpec(hit, dirWorld, hitN, roughness);
         float3 chainSpec = float3(0.0, 0.0, 0.0);
 
         if (chainTaken)
         {
-            // Тинт хопа: F0 металла - его base color (серебро белит, золото желтит).
+            // Hop tint: metal F0 = its base color.
             float3 bounceDir = reflect(dirWorld, hitN);
             float3 bounceOrigin = hit.position + hitN * hitEps;
             float3 bounceTint = hitMetal * SsrHitAlbedo(hit, roughness);
@@ -759,7 +628,6 @@ PSOutput Main(in VSOutput input)
                 SceneHit hitB = SceneTraceClosest(bounceOrigin, bounceDir, 1e4);
                 if (!hitB.hit)
                 {
-                    // Промах доказал видимость неба - обрыв цепочки env-картой.
                     chainSpec += SsrSampleEnvironment(_EnvMap, _EnvMap_sampler, bounceDir, roughness)
                         * bounceTint;
                     break;
@@ -767,10 +635,7 @@ PSOutput Main(in VSOutput input)
 
                 float3 hitBn = hitB.backface ? -hitB.smoothNormal : hitB.smoothNormal;
 
-                // Продолжать ли зеркально - тем же ПЛАВНЫМ весом, что и на первом хите;
-                // остаток веса забирает радианс хита (репроекция/аналитика), поэтому переход
-                // между соседними треугольниками с чуть разными метал/шероховатостью
-                // непрерывен, а энергия сохраняется.
+                // The remainder goes to hit radiance, so the chain conserves energy.
                 float metalB = smoothstep(0.5, 0.9, hitB.metalness);
                 float blendB = metalB * (1.0 - smoothstep(0.15, 0.4, hitB.roughness));
                 bool lastHop = bounce + 1 >= bounceCap;
@@ -781,14 +646,12 @@ PSOutput Main(in VSOutput input)
                     break;
                 }
 
-                // Хит снова металлический и лимит позволяет - продолжаем зеркально.
                 bounceOrigin = hitB.position + hitBn * SsrRayEpsilon(hitB.t);
                 bounceDir = reflect(bounceDir, hitBn);
                 bounceTint *= metalB * SsrHitAlbedo(hitB, roughness);
             }
         }
 
-        // Смешение env-заглушки и цепочки: chainBlend = 0 - только заглушка, 1 - только цепочка.
         lit += lerp(metalEnv, chainSpec, chainTaken ? chainBlend : 0.0);
 
         output.rayColor = float4(lit, confBase);

@@ -4,20 +4,13 @@ using System.IO.Compression;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Разворачивает нативные библиотеки (шим апскейлеров DecaFfxShim.dll, FSR
-/// amd_fidelityfx_upscaler_dx12.dll, DLSS nvngx_dlss.dll) из папки <c>NativeLibrary</c> в корне
-/// репозитория в каталог экзешника при старте. Без этого каждая пересборка в чистый bin теряла
-/// бы их, а нативные бэкенды молча откатывались бы на TAAU.
-///
-/// Копирование ленивое: только когда файла нет или источник новее (пересобранный шим доезжает
-/// сам). Безопасно по времени: P/Invoke и NGX грузят DLL лениво, при первом использовании -
-/// на момент вызова из Main ни одна ещё не загружена, и перезапись возможна.</summary>
+/// <summary>Copies native upscaler libraries from <c>NativeLibrary</c> into the output directory at startup.</summary>
+// Must run before any of those DLLs is loaded; P/Invoke and NGX load lazily, so Main is early enough.
 public static class NativeLibraryDeployer
 {
 	public const string FolderName = "NativeLibrary";
 
-	/// <summary>Версия D3D12SDKVersion редиста в agility-sdk.zip (минор пакета
-	/// Microsoft.Direct3D.D3D12 1.619.x). Менять вместе с обновлением архива.</summary>
+	// D3D12SDKVersion of the redist in agility-sdk.zip; bump together with the archive.
 	private const uint AgilitySdkVersion = 619;
 
 	[System.Runtime.InteropServices.DllImport("DecaFfxShim.dll",
@@ -25,9 +18,7 @@ public static class NativeLibraryDeployer
 		CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
 	private static extern int DecaAgility_Init(uint sdkVersion, string sdkPath);
 
-	/// <summary>Включает разложенный <see cref="DeployAgilitySdk"/> редист Agility SDK - строго ДО
-	/// создания D3D12-устройства (см. EditorMain). Все неудачи безопасны: остаёмся на встроенном
-	/// рантайме Windows.</summary>
+	/// <summary>Enables the deployed Agility SDK redist; must be called before the D3D12 device is created.</summary>
 	public static void TryEnableAgilitySdk()
 	{
 		if (Environment.GetEnvironmentVariable("DECA_AGILITY") == "0" ||
@@ -42,7 +33,7 @@ public static class NativeLibraryDeployer
 		}
 		catch (DllNotFoundException)
 		{
-			// Нет шима - нет и нативных апскейлеров, ради которых Agility и нужен.
+			// No shim means no native upscalers, which is the only reason Agility is needed.
 		}
 	}
 
@@ -50,8 +41,7 @@ public static class NativeLibraryDeployer
 	{
 		var baseDir = AppContext.BaseDirectory;
 
-		// Папка ищется ВВЕРХ от каталога экзешника (bin/x64/Debug/net10.0 -> корень репозитория):
-		// так работает и Debug, и Release, и любой будущий каталог публикации внутри репо.
+		// Searched upwards from the output directory so any bin layout inside the repo works.
 		string? sourceDir = null;
 		for (var dir = new DirectoryInfo(baseDir); dir is not null; dir = dir.Parent)
 		{
@@ -66,8 +56,7 @@ public static class NativeLibraryDeployer
 		if (sourceDir is null || string.Equals(Path.GetFullPath(sourceDir),
 			    Path.GetFullPath(baseDir), StringComparison.OrdinalIgnoreCase))
 		{
-			// Машина без нативных либ (или запуск прямо из папки) - штатный случай: конвейер
-			// умеет жить на встроенном TAAU, а окно Graphics честно покажет недоступность.
+			// Normal case: without the native libs the pipeline stays on the built-in TAAU.
 			return;
 		}
 
@@ -85,8 +74,7 @@ public static class NativeLibraryDeployer
 			}
 			catch (IOException e)
 			{
-				// Занятый файл (второй экземпляр редактора уже загрузил DLL) - не смертельно:
-				// работает прежняя копия, свежая доедет следующим запуском.
+				// Locked file (another editor instance holds the DLL): the old copy keeps working.
 				Console.WriteLine($"[native] {Path.GetFileName(source)}: {e.Message}");
 			}
 		}
@@ -94,10 +82,7 @@ public static class NativeLibraryDeployer
 		DeployAgilitySdk(sourceDir, baseDir);
 	}
 
-	/// <summary>Раскладывает DirectX Agility SDK из <c>NativeLibrary/agility-sdk.zip</c> (nupkg
-	/// Microsoft.Direct3D.D3D12 под нейтральным именем) в <c>bin/D3D12/</c>. Из архива, а не
-	/// готовыми файлами, нарочно: рантайм требует ИМЕННО имени D3D12Core.dll, и раскладывать его
-	/// удобнее самим процессом. Включается затем через DecaAgility_Init (см. EditorMain).</summary>
+	// Extracts D3D12Core.dll from the Microsoft.Direct3D.D3D12 nupkg; the runtime demands that name.
 	private static void DeployAgilitySdk(string sourceDir, string baseDir)
 	{
 		var package = Path.Combine(sourceDir, "agility-sdk.zip");
@@ -114,7 +99,7 @@ public static class NativeLibraryDeployer
 			using var zip = System.IO.Compression.ZipFile.OpenRead(package);
 			foreach (var entry in zip.Entries)
 			{
-				// Debug-слои не раскладываем: нужен только сам рантайм.
+				// Debug layers are skipped: only the runtime itself is needed.
 				if (!entry.FullName.StartsWith("build/native/bin/x64/", StringComparison.OrdinalIgnoreCase) ||
 				    !entry.Name.Equals("D3D12Core.dll", StringComparison.OrdinalIgnoreCase))
 				{

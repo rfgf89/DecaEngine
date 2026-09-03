@@ -20,13 +20,16 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 	private OpenFolderDialog? _openFolderDialog;
 
-	/// <summary>Проект, открытие которого сейчас идёт в фоне (см. LoadProjectFromSln): нужен, чтобы
-	/// по завершении дописать его в недавние и в заголовок окна.</summary>
+	// Project currently loading in the background; recorded on completion.
 	private string? _pendingProjectSln;
 
 	private bool _autoLoadAttempted;
 	private bool _settingsAutoOpened;
 	private int _autoOpenFrame;
+
+	/// <summary>Target of the Edit menu. A property, not a ctor argument: the menu bar is created
+	/// before the inspector; null keeps the menu items disabled.</summary>
+	public InspectorWindow? Inspector { get; set; }
 
 	public MenuBarWindow(string title, DockLayout dockLayout, IWindowHandle windowHandle, ProjectSession projectSession, EditorSettings editorSettings, ImGuiRender imGuiRender) : base(title, imGuiRender)
 	{
@@ -51,9 +54,9 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 	{
 		TryAutoLoadLastProject();
 
-		// Диагностический авто-опен модалок (DECA_AUTO_OPEN_SETTINGS=1 - Settings, =2 - New Project)
-		// для headless-проверки UI скриншотом без кликов по меню. Задержка в кадрах - первые кадры
-		// редактора создают/фокусируют док-окна, и ImGui закрывает открытую в этот момент модалку.
+		// DECA_AUTO_OPEN_SETTINGS opens a modal for headless screenshot checks (1 - Settings,
+		// 2 - New Project). The frame delay is required: early frames dock windows and ImGui
+		// closes any modal opened during that.
 		if (!_settingsAutoOpened && ++_autoOpenFrame == 150)
 		{
 			var autoOpen = Environment.GetEnvironmentVariable("DECA_AUTO_OPEN_SETTINGS");
@@ -69,7 +72,6 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 			}
 		}
 
-		// Открытие проекта идёт в фоне - его завершение подхватывается здесь, каждый кадр.
 		PollProjectLoad();
 
 		_newProjectWindow.Render(0);
@@ -77,7 +79,6 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 		if (ImGui.BeginMenuBar())
 		{
-			// Меню "File"
 			if (ImGui.BeginMenu("File"))
 			{
 				if (ImGui.MenuItem("New Project", "Ctrl+S"))
@@ -93,9 +94,8 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 				if (ImGui.BeginMenu("Recently Project"))
 				{
-					// Чистка от удалённых с диска проектов - В МОМЕНТ ОТКРЫТИЯ меню, а не каждый
-					// кадр: File.Exists на каждый пункт при отвалившемся сетевом диске - это
-					// подвисание меню на каждом кадре, пока оно открыто.
+					// Prune only when the menu opens: a per-frame File.Exists over every entry
+					// stalls the UI on a dead network drive.
 					if (ImGui.IsWindowAppearing())
 					{
 						_recentProjects.Prune();
@@ -103,14 +103,13 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 					if (_recentProjects.Entries.Count == 0)
 					{
-						ImGui.TextDisabled("Нет недавних проектов");
+						ImGui.TextDisabled("No recent projects");
 					}
 					else
 					{
 						var currentSlnPath = _projectSession.ProjectSlnPath;
 
-						// Копия списка — LoadProjectFromSln может изменить _recentProjects.Entries
-						// (переместить/добавить запись), поэтому нельзя итерировать исходную коллекцию.
+						// Iterate a copy: LoadProjectFromSln mutates _recentProjects.Entries.
 						string? clickedSlnPath = null;
 						foreach (var entry in _recentProjects.Entries.ToArray())
 						{
@@ -128,10 +127,10 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 
 							if (ImGui.IsItemHovered())
 							{
-								var tooltip = $"{entry.SlnPath}\nОткрыт: {entry.LastOpened:g}";
+								var tooltip = $"{entry.SlnPath}\nOpened: {entry.LastOpened:g}";
 								if (isCurrent)
 								{
-									tooltip += "\n(уже загружен)";
+									tooltip += "\n(already loaded)";
 								}
 								ImGui.SetTooltip(tooltip);
 							}
@@ -149,39 +148,47 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 				ImGui.Separator();
 				if (ImGui.MenuItem("Exit"))
 				{
-					// Обработка выхода из приложения
 				}
 
 				ImGui.EndMenu();
 			}
 
-			// Меню "Edit"
 			if (ImGui.BeginMenu("Edit"))
 			{
-				if (ImGui.MenuItem("Undo", "Ctrl+Z"))
+				var inspector = Inspector;
+
+				if (ImGui.MenuItem("Undo", "Ctrl+Z", false, inspector?.CanUndo == true))
 				{
-					// Обработка отмены
+					inspector!.Undo();
 				}
 
-				if (ImGui.MenuItem("Redo", "Ctrl+Y"))
+				if (ImGui.MenuItem("Redo", "Ctrl+Y", false, inspector?.CanRedo == true))
 				{
-					// Обработка повторения
+					inspector!.Redo();
 				}
 
 				ImGui.Separator();
-				if (ImGui.MenuItem("Cut"))
+
+				bool hasSelection = inspector?.HasPrefabSelection == true;
+
+				if (ImGui.MenuItem("Cut", "Ctrl+X", false, hasSelection))
 				{
-					// Обработка вырезания
+					inspector!.CutSelected();
 				}
 
-				if (ImGui.MenuItem("Copy"))
+				if (ImGui.MenuItem("Copy", "Ctrl+C", false, hasSelection))
 				{
-					// Обработка копирования
+					inspector!.CopySelected();
 				}
 
-				if (ImGui.MenuItem("Paste"))
+				if (ImGui.MenuItem("Paste", "Ctrl+V", false, inspector?.CanPasteEntity == true))
 				{
-					// Обработка вставки
+					inspector!.PasteIntoSelected();
+				}
+
+				if (ImGui.MenuItem("Duplicate", "Ctrl+D", false, hasSelection))
+				{
+					inspector!.DuplicateSelected();
 				}
 
 				ImGui.Separator();
@@ -193,24 +200,7 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 				ImGui.EndMenu();
 			}
 
-			// Меню "View"
-			if (ImGui.BeginMenu("View"))
-			{
-				if (ImGui.MenuItem("Copy"))
-				{
-					// Обработка копирования
-				}
-
-				if (ImGui.MenuItem("Paste"))
-				{
-					// Обработка вставки
-				}
-
-				ImGui.EndMenu();
-			}
-
-			// Меню "Window" — собирается из реестра DockLayout: каждое
-			// зарегистрированное окно становится пунктом с галочкой.
+			// Built from the DockLayout registry: every registered window becomes an item.
 			if (ImGui.BeginMenu("Window"))
 			{
 				foreach (var windowType in _imGuiRender.windowGetters.Keys)
@@ -226,17 +216,14 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 				ImGui.EndMenu();
 			}
 
-			// Меню "Help"
 			if (ImGui.BeginMenu("Help"))
 			{
 				if (ImGui.MenuItem("Documentation"))
 				{
-					// Открыть документацию
 				}
 
 				if (ImGui.MenuItem("About"))
 				{
-					// Открыть окно "О программе"
 				}
 
 				ImGui.EndMenu();
@@ -303,17 +290,14 @@ public unsafe class MenuBarWindow : ImGuiMenuBarWindow
 		LoadProjectFromSln(slnFile);
 	}
 
-	/// <summary>Начинает открытие проекта. Дожидается его <see cref="PollProjectLoad"/> - открытие
-	/// идёт в фоне (сборка проекта занимает минуты, см. ProjectSession.BeginLoadProject), и держать
-	/// на нём кадр нельзя.</summary>
+	// Loading runs in the background (a project build takes minutes); PollProjectLoad finishes it.
 	private void LoadProjectFromSln(string slnPath)
 	{
 		_pendingProjectSln = slnPath;
 		_projectSession.BeginLoadProject(slnPath);
 	}
 
-	/// <summary>Доводит открытие до конца и делает то, что зависит от результата: список недавних и
-	/// заголовок окна. Звать каждый кадр.</summary>
+	// Must be called every frame.
 	private void PollProjectLoad()
 	{
 		if (!_projectSession.PollLoad())

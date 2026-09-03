@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 using DecaEngine;
 using DecaEngine.Core;
 using Diligent;
-// Сэмпл работает с нативным контекстом напрямую - состояния Diligent-овские, не из ICommandBuffer.
+// Sample drives the native Diligent context directly, so states come from Diligent.
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
 using ValueType = Diligent.ValueType;

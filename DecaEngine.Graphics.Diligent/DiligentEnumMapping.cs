@@ -8,24 +8,15 @@ using NativeSetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>Перевод backend-независимых <see cref="CoreResourceState"/>/<see cref="CoreClearDepthStencilFlags"/>
-/// (см. ICommandBuffer) в нативные типы Diligent - только в этой точке, чтобы Diligent-типы не
-/// протекали в сигнатуру ICommandBuffer.</summary>
+/// <summary>Sole translation point from engine enums to native Diligent types.</summary>
 internal static class DiligentEnumMapping
 {
-	/// <summary>Выставляется в DiligentGraphicsApi.Initialize. Нужен маппингу DepthRead: смысл
-	/// этого состояния в движке - "депт-текстура читается шейдером как SRV", но нативное
-	/// представление зависит от бэкенда (см. ниже).</summary>
+	/// <summary>Set in DiligentGraphicsApi.Initialize; the native DepthRead mapping is backend-specific.</summary>
 	internal static DecaEngine.Graphics.GraphicsBackend Backend;
 
-	// DepthRead:
-	//  - Vulkan: одиночный DEPTH_READ - SRV депта биндится с лейаутом
-	//    DEPTH_STENCIL_READ_ONLY_OPTIMAL (VUID-VkDescriptorImageInfo-imageLayout-00344), а
-	//    комбинированные стейты текстур Diligent на Vulkan не переводит в лейаут (VERIFY
-	//    "single bit state" в ResourceStateToVkImageLayout).
-	//  - D3D12: голый D3D12_RESOURCE_STATE_DEPTH_READ НЕ разрешает чтение SRV - пиксельному
-	//    шейдеру нужен ещё PIXEL_SHADER_RESOURCE, иначе чтение депта в SSAO/SSGI/тенях - UB
-	//    (page fault -> TDR -> device removed). Комбинация read-only состояний валидна.
+	// DepthRead quirk: Vulkan needs a single-bit DEPTH_READ (Diligent can't map combined
+	// states to a layout), while D3D12 DEPTH_READ alone forbids SRV reads — it needs
+	// ShaderResource OR'd in, else depth reads in SSAO/SSGI/shadows are UB (TDR).
 	public static NativeResourceState ToNative(this CoreResourceState state) => state switch
 	{
 		CoreResourceState.Unknown => NativeResourceState.Unknown,

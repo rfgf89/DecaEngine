@@ -1,25 +1,16 @@
-// Восстановление motion vectors ИЗ ОДНОЙ ГЛУБИНЫ - первая ступень апскейлеров (DLSS/FSR), см.
-// MotionVectorPass.cs. Честных пер-инстансных векторов у движка пока нет, и этот пасс даёт то, что
-// можно получить, зная лишь глубину: смещение пикселя, вызванное движением КАМЕРЫ, в предположении
-// что мировая точка неподвижна.
-//
-// Отсюда и граница применимости: статика и небо восстанавливаются точно, а всё, что само двигалось
-// между кадрами (анимация, скиннинг, едущие объекты), получает вектор камеры и потому тянет за
-// собой историю. Это осознанный размен ступени 1 - см. комментарий класса MotionVectorPass.
-//
-// Прозрачность в глубину не пишет, так что под стеклом здесь вектор того, что ЗА стеклом.
+// Camera-only motion vectors reconstructed from depth (upscaler input, see
+// MotionVectorPass.cs): assumes the world point is static, so animated/moving
+// objects get the camera vector. Transparency writes no depth, so under glass
+// this is the vector of what is BEHIND the glass.
 
 Texture2D _DepthTex;
 
-// Зеркалит MotionVectorConstantsData (MotionVectorPass.cs).
+// Mirrors MotionVectorConstantsData (MotionVectorPass.cs).
 cbuffer MotionVectorConstants
 {
-    // Композиция invViewProj(текущий кадр) * viewProj(предыдущий кадр), посчитанная на CPU.
-    //
-    // Одна матрица вместо двух не только экономит mul: перемножение на CPU означает, что МИРОВАЯ
-    // позиция пикселя в шейдере вообще не материализуется. А она - самое опасное место по точности:
-    // мировые координаты бывают в тысячах единиц от начала, и float32 там теряет ровно те доли
-    // пикселя, которыми и живёт временнОй репроджекшен.
+    // invViewProj(current) * viewProj(previous), composed on CPU so world position
+    // never materializes in-shader; float32 world coords lose the sub-pixel
+    // precision temporal reprojection depends on.
     float4x4 reprojection;
 };
 
@@ -41,18 +32,13 @@ PSOutput Main(in VSOutput input)
     int2 pixel = int2(input.pos.xy);
     float depth = _DepthTex.Load(int3(pixel, 0)).r;
 
-    // Точка берётся ГОМОГЕННОЙ и такой же остаётся до самого конца - без промежуточного деления на
-    // w. В этом весь фокус: реверсивный-Z с бесконечной дальней плоскостью (см.
-    // MakePerspectiveReversedZ) отдаёт фону depth == 0, а это точка НА БЕСКОНЕЧНОСТИ, у которой
-    // мировое w равно нулю. Подели мы здесь - на всём небе вышел бы NaN, и его пришлось бы
-    // отдельно ветвить. Проективное преобразование линейно, поэтому композиция двух матриц честно
-    // проносит бесконечно удалённую точку через оба кадра, и небо само собой получает ровно тот
-    // вектор, который ему положен: от вращения камеры (её сдвиг на бесконечность не влияет).
+    // Stay homogeneous until the end: infinite reversed-Z gives sky depth == 0
+    // (point at infinity, w == 0); an intermediate divide would NaN the whole sky,
+    // while the composed projective transform carries it through correctly.
     float4 prevClip = mul(float4(input.ndc, depth, 1.0), reprojection);
 
-    // Точка, ушедшая ЗА прошлую камеру (w <= 0), проецируется зеркально и дала бы вектор,
-    // указывающий в произвольную сторону. Такому пикселю честнее отдать нулевое смещение: апскейлер
-    // разберётся с ним как с дисокклюзией, а мусорный вектор увёл бы его в чужую историю.
+    // Point behind the previous camera (w <= 0) projects mirrored; zero motion is
+    // safer, the upscaler treats it as disocclusion.
     if (prevClip.w <= 1e-6)
     {
         output.motion = float2(0.0, 0.0);
@@ -61,12 +47,9 @@ PSOutput Main(in VSOutput input)
 
     float2 prevNdc = prevClip.xy / prevClip.w;
 
-    // Соглашение: вектор ведёт ИЗ текущего кадра В ПРОШЛЫЙ, в единицах UV (0..1 по экрану), то есть
-    // prevUV = curUV + motion. Именно этого ждут и DLSS, и FSR (с точностью до своего масштабного
-    // коэффициента), и от разрешения такой вектор не зависит - что важно, когда рендер и вывод
-    // разъедутся по размеру.
-    //
-    // NDC -> UV меняет знак Y: в NDC верх кадра это +1, в UV - ноль.
+    // Convention: vector points current -> previous frame in UV units, i.e.
+    // prevUV = curUV + motion (what DLSS/FSR expect, resolution-independent).
+    // NDC -> UV flips Y sign.
     output.motion = (prevNdc - input.ndc) * float2(0.5, -0.5);
 
     return output;

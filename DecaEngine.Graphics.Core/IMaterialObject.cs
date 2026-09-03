@@ -14,19 +14,9 @@ public struct MaterialDrawRange
 
 public interface IMaterialObject : IStateObject
 {
-	/// <summary>Освобождает ли <see cref="IReleaseObject.Release"/> этого материала свои шейдеры.
-	///
-	/// По умолчанию true, и это верно для подавляющего большинства материалов движка: каждый пасс
-	/// заводит СВОЙ экземпляр шейдера именно затем, чтобы материал мог его освободить (см.
-	/// SsaoPassResources и родственные - там об этом прямо написано).
-	///
-	/// Но у загрузчика моделей всё наоборот: один вершинный шейдер и горстка вариантов пиксельного
-	/// ШАРЯТСЯ между всеми материалами модели - ради этого вариантный кэш и существует, компиляция
-	/// стоит сотни миллисекунд. Освобождение шейдера материалом - это декремент счётчика ссылок
-	/// НАТИВНОГО объекта, и двадцать пять материалов на одну ссылку уводят счётчик в минус: объект
-	/// уничтожается на первых вызовах, а следующие бьют в освобождённую память
-	/// (0xC0000005 в Diligent.ComObject.Release). Такие материалы обязаны выставлять false, а
-	/// владелец шейдеров освобождает их сам, по одному разу (см. ModelLoader.Release).</summary>
+	/// <summary>Whether Release also releases this material's shaders. Must be false when shaders
+	/// are shared across materials (model loader) or the native refcount goes negative and later
+	/// releases hit freed memory; the shader owner releases them once instead.</summary>
 	bool OwnsShaders { get; set; }
 
 	PipelineStateType IStateObject.StateType => PipelineStateType.Graphics;
@@ -47,24 +37,18 @@ public interface IMaterialObject : IStateObject
 	public void SetSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel);
 	public void SetImmutableSampler(string name, ISamplerObject sampler, HandleAccess access = HandleAccess.Pixel);
 
-	/// <summary>Привязка TLAS для inline-трассировки в пиксельном шейдере (RT-тени материалов,
-	/// RT-фолбэк SSR - см. SsrPassResources.SetRayScene). Дефолт - no-op: реализует только
-	/// Diligent-бэкенд (DiligentMaterial.SetAccelStructure, стадия строго пиксельная).</summary>
+	/// <summary>Binds a TLAS for inline ray queries in the pixel stage; default is a no-op,
+	/// only the Diligent backend implements it.</summary>
 	public void SetAccelStructure(string name, ITopLevelAS tlas) { }
 
-	/// <summary>Привязка «сырого» структурированного Diligent-буфера как SRV пиксельной стадии
-	/// (таблицы атрибутов сцены для RT-фолбэка SSR). Дефолт - no-op, как у
-	/// <see cref="SetAccelStructure"/>.</summary>
+	/// <summary>Binds a raw structured buffer as a pixel-stage SRV; default is a no-op.</summary>
 	public void SetStructuredBufferSrv(string name, IBuffer buffer) { }
 
-	/// <summary>Привязка массива текстур в одну шейдерную переменную `Texture2D name[N]` (SRV
-	/// пиксельной стадии) - «bindless»-текстуры RT-хитов SSR. Число элементов обязано совпадать с N
-	/// в шейдере, каждый слот - живой Texture2D (свободные добиваются плейсхолдером). Дефолт -
-	/// no-op, как у <see cref="SetAccelStructure"/>.</summary>
+	/// <summary>Binds a texture array to one `Texture2D name[N]` variable; element count must equal
+	/// N in the shader and every slot must be a live texture. Default is a no-op.</summary>
 	public void SetTextureSrvArray(string name, IReadOnlyList<IGpuTexture> textures) { }
 }
 
-// ?????: ????????? ????????? ??? Compute
 public interface IComputeMaterial : IStateObject
 {
 	PipelineStateType IStateObject.StateType => PipelineStateType.Compute;

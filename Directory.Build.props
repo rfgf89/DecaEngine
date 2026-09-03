@@ -1,14 +1,14 @@
 <Project>
 
 	<!--
-		Общие свойства всех проектов репозитория. Импортируется MSBuild'ом ДО тела каждого
-		csproj, поэтому любой проект может переопределить что угодно своим PropertyGroup -
-		этим пользуются генераторы (netstandard2.0) и вендоренные библиотеки.
+		Properties shared by every project in the repo. MSBuild imports this BEFORE the body of
+		each csproj, so any project can override anything from its own PropertyGroup - the
+		generators (netstandard2.0) and the vendored libraries rely on that.
 
-		Зачем: до этого файла семнадцать csproj копировали одни и те же четыре строки, и
-		расходились. Показательный случай - <Platforms>: он был объявлен только у части
-		проектов, из-за чего сборка всего решения с -p:Platform=x64 (Diligent не работает на
-		AnyCPU) вела себя по-разному от проекта к проекту.
+		Why: before this file, seventeen csproj files copied the same four lines and drifted
+		apart. The telling case was <Platforms>: only some projects declared it, so building the
+		whole solution with -p:Platform=x64 (Diligent does not work on AnyCPU) behaved differently
+		from project to project.
 	-->
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
@@ -16,14 +16,14 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 
-		<!-- Движок насквозь работает с нативной памятью: Unsafe*-коллекции, интероп Diligent,
-		     ozz-шим, загрузка мешей. Разрешаем везде, чтобы это не всплывало как ошибка при
-		     переносе файла из проекта в проект. -->
+		<!-- The engine works with native memory throughout: Unsafe* collections, Diligent interop,
+		     the ozz shim, mesh loading. Enabled everywhere so that moving a file from one project
+		     to another never surfaces as a compile error. -->
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
-		<!-- x86 остаётся ради 32-битных проб; ARM64 - потому что EditorPlatform умеет его
-		     вернуть (см. ProjectSession.EditorPlatform), а без объявления здесь сборка
-		     пользовательского проекта на ARM64 падала бы на неизвестной платформе. -->
+		<!-- x86 stays for the 32-bit probes; ARM64 because EditorPlatform can return it
+		     (see ProjectSession.EditorPlatform), and without declaring it here a user project
+		     build on ARM64 would fail on an unknown platform. -->
 		<Platforms>x64;x86;ARM64</Platforms>
 	</PropertyGroup>
 

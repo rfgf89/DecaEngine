@@ -1,17 +1,12 @@
-// Временная адаптация «глаза»: 1x1-таргет с яркостью, к которой конвейер приводит кадр.
-// Читает измеренную за кадр среднюю лог-яркость (конец цепочки редукции) и ПРЕДЫДУЩЕЕ значение
-// адаптации, экспоненциально подтягивая одно к другому - мгновенный перескок экспозиции при
-// повороте камеры к окну читается как мигание.
-//
-// Пинг-понг предыдущего/нового значения разложен на ДВА драя одного кадра (A->B, B->A, каждый с
-// половиной dt) - render-граф замораживает командный буфер, и чередовать привязки по чётности
-// кадра было бы нельзя (см. EyeAdaptationPass.WriteCommands).
+// Temporal eye adaptation into a 1x1 target: exponential approach to the measured luminance.
+// Ping-pong runs as two draws per frame (A->B, B->A, half dt each) because the render graph
+// freezes the command buffer and bindings cannot alternate by frame parity.
 #include "EyeAdaptationCommon.hlsl"
 
-// Конец цепочки редукции: 1x1, среднее log2(luminance) кадра.
+// End of the reduction chain: 1x1 average log2(luminance).
 Texture2D _LumTex;
 
-// Другой таргет пинг-понга: адаптированная яркость предыдущего шага (линейная, не логарифм).
+// Ping-pong partner: previous adapted luminance, linear (not log).
 Texture2D _PrevTex;
 
 PSOutput Main(in VSOutput input)
@@ -23,13 +18,8 @@ PSOutput Main(in VSOutput input)
 
     float prev = _PrevTex.Load(int3(0, 0, 0)).r;
 
-    // Свежесозданный таргет пинг-понга содержит мусор: очистить его один раз при создании нельзя -
-    // командный буфер графа заморожен (чистил бы каждый кадр), а разовая очистка вне графа ломает
-    // лейауты на Vulkan. Поэтому мусор обезвреживается здесь, и ровно двумя проверками:
-    //   - "не > 0" (а не "<= 0": сравнение ложно и для NaN) - первый кадр стартует с измеренной
-    //     яркости, без «проявления» сцены из чёрного;
-    //   - кламп в тот же пользовательский диапазон, что и цель - любое конечное мусорное значение
-    //     превращается в границу диапазона, откуда адаптация сходится за обычное своё время.
+    // A fresh ping-pong target holds garbage and cannot be cleared once (frozen command
+    // buffer; an out-of-graph clear breaks Vulkan layouts). "!(prev > 0)" also catches NaN.
     if (!(prev > 0.0))
     {
         prev = target;

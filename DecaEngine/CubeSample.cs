@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 using DecaEngine;
 using DecaEngine.Core;
 using Diligent;
-// Сэмпл работает с нативным контекстом напрямую - состояния Diligent-овские, не из ICommandBuffer.
+// Sample talks to the native context directly, so these are Diligent states, not ICommandBuffer's.
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
 using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
@@ -169,7 +169,7 @@ public class CubeSample(GraphicsBackend backend) : Application(backend)
 
         var wndSize = WindowSize;
         var proj = Matrix4x4.CreatePerspectiveFieldOfView(
-            90f * (float)(Math.PI / 180), // 90º of FoV
+            90f * (float)(Math.PI / 180),
             wndSize.Width / (float)wndSize.Height, 
             0.01f, 
             100.0f);

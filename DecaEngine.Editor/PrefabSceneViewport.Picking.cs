@@ -19,16 +19,13 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>Пикинг: луч из курсора, сферы и треугольники. Часть <see cref="PrefabSceneViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Picking part of <see cref="PrefabSceneViewport"/>: cursor ray, spheres, triangles.</summary>
 	public partial class PrefabSceneViewport
 	{
-		/// <summary>Пикинг кликом: луч из камеры через пиксель, сферный broadphase по баундам мешей,
-		/// затем точное пересечение с треугольниками (CPU-копии вершин). Возвращает сущность префаба
-		/// ближайшего попадания, null - клик в пустоту.</summary>
+		// Sphere broadphase over mesh bounds, then exact triangles on the CPU vertex copies.
 		private unsafe Entity? Pick(Vector2 cursor, Vector2 size, Vector2 mouse)
 		{
-			// Луч в мировом пространстве - те же камера/проекция, под которыми рендерился кадр.
+			// World-space ray under the same camera/projection the frame was rendered with.
 			float u = (mouse.X - cursor.X) / size.X * 2f - 1f;
 			float v = 1f - (mouse.Y - cursor.Y) / size.Y * 2f;
 			float tanHalf = MathF.Tan(CameraFovDegrees * (MathF.PI / 180f) * 0.5f);
@@ -68,7 +65,6 @@ namespace DecaEngine.Editor
 					var t = ComposeInstanceTransform(instance.transform, record.LastWorld);
 					var matrix = MathUtils.CreateTrs(t.position, t.rotation, t.scale);
 
-					// Broadphase: сфера баундов меша в мире.
 					var center = Vector3.Transform(mesh.Center, matrix);
 					var maxScale = MathF.Max(MathF.Abs(t.scale.X), MathF.Max(MathF.Abs(t.scale.Y), MathF.Abs(t.scale.Z)));
 					var radius = mesh.Radius * maxScale;
@@ -77,8 +73,7 @@ namespace DecaEngine.Editor
 						continue;
 					}
 
-					// Точная фаза: луч в локальном пространстве инстанса против CPU-треугольников.
-					// Без CPU-копий (не должно случаться для моделей превью-лоадера) - берём сферу.
+					// No CPU triangle copies: fall back to the sphere hit.
 					if (mesh.VertexData == null || mesh.IndexData == null || mesh.IndexCount < 3 ||
 						!Matrix4x4.Invert(matrix, out var invMatrix))
 					{
@@ -111,8 +106,7 @@ namespace DecaEngine.Editor
 							continue;
 						}
 
-						// t локального луча не сравним между инстансами (масштаб) - переводим точку
-						// попадания обратно в мир и меряем вдоль мирового луча.
+						// Local-ray t is not comparable across instances: measure along the world ray.
 						var worldHit = Vector3.Transform(lo + ld * localT, matrix);
 						var worldT = Vector3.Dot(worldHit - origin, dir);
 						if (worldT > 0f && worldT < bestT)
@@ -154,8 +148,7 @@ namespace DecaEngine.Editor
 			return t >= 0f;
 		}
 
-		/// <summary>Möller-Trumbore; ld может быть ненормированным (локальное пространство инстанса) -
-		/// t возвращается в его единицах.</summary>
+		/// <summary>Möller-Trumbore; ld may be unnormalized, so t is returned in its units.</summary>
 		private static bool RayIntersectsTriangle(Vector3 lo, Vector3 ld, Vector3 a, Vector3 b, Vector3 c, out float t)
 		{
 			t = 0f;
@@ -187,59 +180,49 @@ namespace DecaEngine.Editor
 			return t > 0f;
 		}
 
-		// --- Probe GI сцены -------------------------------------------------------------------------
+		// --- Scene probe GI -------------------------------------------------------------------------
 
-		/// <summary>Гейт проб сцены: галка «Probe GI» окна Graphics - ТА ЖЕ, что у превью, - плюс
-		/// HDR-тумблер тулбара (поле проб питает HDR-путь освещения, в LDR ему некуда светить).
-		/// Раньше галка окна здесь игнорировалась вовсе: пробы сцены пеклись при снятой «Probe GI»,
-		/// и выключить их можно было только выключив весь HDR.</summary>
+		// The probe field feeds the HDR lighting path only, hence the HDR toggle.
 		private bool ProbesEnabled => _editorSettings.PreviewProbeGi && _editorSettings.SceneViewHdr;
 
-		/// <summary>Статус проб СЦЕНЫ для окна Graphics - раньше окно показывало только превью
-		/// модели, и при работающем в сцене GI писало «нет проб».</summary>
+		/// <summary>Scene probe status line for the Graphics window.</summary>
 		public string ProbeGiStatus
 		{
 			get
 			{
 				if (!ProbesEnabled)
 				{
-					return "выключен (нужен Scene View HDR)";
+					return "disabled (Scene View HDR required)";
 				}
 
 				var s = _probeSession;
 				if (s == null)
 				{
-					return "нет проб";
+					return "no probes";
 				}
 
 				var grid = $"{s.CountX}x{s.CountY}x{s.CountZ}";
 				if (_sceneGpu == null)
 				{
-					return $"{grid}, GPU-путь не поднялся (см. консоль)";
+					return $"{grid}, GPU path did not come up (see console)";
 				}
 
-				// Какой путь трассировки ЖИВОЙ. Снаружи это было невидимо: галка в окне Graphics
-				// показывает ЖЕЛАНИЕ, а путь выбирается при подъёме сессии и законно может с ним не
-				// совпадать: устройство не умеет inline-трассировки либо сессию ещё не перезавели.
-				// Без этой строки одно от другого отличалось только под профайлером.
-				grid += _sceneGpu.Hardware ? ", трассировка аппаратная"
-					: ", трассировка программная";
+				// The trace path is fixed at session start, so it may differ from the checkbox.
+				grid += _sceneGpu.Hardware ? ", hardware tracing"
+					: ", software tracing";
 
 				return s.Realtime
-					? $"{grid}, реальное время"
+					? $"{grid}, realtime"
 					: s.Converged
-						? $"{grid}, готово"
-						: $"{grid}, раунд {s.Round}/{s.TargetRounds}";
+						? $"{grid}, done"
+						: $"{grid}, round {s.Round}/{s.TargetRounds}";
 			}
 		}
 
-		/// <summary>Цвет/интенсивность солнца для бейка - тот же keyIntensity, что у аналитического
-		/// света (ProbeGiParams.z), иначе баунс разойдётся по яркости с прямым светом.</summary>
+		// Must match the analytic light's keyIntensity (ProbeGiParams.z) or bounces diverge.
 		private Vector3 ProbeSunColor() => ViewportSettingsPush.ProbeSunColor(_editorSettings);
 
-		/// <summary>Принудительный ребейк проб сцены - кнопка «Rebake now» окна Graphics (зеркало
-		/// ModelPreviewViewport.RequestProbeRebake; раньше кнопка перепекала только превью, а сессия
-		/// сцены жила старым полем до первого структурного изменения).</summary>
+		/// <summary>Forces a scene probe rebake.</summary>
 		public void RequestProbeRebake() => RequestProbeSession(0f);
 
 	}

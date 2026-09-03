@@ -19,16 +19,10 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
     private RenderCamerasData _renderCamerasData;
     private DirectionalLightCascadeData _directionalLightCascadeData;
 
-    // Кадровая раскладка теневых слайсов punctual-светов: id сущности света -> первый слайс
-    // (см. PunctualShadowScheduler). Пересобирается каждый кадр, читается при сборке пула светов.
+    // Per-frame punctual shadow slice layout: light entity id -> first slice.
     private readonly System.Collections.Generic.Dictionary<int, int> _punctualShadowSlices = new();
 
-    // Стаггеринг теневых каскадов (см. ShadowCascadeSchedule): решение "каскад i перерисовывается
-    // в ЭТОМ кадре" принимается здесь - вместе с рефитом его матрицы, - а исполняет его колбэк
-    // ShadowPass при реплее замороженного графа. Кэши ниже - состояние последнего РЕНДЕРА каждого
-    // каскада: пропущенный каскад обязан сэмплироваться той же матрицей (и с тем же CascadeSizes),
-    // которой его карта нарисована; сами матрицы живут в CascadedShadowComponent.Cascade0..3 и для
-    // пропущенных каскадов просто не трогаются.
+    // Cascade staggering state: a skipped cascade must keep the matrix its map was rendered with.
     private readonly ShadowCascadeSchedule _cascadeSchedule;
     private uint _cascadeFrameIndex;
     private bool _hasCascadeHistory;
@@ -46,8 +40,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         _resourceManager = resourceManager;
         _graphicsPipeline = pipeline;
 
-        // Расписание живёт на конвейере (он передаёт его в каждый пересозданный ShadowPass);
-        // конвейер без расписания = прежнее поведение, каскады каждый кадр.
+        // A pipeline without a schedule redraws every cascade every frame.
         _cascadeSchedule = pipeline switch
         {
             GraphicsPipelineSimple simple => simple.CascadeSchedule,
@@ -61,10 +54,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         var mainCameras = Query.Store.Query<CameraComponent>().WithoutAllComponents(ComponentTypes.Get<CascadedShadowComponent>());
         var lights = Query.Store.Query<LightComponent, SunComponent, CascadedShadowComponent>();
 
-        // Punctual-света (point/spot): всё с LightComponent, кроме солнца - оно идёт своим путём
-        // через каскадные тени выше. Кулятся ПО-ТИПОВО против фрустума каждой камеры (см.
-        // LightCulling), выжившие складываются в общий пул кадра, сегмент камеры - в её
-        // LightData.ClusterParams.
+        // Punctual lights: everything but the sun, which goes through the cascade path above.
         var punctualLightsQuery = Query.Store.Query<LightComponent>().WithoutAllComponents(ComponentTypes.Get<SunComponent>());
 
         int cameraCount = mainCameras.Count;
@@ -78,8 +68,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             return;
         }
 
-        // Граница ИНДЕКСА занятых слотов, а не их количество - слоты выдаются из стека свободных и
-        // разрежены, см. RenderResourceManager.DrawInstanceCount.
+        // Upper index bound, not a count: draw slots come from a free stack and are sparse.
         int drawCount = _resourceManager.DrawInstanceCount;
         int shadowViewCount = lights.Count > 0 ? ShadowLayout.MaxCascades : 0;
 
@@ -124,8 +113,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             {
                 var lightDirection = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, lightEntity.Rotation.value));
 
-                // Маска каскадов кадра - ДО рефита: UpdateCascades перефитит только их, остальные
-                // сохранят матрицу последнего рендера (см. комментарий у _cascadeSchedule).
+                // Mask must be computed before the refit: UpdateCascades only refits masked ones.
                 int updateMask = ComputeCascadeUpdateMask(in referenceCamera, lightDirection, referenceCameraPos, drawCount, ref cascadedShadow);
                 _cascadeSchedule?.SetRenderMask(updateMask);
 
@@ -133,14 +121,13 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
 
                 fixed (CameraComponent* ptr = &cascadedShadow.Cascade0)
                 {
-                    // Each cascade needs its own LightData with its own matrix
                     for (int i = 0; i < ShadowLayout.MaxCascades; i++)
                     {
                         var viewData = (ptr + i)->CreateViewData();
                         var cullData = (ptr + i)->CreateCullData();
                         cullData.drawCount = drawCount;
 
-                        // Each cascade's LightData: all CascadeMatrix entries point to this cascade's viewProj
+                        // All four CascadeMatrix slots hold this cascade's viewProj.
                         var cascadeLightData = new LightData
                         {
                             LightPos = lightEntity.Position.value.AsVector4(),
@@ -162,13 +149,11 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                     }
                 }
 
-                // Main camera gets light data with all four cascade matrices
                 sharedLightData = BuildLightData(ref cascadedShadow, ref light, lightEntity, lightDirection, cascadeSizes, cascadeNearPlanes, cascadeSplits);
             });
         }
 
-        // Теневые слайсы punctual-светов - ДО сборки пер-камерных пулов: TryBuildPunctualLight
-        // читает раскладку, собирая ShadowParams. Приоритет бюджета - по дистанции до опорной камеры.
+        // Must precede the per-camera pools: TryBuildPunctualLight reads this layout.
         PunctualShadowScheduler.BuildShadowSlices(punctualLightsQuery, referenceCameraPos,
             drawCount, ref _renderCamerasData, _punctualShadowSlices);
 
@@ -179,12 +164,10 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             var cullData = camera.CreateCullData();
             cullData.drawCount = drawCount;
 
-            // Пер-камерный кулинг punctual-светов: сегмент камеры в общем пуле кадра начинается с
-            // текущего конца - пул один на все камеры, границы уходят в ClusterParams.
+            // One pool shared by all cameras; this camera's segment starts at the current end.
             int segmentOffset = punctualLightTotal;
             var cullDataCopy = cullData;
-            // Границы влияния светов сегмента по view-глубине - из них строится диапазон срезов
-            // кластерной сетки (см. LightCulling.ClusterDepthRange).
+            // View-depth bounds of the segment, used to size the cluster grid's slice range.
             float minLightZ = float.MaxValue;
             float maxLightZ = float.MinValue;
             punctualLightsQuery.ForEachEntity((ref LightComponent light, Entity lightEntity) =>
@@ -225,9 +208,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         });
     }
 
-    /// <summary>Тангенс полуугла видимого диска солнца - уходит в SpotAngles.w, оттуда PCSS в
-    /// UnlitInstancedPS.SampleWorldLightShadow выводит ширину полутени. Дефолт нуля компонента -
-    /// см. комментарий у LightComponent.SunAngularSize.</summary>
+    // Tangent of the sun disc's half angle; goes to SpotAngles.w, where PCSS reads penumbra width.
     private static float SunTanHalfAngle(in LightComponent light)
     {
         float diameterDeg = light.SunAngularSize > 0f ? light.SunAngularSize : 1.0f;
@@ -256,13 +237,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         }
     }
 
-    /// <summary>Битовая маска каскадов, перерисовываемых (и перефичиваемых) в ЭТОМ кадре.
-    /// Каскады 0/1 - каждый кадр; 2 - каждый второй (чётные кадры); 3 - каждый четвёртый (кадры
-    /// 4k+1 - нарочно вразнос с каскадом 2, чтобы две тяжёлые перерисовки не совпадали). Полное
-    /// обновление форсируется, когда стаггерить опасно: повернулось солнце, изменился набор
-    /// инстансов (drawCount - см. RenderResourceManager.DrawInstanceCount; перестройки графа
-    /// ловит сам ShadowPass через ForceAll при перезаписи команд), камера телепортировалась
-    /// дальше четверти радиуса дальнего каскада, сменились fov/аспект или дистанции срезов.</summary>
+    // Cascade 3 lands on frames 4k+1, deliberately out of phase with cascade 2.
     private int ComputeCascadeUpdateMask(in CameraComponent camera, Vector3 lightDirection, Vector3 cameraPos,
         int drawCount, ref CascadedShadowComponent cascadedShadow)
     {
@@ -274,7 +249,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
         var distances = cascadedShadow.CascadeDistances;
         var splits = new Vector4(distances[1], distances[2], distances[3], distances[4]);
 
-        // CascadeSizes хранит ДИАМЕТРЫ сфер каскадов; порог телепорта - четверть радиуса дальнего.
+        // CascadeSizes holds sphere diameters; the teleport threshold is a quarter of the far radius.
         float teleportThreshold = MathF.Max(0.5f, _cachedCascadeSizes.W * 0.125f);
 
         bool force = !_hasCascadeHistory
@@ -298,15 +273,14 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             return ShadowCascadeSchedule.AllCascades;
         }
 
-        // Раскладка ниже рассчитана на четыре каскада (ShadowLayout.MaxCascades).
+        // The bit layout below assumes four cascades (ShadowLayout.MaxCascades).
         int mask = 0b0011;
         if ((_cascadeFrameIndex & 1u) == 0u) mask |= 0b0100;
         if ((_cascadeFrameIndex & 3u) == 1u) mask |= 0b1000;
         return mask;
     }
 
-    /// <summary>Относительный допуск, а не точное сравнение: PrefabSceneViewport подгоняет
-    /// дистанции срезов под камеру, и микросдвиги зума не должны выключать стаггеринг целиком.</summary>
+    // Relative tolerance: split distances drift with zoom and must not disable staggering.
     private static bool SplitsChanged(Vector4 a, Vector4 b)
     {
         float scale = MathF.Max(1f, MathF.Max(MathF.Abs(a.W), MathF.Abs(b.W)));
@@ -318,8 +292,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
     {
         var cascadeSplits = cascadedShadow.CascadeDistances;
 
-        // Стартуем с кэша последнего рендера: лейны пропущенных каскадов обязаны сохранить размер
-        // и near того кадра, которым их карта нарисована (от CascadeSizes масштабируется PCF-ядро).
+        // Start from the last render: skipped cascades must keep their rendered size and near.
         var cascadeSizes = _cachedCascadeSizes;
         var cascadeNearPlanes = _cachedCascadeNearPlanes;
 
@@ -328,17 +301,14 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
 
         Matrix4x4.Invert(camera.renderCamera.view, out Matrix4x4 cameraWorld);
 
-        // Скретч углов среза фрустума - НА СТЕКЕ и ВНЕ петли: прежний new Vector3[8] внутри неё
-        // аллоцировал на каждый каскад каждый кадр.
+        // Hoisted out of the loop: a per-cascade array would allocate every frame.
         Span<Vector3> cornersViewSpace = stackalloc Vector3[8];
 
         for (int i = 0; i < ShadowLayout.MaxCascades; i++)
         {
             if ((updateMask & (1 << i)) == 0)
             {
-                // Каскад в этом кадре не перерисовывается (см. ComputeCascadeUpdateMask) - его
-                // камера Cascade0..3 не трогается: матрица сэмплинга обязана остаться той, которой
-                // карта нарисована, рефит без рендера дал бы рассинхрон тени с её картой.
+                // Not redrawn this frame: refitting without rendering desyncs shadow from map.
                 continue;
             }
 
@@ -351,12 +321,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             float farY = f * tanHalfFov;
             float farX = farY * camera.data.aspect;
 
-            // Камера LH, forward = +Z (см. MakePerspectiveReversedZ: clip.w = +z_view; тот же
-            // приём в SimpleCullingAndRenderSystem.FitFrustumSlice - pos + forward*dist).
-            // Прежние -n/-f (RH-конвенция) фитили каскады к срезам ПОЗАДИ камеры: внутри сцены
-            // (превью Sponza) геометрия всё равно попадала в сферы и это маскировалось, а в
-            // Scene View с орбитальной камерой снаружи мелкие каскады висели в пустоте за спиной
-            // и вся видимая геометрия доставалась одному крупному.
+            // Left-handed camera, forward = +Z: slice depths are positive, not negated.
             cornersViewSpace[0] = new Vector3(-nearX, -nearY, n);
             cornersViewSpace[1] = new Vector3(nearX, -nearY, n);
             cornersViewSpace[2] = new Vector3(nearX, nearY, n);
@@ -380,11 +345,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
                 radius = Math.Max(radius, Vector3.Distance(cornersViewSpace[j], center));
             }
 
-            // Кайма ВОКРУГ сферы каскада - см. ShadowLayout.CascadeMarginTexels. Орто-матрица
-            // ниже строится по этому радиусу, то есть сфера ложится в карту не впритык, а с
-            // отступом от края: тот самый отступ, который шейдер требует пройти внутрь, прежде чем
-            // взять каскад, - иначе он отъедался у объёма изнутри и по границам каскадов шли
-            // просветы. Снап тоже по НОВОМУ размеру текселя, иначе сетка снапа разъедется с картой.
+            // Grow the sphere by the shader's border margin; texel snapping must use the new size.
             radius /= 1f - 2f * ShadowLayout.CascadeMarginTexels / ShadowLayout.ShadowMapSize;
 
             float worldUnitsPerTexel = (radius * 2.0f) / ShadowLayout.ShadowMapSize;
@@ -395,23 +356,12 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             Matrix4x4.Invert(tempLightView, out Matrix4x4 tempLightViewInv);
             center = Vector3.Transform(lightSpaceCenter, tempLightViewInv);
 
-            // Глаз оттянут от сферы каскада к свету на её диаметр, а far расширен на столько же:
-            // кастеры МЕЖДУ солнцем и объёмом каскада (высокая геометрия над срезом фрустума -
-            // башня за спиной камеры) иначе режутся near-плоскостью и не отбрасывают тень.
-            // Тот же фикс, что в SimpleCullingAndRenderSystem.BuildLightData.
+            // Eye pulled back toward the sun: casters above the slice would else be near-clipped.
             float casterExtension = radius * 2.0f;
             Vector3 lightPos = center - lightDirection * (radius + casterExtension);
             float znear = 0.01f;
 
-            // ...а far - ЕЩЁ на половину радиуса за сферу. Без этого запаса дальняя плоскость
-            // касалась задней стенки сферы ровно (znear-glaz + 2r + casterExtension), то есть у
-            // приёмников на задней полусфере ndc.z выходил ровно 1 или чуть больше, а
-            // UnlitInstancedPS.SampleWorldLightShadow такой каскад ОТБРАСЫВАЕТ (lightNdc.z >= 1.0 ->
-            // continue). Выталкивают за единицу три вещи разом: normal-offset сдвигает точку выборки
-            // на полтора текселя ОТ поверхности, снап центра к сетке текселей двигает саму сферу, и
-            // сверху ложится погрешность float. Точка проваливалась в следующий каскад (грубее и с
-            // другим байасом), а на последнем - в «освещено», что и читается как просветы.
-            // Цена запаса - только точность глубины: диапазон 4r -> 4.5r, на D32_FLOAT это ничто.
+            // Far margin past the sphere: the shader drops receivers whose lightNdc.z reaches 1.
             float receiverExtension = radius * 0.5f;
             float zfar = radius * 2.0f + casterExtension + receiverExtension;
 
@@ -428,8 +378,7 @@ public class CullingAndRenderSystem : QuerySystem, IDisposable
             }
         }
 
-        // Лейны перефиченных каскадов уходят в кэш: следующий кадр стартует с них, чтобы
-        // пропущенные каскады сохранили размер и near своего последнего рендера.
+        // Cache the refit lanes so the next frame's skipped cascades keep these values.
         _cachedCascadeSizes = cascadeSizes;
         _cachedCascadeNearPlanes = cascadeNearPlanes;
 

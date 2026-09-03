@@ -6,19 +6,12 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Ресурсы отладочной визуализации буфера векторов движения (см. MotionVectorDebugPS.hlsl).
-/// Живут ровно столько же, сколько <see cref="MotionVectorPassResources"/>, и создаются вместе с ними:
-/// сам по себе буфер векторов кадр не меняет, и пока апскейлера нет, это ЕДИНСТВЕННЫЙ способ увидеть,
-/// что пасс вообще посчитал.
-///
-/// Тумблер живёт в кбуфере, а не в <see cref="PipelineFeatures"/>, и выключенный пасс просто
-/// дискардит весь экран. Так галка не пересобирает граф и срабатывает в тот же кадр, а платим мы за
-/// это одним фуллскрин-дроу без единой записи в таргет.</summary>
+/// <summary>Resources for the motion vector debug overlay. The toggle lives in a cbuffer rather than
+/// <see cref="PipelineFeatures"/>, so flipping it costs one discarded fullscreen draw, not a graph
+/// rebuild.</summary>
 public sealed unsafe class MotionVectorDebugPassResources : IReleaseObject
 {
-	/// <summary>Во сколько ПИКСЕЛЕЙ смещения упирается шкала. Порядка десятка - это заметное, но не
-	/// рывковое движение камеры на 60 fps; за пределами диапазона шейдер гасит синий канал, так что
-	/// слишком мелкое значение видно сразу (см. MotionVectorDebugPS.hlsl).</summary>
+	/// <summary>Displacement in PIXELS that saturates the scale; beyond it the shader kills blue.</summary>
 	public const float DefaultRangePixels = 16f;
 
 	internal IMaterialObject Material { get; }
@@ -29,14 +22,13 @@ public sealed unsafe class MotionVectorDebugPassResources : IReleaseObject
 	public MotionVectorDebugPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer,
 		IGpuTexture motionTarget, uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight)
 	{
-		// Свой экземпляр VS - см. комментарий в ColorGradePassResources (шареный шейдер освобождался
-		// бы дважды при пересоздании окружения).
+		// Own VS instance: a shared shader would be released twice when the environment is rebuilt.
 		var vs = graphicsApi.CreateShader("Motion Vector Debug VS", "EditorAssets/shader",
 			"SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Motion Vector Debug PS", "EditorAssets/shader",
 			"MotionVectorDebugPS.hlsl", ShaderObjectType.Pixel);
 
-		// Формат жёстко RGBA8: пасс пишет в ОТОБРАЖАЕМЫЙ таргет, после тонемапа - см. док шейдера.
+		// Format is fixed RGBA8: this pass writes to the DISPLAYED target, after tonemap.
 		var state = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Motion Vector Debug PSO",
@@ -53,12 +45,10 @@ public sealed unsafe class MotionVectorDebugPassResources : IReleaseObject
 		Material.SetState(state);
 		batchRenderer.BindViewConstants(Material);
 
-		// Сэмплера нет: буфер векторов читается Load'ом пиксель-в-пиксель, фильтрация усреднила бы
-		// векторы поперёк силуэтов и нарисовала бы движение там, где его нет.
+		// No sampler: the motion buffer is Load'ed 1:1, filtering would average across silhouettes.
 		Material.SetTexture("_MotionTex", motionTarget);
 
-		// dynamic = false: нужен именно UpdateBuffer из командного буфера (USAGE_DEFAULT) - см.
-		// MotionVectorPassResources.
+		// dynamic = false: this needs UpdateBuffer from the command buffer (USAGE_DEFAULT).
 		_constantBuffer = graphicsApi.CreateBuffer(new BufferInfo
 		{
 			name = "MotionVectorDebugConstants",
@@ -76,31 +66,25 @@ public sealed unsafe class MotionVectorDebugPassResources : IReleaseObject
 		Resize(renderWidth, renderHeight, displayWidth, displayHeight);
 	}
 
-	/// <summary>Layout кбуфера "MotionVectorDebugConstants" в MotionVectorDebugPS.hlsl - два float4.</summary>
+	// Layout of the "MotionVectorDebugConstants" cbuffer in MotionVectorDebugPS.hlsl: two float4.
 	private struct MotionVectorDebugConstantsData
 	{
-		/// <summary>xy - размер БУФЕРА ВЕКТОРОВ в пикселях (рендер-разрешение), z - 1/диапазон,
-		/// w - включённость.</summary>
+		// xy - motion buffer size in pixels (render resolution), z - 1/range, w - enabled.
 		public Vector4 Params;
 
-		/// <summary>xy - отношение рендер-размера к отображаемому по осям: пасс рисует в display-кадр,
-		/// а Load из буфера векторов требует рендер-координату (см. MotionVectorDebugPS.hlsl).</summary>
+		// xy - render-to-display size ratio: the pass draws into the display frame but Loads
+		// from the motion buffer, which needs render-space coordinates.
 		public Vector4 Params2;
 	}
 
-	/// <summary>Живая ручка: пасс перечитывает кбуфер каждым реплеем, так что ни пересборки графа, ни
-	/// ожидания GPU переключение не требует.</summary>
 	public void SetDebugView(bool enabled, float rangePixels)
 	{
-		// Диапазон уходит в шейдер уже перевёрнутым - деление на ноль при range == 0 иначе выдало бы
-		// inf и покрасило бы кадр в чистые углы шкалы вместо честного «диапазон слишком мал».
+		// Range is inverted here; a zero range would otherwise divide by zero in the shader.
 		_constants->Params.Z = 1f / MathF.Max(rangePixels, 1e-3f);
 		_constants->Params.W = enabled ? 1f : 0f;
 	}
 
-	/// <summary>Признаёт новые размеры: рендер-размер переводит вектор из долей экрана в пиксели
-	/// (шкала в пикселях РЕНДЕР-разрешения - именно их потребляет апскейлер), а отношение размеров
-	/// отображает display-пиксель пасса в координату буфера векторов.</summary>
+	/// <summary>Accepts new sizes; the scale is in RENDER-resolution pixels.</summary>
 	public void Resize(uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight)
 	{
 		_constants->Params.X = renderWidth;
@@ -109,8 +93,7 @@ public sealed unsafe class MotionVectorDebugPassResources : IReleaseObject
 		_constants->Params2.Y = renderHeight / (float)Math.Max(1u, displayHeight);
 	}
 
-	/// <summary>Перепривязывает буфер векторов ПОСЛЕ его Resize - Resize пересоздаёт нативную
-	/// текстуру, и SRB иначе держал бы уничтоженную (см. ModelPreviewViewport.ResizeTargets).</summary>
+	/// <summary>Must be called AFTER a resize: it recreates the native texture the SRB points at.</summary>
 	public void RebindTargets(IGpuTexture motionTarget, uint renderWidth, uint renderHeight,
 		uint displayWidth, uint displayHeight)
 	{
@@ -128,16 +111,8 @@ public sealed unsafe class MotionVectorDebugPassResources : IReleaseObject
 	}
 }
 
-/// <summary>
-/// Render-graph pass that paints the motion vector buffer over the displayed frame.
-///
-/// Место в кадре: ПОСЛЕ тонемапа и грейдинга, но ДО оверлеев - как и грейдинг, пасс работает по
-/// отображаемому RGBA8-кадру (см. MotionVectorDebugPS.hlsl), а гизмо и контур выделения обязаны
-/// остаться видны поверх отладки, иначе в этом режиме нельзя даже выбрать объект.
-///
-/// Копии кадра, в отличие от <see cref="ColorGradePass"/>, не нужно: пасс кадр не читает, а
-/// полностью замещает.
-/// </summary>
+/// <summary>Render-graph pass that paints the motion vector buffer over the displayed frame. Runs
+/// after tonemap and grading but before overlays, so gizmos stay visible on top.</summary>
 public sealed class MotionVectorDebugPass : RenderGraphPass<MotionVectorDebugPass.PassData>
 {
 	public override string Name => "Motion Vector Debug Pass";
@@ -160,7 +135,6 @@ public sealed class MotionVectorDebugPass : RenderGraphPass<MotionVectorDebugPas
 		_viewPortRef = viewPortRef;
 	}
 
-	/// <summary>Объявляет графу таргеты пасса - см. <see cref="ForwardPass.Setup"/>.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		builder.ReadTarget(builder.ImportTexture(_motionTarget));

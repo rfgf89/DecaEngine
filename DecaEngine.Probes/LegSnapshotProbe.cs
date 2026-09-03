@@ -12,22 +12,16 @@ using DecaEngine.Editor;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Боковые стик-кадры ног персонажа на рельефе (DECA_PROBE_LEGSHOT=&lt;папка&gt;, работает внутри
-/// DECA_PROBE_SCENE=1). Числовые метрики пробников отвечают «в теле ли лапа» и «вывернуто ли
-/// колено», но не отвечают на жалобы вида «нога стоит не так»: форма позы - вещь визуальная, и
-/// проверять её надо глазами. Кадр - ортопроекция X-Y (лестница демо-сцены растёт вдоль X, скелет
-/// лисы лежит вдоль X): профиль пола щупается ТЕМИ ЖЕ физическими лучами, что и foot IK, скелет
-/// рисуется целиком серым, задние цепочки бедро-колено-скакательный-носок подсвечены, передние -
-/// плечо-предплечье-кисть.
-/// </summary>
+/// <summary>Stick-figure leg snapshots on terrain (DECA_PROBE_LEGSHOT=&lt;dir&gt;, needs
+/// DECA_PROBE_SCENE=1).</summary>
+// Ground profile is sampled with the same physics rays foot IK uses, so the picture and the
+// solver cannot disagree about the terrain.
 public static class LegSnapshotProbe
 {
 	private const int Width = 960;
 	private const int Height = 600;
 
-	/// <summary>Фазы съёмки, секунды сцены: шаг лисы ~1 с, десяток кадров через 0.25 покрывает
-	/// больше двух циклов - и опору, и замах обеих ног.</summary>
+	// Scene seconds; the fox's stride is ~1 s, so 0.25 spacing covers two full cycles.
 	private static readonly float[] Times =
 		{ 0.75f, 1.00f, 1.25f, 1.50f, 1.75f, 2.00f, 2.25f, 2.50f, 2.75f, 3.00f };
 
@@ -41,11 +35,8 @@ public static class LegSnapshotProbe
 			return;
 		}
 
-		// A/B-ветка: DECA_PROBE_LEGSHOT_NOIK=1 выключает foot IK у субъекта - кадры тогда
-		// показывают ЧИСТЫЙ КЛИП. Разница двух прогонов отвечает на главный вопрос любой жалобы
-		// на позу ноги: это солвер согнул или так нарисовано в клипе.
-		// A/B-ветки: NOIK - чистый клип, NOLOCK - IK без локинга. Тройка прогонов раскладывает
-		// вину между клипом, каналом высоты и локингом.
+		// A/B branches: NOIK gives the raw clip, NOLOCK gives IK without locking. The three runs
+		// split the blame between clip, height channel and locking.
 		if (!_ikToggleDone)
 		{
 			bool noIk = Environment.GetEnvironmentVariable("DECA_PROBE_LEGSHOT_NOIK") == "1";
@@ -87,12 +78,9 @@ public static class LegSnapshotProbe
 
 	private static bool _ikToggleDone;
 
-	// --- Дребезг лап -------------------------------------------------------------------------------
+	// --- Foot jitter -------------------------------------------------------------------------------
 	//
-	// Вторая разность мировой позиции точек опоры по кадрам: гладкий мах даёт миллиметры на кадр
-	// (ускорение маха), дребезг захвата/отпуска локинга или скачки цели - всплеск на порядок.
-	// Число само по себе не вердикт: та же метрика на прогоне без IK (DECA_PROBE_LEGSHOT_NOIK=1) -
-	// планка клипа, и судить надо ПАРУ.
+	// Second difference of world contact positions per frame; judge against the NOIK run, not alone.
 
 	private static readonly string[] JitterJoints =
 		["b_LeftFoot02_018", "b_RightFoot02_022", "b_LeftHand_011", "b_RightHand_08"];
@@ -157,8 +145,6 @@ public static class LegSnapshotProbe
 		IReadOnlyList<Entity> skinnedEntities, Dictionary<int, ModelLoader> models,
 		float time, string outDir)
 	{
-		// Субъект - лестничная лиса: единственный персонаж демо-сцены, у которого foot IK работает
-		// на перепадах каждый кадр, а не изредка на кочке.
 		Entity subject = default;
 		foreach (var entity in skinnedEntities)
 		{
@@ -177,51 +163,43 @@ public static class LegSnapshotProbe
 		var world = PrefabSceneViewport.ComputeWorldMatrix(subject);
 		var skeleton = model.Skeleton;
 
-		// Мировые позиции суставов - один раз, дальше только 2D.
 		var joints = new Vector3[skeleton.JointCount];
 		for (int i = 0; i < joints.Length; i++)
 		{
 			joints[i] = Vector3.Transform(pose[i].Translation, world);
 		}
 
-		// Деформированный МЕШ - каркасом по рёбрам: скелет отвечает «куда согнуло кости», а жалобы
-		// пользователя приходят про то, как выглядит ТЕЛО; облако вершин низкополигональной лисы
-		// слишком редкое. Скиннинг - той же свёрткой палитры, что ушла бы в GPU (см.
-		// ScenePhysicsProbe.ReportDeformedExtents).
+		// Skinned with the same palette convolution the GPU would use.
 		var cloud = SkinnedMesh(animation, model, subject, world);
 
-		// Два ракурса: тело лисы в мире лежит вдоль Z, лестница растёт вдоль X - вид вдоль X
-		// (горизонталь кадра = Z) показывает сгиб коленей сбоку, вид вдоль Z (горизонталь = X) -
-		// перепад ступеней под левой и правой сторонами.
+		// Two views: the fox lies along Z and the stairs run along X, so one shows knee bend and
+		// the other the step offset between left and right sides.
 		Draw(physics, subject, skeleton, joints, cloud, time, outDir, "side", Vector3.UnitZ);
 		Draw(physics, subject, skeleton, joints, cloud, time, outDir, "front", Vector3.UnitX);
 		ReportGaps(physics, skeleton, joints, time);
 
 		Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-			$"[probe] legshot: t={time:0.00} дребезг за окно - задние {_jitterWorstHind * 1000f:0.0} мм/кадр², " +
-			$"передние {_jitterWorstFront * 1000f:0.0} мм/кадр²"));
+			$"[probe] legshot: t={time:0.00} jitter over the window - hind {_jitterWorstHind * 1000f:0.0} mm/frame², " +
+			$"front {_jitterWorstFront * 1000f:0.0} mm/frame²"));
 		_jitterWorstHind = 0f;
 		_jitterWorstFront = 0f;
 	}
 
-	/// <summary>Зазор «сустав опоры - поверхность под ним» по каждой лапе, метры мира. Числа к
-	/// картинкам: картинка отвечает «как выглядит», зазор - «на сколько именно висит»; сравнение
-	/// прогонов с IK и без (DECA_PROBE_LEGSHOT_NOIK=1) отделяет отклонения самого клипа от того,
-	/// что добавил или снял солвер.</summary>
+	// Contact-joint-to-surface gap per foot, in world metres.
 	private static void ReportGaps(ScenePhysics physics, PreparedSkeleton skeleton, Vector3[] joints,
 		float time)
 	{
 		(string Label, string Joint)[] contacts =
 		[
-			("задняя L", "b_LeftFoot02_018"),
-			("задняя R", "b_RightFoot02_022"),
-			("передняя L", "b_LeftHand_011"),
-			("передняя R", "b_RightHand_08"),
+			("hind L", "b_LeftFoot02_018"),
+			("hind R", "b_RightFoot02_022"),
+			("front L", "b_LeftHand_011"),
+			("front R", "b_RightHand_08"),
 		];
 
 		var line = new System.Text.StringBuilder();
 		line.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-			$"[probe] legshot: t={time:0.00} зазоры"));
+			$"[probe] legshot: t={time:0.00} gaps"));
 
 		foreach (var contact in contacts)
 		{
@@ -234,7 +212,7 @@ public static class LegSnapshotProbe
 			var position = joints[joint];
 			var hit = physics.SampleGround(position + Vector3.UnitY * 3f, -Vector3.UnitY, 6f);
 			line.Append(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-				$" | {contact.Label} {(hit.Hit ? position.Y - hit.Position.Y : float.NaN):+0.000;-0.000} м"));
+				$" | {contact.Label} {(hit.Hit ? position.Y - hit.Position.Y : float.NaN):+0.000;-0.000} m"));
 		}
 
 		Console.WriteLine(line.ToString());
@@ -255,9 +233,7 @@ public static class LegSnapshotProbe
 		}
 	}
 
-	/// <summary>Меш, деформированный текущей палитрой: мировые вершины плюс индексы треугольников
-	/// (все меши модели одним списком, LOD-уровни в IndexData просто перерисовывают ту же форму
-	/// грубее - для каркаса это безвредно).</summary>
+	// All meshes flattened into one list; LOD levels in IndexData redraw the same shape coarser.
 	private static unsafe (List<Vector3> Vertices, List<int> Indices) SkinnedMesh(
 		AnimationDriver animation, ModelLoader model, Entity subject, in Matrix4x4 world)
 	{
@@ -318,8 +294,7 @@ public static class LegSnapshotProbe
 		string outDir, string label, Vector3 horizontal)
 	{
 
-		// Окно кадра - вокруг персонажа, с постоянным масштабом между кадрами (привязка к целым
-		// ступеням лестницы дала бы прыгающую камеру).
+		// Scale is fixed across frames: snapping the window to whole steps makes the camera jump.
 		var subjectPosition = subject.Position.value;
 		float viewX0 = Vector3.Dot(subjectPosition, horizontal) - 1.1f;
 		float scale = Width / 2.2f;
@@ -331,8 +306,7 @@ public static class LegSnapshotProbe
 			rgba[i] = 16; rgba[i + 1] = 16; rgba[i + 2] = 20; rgba[i + 3] = 255;
 		}
 
-		// Профиль пола - лучами по столбцам кадра, в вертикальной плоскости через персонажа:
-		// именно этот рельеф щупает foot IK, и рисовать надо его, а не авторские числа лестницы.
+		// Ground profile is raycast per column, not read from the authored stair numbers.
 		for (int px = 0; px < Width; px++)
 		{
 			float x = viewX0 + px / scale;
@@ -350,10 +324,8 @@ public static class LegSnapshotProbe
 			}
 		}
 
-		// Тело - каркасом, тусклым: поверх него читаются и скелет, и подсветка ног.
 		DrawWireframe(rgba, cloud, horizontal, viewX0, viewY0, scale);
 
-		// Весь скелет - серым: контекст позы (корпус, шея, хвост) без него не читается.
 		for (int i = 0; i < joints.Length; i++)
 		{
 			int parent = skeleton.Parents[i];
@@ -364,8 +336,7 @@ public static class LegSnapshotProbe
 			}
 		}
 
-		// Подсветка ног - по именам рига Khronos Fox, как в CharacterPlaneProbe: пробник
-		// воспроизводит конкретного персонажа. Ненайденное имя просто не подсвечивается.
+		// Khronos Fox rig names; a missing name is simply left unhighlighted.
 		DrawChain(rgba, skeleton, joints, horizontal, viewX0, viewY0, scale, 255, 210, 60,
 			"b_LeftLeg01_015", "b_LeftLeg02_016", "b_LeftFoot01_017", "b_LeftFoot02_018");
 		DrawChain(rgba, skeleton, joints, horizontal, viewX0, viewY0, scale, 255, 140, 40,
@@ -401,7 +372,6 @@ public static class LegSnapshotProbe
 				var from = Project(joints[previous], horizontal, viewX0, viewY0, scale);
 				var to = Project(joints[joint], horizontal, viewX0, viewY0, scale);
 
-				// Жирная линия: три параллельных прохода читаются на фоне серого скелета.
 				for (int offset = -1; offset <= 1; offset++)
 				{
 					DrawLine(rgba, (from.X, from.Y + offset), (to.X, to.Y + offset), r, g, b);

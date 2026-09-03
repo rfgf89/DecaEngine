@@ -7,39 +7,24 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Процедурный equirect-энвайронмент для PBR-превью (слот _EnvMap в UnlitInstancedPS.hlsl):
-/// градиентное небо с мягким «солнцем», линия горизонта и тёмная земля. Мип-цепочка -
-/// аналитический префильтр по roughness: каждый уровень ЗАНОВО генерируется в своём разрешении
-/// с прогрессивно размытыми солнцем/горизонтом (а не даунсемплится), так что
-/// SampleLevel(mip = roughness * MipMax) даёт корректно смягчённое отражение без
-/// сверточного префильтра на GPU. Значения линейные, 0..1 (RGBA8) - «панч» бликов
-/// обеспечивают аналитические key/fill источники, а не энвайронмент.
-/// </summary>
-/// <summary>Результат создания энвайронмента превью: текстура + направление НА доминантный
-/// источник света в ней (солнце/софтбокс) - из него строится мировой ключевой свет и тени.
-/// Radiance - CPU-двойник шейдерного SampleEnvironment (линейный радианс неба по мировому
-/// направлению, БЕЗ пользовательского поворота) - им пользуется CPU-бейк probe-GI
-/// (см. <see cref="ProbeGiBaker"/>); потокобезопасен.</summary>
+/// <summary>Preview environment: texture, direction TOWARD its dominant light, and Radiance - a thread-safe CPU twin of the shader's SampleEnvironment (linear, no user yaw) used by the probe-GI baker.</summary>
 public readonly record struct EnvironmentMapResult(IGpuTexture Texture, Vector3 SunDirection,
 	Func<Vector3, Vector3> Radiance);
 
+/// <summary>Procedural equirect environment for PBR preview (_EnvMap): each mip is regenerated at its own resolution with roughness-blurred sun/horizon (not downsampled), so SampleLevel(mip = roughness * MipMax) approximates a GGX prefilter. Values linear 0..1.</summary>
 public static class PreviewEnvironmentMap
 {
 	public const int BaseWidth = 256;
 	public const int BaseHeight = 128;
 
-	/// <summary>Число мип-уровней; шейдерная константа EnvMipMax обязана быть MipCount - 1.</summary>
+	/// <summary>Mip level count; the shader constant EnvMipMax must equal MipCount - 1.</summary>
 	public const int MipCount = 7;
 
-	// Фиксированное направление на «солнце» (мир): вверх и в сторону - чтобы отражение жило на
-	// верхних полусферах, но не совпадало по экрану с камерным key-светом один в один.
+	// Fixed world direction toward the sun: up and to the side, so the reflection lives on upper
+	// hemispheres but does not coincide on screen with the camera key light.
 	private static readonly Vector3 SunDirection = Vector3.Normalize(new Vector3(-0.45f, 0.72f, 0.35f));
 
-	/// <summary>Создаёт энвайронмент превью. Источник переключаемый (задел под настройки графики):
-	/// если <paramref name="hdrPath"/> задан и файл читается - загружается equirect .hdr (Radiance)
-	/// с CPU-префильтром мипов в RGBA16F; иначе (или при любой ошибке) - процедурное небо, как
-	/// раньше. Отказ HDR не роняет превью, а логируется и откатывается на процедурный путь.</summary>
+	/// <summary>Creates the preview environment; loads the equirect .hdr when given, any failure logs and falls back to the procedural sky.</summary>
 	public static EnvironmentMapResult Create(IGraphicsApi api, string hdrPath = null)
 	{
 		if (!string.IsNullOrEmpty(hdrPath))
@@ -77,10 +62,7 @@ public static class PreviewEnvironmentMap
 			dir => Shade(dir, 0f));
 	}
 
-	/// <summary>Загрузка equirect Radiance .hdr: даунсемпл до BaseWidth x BaseHeight, автоэкспозиция
-	/// к среднему уровню процедурного неба, мип-цепочка с прогрессивным blur-ом (дешёвый CPU-аналог
-	/// префильтра по roughness) и заливка в RGBA16F - RGBA8 обрезал бы HDR-диапазон солнца/окон,
-	/// и зеркальные отражения потеряли бы энергию.</summary>
+	/// <summary>Loads an equirect .hdr into RGBA16F - RGBA8 would clip the sun's HDR range and specular reflections would lose energy.</summary>
 	private static EnvironmentMapResult? TryCreateFromHdr(IGraphicsApi api, string hdrPath)
 	{
 		if (!File.Exists(hdrPath))
@@ -94,7 +76,7 @@ public static class PreviewEnvironmentMap
 			return null;
 		}
 
-		// Даунсемпл усреднением по блокам источника - equirect обычно 1-4k, база превью 256x128.
+		// Block-average downsample - source equirect is typically 1-4k, preview base is 256x128.
 		var basePixels = new Vector3[BaseWidth * BaseHeight];
 		double luminanceSum = 0;
 		for (int y = 0; y < BaseHeight; y++)
@@ -125,12 +107,9 @@ public static class PreviewEnvironmentMap
 			}
 		}
 
-		// Автоэкспозиция: средняя яркость приводится к уровню процедурного неба (~0.35), чтобы HDR
-		// любой абсолютной шкалы (люксы, безразмерные) давал сопоставимую с аналитическими
-		// источниками картинку. Пики (солнце) не клампим - float16 их переживает, тонмаппер сожмёт.
-		// Потолок пиков ПОСЛЕ экспозиции: солнце/софтбоксы в HDR на порядки ярче среднего, и в
-		// зеркальном отражении глянцевой доски такие значения пробивают тонмаппер в чисто-белые
-		// полосы. 6x среднего сохраняет HDR-панч бликов, но не выжигает поверхности.
+		// Auto-exposure: mean luminance is normalized to the procedural sky's (~0.35) so any
+		// absolute HDR scale matches the analytic lights. Peaks are clamped AFTER exposure at 6x
+		// mean: HDR suns punch through the tonemapper into pure white in glossy reflections.
 		float averageLuminance = (float)(luminanceSum / basePixels.Length);
 		float exposure = averageLuminance > 1e-5f ? 0.35f / averageLuminance : 1f;
 		for (int i = 0; i < basePixels.Length; i++)
@@ -138,9 +117,8 @@ public static class PreviewEnvironmentMap
 			basePixels[i] = Vector3.Min(basePixels[i] * exposure, new Vector3(6f));
 		}
 
-		// Доминантное направление света: яркостно-взвешенное среднее направлений текселей с весом
-		// lum^4 (пики - солнце/софтбокс - доминируют) и sin(theta)-коррекцией equirect-площади.
-		// Из него строятся мировой ключевой свет и тени превью.
+		// Dominant light direction: lum^4-weighted texel directions with sin(theta) equirect-area
+		// correction; the preview key light and shadows are built from it.
 		var weightedDirection = Vector3.Zero;
 		for (int y = 0; y < BaseHeight; y++)
 		{
@@ -163,14 +141,14 @@ public static class PreviewEnvironmentMap
 			? Vector3.Normalize(weightedDirection)
 			: SunDirection;
 
-		// Свет из-под горизонта тенями сверху не выглядит - поджимаем к верхней полусфере.
+		// Light from below the horizon reads wrong as top-down shadows - clamp to the upper hemisphere.
 		if (sunDirection.Y < 0.15f)
 		{
 			sunDirection = Vector3.Normalize(new Vector3(sunDirection.X, 0.15f, sunDirection.Z));
 		}
 
-		// Мип-цепочка: 2x-даунсемпл + горизонтально-заворачивающийся blur, ширина растёт с уровнем -
-		// дешёвое приближение GGX-префильтра, согласованное с процедурным путём.
+		// Mip chain: 2x downsample + horizontally wrapping blur widening per level - a cheap
+		// GGX-prefilter stand-in, consistent with the procedural path.
 		var mips = new List<byte[]>(MipCount);
 		var level = basePixels;
 		int levelWidth = BaseWidth, levelHeight = BaseHeight;
@@ -187,7 +165,7 @@ public static class PreviewEnvironmentMap
 			mips.Add(ToHalfPixels(level, levelWidth, levelHeight));
 		}
 
-		// CPU-радианс для probe-GI: билинейный lookup базового уровня (уже с экспозицией/клампом).
+		// CPU radiance for probe-GI: bilinear lookup of the base level (exposure/clamp applied).
 		var radiancePixels = basePixels;
 		Vector3 SampleHdr(Vector3 dir)
 		{
@@ -240,7 +218,7 @@ public static class PreviewEnvironmentMap
 		return (dst, newWidth, newHeight);
 	}
 
-	/// <summary>3x3-блюр: по X заворачивается (equirect-шов), по Y клампится (полюса).</summary>
+	/// <summary>3x3 blur: wraps in X (equirect seam), clamps in Y (poles).</summary>
 	private static Vector3[] BlurWrapped(Vector3[] src, int width, int height)
 	{
 		var dst = new Vector3[src.Length];
@@ -290,7 +268,7 @@ public static class PreviewEnvironmentMap
 
 		for (int y = 0; y < height; y++)
 		{
-			// Equirect: v 0 -> зенит (+Y), v 1 -> надир (-Y).
+			// Equirect: v 0 -> zenith (+Y), v 1 -> nadir (-Y).
 			float theta = (y + 0.5f) / height * MathF.PI;
 			float dirY = MathF.Cos(theta);
 			float sinTheta = MathF.Sin(theta);
@@ -323,14 +301,13 @@ public static class PreviewEnvironmentMap
 		var sky = Vector3.Lerp(skyHorizon, skyZenith, MathF.Pow(MathF.Max(dir.Y, 0f), 0.55f));
 		var ground = Vector3.Lerp(groundHorizon, groundDeep, MathF.Pow(MathF.Max(-dir.Y, 0f), 0.5f));
 
-		// Ширина перехода горизонта растёт с roughness - размытое отражение не должно сохранять
-		// резкую линию, которую честный префильтр давно бы растушевал.
+		// Horizon transition widens with roughness - a blurred reflection must not keep a sharp
+		// line that a real prefilter would have smeared.
 		float horizonWidth = 0.04f + 0.5f * roughness;
 		float t = SmoothStep(-horizonWidth, horizonWidth, dir.Y);
 		var color = Vector3.Lerp(ground, sky, t);
 
-		// Мягкое солнце: гауссоподобное пятно, расплывающееся и тускнеющее с roughness (грубая
-		// консервация энергии - интеграл по сфере остаётся примерно тем же).
+		// Gaussian-like sun spot that spreads and dims with roughness (rough energy conservation).
 		float sunSharpness = Lerp(180f, 3f, roughness);
 		float sunIntensity = Lerp(1.6f, 0.25f, roughness);
 		float alignment = Vector3.Dot(dir, SunDirection);

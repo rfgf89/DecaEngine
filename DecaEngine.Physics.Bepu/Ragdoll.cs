@@ -7,75 +7,43 @@ using BepuPhysics.Constraints;
 
 namespace DecaEngine.Physics;
 
-/// <summary>
-/// Описание одной кости рэгдолла. Задаётся ВЫЗЫВАЮЩИМ, а не выводится из скелета автоматически:
-/// какие кости рига физические, а какие - служебные (пальцы, вспомогательные узлы, кости
-/// вторичного движения), знает только автор персонажа. Автоматика здесь дала бы рэгдолл из
-/// двухсот тел, из которых нужны двадцать.
-/// </summary>
+/// <summary>One ragdoll bone description; authored by the caller, not derived from the skeleton.</summary>
 public struct RagdollBoneDesc
 {
-	/// <summary>Джойнт скелета, к которому привязано тело; он же - проксимальный конец капсулы.</summary>
+	/// <summary>Skeleton joint the body is bound to; also the proximal end of the capsule.</summary>
 	public int Joint;
 
-	/// <summary>Джойнт, задающий направление и длину капсулы (обычно ребёнок). -1 - использовать
-	/// <see cref="Length"/> вдоль оси Y джойнта.</summary>
+	/// <summary>Joint defining capsule direction/length; -1 = use <see cref="Length"/> along joint Y.</summary>
 	public int ChildJoint;
 
-	/// <summary>Индекс РОДИТЕЛЬСКОЙ КОСТИ РЭГДОЛЛА в описании, -1 у корня. Именно кости рэгдолла, а
-	/// не джойнта скелета: между ними обычно есть пропущенные звенья.</summary>
+	/// <summary>Index of the parent RAGDOLL bone in this description (-1 for root), not a skeleton joint.</summary>
 	public int Parent;
 
 	public float Radius;
 	public float Length;
 	public float Mass;
 
-	/// <summary>Косинус максимального отклонения от исходного направления в суставе. 1 - сустав
-	/// жёсткий, -1 - свободный. По умолчанию (0) ограничение не ставится вовсе.</summary>
+	/// <summary>Cos of max swing from the assembly direction. 1 = rigid, -1 = free, 0 = no limit.</summary>
 	public float SwingLimitCos;
 
-	/// <summary>
-	/// Предел СКРУЧИВАНИЯ кости вокруг собственной длинной оси, радианы (± от позы сборки). Ноль -
-	/// не ограничивать.
-	///
-	/// Отдельно от <see cref="SwingLimitCos"/>, потому что это другая степень свободы: конус
-	/// ограничивает, куда кость может ОТКЛОНИТЬСЯ, и ничего не говорит о том, на сколько она может
-	/// провернуться вокруг себя. Без этого предела лапа выворачивается на любой угол, оставаясь
-	/// внутри конуса, - и персонаж выглядит сломанным при формально соблюдённых ограничениях.
-	/// </summary>
+	/// <summary>Twist limit around the bone's long axis, radians from assembly pose; 0 = no limit.</summary>
 	public float TwistLimitAngle;
 
-	/// <summary>
-	/// Ось ШАРНИРА в мире на момент сборки; ноль - сустав не шарнирный (обычный конус + твист).
-	/// Колено и локоть - одноосные суставы: конус разрешает согнуть их и НАЗАД, и упавший персонаж
-	/// заламывает ноги анатомически невозможно, формально не нарушая ни одного предела. Шарнир
-	/// оставляет одну степень свободы, а <see cref="HingeMinAngle"/>/<see cref="HingeMaxAngle"/>
-	/// ограничивают её диапазон (радианы от позы сборки; плюс - глубже в сгиб). Конус и твист у
-	/// шарнирного сустава не ставятся: шарнир уже держит обе лишние степени.
-	/// </summary>
+	/// <summary>Hinge axis in world at assembly time; zero = not a hinge (cone + twist instead).
+	/// Hinged joints get no cone/twist; <see cref="HingeMinAngle"/>/<see cref="HingeMaxAngle"/>
+	/// bound the single remaining DOF (radians from assembly pose, positive = deeper flex).</summary>
 	public Vector3 HingeAxisWorld;
 	public float HingeMinAngle;
 	public float HingeMaxAngle;
 }
 
 /// <summary>
-/// Рэгдолл: набор капсул по костям с шарнирами в суставах, умеющий жить в двух режимах и
-/// переключаться между ними.
+/// Ragdoll: capsules per bone with jointed constraints, switchable between animation-driven and
+/// physics-driven modes (plus active ragdoll via angular servos).
 ///
-/// - КИНЕМАТИЧЕСКИЙ: тела с бесконечной массой едут за позой анимации. Персонаж полностью
-///   управляется аниматором, но при этом расталкивает окружение.
-/// - ДИНАМИЧЕСКИЙ: тела падают сами, поза читается ИЗ НИХ.
-///
-/// Плюс active ragdoll - динамический режим с угловыми сервоприводами, тянущими каждый сустав к
-/// позе анимации. Именно он даёт «живое» падение, когда персонаж ещё пытается держаться, а не
-/// мешок костей.
-///
-/// Тела ВСЕГДА динамические, даже в режиме анимации. Это не небрежность, а требование Bepu: связь
-/// между двумя КИНЕМАТИЧЕСКИМИ телами недопустима, а рэгдолл - это сплошь связанные тела, и в
-/// момент, когда весь набор становился кинематическим, решатель портил кучу (STATUS_HEAP_CORRUPTION
-/// на первом же шаге). Поэтому режим анимации реализован не бесконечной массой, а ЖЁСТКИМ
-/// заданием скорости каждый кадр: гравитация и удары успевают внести вклад лишь за один шаг и тут
-/// же перезаписываются, то есть тело ведёт себя как кинематическое, оставаясь динамическим.
+/// Bodies are ALWAYS dynamic, even in animation mode: Bepu forbids constraints between two
+/// kinematic bodies (making the whole set kinematic corrupted the solver heap). Animation mode is
+/// implemented by hard velocity writes each frame instead of infinite mass.
 /// </summary>
 public sealed class Ragdoll
 {
@@ -83,20 +51,17 @@ public sealed class Ragdoll
 	{
 		public BodyHandle Body;
 
-		/// <summary>Капсула кости. Хранится, чтобы её было чем убрать: формы живут в реестре
-		/// симуляции отдельно от тел, и снятие тела их не трогает (см. <see cref="Destroy"/>).</summary>
+		/// <summary>Kept so it can be removed: shapes live in the simulation registry independently of bodies.</summary>
 		public TypedIndex Shape;
 
 		public int Joint;
 		public int Parent;
 		public BodyInertia DynamicInertia;
 
-		/// <summary>Ориентация тела относительно джойнта в момент сборки: капсула Bepu лежит вдоль
-		/// своей локальной оси Y, а кость смотрит куда угодно, и без этой поправки поза, прочитанная
-		/// из физики, приходила бы повёрнутой.</summary>
+		/// <summary>Body orientation relative to the joint at assembly; Bepu capsules lie along local Y.</summary>
 		public Quaternion JointToBody;
 
-		/// <summary>Смещение центра капсулы от джойнта, в пространстве ТЕЛА.</summary>
+		/// <summary>Capsule-center-to-joint offset, in BODY space.</summary>
 		public Vector3 BodyToJoint;
 
 		public ConstraintHandle Socket;
@@ -107,17 +72,15 @@ public sealed class Ragdoll
 	private readonly PhysicsWorld _world;
 	private readonly Bone[] _bones;
 
-	/// <summary>Идёт ли поза от анимации (true) или от физики (false). См. шапку о том, почему это
-	/// НЕ кинематические тела.</summary>
+	/// <summary>True when pose comes from animation; bodies stay dynamic either way (see class doc).</summary>
 	public bool IsAnimationDriven { get; private set; } = true;
 
 	public int BoneCount => _bones.Length;
 
-	/// <summary>Джойнт скелета, которому соответствует кость рэгдолла.</summary>
+	/// <summary>Skeleton joint corresponding to a ragdoll bone.</summary>
 	public int JointOf(int bone) => _bones[bone].Joint;
 
-	/// <summary>Тело кости - для диагностики (скорости, силы) и для внешних воздействий: толчок от
-	/// взрыва прикладывается к конкретной кости, а не к рэгдоллу целиком.</summary>
+	/// <summary>Body of a bone, for diagnostics and external impulses.</summary>
 	public BodyHandle BodyOf(int bone) => _bones[bone].Body;
 
 	private Ragdoll(PhysicsWorld world, Bone[] bones)
@@ -126,13 +89,8 @@ public sealed class Ragdoll
 		_bones = bones;
 	}
 
-	/// <summary>
-	/// Собирает рэгдолл по текущей позе. <paramref name="jointWorld"/> - МИРОВЫЕ матрицы джойнтов
-	/// (модельные, домноженные на трансформ сущности): физика живёт в мире, и собирать её в
-	/// пространстве модели значило бы городить второй набор координат.
-	///
-	/// Стартует КИНЕМАТИЧЕСКИМ: персонаж в момент появления управляется анимацией, а не валится.
-	/// </summary>
+	/// <summary>Builds a ragdoll from the current pose; jointWorld are WORLD-space joint matrices.
+	/// Starts animation-driven.</summary>
 	public static Ragdoll Build(PhysicsWorld world, ReadOnlySpan<RagdollBoneDesc> description,
 		Matrix4x4[] jointWorld)
 	{
@@ -144,9 +102,8 @@ public sealed class Ragdoll
 			var jointMatrix = jointWorld[desc.Joint];
 			var jointPosition = jointMatrix.Translation;
 
-			// Направление и длина кости - по ребёнку, если он задан. Иначе кость считается
-			// смотрящей вдоль своей локальной Y: так ориентированы концевые кости (голова, кисть),
-			// у которых ребёнка в риге просто нет.
+			// Bone direction/length from the child joint if given, else along the joint's local Y
+			// (terminal bones such as head/hand have no child in the rig).
 			Vector3 direction;
 			float length;
 
@@ -162,12 +119,11 @@ public sealed class Ragdoll
 				direction = Vector3.Normalize(new Vector3(jointMatrix.M21, jointMatrix.M22, jointMatrix.M23));
 			}
 
-			// Капсула Bepu измеряется ЦИЛИНДРИЧЕСКОЙ частью: полная длина больше на два радиуса.
-			// Без вычета концевые полусферы удлиняли бы каждую кость, и суставы не сходились бы.
+			// Bepu capsule length is the CYLINDRICAL part only; subtract the end hemispheres.
 			float cylinder = MathF.Max(length - 2f * desc.Radius, 0.01f);
 			var shape = world.AddCapsule(desc.Radius, cylinder);
 
-			// Капсула лежит вдоль локальной Y - разворачиваем её вдоль кости.
+			// Capsule lies along local Y; rotate it along the bone.
 			var orientation = FromToRotation(Vector3.UnitY, direction);
 			var center = jointPosition + direction * (length * 0.5f);
 
@@ -186,22 +142,9 @@ public sealed class Ragdoll
 			};
 		}
 
-		// Фильтр подгрупп (см. SubgroupCollisionFilter - приём из демок Bepu): весь рэгдолл - одна
-		// группа, каждая кость - своя подгруппа.
-		//
-		// Не сталкиваются только СМЕЖНЫЕ по суставу кости - родитель с ребёнком. Их капсулы
-		// пересекаются по построению (сустав у них общий), и решатель, расталкивая их контактами,
-		// воюет с собственным шарниром: персонаж дрожит и уползает по полу вместо того, чтобы лежать.
-		//
-		// Все остальные пары сталкиваются, и это НЕ мелочь: голова о туловище, лапа о лапу, хвост о
-		// бок - именно они не дают персонажу сложиться сам сквозь себя. Тряпичная кукла держит форму
-		// не одними суставами: у неё есть объём, и он тоже часть ограничений. Запрет столкновений
-		// внутри рэгдолла ЦЕЛИКОМ убирал войну с шарнирами вместе со всей этой защитой, и персонаж
-		// сворачивался в физически невозможный узел.
-		//
-		// Подгрупп ровно 64 - маска битовая. Рэгдолл длиннее (полный риг с пальцами) в неё не
-		// поместится: кости с 64-й получают пустую маску членства, то есть сталкиваются со всеми
-		// своими соседями. Дрожащий сустав честнее молча перепутанных битов у костей 64 и 0.
+		// Subgroup filter: only joint-ADJACENT bones skip collision (their capsules overlap by
+		// construction and contacts would fight the socket); all other pairs still collide so the
+		// ragdoll keeps its volume. Mask is 64-bit: bones past 63 collide with everything.
 		int group = world.NewCollisionGroup();
 
 		for (int i = 0; i < bones.Length; i++)
@@ -223,9 +166,7 @@ public sealed class Ragdoll
 		return ragdoll;
 	}
 
-	/// <summary>Шарниры и ограничения. Точка крепления - ПРОКСИМАЛЬНЫЙ конец кости (сам джойнт), а
-	/// не центр капсулы: сустав анатомически находится там, и крепление за центр давало бы висящие
-	/// на полдлины кости конечности.</summary>
+	/// <summary>Joints and limits; anchor is the PROXIMAL end of the bone (the joint itself), not the capsule center.</summary>
 	private void CreateConstraints(ReadOnlySpan<RagdollBoneDesc> description)
 	{
 		for (int i = 0; i < _bones.Length; i++)
@@ -252,10 +193,8 @@ public sealed class Ragdoll
 
 			_bones[i].Socket = _world.Simulation.Solver.Add(_bones[parent].Body, _bones[i].Body, socket);
 
-			// Угловой сервопривод заводится СРАЗУ, даже если active ragdoll выключен: добавление
-			// связи в решатель на лету стоит перестройки батчей, и делать это в момент, когда
-			// персонажа сбивают с ног, - худший из возможных выборов. Пока он не нужен, ему просто
-			// ставится нулевая максимальная сила.
+			// Servo is created up front even when active ragdoll is off: adding a constraint later
+			// forces a solver batch rebuild at the worst possible moment. Unused = zero max force.
 			var servo = new AngularServo
 			{
 				TargetRelativeRotationLocalA = Quaternion.Conjugate(parentPose.Orientation) * childPose.Orientation,
@@ -268,8 +207,7 @@ public sealed class Ragdoll
 
 			if (description[i].HingeAxisWorld.LengthSquared() > 1e-8f)
 			{
-				// Шарнир: одна ось вращения плюс диапазон угла вокруг неё. Заменяет и конус, и
-				// твист - лишние степени свободы уже удержаны выравниванием осей.
+				// Hinge replaces cone + twist; excess DOFs are held by axis alignment.
 				var axis = Vector3.Normalize(description[i].HingeAxisWorld);
 
 				var hinge = new AngularHinge
@@ -308,14 +246,8 @@ public sealed class Ragdoll
 		}
 	}
 
-	/// <summary>
-	/// Ось и диапазон шарнира из ПОЗЫ СБОРКИ - для коленей и локтей (см.
-	/// <see cref="RagdollBoneDesc.HingeAxisWorld"/>). Ось - нормаль плоскости текущего изгиба;
-	/// диапазон анатомический и самокалибрующийся: разгибание до почти прямой (пять градусов
-	/// запаса - не через прямую в обратный сгиб), сгиб до ~140 градусов суммарного угла. Почти
-	/// прямая конечность оси не даёт (шум вместо направления - ровно та ловушка, что была у полюса
-	/// foot IK) - сустав остаётся конусным.
-	/// </summary>
+	/// <summary>Derives hinge axis/range from the assembly pose (knees/elbows). A near-straight limb
+	/// gives no reliable axis, so the joint stays cone-limited in that case.</summary>
 	public static void MarkHinge(ref RagdollBoneDesc bone, Vector3 upperWorld, Vector3 midWorld,
 		Vector3 footWorld)
 	{
@@ -347,23 +279,12 @@ public sealed class Ragdoll
 		bone.HingeMaxAngle = MathF.Max(maxFlex - bend, 0f);
 	}
 
-	/// <summary>
-	/// Предел скручивания вокруг длинной оси кости (см. <see cref="RagdollBoneDesc.TwistLimitAngle"/>).
-	///
-	/// У <see cref="TwistLimit"/> ось скручивания - это **Z** базиса, а «нулевым углом» считается его
-	/// X (так написано в документации Bepu, и перепутать здесь легко: у капсулы длинная ось - Y).
-	/// Поэтому строится отдельный базис: Z вдоль кости, X - любой перпендикуляр, лишь бы ОДИН И ТОТ
-	/// ЖЕ для обоих тел.
-	///
-	/// Базис снимается в позе СБОРКИ и выражается в локальных пространствах каждого тела - тогда
-	/// текущее скручивание в этой позе равно нулю, а предел ±angle отсчитывается от неё. Взять базис
-	/// «из мира» и не переводить в локальные - значит привязать сустав к ориентации персонажа в
-	/// момент сборки: повернувшись, он получил бы перекрученный сустав на ровном месте.
-	/// </summary>
+	/// <summary>Twist limit around the bone's long axis. Bepu's TwistLimit twists around basis Z
+	/// with X as the zero angle, so a dedicated basis is built (Z along bone, shared X) and taken
+	/// in ASSEMBLY pose local spaces so the limit is +/-angle from that pose.</summary>
 	private void AddTwistLimit(int parent, int child, in RigidPose parentPose, in RigidPose childPose,
 		float angle)
 	{
-		// Длинная ось капсулы ребёнка в мире - вокруг неё и меряется скручивание.
 		var twist = Vector3.Transform(Vector3.UnitY, childPose.Orientation);
 		float length = twist.Length();
 
@@ -375,20 +296,16 @@ public sealed class Ragdoll
 		AddTwistRange(parent, child, parentPose, childPose, twist / length, -angle, angle);
 	}
 
-	/// <summary>Предел вращения вокруг ПРОИЗВОЛЬНОЙ оси с несимметричным диапазоном - им же
-	/// ограничивается угол шарнира (там ось - ось сгиба, а не длинная ось кости, и диапазон
-	/// смещён: разгибать почти нельзя, сгибать - можно).</summary>
+	/// <summary>Rotation limit around an arbitrary axis with an asymmetric range; also used for hinge angle.</summary>
 	private void AddTwistRange(int parent, int child, in RigidPose parentPose, in RigidPose childPose,
 		Vector3 axisWorld, float minimumAngle, float maximumAngle)
 	{
-		// Перпендикуляр берётся от той оси мира, которая с осью наименее сонаправлена: взять
-		// фиксированную (скажем, всегда UnitX) значит получить вырожденное произведение у оси,
-		// смотрящей вдоль неё, - а такие в скелете есть всегда.
+		// Pick the helper axis least aligned with the twist axis to avoid a degenerate cross product.
 		var helper = MathF.Abs(axisWorld.X) < 0.7f ? Vector3.UnitX : Vector3.UnitZ;
 		var x = Vector3.Normalize(Vector3.Cross(helper, axisWorld));
 		var y = Vector3.Cross(axisWorld, x);
 
-		// Строки матрицы - базисные векторы (та же конвенция, что у MathUtils.CreateTrs).
+		// Matrix rows are basis vectors (same convention as MathUtils.CreateTrs).
 		var basis = Quaternion.CreateFromRotationMatrix(new Matrix4x4(
 			x.X, x.Y, x.Z, 0f,
 			y.X, y.Y, y.Z, 0f,
@@ -407,16 +324,8 @@ public sealed class Ragdoll
 		_world.Simulation.Solver.Add(_bones[parent].Body, _bones[child].Body, limit);
 	}
 
-	/// <summary>
-	/// Убирает рэгдолл из мира целиком: тела, их связи и формы. Нужен потому, что рэгдолл в
-	/// редакторе - НЕ вечная сущность: галочка Enabled его создаёт и уничтожает, персонажа удаляют
-	/// из сцены, префаб перезагружают. Без этого каждое такое событие оставляло бы в симуляции
-	/// два десятка невидимых капсул, которые продолжают падать и расталкивать живых.
-	///
-	/// Связи снимать отдельно не нужно: удаление тела в Bepu снимает и все связи, в которых оно
-	/// участвует. А вот формы - нужно: они лежат в реестре симуляции сами по себе, и тело их не
-	/// «владеет».
-	/// </summary>
+	/// <summary>Removes bodies, constraints and shapes. Bepu removes constraints with the body, but
+	/// shapes live in the registry on their own and must be removed explicitly.</summary>
 	public void Destroy()
 	{
 		for (int i = 0; i < _bones.Length; i++)
@@ -426,23 +335,16 @@ public sealed class Ragdoll
 		}
 	}
 
-	/// <summary>Мировая поза тела кости - для дебага (каркас капсулы рисуется по НЕЙ, а не по позе
-	/// джойнта: расхождение этих двух и есть то, что ищут, когда физика персонажа живёт отдельно от
-	/// картинки).</summary>
+	/// <summary>World pose of a bone body (debug capsule wireframe is drawn from this, not the joint pose).</summary>
 	public RigidPose PoseOf(int bone) => _world.Simulation.Bodies[_bones[bone].Body].Pose;
 
-	/// <summary>Форма кости - чтобы дебаг мог нарисовать её РЕАЛЬНЫЕ размеры, а не те, что были
-	/// заказаны в описании.</summary>
+	/// <summary>Shape of a bone, so debug draw can show the actual dimensions.</summary>
 	public TypedIndex ShapeOf(int bone) => _bones[bone].Shape;
 
-	/// <summary>Родительская КОСТЬ РЭГДОЛЛА, -1 у корня: по ней дебаг рисует связи суставов.</summary>
+	/// <summary>Parent RAGDOLL bone, -1 for root.</summary>
 	public int ParentOf(int bone) => _bones[bone].Parent;
 
-	/// <summary>
-	/// Переключает источник позы. Переход в физику НЕ обнуляет скорости: тела к этому моменту уже
-	/// движутся со скоростью, которую им задавала анимация, и персонаж падает ПРОДОЛЖАЯ движение, а
-	/// не с места - именно это отличает подсечку на бегу от выключения питания.
-	/// </summary>
+	/// <summary>Switches the pose source. Entering physics keeps current velocities so momentum carries over.</summary>
 	public void SetAnimationDriven(bool animationDriven)
 	{
 		if (animationDriven == IsAnimationDriven)
@@ -454,37 +356,24 @@ public sealed class Ragdoll
 
 		for (int i = 0; i < _bones.Length; i++)
 		{
-			// Через Activator, а не присваиванием Awake у BodyReference: индексатор Bodies возвращает
-			// значение, и запись в его поле компилятор не пропускает (CS1612).
+			// Via Awakener: the Bodies indexer returns by value, so writing Awake there is CS1612.
 			_world.Simulation.Awakener.AwakenBody(_bones[i].Body);
 		}
 	}
 
-	/// <summary>
-	/// Гонит тела к позе анимации. В кинематическом режиме - ЖЁСТКО, скоростью, вычисленной из
-	/// разницы поз: телепортировать тело нельзя, иначе оно проходит сквозь препятствия, не заметив
-	/// их, и перестаёт что-либо расталкивать. В динамическом - через угловые сервоприводы, то есть
-	/// это и есть active ragdoll.
-	/// </summary>
+	/// <summary>Drives bodies toward the animation pose: hard velocities in animation mode
+	/// (teleporting would tunnel through obstacles), angular servos in dynamic mode.</summary>
 	public void DriveToPose(Matrix4x4[] jointWorld, float deltaSeconds, float servoStrength = 0f)
 	{
 		if (deltaSeconds <= 0f)
 		{
-			// Нулевой шаг - это режим редактирования: время не идёт, и «гнать скоростью» нечем.
-			// Тела СТАВЯТСЯ в позу напрямую. Без этого рэгдолл остаётся там, где его собрали, и
-			// персонаж, которого автор двигает гизмо, перестаёт зависеть от собственного трансформа:
-			// сущность едет, а поза, прочитанная из тел, стоит на прежнем месте.
+			// Zero step = edit mode: no time to drive with, so place bodies directly.
 			TeleportToPose(jointWorld);
 			return;
 		}
 
-		// Делитель - НЕ МЕНЬШЕ шага симуляции. Скорость, посчитанную на кадр, интегрируют
-		// фиксированные шаги 1/120, и при FPS выше 120 кадр КОРОЧЕ шага: в кадр, куда попадает шаг,
-		// тело проезжает в (шаг/кадр) раз больше своей дельты, следующий кадр «исправляет» перелёт
-		// новым перелётом - экспоненциальная раскачка до бесконечности за доли секунды. Дальше
-		// NaN-габарит и смерть широкой фазы Bepu переполнением стека при построении дерева - краш
-		// выглядит как «Bepu сломался», а не как «делитель не тот». Headless-пробник этого не видит
-		// ПО ПОСТРОЕНИЮ: он шагает ровным кадром 1/60, длиннее шага симуляции.
+		// Divisor must be >= the fixed sim step: with frames shorter than 1/120 the per-frame
+		// velocity overshoots each integrated step and feedback blows up to NaN within seconds.
 		float driveSeconds = MathF.Max(deltaSeconds, PhysicsWorld.FixedTimeStep);
 
 		for (int i = 0; i < _bones.Length; i++)
@@ -517,12 +406,7 @@ public sealed class Ragdoll
 		}
 	}
 
-	/// <summary>
-	/// Толчок телам: приращение СКОРОСТИ (не импульс в ньютонах - от массы костей эффект зависеть
-	/// не должен, толчок в 2 м/с обязан качнуть и мышь, и лошадь одинаково), взвешенное по
-	/// джойнтам. Вес на джойнт приходит снаружи: кто и как распределяет удар по телу (маска
-	/// хит-реакции, точка попадания), рэгдоллу знать незачем.
-	/// </summary>
+	/// <summary>Applies a velocity delta (not an impulse; effect must not depend on bone mass) weighted per joint.</summary>
 	public void AddVelocity(Vector3 deltaVelocity, float[] jointWeights)
 	{
 		for (int i = 0; i < _bones.Length; i++)
@@ -541,14 +425,7 @@ public sealed class Ragdoll
 		}
 	}
 
-	/// <summary>
-	/// СТАВИТ тела в позу напрямую, гася скорости.
-	///
-	/// В симуляции так делать нельзя - телепортированное тело проходит сквозь препятствия, не заметив
-	/// их, и ничего не расталкивает; для идущего времени есть <see cref="DriveToPose"/>. Но там, где
-	/// времени нет - режим редактирования, первый кадр после сборки, перенос персонажа - это
-	/// единственный способ вообще куда-то его поставить.
-	/// </summary>
+	/// <summary>Places bodies at the pose directly, zeroing velocities; only valid when time is not advancing.</summary>
 	public void TeleportToPose(Matrix4x4[] jointWorld)
 	{
 		for (int i = 0; i < _bones.Length; i++)
@@ -558,17 +435,14 @@ public sealed class Ragdoll
 
 			body.Pose = target;
 
-			// Скорости гасятся обязательно: тело, поставленное на новое место со старой скоростью,
-			// на первом же шаге игры улетит с неё, и выглядеть это будет как «персонаж прыгнул при
-			// нажатии Play».
+			// Zero velocities, or the body flies off its new position on the first sim step.
 			body.Velocity.Linear = Vector3.Zero;
 			body.Velocity.Angular = Vector3.Zero;
 			body.Awake = true;
 		}
 	}
 
-	/// <summary>Читает позу из тел в МИРОВЫЕ матрицы джойнтов. Обратная операция к
-	/// <see cref="DriveToPose"/>: ею персонаж рисуется, пока лежит рэгдоллом.</summary>
+	/// <summary>Reads the pose from bodies into WORLD joint matrices; inverse of <see cref="DriveToPose"/>.</summary>
 	public void ReadPose(Matrix4x4[] jointWorld)
 	{
 		for (int i = 0; i < _bones.Length; i++)
@@ -592,9 +466,7 @@ public sealed class Ragdoll
 		return new RigidPose(position, orientation);
 	}
 
-	/// <summary>Угловая скорость, переводящая одну ориентацию в другую за шаг. Кратчайшая дуга:
-	/// без проверки знака тело раз в несколько кадров решало бы доехать «длинным путём» и
-	/// прокручивалось вокруг себя.</summary>
+	/// <summary>Angular velocity taking one orientation to another over the step, via the shortest arc.</summary>
 	private static Vector3 AngularVelocity(Quaternion from, Quaternion to, float deltaSeconds)
 	{
 		var delta = to * Quaternion.Conjugate(from);

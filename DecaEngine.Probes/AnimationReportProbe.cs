@@ -6,23 +6,9 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Численный отчёт по анимационному клипу (DECA_PROBE_ANIMREPORT=1).
-///
-/// Инструмент для работы БЕЗ ГЛАЗ. Картинка показывает один кадр, а качество анимации живёт в
-/// движении: скользит ли стопа по земле, замыкается ли цикл, симметричен ли шаг. Всё это - числа, и
-/// по ним клип можно править итеративно, не открывая редактор и не разглядывая кадры.
-///
-/// Говорит СЛОТАМИ humanoid, а не именами костей (см. <see cref="HumanoidAvatar"/>), поэтому
-/// одинаково работает и на человеке, и на четвероногом: у лисы передние лапы приезжают в слоты рук,
-/// задние - в слоты ног, и «скольжение стопы» для них означает ровно то же самое.
-///
-/// Считается на C#-семплере, без GPU и без ozz: отчёт нужен там, где ещё ничего не собрано.
-/// </summary>
+/// <summary>Numeric quality report for animation clips (DECA_PROBE_ANIMREPORT=1).</summary>
 public static class AnimationReportProbe
 {
-	/// <summary>Число выборок по клипу. 60 - достаточно, чтобы поймать и фазу шага, и дрожание
-	/// отдельного ключа, и при этом отчёт остаётся читаемым человеком и мной.</summary>
 	private const int Samples = 60;
 
 	public static void Run(ModelLoader model)
@@ -31,7 +17,7 @@ public static class AnimationReportProbe
 
 		if (skeleton == null || model.Animations.Count == 0)
 		{
-			Console.WriteLine("[probe] animreport: нет скелета или клипов - отчитываться не о чем");
+			Console.WriteLine("[probe] animreport: no skeleton or clips - nothing to report");
 			return;
 		}
 
@@ -44,9 +30,7 @@ public static class AnimationReportProbe
 		}
 	}
 
-	/// <summary>Путь модели, если пробник его сообщил, - чтобы взять СОХРАНЁННЫЙ аватар вместо
-	/// автоматического. Статическое поле, а не параметр: отчёт зовётся из середины пробника, где
-	/// путь уже потерян, а тащить его сквозь три вызова ради одной строки незачем.</summary>
+	/// <summary>Model path, when known, so a saved avatar wins over the auto-mapped one.</summary>
 	public static string ModelPathHint = string.Empty;
 
 	private static void Report(PreparedSkeleton skeleton, HumanoidAvatar avatar, int[] slots,
@@ -72,30 +56,22 @@ public static class AnimationReportProbe
 			positions[i] = frame;
 		}
 
-		Console.WriteLine($"[probe] animreport: клип '{clip.Name}', {duration:0.###} с, " +
-			$"выборок {Samples}, костей {skeleton.JointCount}");
+		Console.WriteLine($"[probe] animreport: clip '{clip.Name}', {duration:0.###} s, " +
+			$"samples {Samples}, bones {skeleton.JointCount}");
 
 		ReportLoop(positions, skeleton, clip.Name);
 		ReportRoot(positions, slots, clip.Name);
 
-		// Опору меряем по НОСКУ, если он размечен, и только иначе по стопе: планта - это носок, а
-		// голеностоп в момент переката едет вперёд на всю длину ступни, и по нему любой нормальный
-		// шаг выглядит «скользящим» (замерено на Fox: 100..300% хода при живой анимации).
-		ReportFoot(positions, slots, HumanoidBone.LeftToes, HumanoidBone.LeftFoot, "опора L", clip.Name);
-		ReportFoot(positions, slots, HumanoidBone.RightToes, HumanoidBone.RightFoot, "опора R", clip.Name);
-		ReportFoot(positions, slots, HumanoidBone.LeftHand, HumanoidBone.LeftHand, "кисть L", clip.Name);
-		ReportFoot(positions, slots, HumanoidBone.RightHand, HumanoidBone.RightHand, "кисть R", clip.Name);
+		// Prefer the toe: the ankle travels a foot length during roll and fakes sliding.
+		ReportFoot(positions, slots, HumanoidBone.LeftToes, HumanoidBone.LeftFoot, "foot L", clip.Name);
+		ReportFoot(positions, slots, HumanoidBone.RightToes, HumanoidBone.RightFoot, "foot R", clip.Name);
+		ReportFoot(positions, slots, HumanoidBone.LeftHand, HumanoidBone.LeftHand, "hand L", clip.Name);
+		ReportFoot(positions, slots, HumanoidBone.RightHand, HumanoidBone.RightHand, "hand R", clip.Name);
 
 		ReportSymmetry(positions, slots, clip.Name);
 	}
 
-	/// <summary>
-	/// Замыкание цикла: насколько поза в конце клипа отличается от позы в начале.
-	///
-	/// Главное число для зацикленной анимации. Незамкнутый цикл даёт рывок на стыке, который в
-	/// редакторе видно как подёргивание раз в период - и который почти невозможно заметить на
-	/// отдельном кадре. Меряется в долях РАЗМАХА позы, а не в единицах: масштаб моделей произволен.
-	/// </summary>
+	// Loop closure, measured as a fraction of pose extent: model scale is arbitrary.
 	private static void ReportLoop(Vector3[][] positions, PreparedSkeleton skeleton, string clipName)
 	{
 		float extent = Extent(positions);
@@ -106,9 +82,7 @@ public static class AnimationReportProbe
 		{
 			float delta = Vector3.Distance(positions[0][j], positions[^1][j]);
 
-			// Последняя выборка - НЕ конец клипа: выборки идут по i/Samples, то есть последняя стоит
-			// за один шаг до конца. Сравнивать надо именно с ней, иначе «разрыв» в идеально
-			// зацикленном клипе оказался бы равен одному шагу движения.
+			// Samples run at i/Samples, so the last one is one step before the clip end.
 			if (delta > worst)
 			{
 				worst = delta;
@@ -119,17 +93,13 @@ public static class AnimationReportProbe
 		float step = StepMotion(positions);
 		float relative = extent > 1e-6f ? worst / extent : 0f;
 
-		// Порог - доля РАЗМАХА позы, а не кратность шагу выборки. Кратность шагу отбраковывала
-		// нормальные клипы: у быстро движущейся кости (хвост, кисть) шаг велик сам по себе, и
-		// сравнение с ним ничего не говорит о стыке. Замерено на Khronos Fox: у его трёх клипов
-		// разрыв 0.5..2% размаха, и это визуально бесшовные циклы - значит порог должен быть выше.
-		Console.WriteLine($"[probe] animreport [{clipName}]: замыкание цикла - худший разрыв " +
-			$"{worst:0.###} ({relative * 100f:0.#}% размаха) на '{skeleton.JointNames[worstJoint]}', " +
-			$"движение за шаг {step:0.###} {(relative <= 0.03f ? "OK" : "ЦИКЛ НЕ ЗАМКНУТ")}");
+		// 3% of pose extent: seamless reference clips measure 0.5..2%.
+		Console.WriteLine($"[probe] animreport [{clipName}]: loop closure - worst gap " +
+			$"{worst:0.###} ({relative * 100f:0.#}% of extent) at '{skeleton.JointNames[worstJoint]}', " +
+			$"motion per step {step:0.###} {(relative <= 0.03f ? "OK" : "LOOP NOT CLOSED")}");
 	}
 
-	/// <summary>Вертикальные колебания таза - «походка». Ноль означает, что персонаж едет как на
-	/// рельсах: у живого шага таз обязан покачиваться.</summary>
+	// Vertical hip travel: zero means the character glides on rails.
 	private static void ReportRoot(Vector3[][] positions, int[] slots, string clipName)
 	{
 		int hips = slots[(int)HumanoidBone.Hips];
@@ -147,15 +117,11 @@ public static class AnimationReportProbe
 			max = MathF.Max(max, frame[hips].Y);
 		}
 
-		Console.WriteLine($"[probe] animreport [{clipName}]: таз - вертикальный размах {max - min:0.###} " +
+		Console.WriteLine($"[probe] animreport [{clipName}]: hips - vertical travel {max - min:0.###} " +
 			$"(y {min:0.##}..{max:0.##})");
 	}
 
-	/// <summary>
-	/// Скольжение опоры. Классическая метрика качества шага: пока конечность СТОИТ на земле (её
-	/// высота у минимума), она не должна ехать горизонтально. Едет - персонаж «катится на роликах»,
-	/// и это первое, что бросается в глаза в игре, но не видно ни на одном кадре.
-	/// </summary>
+	// Foot sliding: horizontal travel while the limb is near its lowest height.
 	private static void ReportFoot(Vector3[][] positions, int[] slots, HumanoidBone preferred,
 		HumanoidBone fallback, string title, string clipName)
 	{
@@ -179,8 +145,7 @@ public static class AnimationReportProbe
 			max = MathF.Max(max, frame[joint].Y);
 		}
 
-		// Порог контакта - нижняя пятая часть хода конечности. Доля, а не абсолют: у лисы ход лапы
-		// в единицах модели, у метрового персонажа - в метрах.
+		// Contact threshold is the lowest fifth of limb travel: a ratio, since units vary.
 		float lift = max - min;
 		float threshold = min + MathF.Max(lift * 0.2f, 1e-5f);
 
@@ -203,19 +168,13 @@ public static class AnimationReportProbe
 
 		float verdictBase = MathF.Max(lift, 1e-6f);
 
-		// ВЕРДИКТА ЗДЕСЬ НЕТ - и это осознанно. Скольжение считается в пространстве МОДЕЛИ, а
-		// локомоционный клип обычно везёт персонажа вперёд корнем: опорная нога тогда законно едет
-		// назад относительно модели, и метрика показывает 100..350% на безупречной анимации
-		// (замерено на Khronos Fox). Честное число требует компенсации хода корня, и до неё ставить
-		// «СКОЛЬЗИТ» значит приучить себя игнорировать красное.
-		Console.WriteLine($"[probe] animreport [{clipName}]: {title} - ход {lift:0.###}, " +
-			$"опора {contacts}/{positions.Length} кадров, скольжение {slide:0.###} " +
-			$"({slide / verdictBase * 100f:0.#}% хода){(contacts == 0 ? " БЕЗ ОПОРЫ" : "")}");
+		// No verdict: slide is in MODEL space, so root motion legitimately inflates it.
+		Console.WriteLine($"[probe] animreport [{clipName}]: {title} - lift {lift:0.###}, " +
+			$"contact {contacts}/{positions.Length} frames, slide {slide:0.###} " +
+			$"({slide / verdictBase * 100f:0.#}% of lift){(contacts == 0 ? " NO CONTACT" : "")}");
 	}
 
-	/// <summary>Симметрия шага: левая и правая конечности должны двигаться в противофазе. Считается
-	/// как сдвиг, при котором высота левой лучше всего совпадает с высотой правой; у шага он около
-	/// половины периода.</summary>
+	// Gait phase: the shift at which left foot height best matches right foot height.
 	private static void ReportSymmetry(Vector3[][] positions, int[] slots, string clipName)
 	{
 		int left = slots[(int)HumanoidBone.LeftFoot];
@@ -249,11 +208,9 @@ public static class AnimationReportProbe
 
 		float phase = bestShift / (float)positions.Length;
 
-		// Тоже без вердикта: противофаза - свойство ДВУНОГОГО шага. У четвероногого рысь, иноходь и
-		// галоп дают совсем другие сдвиги, и объявлять их ошибкой рига нельзя. Число полезно как
-		// подпись походки: 0.5 - шаг, около 0 - прыжок или галоп.
-		Console.WriteLine($"[probe] animreport [{clipName}]: фаза ног - сдвиг {phase:0.##} периода " +
-			$"({(MathF.Abs(phase - 0.5f) < 0.15f ? "противофаза - шаг" : "синхронно - прыжок/галоп/иноходь")})");
+		// No verdict: antiphase is a biped trait; quadruped gaits give other shifts.
+		Console.WriteLine($"[probe] animreport [{clipName}]: leg phase - shift {phase:0.##} of the period " +
+			$"({(MathF.Abs(phase - 0.5f) < 0.15f ? "antiphase - walk" : "in sync - jump/gallop/pace")})");
 	}
 
 	private static float Extent(Vector3[][] positions)
@@ -273,9 +230,7 @@ public static class AnimationReportProbe
 		return (max - min).Length();
 	}
 
-	/// <summary>Типичное движение позы за один шаг выборки - масштаб, относительно которого судится
-	/// разрыв цикла. Без него порог пришлось бы задавать абсолютным числом, а он зависит и от
-	/// масштаба модели, и от скорости клипа.</summary>
+	// Mean pose motion per sample step - the scale the loop gap is judged against.
 	private static float StepMotion(Vector3[][] positions)
 	{
 		float sum = 0f;

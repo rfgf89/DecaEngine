@@ -1,24 +1,17 @@
-// Тело выборки probe-GI одного ОБЪЁМА (каскада) - включается по разу на каскад с переопределёнными
-// макросами (см. UnlitInstancedPS.hlsl). HLSL не умеет передавать текстуры параметрами до SM 6.6,
-// поэтому один и тот же код разворачивается под разные наборы атласов инклюдом, а не функцией.
+// Probe-GI sampling body for one cascade volume; included once per cascade with
+// redefined macros (see UnlitInstancedPS.hlsl) because HLSL before SM 6.6 cannot
+// pass textures as function parameters.
 //
-// Ожидает макросы:
-//   PROBE_GI_FN       - имя генерируемой функции
-//   PROBE_GI_SH0..SH3, PROBE_GI_VIS, PROBE_GI_OFFSET - текстуры атласов объёма
-//   PROBE_GI_ORIGIN / PROBE_GI_CELL / PROBE_GI_COUNTS / PROBE_GI_SCROLL - float4 его сетки
+// Expected macros:
+//   PROBE_GI_FN       - name of the generated function
+//   PROBE_GI_SH0..SH3, PROBE_GI_VIS, PROBE_GI_OFFSET - volume atlas textures
+//   PROBE_GI_ORIGIN / PROBE_GI_CELL / PROBE_GI_COUNTS / PROBE_GI_SCROLL - grid float4s
 //
-// Использует OctEncode, NonLinearIrradianceL1 и viewData - они объявлены до
-// первого включения. Возвращает (-1,-1,-1), если точка вне объёма или весам не из чего
-// собраться - вызывающий падает на следующий, более крупный каскад (см. SampleProbeGiCascaded).
-//
-// sunFraction - доля солнечного света (баунс + переотскоки) в поле, альфа Sh2: экранная тень
-// ключа глушит только её - небесная часть эмбиента в тени легитимна.
-// probeMarker - для отладочного вида расстановки проб: x = расстояние до ближайшей из восьми проб
-// ячейки в долях шага, y = её смещение релокацией (в долях шага), z = её валидность.
-//
-// confidence - вес доверия объёму, 0..1; вызывающий домножает на него вес каскада. У плотной
-// сетки всегда 1 (см. тело функции): величина осталась в сигнатуре, потому что механизм плавного
-// проявления может понадобиться снова, а звать её неоткуда, если её нет.
+// Returns (-1,-1,-1) outside the volume or with no usable weights; the caller falls
+// through to the next coarser cascade (see SampleProbeGiCascaded).
+// sunFraction: sun share of the field (Sh2 alpha); the screen-space key shadow damps only it.
+// probeMarker: debug view; x = dist to nearest probe, y = relocation offset (both in cell
+// fractions), z = validity. confidence: 0..1 cascade trust, always 1 for the dense grid.
 float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float sunFraction,
                    out float3 probeMarker, out float confidence)
 {
@@ -29,52 +22,22 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
 
     float3 counts3 = PROBE_GI_COUNTS.xyz;
 
-    // Смещение точки сэмпла по нормали И ПО ВЗГЛЯДУ - self-shadow bias, формула (2) Majercik 2021
-    // (§4.1): (n*0.2 + wo*0.8) * (0.75 * минимальный шаг проб) * ручка. Дисперсия оценки видимости
-    // максимальна ровно на поверхности; смещение к камере уводит точку с разрыва в ту сторону,
-    // откуда смотрят. Множитель зашит в PROBE_GI_CELL.w (см. ModelPreviewViewport).
-    // ВАЖНО: смещённая точка используется ТОЛЬКО для теста видимости (toProbe/Чебышёв/wrap) - ровно
-    // как в статье: "a new point which we use for the visibility test". Трилинейные веса и выбор
-    // ячейки считаются от ЧЕСТНОЙ worldPos: смещение идёт вдоль нормали, на рёбрах треугольников
-    // нормаль скачет, и смещённая точка вместе с ней - гнать через неё веса ячейки значит рисовать
-    // грани треугольников прямо в эмбиенте (видно при большом Normal bias). Вес видимости мягкий,
-    // ему скачок безвреден; веса ячейки жёсткие - им нельзя.
-    // Смещение ТОЛЬКО к камере, без нормали - осознанный отход от весов 0.2/0.8 статьи: любая
-    // доля нормали в смещении рисует грани треугольников в эмбиенте (нормаль скачет на рёбрах,
-    // с ней скачут точка видимости и её веса), и жёсткие фасетки на плоских мешах хуже, чем
-    // редкое самозатенение у скользящих углов, от которого нормаль страховала. Направление на
-    // камеру непрерывно по экрану везде - граней не даёт по построению.
-    //
-    // ДОЛЯ взгляда в направлении сдвига - ручка (PROBE_GI_COUNTS.w, настройка View bias). Она есть
-    // потому, что оба крайних положения дают свой видимый артефакт, и выбрать за художника нельзя:
-    //   1 (строго к камере) - фасеток нет, но освещение становится ВИДОЗАВИСИМЫМ: точка теста
-    //     видимости ездит вместе с камерой, у восьми угловых проб пляшут веса Чебышёва и wrap, и
-    //     при облёте кажется, что пробы съезжают и то светлеют, то темнеют;
-    //   0 (строго по нормали) - картинка от камеры не зависит вовсе, но на мешах с РАЗРЫВНЫМИ
-    //     нормалями (жёсткие рёбра) точка сэмпла скачет через ребро, и в эмбиенте проступают грани
-    //     треугольников.
-    // Статья (Majercik 2021, §4.1) берёт 0.8 взгляда и 0.2 нормали - компромисс посередине.
+    // Self-shadow bias (Majercik 2021 4.1), scale baked into PROBE_GI_CELL.w. The biased point
+    // feeds ONLY the visibility test; trilinear weights use the true worldPos, else hard edges
+    // show triangle facets. PROBE_GI_COUNTS.w blends the bias direction normal->camera.
     float3 toCamera = normalize(viewData.CameraWorldPos - worldPos);
     float3 biasDir = lerp(N, toCamera, PROBE_GI_COUNTS.w);
     float biasLen = length(biasDir);
     float3 samplePos = worldPos + (biasLen > 1e-4 ? biasDir / biasLen : N) * PROBE_GI_CELL.w;
     float3 f = (worldPos - PROBE_GI_ORIGIN.xyz) / PROBE_GI_CELL.xyz;
 
-    // Вне объёма - к следующему каскаду. Кламп, как у одиночной сетки, здесь не годится: он
-    // прилепил бы точку к граничной ячейке, и мелкий каскад «растянулся» бы на всю сцену.
+    // Outside the volume: fall through to the next cascade; clamping would stretch
+    // this cascade's border cells over the whole scene.
     if (any(f < 0.0) || any(f > counts3 - 1.0))
     {
         return float3(-1.0, -1.0, -1.0);
     }
 
-    // Базовый узел ячейки - пол координат сетки. Индирекции, уверенности кирпича и уровней
-    // подразделения здесь больше нет: у плотной сетки проба есть в каждом узле, адрес считается
-    // арифметикой, и промахнуться мимо «незанятого места» больше негде.
-    //
-    // Уверенность осталась в сигнатуре ради вызывающего (он домножает на неё вес каскада), но
-    // всегда единица. Она лечила ступеньку на границе кирпича: прокрутка приводила кирпичи слоями,
-    // у слоя была своя свежесть, и на стыке с прогретой серединой вес каскада прыгал разрывом
-    // размером с кирпич. Границ кирпичей не осталось - не осталось и разрыва.
     confidence = 1.0;
 
     int3 counts = (int3)counts3;
@@ -88,59 +51,39 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
     float sunFracSum = 0.0;
     float weightSum = 0.0;
 
-    // [loop] - ради времени КОМПИЛЯЦИИ, не выполнения: тело угла большое (~10 Load-ов), инклюд
-    // разворачивается на три каскада, и unroll 8 углов был главным вкладом в 7.5 с FXC-компиляции
-    // варианта UnlitInstancedPS (с [loop] по всем тяжёлым циклам - 1.3 с, см. комментарий у
-    // каскадного цикла солнца там же). Runtime-у выборка проб не узкое место и с развёрткой не
-    // была - см. замер у билинейки карты глубин ниже.
+    // [loop] for COMPILE time: unrolling 8 heavy corners across 3 cascades dominated FXC time.
     [loop]
     for (int corner = 0; corner < 8; corner++)
     {
         int3 offset = int3(corner & 1, (corner >> 1) & 1, corner >> 2);
 
-        // Узел -> тексель: тороидальный заворот прокруткой, затем плоскости столбиком. Зеркало
-        // ProbeGiBaker.Wrap / ProbeTexel. Слагаемое counts перед остатком обязательно - % от
-        // отрицательного делимого в HLSL отрицателен.
+        // Node -> texel: toroidal scroll wrap, planes stacked in Y; mirrors
+        // ProbeGiBaker.Wrap/ProbeTexel. "+ counts" is required: HLSL % of a
+        // negative dividend is negative.
         int3 lp = localCell + offset;
         int3 sp = ((lp + scroll) % counts + counts) % counts;
         int3 texel = int3(sp.x, sp.z * counts.y + sp.y, 0);
 
-        // Валидность в альфе Sh1 читается первой - невалидный угол не тянет остальные Load-ы.
-        // ТРИЛИНЕЙНЫЙ вес считается отдельно и умножается ПОСЛЕ подавления малых весов - как в
-        // эталонной реализации DDGI. Порядок принципиален: crush нелинеен, и трилинейка,
-        // пропущенная через него, теряет плавность - веса становятся почти бинарными, и вместо
-        // интерполяции получаются плато с резкими органическими границами (видно в дебаг-виде
-        // поля как «странная интерполяция»).
+        // Validity (Sh1 alpha) read first so an invalid corner skips the other Loads.
         float4 sh1 = PROBE_GI_SH1.Load(texel);
         float trilinear = (offset.x ? t.x : 1.0 - t.x)
                         * (offset.y ? t.y : 1.0 - t.y)
                         * (offset.z ? t.z : 1.0 - t.z);
         float w = sh1.a;
 
-        // Мягкий backface-вес (DDGI wrap shading): проба ПОЗАДИ поверхности не должна тянуть
-        // своё поле сквозь стену/колонну - иначе в зазорах тонкой геометрии небо/солнце
-        // протекают на теневую сторону даже при нормальном бейасе. Квадрат полукосинуса
-        // оставляет боковым пробам частичный вес (иначе плоская стена теряла бы половину
-        // интерполяции и полосила по ячейкам).
+        // Soft backface weight (DDGI wrap shading): probes behind the surface must not
+        // leak through thin geometry; squared half-cosine keeps side probes partial weight.
         float3 probeOffsetWorld = PROBE_GI_OFFSET.Load(texel).rgb;
         float3 probeWorld = PROBE_GI_ORIGIN.xyz + (float3)lp * probeStep + probeOffsetWorld;
         float3 toProbe = probeWorld - samplePos;
         float toProbeLen = length(toProbe);
 
-        // Направление на пробу от ЧЕСТНОЙ точки, без смещения - только под wrap-вес ниже.
-        // Эталон RTXGI (Irradiance.hlsl, DDGIGetVolumeIrradiance) держит ровно две разные
-        // величины и разводит их по назначению: worldPosToAdjProbe (без смещения) идёт в
-        // wrapShading, а biasedPosToAdjProbe/biasedPosToAdjProbeDist (со смещением) - в окто-
-        // координату и в тест Чебышёва. Разница принципиальна, потому что смещение у нас
-        // видозависимо (доля взгляда, ручка View bias): считая wrap от смещённой точки, мы
-        // подмешиваем камеру в ЖЁСТКИЙ по своей природе вес - при облёте у восьми угловых проб
-        // плывут веса, и картинка «дышит». Тесту видимости смещение нужно по построению (он и
-        // заводится ради того, чтобы уйти с разрыва), а wrap меряет геометрию затенения точки и
-        // о камере знать не должен вовсе.
+        // Wrap weight uses the UNBIASED direction (RTXGI convention): the bias is
+        // view-dependent here, and feeding it into wrap makes weights swim with the camera.
         float3 toProbeTrue = probeWorld - worldPos;
 
-        // Отметка ближайшей пробы - до всех отсечек по весу: показывать надо и невалидные пробы,
-        // ради них отладочный вид и заводится.
+        // Nearest-probe marker before any weight rejection: the debug view exists
+        // precisely to show invalid probes.
         float cellSize = min(probeStep.x, min(probeStep.y, probeStep.z));
         if (toProbeLen < probeMarker.x * cellSize)
         {
@@ -149,39 +92,14 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
                                  sh1.a);
         }
         float wrap = (dot(toProbeTrue / max(length(toProbeTrue), 1e-4), N) + 1.0) * 0.5;
-        // 0.2, а не 0.05: эталонная реализация статьи оставляет боковым пробам заметно больший
-        // остаточный вес. Меньший пол выглядит «строже», но на плоской стене отбирает у половины
-        // окружающих проб почти весь вес, и интерполяция начинает полосить по ячейкам.
+        // Floor 0.2 per the reference; lower floors make flat walls band per cell.
         w *= wrap * wrap + 0.2;
 
-        // Тест Чебышёва по окто-карте видимости пробы (DDGI depth): если от пробы до точки
-        // дальше, чем проба в среднем видит в этом направлении - между ними стена, вес гасится
-        // пропорционально дисперсии. Ловит боковые протечки у стыков (основания колонн, кромки
-        // штор), до которых wrap-вес по нормали не дотягивается.
+        // Chebyshev visibility test against the probe's octahedral depth map (DDGI).
         float2 oct = OctEncode(-toProbe / max(toProbeLen, 1e-4));
 
-        // БИЛИНЕЙНАЯ выборка карты глубин, а не точечный Load. Карта всего 8x8 на пробу (~25° на
-        // тексель), и точечная выборка делает глубину ступенчатой по направлению: на дальних
-        // каскадах, где ячейка крупная и проба далеко, в один тексель попадают и стена, и проём -
-        // средняя глубина скачет между соседними текселями, тест Чебышёва то срабатывает, то нет,
-        // и свет протекает сквозь тонкую геометрию (шторы, кромки колонн). Отсюда же зависимость
-        // артефакта от расстояния до камеры: вблизи работает мелкий каскад, там ячейка меньше.
-        //
-        // Фильтруем вручную по четырём текселям с окто-обёрткой (см. OctWrapTexel): аппаратный
-        // сэмплер потребовал бы border-текселей в атласе, то есть переразметки и правок в обеих
-        // записях, а на кромках развёртки всё равно был бы приблизителен.
-        //
-        // Эталон (RTXGI-DDGI) идёт вторым путём: он держит вокруг каждого окто-тайла рамку в тексель
-        // и копирует в неё кромки соседних октантов (ProbeBlendingCS.hlsl, UpdateBorderTexel), после
-        // чего билинейку делает железо одним Sample вместо четырёх Load. Перенос ЗАМЕРЕН И
-        // ОТВЕРГНУТ: выигрыша нет. Прогон 300 кадров на Sponza (три повтора, аппаратная
-        // трассировка), четыре выборки против ОДНОЙ - 6.92/6.92/6.95 мс на кадр против
-        // 6.91/6.92/6.93. Разница 0.01-0.02 мс тонет в разбросе между повторами (0.03 мс), а ведь
-        // одна точечная выборка - это оптимистичная ГРАНИЦА приёма: аппаратная билинейка сама по
-        // себе не дешевле точечного Load. Восемь углов на три каскада дают под сотню выборок на
-        // пиксель, и всё равно упирается не в них - выборка probe-GI на этой сцене не узкое место.
-        // Платить за неизмеримый выигрыш переразметкой атласа, правками в обеих записях и переходом
-        // на сэмплер в материалах не стоит.
+        // Manual bilinear filter of the vis map with octahedral wrap (OctWrapTexel):
+        // point Loads make depth stepped per texel and leak light through thin geometry.
         int visRes = ProbeVisRes();
         float2 visUv = oct * (float)visRes - 0.5;
         int2 visBase = (int2)floor(visUv);
@@ -199,24 +117,19 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
             float variance = abs(visDepth.y - visDepth.x * visDepth.x) + 1e-4;
             float diff = toProbeLen - visDepth.x;
             float cheb = variance / (variance + diff * diff);
-            // Пол 0.05 - как в эталонной реализации: полностью занулять вес загороженной пробы
-            // нельзя, иначе в углу, где все восемь проб «за стеной», сумма весов схлопывается и
-            // точке не остаётся освещения вовсе.
+            // Floor 0.05 (reference): zeroing occluded probes collapses the weight sum in corners.
             w *= max(cheb * cheb * cheb, 0.05);
         }
 
-        // Перцептивное подавление МАЛЫХ весов (§5.2 статьи Majercik 2019): глаз замечает протечку
-        // света в тёмное место острее, чем недостачу в светлом, поэтому уже подавленный соседями
-        // вес давится ещё и кубически.
+        // Perceptual crush of small weights (Majercik 2019 §5.2).
         const float crushThreshold = 0.2;
         if (w < crushThreshold)
         {
             w *= (w * w) / (crushThreshold * crushThreshold);
         }
 
-        // Трилинейка - ПОСЛЕ crush (порядок эталона): плавность интерполяции между пробами не
-        // проходит через нелинейность. Пол 0.001 - тоже из эталона: угол ячейки не обнуляется
-        // совсем, иначе на самой грани ячейки сумма весов рвётся.
+        // Trilinear AFTER crush (reference order); floor 0.001 keeps the weight
+        // sum continuous at cell faces.
         w *= max(trilinear, 0.001);
 
         if (w <= 1e-5)
@@ -243,17 +156,15 @@ float3 PROBE_GI_FN(float3 worldPos, float3 N, out float skyVisibility, out float
     skyVisibility = saturate(sum0.a * inv);
     sunFraction = saturate(sunFracSum * inv);
 
-    // Перевод в нормированное соглашение (R0 = среднее по сфере): свёртка облучённости даёт
-    // множители pi*Y00 = 0.8862269 для L0 и (2pi/3)*Y1 = 1.0233267 для L1, а деление на pi в
-    // конце - это ламбертов множитель. Собрав всё вместе: R0 = L0 * 0.282095,
-    // 2*R1 = L1 * 0.325735, то есть R1 = L1 * 0.1628675.
+    // Normalized convention (R0 = sphere mean): irradiance convolution + Lambert /pi
+    // give R0 = L0 * 0.282095, R1 = L1 * 0.1628675.
     float3 R0 = sum0.rgb * (inv * 0.2820948);
     float3 R1x = sumX * (inv * 0.1628675);
     float3 R1y = sumY * (inv * 0.1628675);
     float3 R1z = sumZ * (inv * 0.1628675);
 
-    // По каналу: у красного и синего направленность своя (небо синее сверху, отскок тёплый снизу),
-    // и общей на три канала её делать нельзя - цвет уедет.
+    // Per channel: red/blue have different directionality (blue sky up, warm bounce
+    // down); a shared L1 direction would shift color.
     float3 irradiance = float3(
         NonLinearIrradianceL1(R0.r, float3(R1x.r, R1y.r, R1z.r), N),
         NonLinearIrradianceL1(R0.g, float3(R1x.g, R1y.g, R1z.g), N),

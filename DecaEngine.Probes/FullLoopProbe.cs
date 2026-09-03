@@ -12,16 +12,9 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// ВРЕМЕННЫЙ отладочный CLI-режим: `DecaEngine.Editor.exe --full-loop &lt;model.gltf&gt; [frames]
-/// [backend]`. В отличие от <see cref="PreviewLoopProbe"/> (который гоняет ТОЛЬКО
-/// <see cref="ModelPreviewViewport"/> изолированно), собирает ОБА рендер-графа редактора - главный
-/// back-buffer <see cref="GraphicsPipeline"/> (как в <see cref="EditorManager"/>) И offscreen-превью
-/// - в том же порядке (preview.Update -> root.Update -> pipeline.Execute -> Present), что и
-/// EditorManager.OnUpdate. Нужен, потому что NRE в DiligentCommandBuffer.Execute при
-/// SetBackBufferTarget (см. баг "переключение SSAO->GTAO роняет NRE") бьёт по ГЛАВНОМУ пайплайну и
-/// не воспроизводится, если превью гонять в одиночку - PreviewLoopProbe его не ловит.
-/// </summary>
+/// <summary>Debug CLI: `--full-loop &lt;model.gltf&gt; [frames] [backend]`.</summary>
+// Runs both editor render graphs in EditorManager's order; backbuffer bugs need the main
+// pipeline present, so PreviewLoopProbe (preview only) cannot reproduce them.
 public static class FullLoopProbe
 {
 	public static void Run(string[] args)
@@ -57,10 +50,7 @@ public static class FullLoopProbe
 			new Scale3(1, 1, 1),
 			cameraComponent);
 
-		// DECA_LOOP_LIGHTS=N - засеять главную сцену N точечными светами по кольцу и одним спотом:
-		// структурная проверка всего кластерного пути (сбор и по-типовый кулинг в
-		// CullingAndRenderSystem, компьют-кластеризация LightClusterCS, чтение кластеров в PS) под
-		// живой валидацией бэкенда. Картинку не проверяет - геометрии в главной сцене нет.
+		// DECA_LOOP_LIGHTS=N: seed N point lights plus a spot to exercise the clustered path.
 		if (int.TryParse(Environment.GetEnvironmentVariable("DECA_LOOP_LIGHTS"), out var lightCount) && lightCount > 0)
 		{
 			for (int li = 0; li < lightCount; li++)
@@ -74,8 +64,7 @@ public static class FullLoopProbe
 						Color = new Vector3(1f, 0.8f, 0.6f),
 						Intensity = 5f,
 						Range = 4f,
-						// Часть светов - с тенями: прогоняет раздачу слайсов (бюджет меньше, чем
-						// просят) и запись/сэмплинг shadow map punctual-светов.
+						// Only some lights cast: exercises slice hand-out under an undersized budget.
 						ShadowStrength = li % 3 == 0 ? 1f : 0f,
 					});
 			}
@@ -107,10 +96,8 @@ public static class FullLoopProbe
 				? AmbientOcclusionMode.Gtao
 				: AmbientOcclusionMode.Ssao,
 
-			// DECA_PROBE_TEXSIZE=<n> - тот же потолок текстур, что и у --preview-probe. Ручка обязана
-			// быть общей у обоих пробников: потолок входит в подпись cooked-модели (см.
-			// ModelLoadOptions.CookSignature), и разойдись они - один пробник пёк бы кеш, которым
-			// второй никогда не воспользуется, молча уходя на путь без кеша.
+			// DECA_PROBE_TEXSIZE must match --preview-probe: it feeds ModelLoadOptions.CookSignature,
+			// so a divergent cap silently invalidates the other probe's cooked cache.
 			PreviewMaxTextureSize = int.TryParse(Environment.GetEnvironmentVariable("DECA_PROBE_TEXSIZE"), out var texSize)
 				? Math.Clamp(texSize, 128, 8192)
 				: 2048,
@@ -118,11 +105,8 @@ public static class FullLoopProbe
 
 		var modelStore = new ModelStore(api);
 
-		// DECA_LOOP_TEXBUDGET_MB=N - зажать бюджет текстурной памяти до N МБ и отпустить его на
-		// середине прогона. Проверка того, что упор в бюджет ставит догрузку качества на ПАУЗУ, а не
-		// хоронит её: разжатая лестница остаётся в очереди, и после освобождения памяти качество
-		// обязано доехать до потолка. Раньше отказ бюджета выбрасывал очередь вместе с исходником -
-		// текстура навсегда оставалась на том качестве, до которого успела дойти.
+		// DECA_LOOP_TEXBUDGET_MB=N: squeeze the texture budget, release it mid-run, and check that
+		// hitting the budget pauses quality upload rather than dropping the queue.
 		var squeezeBudgetMb = int.TryParse(Environment.GetEnvironmentVariable("DECA_LOOP_TEXBUDGET_MB"), out var mb) && mb > 0
 			? mb
 			: 0;
@@ -134,11 +118,7 @@ public static class FullLoopProbe
 			Console.WriteLine($"[full] texture memory budget squeezed to {squeezeBudgetMb} MB until frame {budgetReleaseFrame}");
 		}
 
-		// Диагностика бесшовного появления модели: показ ждёт готовности текстур (см.
-		// ModelStore.ModelTexturesReady), поэтому кадр, на котором модель попала в сцену (HasModel),
-		// обязан быть НЕ РАНЬШЕ кадра готовности текстур, а сами текстуры на нём - в целевом размере.
-		// Если бы показ шёл по одной лишь финализации, разрыв между этими кадрами и был бы тем самым
-		// "миганием" текстур.
+		// Pop-in diagnostics: the visible frame must not precede the textures-ready frame.
 		var frame = 0;
 		var finalizedFrame = -1;
 		var texturesFrame = -1;
@@ -172,9 +152,7 @@ public static class FullLoopProbe
 		var viewport = new ModelPreviewViewport(api, settings, modelStore);
 		viewport.LoadModel(modelPath);
 
-		// Стоимость ModelStore.Tick на ГЛАВНОМ потоке по кадрам: декод ступеней живёт в пуле, но
-		// заливка на GPU (CreateTexture с мип-цепочкой) - здесь, и именно она способна дать рывок
-		// кадра во время догрузки качества.
+		// Main-thread cost of ModelStore.Tick: mip-chain uploads run here and can spike a frame.
 		var tickMs = new List<double>(frames);
 		var clock = System.Diagnostics.Stopwatch.StartNew();
 
@@ -190,14 +168,11 @@ public static class FullLoopProbe
 				Console.WriteLine($"[full] frame {i}: texture memory budget released");
 			}
 
-			// LoadModel грузит в фоновом Task.Run - реальные кадры редактора идут с реальным
-			// интервалом, иначе PollPendingLoad ни разу не увидит PrepareTask завершённым.
+			// Real frame interval: LoadModel runs on a background task PollPendingLoad must observe.
 			Thread.Sleep(16);
 
-			// Тот же порядок, что EditorManager.OnUpdate: столу ОДИН тик на весь процесс (загрузка/
-			// финализация/стриминг текстур теперь там - см. ModelStore class-doc), затем preview ПЕРЕД
-			// главным пайплайном (см. комментарий там про rebind swap-chain backbuffer), затем ECS
-			// root, затем pipeline.Execute() (обязан быть ПОСЛЕДНИМ Execute() кадра), затем Present().
+			// Order matches EditorManager.OnUpdate: one store tick, preview before the main
+			// pipeline, then ECS root, then pipeline.Execute (last Execute of the frame), Present.
 			var tickStart = clock.Elapsed.TotalMilliseconds;
 			modelStore.Tick(dt);
 			tickMs.Add(clock.Elapsed.TotalMilliseconds - tickStart);
@@ -209,9 +184,6 @@ public static class FullLoopProbe
 
 			time += dt;
 
-			// Кадр, на котором стриминг закончился ПОЛНОСТЬЮ (у всех текстур исчерпан исходник) - метрика
-			// пропускной способности декода/заливки, которую момент показа модели не отражает вовсе:
-			// показ открывает первая ступень, а качество доезжает намного позже.
 			if (streamedFrame < 0 && streamedModel != null && streamedModel.StreamedTextures.Count > 0)
 			{
 				var done = true;
@@ -238,11 +210,8 @@ public static class FullLoopProbe
 					$"(finalized at {finalizedFrame}, textures ready at {texturesFrame})");
 			}
 
-			// DECA_LOOP_RESIZE=1 - дёргать РЕАЛЬНЫЙ путь ресайза окна (WindowHandle.Size сеттер ->
-			// OnWindowResize -> DiligentGraphicsApi.OnWindowHandleResize -> SwapChain.Resize) каждые
-			// 50 кадров, независимо от AO - проверка гипотезы: NRE на SetBackBufferTarget
-			// (GetCurrentBackBufferRTV() == null) может быть гонкой ресайза свопчейна с Execute(),
-			// а не самим переключением AO технику - AO лишь совпало по времени у пользователя.
+			// DECA_LOOP_RESIZE=1: drive the real window resize path every 50 frames, hunting a
+			// swap-chain resize racing Execute().
 			if (Environment.GetEnvironmentVariable("DECA_LOOP_RESIZE") == "1" && i > 0 && i % 50 == 0)
 			{
 				var newSize = (i / 50) % 2 == 0 ? new Vector2(1000, 600) : new Vector2(1280, 720);
@@ -250,12 +219,8 @@ public static class FullLoopProbe
 				window.Size = newSize;
 			}
 
-			// DECA_LOOP_TOGGLE=1 - переключать раз в TOGGLE_INTERVAL кадров, но только когда модель
-			// уже резидентна (HasModel) - иначе тоггл отменяет ещё не завершившуюся фоновую загрузку
-			// (Sponza в Debug-сборке парсится секунды 3-4) и она никогда не долетает до финала, что
-			// выглядит как зависание, но им не является (просто цикл тестов быстрее реальной загрузки).
-			// Чередует AO technique (Ssao/Gtao) И вкл/выкл SSAO целиком (RecreateEnvironment
-			// создаёт/уничтожает _ssaoResources) - разные code path, оба стоит простучать.
+			// DECA_LOOP_TOGGLE=1: only toggles once the model is resident, otherwise it cancels the
+			// still-running background load. Alternates AO technique and the SSAO on/off path.
 			const int ToggleInterval = 400;
 			if (Environment.GetEnvironmentVariable("DECA_LOOP_TOGGLE") == "1" && i > 0 && i % ToggleInterval == 0 && viewport.HasModel)
 			{
@@ -280,8 +245,6 @@ public static class FullLoopProbe
 			$"finalized={finalizedFrame}, texturesReady={texturesFrame}, visible={visibleFrame}, " +
 			$"streamingComplete={streamedFrame}");
 
-		// Качество в КОНЦЕ прогона: показ открывается на первой (мелкой) ступени, поэтому отдельно
-		// нужно видеть, что лестница потом действительно доехала до потолка, а не застряла на ней.
 		if (streamedModel != null && streamedModel.StreamedTextures.Count > 0)
 		{
 			var finalMin = int.MaxValue;
@@ -303,16 +266,14 @@ public static class FullLoopProbe
 
 		Console.WriteLine($"[full] store state: {modelStore.DescribeStreamingState()}");
 
-		// Предупреждения/ошибки стола (сбойный декод, упёршийся бюджет) уходят в ImGui-консоль
-		// редактора и в stdout НЕ попадают - без этой выжимки прогон выглядит успешным даже когда все
-		// текстуры до одной провалили декод.
+		// Store warnings go to the editor's ImGui console, never stdout: without this digest a run
+		// where every texture failed to decode still looks successful.
 		var warnings = new Dictionary<string, int>();
 		foreach (var entry in EngineLog.Snapshot())
 		{
 			if (entry.Level == LogLevel.Warning || entry.Level == LogLevel.Error)
 			{
-				// Схлопываем по первым словам: сообщения различаются путём/причиной, а интересно
-				// именно КАКИХ и СКОЛЬКО, а не 76 почти одинаковых строк.
+				// Collapsed by prefix: messages differ only by path, and the count is what matters.
 				var key = entry.Message.Length > 90 ? entry.Message[..90] : entry.Message;
 				warnings[key] = warnings.TryGetValue(key, out var count) ? count + 1 : 1;
 			}
@@ -323,15 +284,13 @@ public static class FullLoopProbe
 			Console.WriteLine($"[full] log x{count}: {message}");
 		}
 
-		// Рывки стриминга: интересна не средняя стоимость тика, а хвост - один 10-миллисекундный
-		// кадр посреди догрузки качества виден как дёрганье.
+		// The tail matters, not the mean: a single 10 ms tick mid-stream reads as a hitch.
 		if (tickMs.Count > 0)
 		{
 			var sorted = tickMs.ToArray();
 			Array.Sort(sorted);
 
-			// Отдельно - хвост ПОСЛЕ появления модели: до этого момента рывки в кадре не видны
-			// (модели в нём ещё нет), и они мешали бы читать метрику.
+			// Hitches before the model is visible are invisible on screen, so split the tail.
 			var afterVisible = new List<double>();
 			for (int i = Math.Max(0, visibleFrame); i < tickMs.Count; i++)
 			{

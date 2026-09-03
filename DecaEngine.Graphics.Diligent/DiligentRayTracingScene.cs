@@ -4,20 +4,11 @@ using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>
-/// Аппаратные структуры ускорения сцены (BLAS/TLAS) под динамический GI. Двухуровневая схема - это
-/// и есть ответ на «движущийся мир»: BLAS строится на МЕШ один раз и переживает любые перемещения,
-/// а TLAS пересобирается из матриц инстансов - операция на порядки дешевле, её не жалко делать хоть
-/// каждый кадр. Ровно поэтому статичный CPU-BVH из ProbeGiBaker для динамики не годился: он знает
-/// только мировые треугольники и при любом движении строится заново целиком.
-///
-/// Владеет BLAS-ами, TLAS-ом и скретч-буферами; создавать только когда
-/// <see cref="IGraphicsApi.RayTracing"/> не <see cref="RayTracingSupport.None"/>.
-/// </summary>
+/// <summary>Hardware acceleration structures (BLAS/TLAS) for dynamic GI. Only create this when
+/// <see cref="IGraphicsApi.RayTracing"/> is not <see cref="RayTracingSupport.None"/>.</summary>
 public sealed class DiligentRayTracingScene : IReleaseObject
 {
-	/// <summary>Один инстанс для TLAS: какой меш и куда поставлен. CustomId уезжает в шейдер как
-	/// InstanceID() - по нему трассировка узнаёт, во что попала.</summary>
+	/// <summary>One TLAS instance; CustomId reaches the shader as InstanceID().</summary>
 	public readonly record struct Instance(DiligentMesh Mesh, Matrix4x4 Transform, uint CustomId);
 
 	private readonly IRenderDevice _device;
@@ -30,11 +21,10 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 	private ulong _scratchSize;
 	private uint _tlasCapacity;
 
-	/// <summary>Готовый TLAS для привязки в шейдер (RaytracingAccelerationStructure). null, пока
-	/// <see cref="Rebuild"/> не позвали ни разу.</summary>
+	/// <summary>TLAS to bind as RaytracingAccelerationStructure; null until <see cref="Rebuild"/>.</summary>
 	public ITopLevelAS? Tlas => _tlas;
 
-	/// <summary>Сколько инстансов в последней сборке - диагностика.</summary>
+	/// <summary>Instance count of the last build.</summary>
 	public int InstanceCount { get; private set; }
 
 	public DiligentRayTracingScene(DiligentGraphicsApi api)
@@ -43,9 +33,7 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		_context = api.ImmediateContext;
 	}
 
-	/// <summary>BLAS для меша, с кешированием: геометрия в объектном пространстве, от положения
-	/// инстанса не зависит, поэтому строится один раз на меш и переиспользуется всеми его
-	/// инстансами.</summary>
+	// BLAS geometry is in object space, so one per mesh is shared by all of its instances.
 	private IBottomLevelAS GetOrBuildBlas(DiligentMesh mesh)
 	{
 		if (_blas.TryGetValue(mesh, out var cached))
@@ -74,15 +62,13 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		{
 			Name = $"{mesh.Name} BLAS",
 			Triangles = [triangleDesc],
-			// Трассировка тут - основная нагрузка кадра, а строим мы BLAS один раз, поэтому берём
-			// самый быстрый обход ценой более долгой сборки.
+			// Built once, traced every frame: pay build time for the fastest traversal.
 			Flags = RaytracingBuildAsFlags.PreferFastTrace,
 		});
 
 		EnsureScratch(blas.GetScratchBufferSizes().Build);
 
-		// Позиция лежит первым полем вершины (см. ModelLoader.Vertex), поэтому смещение нулевое, а
-		// шаг - полный размер вершины: трассировка сама выберет из неё только xyz.
+		// Position is the first vertex field, so offset 0 with the full vertex stride.
 		_context.BuildBLAS(new BuildBLASAttribs
 		{
 			Blas = blas,
@@ -114,8 +100,7 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		return blas;
 	}
 
-	/// <summary>Пересобирает TLAS под текущий набор инстансов. Это и есть покадровая операция
-	/// динамического мира: BLAS-ы не трогаются, платим только за верхний уровень.</summary>
+	/// <summary>Rebuilds the TLAS for the current instance set; BLASes are left untouched.</summary>
 	public void Rebuild(IReadOnlyList<Instance> instances)
 	{
 		InstanceCount = instances.Count;
@@ -149,8 +134,7 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 			Instances = data,
 			InstanceBuffer = _instanceBuffer,
 			ScratchBuffer = _scratch,
-			// Таблиц привязки шейдеров нет: трассировка планируется inline (RayQuery), а там hit-группы
-			// не участвуют - луч возвращает попадание прямо в вызывающий шейдер.
+			// Inline tracing (RayQuery) only: no shader binding table, so no hit groups.
 			HitGroupStride = 0,
 			BindingMode = HitGroupBindingMode.PerInstance,
 			TLASTransitionMode = ResourceStateTransitionMode.Transition,
@@ -160,8 +144,7 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		});
 	}
 
-	/// <summary>TLAS пересоздаётся только когда инстансов стало БОЛЬШЕ, чем влезает: ёмкость растёт
-	/// с запасом, иначе добавление одного пропа пересоздавало бы структуру каждый кадр.</summary>
+	// Capacity grows with slack: exact sizing would recreate the TLAS on every added prop.
 	private void EnsureTlas(uint instanceCount)
 	{
 		if (_tlas != null && _tlasCapacity >= instanceCount)
@@ -175,15 +158,14 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		{
 			Name = "Scene TLAS",
 			MaxInstanceCount = _tlasCapacity,
-			// AllowUpdate - чтобы позже можно было делать дешёвый refit вместо полной пересборки,
-			// когда инстансы только сдвинулись, а их состав не поменялся.
+			// AllowUpdate leaves room for a cheap refit when only instance transforms change.
 			Flags = RaytracingBuildAsFlags.AllowUpdate | RaytracingBuildAsFlags.PreferFastTrace,
 		});
 	}
 
 	private void EnsureInstanceBuffer(uint instanceCount)
 	{
-		// Размер записи инстанса задаёт рантайм (TLAS_INSTANCE_DATA_SIZE = 64 байта в DXR и Vulkan).
+		// TLAS_INSTANCE_DATA_SIZE is 64 bytes in both DXR and Vulkan.
 		ulong size = instanceCount * 64UL;
 		if (_instanceBuffer != null && _instanceBuffer.GetDesc().Size >= size)
 		{
@@ -200,8 +182,7 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		});
 	}
 
-	/// <summary>Один скретч-буфер на все сборки: он нужен только ВНУТРИ построения и переиспользуется,
-	/// растёт до максимума запрошенного.</summary>
+	// One scratch buffer shared by all builds; it is only live during a build.
 	private void EnsureScratch(ulong size)
 	{
 		if (_scratch != null && _scratchSize >= size)
@@ -220,9 +201,7 @@ public sealed class DiligentRayTracingScene : IReleaseObject
 		});
 	}
 
-	/// <summary>Матрица движка (строковая, перенос в последней СТРОКЕ) в матрицу инстанса
-	/// трассировки (3x4, перенос в последнем СТОЛБЦЕ) - то же преобразование, что VS делает через
-	/// mul(pos, modelMatrix).</summary>
+	// Engine matrix is row-major (translation in the last row); RT instances want 3x4 column.
 	private static Matrix3x4 ToMatrix3x4(Matrix4x4 m) => new(
 		m.M11, m.M21, m.M31, m.M41,
 		m.M12, m.M22, m.M32, m.M42,

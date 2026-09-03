@@ -18,14 +18,15 @@
     </ItemGroup>
 
     <!--
-        Шейдеры ImGui едут вместе с этим проектом, а не с приложением. Ищет их
-        ImGuiDiligentRender.CreateDeviceResources - по пути <рабочий каталог>/Assets/Shaders, - и
-        любой, кто подключает этот рендер, обязан получить их в свой вывод.
+        The ImGui shaders ship with this project, not with the application.
+        ImGuiDiligentRender.CreateDeviceResources looks for them at <working directory>/Assets/Shaders,
+        so anyone who plugs in this renderer must get them into their own output.
 
-        Раньше они лежали в проекте СЭМПЛОВ (DecaEngine/Assets/Shaders) вперемешку с тринадцатью
-        демонстрационными, а редактор получал их только потому, что ссылался на сэмплы. Когда эта
-        ссылка ушла как ненужная, редактор перестал стартовать: Diligent не смог создать шейдеры
-        шрифта, PSO остался без вершинного шейдера, и падало уже на NullReferenceException.
+        They used to live in the SAMPLES project (DecaEngine/Assets/Shaders), mixed in with thirteen
+        demo shaders, and the editor only got them because it referenced the samples. When that
+        reference was dropped as unnecessary, the editor stopped starting up: Diligent could not
+        create the font shaders, the PSO was left without a vertex shader, and the crash surfaced as
+        a NullReferenceException.
     -->
     <ItemGroup>
       <Content Include="Assets\**">

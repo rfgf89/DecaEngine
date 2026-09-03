@@ -7,27 +7,11 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Проверка автоматической разметки аватара (DECA_PROBE_HUMANOID=1).
-///
-/// Основная проверка идёт на СИНТЕТИЧЕСКИХ ригах, а не на модели из аргументов, и это не лень, а
-/// единственный способ проверить разметку по существу. Разметка выглядит правдоподобной ровно до
-/// того момента, как по ней поедет ретаргетинг: «голень назначена не на ту кость» и «голень
-/// назначена правильно» в списке слотов отличаются одной цифрой в имени. У синтетического рига
-/// правильный ответ известен ЗАРАНЕЕ - его строил тот же код, - и сравнение получается точным, а не
-/// «на глаз».
-///
-/// Риги генерируются в нескольких соглашениях имён (Mixamo, Unreal, Blender) плюс БЕЗЫМЯННЫЙ - в
-/// нём проверяется чистая топология, включая разведение сторон по знаку X. Плюс укороченный риг
-/// без ключиц и носков: в реальных моделях их часто нет, и цепочка руки из трёх звеньев обязана
-/// раскладываться со сдвигом.
-///
-/// Модель из аргументов размечается в конце - как «полевая» проверка на настоящих данных.
-/// </summary>
+// Checks synthetic rigs whose correct mapping is known up front, then the model from args.
+/// <summary>Humanoid avatar auto-mapping probe (DECA_PROBE_HUMANOID=1).</summary>
 public static class HumanoidProbe
 {
-	/// <summary>Описание одного сустава синтетического рига: слот, родитель и локальное смещение в
-	/// T-позе.</summary>
+	// One synthetic rig joint: slot, parent and local T-pose offset.
 	private readonly record struct RigJoint(HumanoidBone Slot, int Parent, Vector3 Offset, string Suffix);
 
 	public static void Run(ModelLoader model)
@@ -35,13 +19,13 @@ public static class HumanoidProbe
 		ProbeSynthetic("Mixamo", Naming.Mixamo, shoulders: true, toes: true, fingers: true);
 		ProbeSynthetic("Unreal", Naming.Unreal, shoulders: true, toes: true, fingers: true);
 		ProbeSynthetic("Blender", Naming.Blender, shoulders: true, toes: true, fingers: true);
-		ProbeSynthetic("без имён", Naming.Anonymous, shoulders: true, toes: true, fingers: true);
-		ProbeSynthetic("укороченный", Naming.Mixamo, shoulders: false, toes: false, fingers: false);
+		ProbeSynthetic("unnamed", Naming.Anonymous, shoulders: true, toes: true, fingers: true);
+		ProbeSynthetic("reduced", Naming.Mixamo, shoulders: false, toes: false, fingers: false);
 
 		ProbeModel(model);
 	}
 
-	// --- Синтетические риги ------------------------------------------------------------------------
+	// --- Synthetic rigs ----------------------------------------------------------------------------
 
 	private static void ProbeSynthetic(string title, Func<HumanoidBone, string, string> naming,
 		bool shoulders, bool toes, bool fingers)
@@ -75,13 +59,13 @@ public static class HumanoidProbe
 			}
 			else
 			{
-				wrong.Add($"{HumanoidBones.Of(slot).Title}: ждали '{want}', получили '{(actual.Length > 0 ? actual : "-")}'");
+				wrong.Add($"{HumanoidBones.Of(slot).Title}: expected '{want}', got '{(actual.Length > 0 ? actual : "-")}'");
 			}
 		}
 
-		Console.WriteLine($"[probe] humanoid [{title}]: слотов угадано {correct}/{expected}, " +
-			$"проблем валидации {issues.Count} " +
-			$"{(correct == expected && issues.Count == 0 ? "OK" : "РАЗМЕТКА НЕВЕРНА")}");
+		Console.WriteLine($"[probe] humanoid [{title}]: slots guessed {correct}/{expected}, " +
+			$"validation issues {issues.Count} " +
+			$"{(correct == expected && issues.Count == 0 ? "OK" : "MAPPING IS WRONG")}");
 
 		ProbeReferencePose(title, avatar, skeleton);
 
@@ -96,25 +80,17 @@ public static class HumanoidProbe
 		}
 	}
 
-	/// <summary>
-	/// Референсная поза: снятие, оценка и round-trip через файл.
-	///
-	/// Синтетический риг построен ТОЧНО в T-позе, поэтому здесь известен правильный ответ: оценка
-	/// обязана дать около нуля градусов по всем четырём конечностям. Это ловит и ошибку в самой
-	/// оценке (перепутанные стороны, не та ось), и ошибку в сборке модельных матриц из референса.
-	/// </summary>
+	// The synthetic rig is built exactly in T-pose, so all four limbs must evaluate near zero degrees.
 	private static void ProbeReferencePose(string title, HumanoidAvatar avatar, PreparedSkeleton skeleton)
 	{
 		HumanoidReferencePose.CaptureFromBind(avatar, skeleton);
 
 		var report = HumanoidReferencePose.Evaluate(avatar, skeleton);
 
-		Console.WriteLine($"[probe] humanoid [{title}]: T-поза - руки {report.LeftArmDegrees:0.#}°/" +
-			$"{report.RightArmDegrees:0.#}°, ноги {report.LeftLegDegrees:0.#}°/{report.RightLegDegrees:0.#}° " +
-			$"{(report.LooksLikeTPose ? "OK" : "НЕ ПОХОЖЕ НА T")}");
+		Console.WriteLine($"[probe] humanoid [{title}]: T-pose - arms {report.LeftArmDegrees:0.#}°/" +
+			$"{report.RightArmDegrees:0.#}°, legs {report.LeftLegDegrees:0.#}°/{report.RightLegDegrees:0.#}° " +
+			$"{(report.LooksLikeTPose ? "OK" : "DOES NOT LOOK LIKE T")}");
 
-		// Round-trip через файл: референс - это несколько десятков TRS, и потеря точности или
-		// пропуск кости здесь проявились бы уже в ретаргетинге, где искать её будет негде.
 		string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
 			$"deca_humanoid_ref_{Environment.ProcessId}.glb");
 
@@ -137,9 +113,9 @@ public static class HumanoidProbe
 			worst = MathF.Max(worst, Vector3.Distance(pair.Value.scale, back.scale));
 		}
 
-		Console.WriteLine($"[probe] humanoid [{title}]: round-trip позы - костей " +
-			$"{loaded?.ReferenceLocals.Count ?? 0}/{avatar.ReferenceLocals.Count}, потеряно {missing}, " +
-			$"худшее расхождение {worst:0.#######} {(missing == 0 && worst < 1e-5f ? "OK" : "ПОТЕРИ")}");
+		Console.WriteLine($"[probe] humanoid [{title}]: pose round-trip - bones " +
+			$"{loaded?.ReferenceLocals.Count ?? 0}/{avatar.ReferenceLocals.Count}, lost {missing}, " +
+			$"worst mismatch {worst:0.#######} {(missing == 0 && worst < 1e-5f ? "OK" : "LOSSES")}");
 
 		try
 		{
@@ -150,15 +126,7 @@ public static class HumanoidProbe
 		}
 	}
 
-	/// <summary>
-	/// Скелет человека в T-позе, метры. Пропорции взяты условно-анатомическими, но важны в нём не
-	/// они, а СТРОЕНИЕ: таз с тремя ветвями, позвоночник с ветвлением на груди, руки вдоль X, ноги
-	/// вниз, пальцы веером от кисти. Именно за эти признаки цепляется автомат.
-	///
-	/// Левая сторона - в сторону +X: это соглашение движка для безымянных ригов (см.
-	/// HumanoidAutoMap.AssignSides), и синтетический риг обязан ему следовать, иначе безымянный
-	/// случай проверялся бы против неверного ожидания.
-	/// </summary>
+	// Human T-pose skeleton in metres; left side points to +X, the engine convention for unnamed rigs.
 	private static List<RigJoint> BuildRig(bool shoulders, bool toes, bool fingers)
 	{
 		var joints = new List<RigJoint>();
@@ -208,8 +176,8 @@ public static class HumanoidProbe
 			return;
 		}
 
-		// Пять пальцев веером: на них проверяется ограничитель спуска по конечности - без него
-		// цепочка руки уходит в мизинец, и кистью объявляется его фаланга.
+		// Five splayed fingers exercise the limb-descent limiter: without it the arm chain runs
+		// into a finger and its phalanx is declared the hand.
 		for (int i = 0; i < 5; i++)
 		{
 			add(HumanoidBone.Count, hand, new Vector3(0.08f * side, 0f, (i - 2) * 0.02f), $"Finger{i + 1}");
@@ -253,10 +221,8 @@ public static class HumanoidProbe
 		{
 			var joint = joints[i];
 
-			// Имена доводятся до уникальности номером. Это не украшение: движок ищет кости ПО ИМЕНИ,
-			// и риг с повторами - это риг, у которого все одноимённые кости для поиска одна и та же.
-			// Безымянное соглашение выдаёт одну и ту же строку на все суставы, и без этого шага оно
-			// проверяло бы не топологию, а поведение при коллизии имён.
+			// Names must be unique: the engine looks bones up by name, and the anonymous convention
+			// returns the same string for every joint.
 			string name = naming(joint.Slot, joint.Suffix);
 			if (!used.Add(name))
 			{
@@ -273,16 +239,13 @@ public static class HumanoidProbe
 				scale = Vector3.One,
 			};
 
-			// Обратная bind-матрица автомату не нужна вовсе (он смотрит только на иерархию и
-			// позиции), но оставлять массив пустым нельзя: скелет обязан быть согласованным, иначе
-			// проверка молча зависела бы от того, чего не проверяет.
 			skeleton.InverseBind[i] = Matrix4x4.Identity;
 		}
 
 		return skeleton;
 	}
 
-	// --- Соглашения имён ---------------------------------------------------------------------------
+	// --- Naming conventions ------------------------------------------------------------------------
 
 	private static class Naming
 	{
@@ -367,26 +330,21 @@ public static class HumanoidProbe
 			_ => $"DEF-{suffix}",
 		};
 
-		/// <summary>Имена, не говорящие ни о чём. Проверяют чистую топологию: разметку цепочек и
-		/// разведение сторон по знаку X - единственное, что автомату остаётся, когда имена молчат.</summary>
+		// Meaningless names: forces the mapper onto pure topology and the X-sign side split.
 		public static string Anonymous(HumanoidBone slot, string suffix) => "j";
 	}
 
-	// --- Модель из аргументов ----------------------------------------------------------------------
+	// --- Model from args ---------------------------------------------------------------------------
 
-	/// <summary>
-	/// Разметка настоящей модели - без ожидаемого ответа, просто печать. Лиса не человек, и это не
-	/// мешает: автомат опирается на СТРОЕНИЕ (таз с тремя ветвями, длинная цепочка вверх до головы,
-	/// две цепочки вниз), а оно у четвероногого такое же. Передние лапы приезжают в слоты рук -
-	/// структурно это верно, и именно так их и надо ретаргетить.
-	/// </summary>
+	// No expected answer here, just a printout: quadrupeds map front legs into the arm slots, which
+	// is structurally correct.
 	private static void ProbeModel(ModelLoader model)
 	{
 		var skeleton = model.Skeleton;
 
 		if (skeleton == null)
 		{
-			Console.WriteLine("[probe] humanoid [модель]: скелета нет - размечать нечего");
+			Console.WriteLine("[probe] humanoid [model]: no skeleton - nothing to map");
 			return;
 		}
 
@@ -395,22 +353,20 @@ public static class HumanoidProbe
 
 		foreach (var info in HumanoidBones.All)
 		{
-			Console.WriteLine($"[probe] humanoid [модель]: {info.Title,-18} {(info.Required ? "*" : " ")} " +
+			Console.WriteLine($"[probe] humanoid [model]: {info.Title,-18} {(info.Required ? "*" : " ")} " +
 				$"{(avatar.IsAssigned(info.Bone) ? avatar[info.Bone] : "-")}");
 		}
 
-		Console.WriteLine($"[probe] humanoid [модель]: проблем {issues.Count}");
+		Console.WriteLine($"[probe] humanoid [model]: issues {issues.Count}");
 
 		foreach (var issue in issues)
 		{
-			Console.WriteLine($"[probe] humanoid [модель]:   {HumanoidBones.Of(issue.Bone).Title} - {issue.Message}");
+			Console.WriteLine($"[probe] humanoid [model]:   {HumanoidBones.Of(issue.Bone).Title} - {issue.Message}");
 		}
 
 		ProbeRoundTrip(avatar);
 	}
 
-	/// <summary>Аватар живёт в файле рядом с моделью, и потеря слота при записи или чтении выглядит
-	/// потом как «автомат разметил хуже, чем в прошлый раз».</summary>
 	private static void ProbeRoundTrip(HumanoidAvatar avatar)
 	{
 		string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
@@ -428,8 +384,8 @@ public static class HumanoidProbe
 			}
 		}
 
-		Console.WriteLine($"[probe] humanoid: round-trip аватара - расхождений {mismatch} " +
-			$"{(mismatch == 0 ? "OK" : "ПОТЕРЯНЫ СЛОТЫ")}");
+		Console.WriteLine($"[probe] humanoid: avatar round-trip - mismatches {mismatch} " +
+			$"{(mismatch == 0 ? "OK" : "SLOTS LOST")}");
 
 		try
 		{
@@ -437,7 +393,6 @@ public static class HumanoidProbe
 		}
 		catch (Exception)
 		{
-			// Временный файл, который не удалился, - не повод ронять пробник.
 		}
 	}
 }

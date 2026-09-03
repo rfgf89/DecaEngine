@@ -4,6 +4,7 @@ using System.Linq;
 using System.Numerics;
 using BepuPhysics;
 using BepuPhysics.Collidables;
+using DecaEngine.Core.Diagnostics;
 using DecaEngine.Editor.ECS;
 using Friflo.Engine.ECS;
 using DecaEngine.Scene;
@@ -11,21 +12,11 @@ using DecaEngine.Scene;
 namespace DecaEngine.Editor;
 
 /// <summary>
-/// Тела персонажей, которых ведут геймплейные скрипты (пока это <see cref="CircleMoveComponent"/> с
-/// включённым <see cref="CircleMoveComponent.Physical"/>).
-///
-/// Живёт СБОКУ от ECS, как <see cref="AnimationDriver"/>, и по той же причине: хендлы Bepu - это
-/// нативное состояние, а компонент хранилище копирует при каждой смене архетипа, и хендл такого не
-/// переживает. Ключ - идентификатор сущности префаба.
-///
-/// Персонаж двигается ЗАДАНИЕМ СКОРОСТИ капсуле, а не записью её позы. Разница ровно та, ради
-/// которой физика тут вообще заведена: заданная поза - это телепорт, между кадрами тело оказывается
-/// по другую сторону ступени, и решатель контактов не участвует вовсе. Скорость же решатель обязан
-/// погасить о препятствие.
-///
-/// Горизонтальная скорость задаётся, ВЕРТИКАЛЬНАЯ остаётся своя - персонаж падает под гравитацией и
-/// стоит на полу сам. Запись нуля по Y превратила бы капсулу в летающую: она бы не падала, и
-/// «стоять на полу» пришлось бы изображать вручную.
+/// Physics bodies for script-driven characters, keyed by prefab entity id. Lives beside the ECS
+/// (like <see cref="AnimationDriver"/>) because Bepu handles are native state that does not
+/// survive component copies on archetype changes. Characters move by SETTING VELOCITY on the
+/// capsule, never by writing the pose: a written pose is a teleport that bypasses the contact
+/// solver. Only horizontal velocity is set; vertical stays the body's own so gravity works.
 /// </summary>
 public sealed class CharacterMotionDriver
 {
@@ -34,39 +25,30 @@ public sealed class CharacterMotionDriver
 		public BodyHandle Body;
 		public TypedIndex Shape;
 
-		/// <summary>Размеры, под которые заведено тело. Форма Bepu неизменяема, поэтому правка полей
-		/// компонента в инспекторе пересобирает капсулу - без этого ползунки радиуса выглядели бы
-		/// работающими, не делая ничего.</summary>
+		/// <summary>Dimensions the body was built with; Bepu shapes are immutable, so inspector edits rebuild the capsule.</summary>
 		public float Radius;
 		public float Height;
 
-		/// <summary>Последнее НЕНУЛЕВОЕ направление хода. Персонаж, упёршийся в стену, стоит с нулевой
-		/// скоростью, и доворот по ней развернул бы его в произвольную сторону - вместо этого он
-		/// сохраняет ту, в которую шёл.</summary>
+		/// <summary>Cylindrical part of a horizontal capsule; zero means vertical. A horizontal capsule has Height = 2*radius, so "feet = center - half height" holds for both.</summary>
+		public float Length;
+
+		/// <summary>Last NON-ZERO travel direction; a wall-blocked character keeps facing where it was going instead of spinning arbitrarily.</summary>
 		public Vector3 Facing = Vector3.UnitZ;
 
-		/// <summary>Направление, в которое корпус ДОВЕРНУЛСЯ к этому кадру: к <see cref="Facing"/> он
-		/// идёт с пределом угловой скорости (TurnSpeed скрипта). Без предела смена направления
-		/// разворачивала сущность за кадр - корпус «телепортировался», хотя ноги ещё шли по-старому.</summary>
+		/// <summary>Direction the torso has turned to this frame; approaches Facing at the TurnSpeed angular limit to avoid one-frame snaps.</summary>
 		public Vector3 SmoothedFacing = Vector3.UnitZ;
 
-		/// <summary>Предел доворота, рад/с; ноль и меньше - мгновенно (прежнее поведение).</summary>
+		/// <summary>Turn limit, rad/s; zero or less means instant.</summary>
 		public float TurnSpeed;
 
-		/// <summary>Засеян ли Facing из ФАКТИЧЕСКОГО поворота сущности. Тело пересоздаётся после
-		/// каждого подъёма из рэгдолла, и дефолтный Facing=UnitZ у свежего состояния разворачивал
-		/// вставшего персонажа рывком в +Z мира - «телепорт поворота» на первом кадре ходьбы.</summary>
+		/// <summary>Whether Facing was seeded from the entity's ACTUAL rotation; the body is recreated after ragdoll recovery and the default UnitZ would snap the character toward world +Z.</summary>
 		public bool FacingSeeded;
 
-		/// <summary>Настройки доворота, снятые со СКРИПТА при рулении. <see cref="Apply"/> обходит
-		/// тела, а не скрипты (их уже два вида), и знать, который из компонентов вёл это тело, ему
-		/// незачем - достаточно того, что решил Steer.</summary>
+		/// <summary>Turn settings captured from the steering script; Apply walks bodies, not scripts, and does not need to know which script drove them.</summary>
 		public bool FaceMotion = true;
 		public Vector3 ModelForward = Vector3.UnitZ;
 
-		/// <summary>Остаток coyote time: сколько ещё секунд прыжок разрешён ПОСЛЕ схода с опоры.
-		/// Игрок, шагнувший с кромки и нажавший Space на кадр позже, по игровым меркам успел - а по
-		/// голому лучу уже нет, и прыжок «не срабатывает» непредсказуемо.</summary>
+		/// <summary>Remaining coyote time: seconds a jump is still allowed AFTER leaving the ground.</summary>
 		public float CoyoteLeft;
 	}
 
@@ -75,17 +57,18 @@ public sealed class CharacterMotionDriver
 
 	public int CharacterCount => _characters.Count;
 
-	/// <summary>Ввод игрока НА ЭТОТ КАДР (см. <see cref="PlayerInput"/>). Пишет вьюпорт перед
-	/// <see cref="Steer"/>; пробник пишет руками - поэтому управление проверяется headless.</summary>
+	/// <summary>Times a capsule was rescued from under the floor; nonzero in a normal scene means something pushes characters through the one-sided mesh.</summary>
+	public int FloorRescues { get; private set; }
+
+	/// <summary>Player input FOR THIS FRAME; written by the viewport before Steer (or by a probe, so control is testable headless).</summary>
 	public PlayerInput Input;
 
 	/// <summary>
-	/// Заводит и снимает тела и задаёт им скорость на ближайший шаг. Звать ДО
-	/// <see cref="ScenePhysics.Update"/>: скорость, заданная после шага, применится только к
-	/// следующему, и персонаж будет отставать от собственной команды на кадр.
+	/// Creates/removes bodies and sets their velocity for the next step. Call BEFORE
+	/// <see cref="ScenePhysics.Update"/>: velocity set after the step only applies to the next one,
+	/// leaving the character a frame behind its own command.
 	/// </summary>
-	/// <param name="active">Идёт ли игра. Неактивный привод снимает все тела: персонаж на паузе
-	/// обязан стоять там, куда его поставил автор сцены, а не там, где его застало выключение.</param>
+	/// <param name="active">When inactive, all bodies are removed so a paused character stays where the scene author put it.</param>
 	public void Steer(EntityStore? store, ScenePhysics? physics, bool active, float deltaSeconds = 0f,
 		AnimationDriver? animation = null)
 	{
@@ -94,6 +77,18 @@ public sealed class CharacterMotionDriver
 			Clear(physics);
 			return;
 		}
+
+		// No floor yet - no bodies. Scene statics STREAM in: a capsule spawned into an empty world
+		// falls below the future floor plane in a fraction of a second, and the one-sided mesh
+		// then never sees it - the character falls forever. Bodies appear the first frame statics
+		// exist (see ScenePhysics.HasStatics).
+		if (!physics.HasStatics)
+		{
+			Clear(physics);
+			return;
+		}
+
+		_rescueLogCooldown = MathF.Max(0f, _rescueLogCooldown - deltaSeconds);
 
 		_stale.Clear();
 		foreach (var id in _characters.Keys)
@@ -107,20 +102,18 @@ public sealed class CharacterMotionDriver
 			(ref CircleMoveComponent move, ref CharacterBodyComponent shape, ref Position position,
 				ref Rotation rotation, Entity entity) =>
 		{
-			// Игрок сильнее скрипта: сущность с обоими компонентами ведёт ввод, а не круг - иначе
-			// два рулевых писали бы скорость одному телу, и побеждал бы порядок обхода.
+			// Player input outranks the script: with both components, input drives the body -
+			// otherwise two steerers would write velocity and traversal order would win.
 			if (!move.Enabled || move.Radius <= 1e-4f || entity.HasComponent<PlayerMoveComponent>())
 			{
 				return;
 			}
 
-			// Падение/подъём решается ДО рулевого: пока персонаж лежит, тела у него нет, и рулить
-			// нечем. Отсутствие компонента - обычный ходок, который не падает никогда.
+			// Fall/recover is decided BEFORE steering: a lying character has no body to steer.
 			if (entity.HasComponent<FallRecoverComponent>() && animation != null)
 			{
 				if (!UpdateFallRecover(entity, physics, animation, move.Forward, deltaSeconds))
 				{
-					// Персонаж лежит или встаёт - тело снято, вести его нечем и незачем.
 					return;
 				}
 			}
@@ -131,28 +124,29 @@ public sealed class CharacterMotionDriver
 			var character = EnsureBody(entity, shape, position.value, physics, parentToWorld);
 			var body = physics.World.Simulation.Bodies[character.Body];
 
+			// Must run first: steering and rays below measure from the feet, which must be ABOVE the floor.
+			RescueFromUnderFloor(physics, character, body);
+
 			SeedFacing(character, rotation.value, move.Forward, parentToWorld);
 
-			// Рулевое считается от ног, а не от центра капсулы: круг задан по земле, и полметра
-			// разницы по высоте на него не влияют, но путать эти две точки в одном месте и не путать
-			// в другом - верный способ получить круг, смещённый на радиус капсулы.
+			// Steering is measured from the feet, not the capsule center: the circle is defined on
+			// the ground, and mixing the two points shifts the circle by the capsule radius.
 			var feet = body.Pose.Position - new Vector3(0f, character.Height * 0.5f, 0f);
 			var velocity = CircleMotion.SteerVelocity(move, ToLocal(feet, parentToWorld), out float angle);
 
-			// Фаза - ИЗМЕРЕННАЯ, а не проинтегрированная. У тела она может отставать (упёрлось в
-			// ступень) или обгонять (столкнули), и накопленная фаза разошлась бы с ним навсегда.
+			// Phase is MEASURED, not integrated: the body can lag (blocked) or lead (pushed), and
+			// an accumulated phase would diverge from it permanently.
 			move.Angle = CircleMotion.Wrap(angle);
 
 			var world = ToWorldDirection(velocity, parentToWorld);
 
 			body.Velocity.Linear = new Vector3(world.X, body.Velocity.Linear.Y, world.Z);
 
-			// Капсула не заваливается и не крутится: собственная ориентация тела персонажу не нужна
-			// вовсе (её задаёт доворот по ходу), а завалившаяся капсула - это персонаж, лежащий на
-			// боку и продолжающий идти. Гасится и скорость, и уже накопленный поворот: одной скорости
-			// мало, решатель успевает довернуть тело контактом внутри шага.
+			// The capsule must not tip or spin: orientation comes from facing smoothing, and both
+			// angular velocity and accumulated rotation are cleared - velocity alone is not enough,
+			// the solver can rotate the body via contacts within a step.
 			body.Velocity.Angular = Vector3.Zero;
-			body.Pose.Orientation = Quaternion.Identity;
+			body.Pose.Orientation = BodyOrientation(character);
 			body.Awake = true;
 
 			ApplyStepUp(physics, shape, character, body, world);
@@ -183,10 +177,7 @@ public sealed class CharacterMotionDriver
 		DetectRams(physics, animation, deltaSeconds);
 	}
 
-	/// <summary>Засеивает направление корпуса из ФАКТИЧЕСКОГО поворота сущности - для только что
-	/// созданного тела (первый кадр Play, подъём из рэгдолла: тело на падении снимается и
-	/// пересоздаётся). Дефолтный Facing=UnitZ свежего состояния разворачивал вставшего персонажа
-	/// рывком в +Z мира.</summary>
+	/// <summary>Seeds torso facing from the entity's actual rotation for a freshly created body (first Play frame, ragdoll recovery); the default UnitZ would snap the character toward world +Z.</summary>
 	private static void SeedFacing(Character character, in Quaternion rotation, Vector3 modelForward,
 		in Matrix4x4 parentToWorld)
 	{
@@ -209,9 +200,9 @@ public sealed class CharacterMotionDriver
 	}
 
 	/// <summary>
-	/// Ведёт корпус к направлению хода с пределом угловой скорости. Нулевой предел - мгновенно
-	/// (прежнее поведение и старые сцены). Плоскость - только горизонталь: направления хода
-	/// горизонтальны по построению обоих скриптов.
+	/// Turns the torso toward the travel direction with an angular speed limit; zero limit means
+	/// instant (legacy behavior). Horizontal plane only - both scripts produce horizontal
+	/// directions by construction.
 	/// </summary>
 	private static void AdvanceFacing(Character character, float deltaSeconds)
 	{
@@ -238,10 +229,9 @@ public sealed class CharacterMotionDriver
 		current = Vector3.Normalize(current);
 		target = Vector3.Normalize(target);
 
-		// Подписанный угол в горизонтальной плоскости; шаг ограничен пределом. Разворот на 180°
-		// идёт через произвольную из сторон (cross нулевой, Atan2 отдаёт знак нуля) - для
-		// перепрыгивания через «ровно назад» этого достаточно, а выбор стороны там и у живого
-		// существа произволен.
+		// Signed angle in the horizontal plane, step clamped to the limit. A 180-degree reversal
+		// picks an arbitrary side (cross is zero, Atan2 keeps the sign of zero) - acceptable,
+		// since a real creature's choice there is arbitrary too.
 		float cross = current.Z * target.X - current.X * target.Z;
 		float signedAngle = MathF.Atan2(cross, Math.Clamp(Vector3.Dot(current, target), -1f, 1f));
 		float step = Math.Clamp(signedAngle, -character.TurnSpeed * deltaSeconds,
@@ -252,16 +242,13 @@ public sealed class CharacterMotionDriver
 			: Vector3.Transform(current, Quaternion.CreateFromAxisAngle(Vector3.UnitY, step));
 	}
 
-	/// <summary>Кулдаун реакций по сущностям: капсулы, столкнувшись, остаются в контакте десятки
-	/// кадров, и без кулдауна каждый из них перезапускал бы конверт - реакция выглядела бы как
-	/// вечная тряска, а не как толчок.</summary>
+	/// <summary>Per-entity reaction cooldown: colliding capsules stay in contact for dozens of frames, and without a cooldown each frame would restart the hit reaction.</summary>
 	private readonly Dictionary<int, float> _ramCooldown = new();
 
 	/// <summary>
-	/// Таран: два персонажа со скриптами движения сблизились на скорости - оба получают
-	/// хит-реакцию (см. <see cref="AnimationDriver.TriggerHitReaction"/>). Детект по СБЛИЖЕНИЮ
-	/// (проекция относительной скорости на разделяющую ось), а не по расстоянию: идущие бок о бок
-	/// персонажи касаются капсулами постоянно, и толкать их за это нельзя.
+	/// Ram detection: two moving characters closing at speed both get a hit reaction. Detects by
+	/// CLOSING SPEED (relative velocity projected on the separating axis), not distance - side by
+	/// side characters touch capsules constantly and must not be shoved for it.
 	/// </summary>
 	private void DetectRams(ScenePhysics physics, AnimationDriver? animation, float deltaSeconds)
 	{
@@ -290,7 +277,10 @@ public sealed class CharacterMotionDriver
 
 				var separation = bodyB.Pose.Position - bodyA.Pose.Position;
 				float distance = separation.Length();
-				float touch = entries[a].Value.Radius + entries[b].Value.Radius + 0.06f;
+				// Half-lengths of horizontal capsules count toward touch distance: long bodies'
+				// centers never get closer than the sum of half-lengths.
+				float touch = entries[a].Value.Radius + entries[b].Value.Radius +
+					(entries[a].Value.Length + entries[b].Value.Length) * 0.5f + 0.06f;
 
 				if (distance > touch || distance < 1e-4f)
 				{
@@ -305,8 +295,8 @@ public sealed class CharacterMotionDriver
 					continue;
 				}
 
-				// Толчок вдоль оси столкновения с добавкой вверх: чисто горизонтальный качок у
-				// четвероногого почти не читается - корпус жёсткий вдоль хода.
+				// Shove along the collision axis plus an upward component: a purely horizontal
+				// nudge barely reads on a quadruped whose body is stiff along travel.
 				var shove = axis * approach * 0.7f + Vector3.UnitY * approach * 0.25f;
 
 				Trigger(entries[b].Key, shove, animation);
@@ -327,16 +317,12 @@ public sealed class CharacterMotionDriver
 	}
 
 	/// <summary>
-	/// Step-up: капсула без него не берёт ступени вовсе - вертикальная стенка глушит горизонтальную
-	/// скорость контактом. Луч сразу ПЕРЕД капсулой сверху вниз ищет опору выше ног; найденная в
-	/// пределах <see cref="CharacterBodyComponent.StepHeight"/> - это ступень, и тело получает
-	/// вертикальную скорость, достаточную, чтобы поднять НИЗ капсулы на её кромку (баллистика от
-	/// реальной гравитации мира - захардкоженные 9.81 врали бы в сцене с авторской).
-	///
-	/// Порог снизу отсекает пологие склоны: пандус и кочку капсула берёт контактом сама, и
-	/// подпрыгивать на них значило бы скакать по всей сцене. Потолка над ступенью луч не проверяет
-	/// осознанно: низкая ниша над лестницей - авторская экзотика, и решатель просто не пустит тело
-	/// в неё, отменив подскок контактом.
+	/// Step-up: without it a capsule cannot climb steps at all - the vertical face kills the
+	/// horizontal velocity via contact. A downward ray just ahead of the capsule finds support
+	/// above the feet within StepHeight and gives the body enough vertical speed to lift the
+	/// capsule bottom onto the edge (ballistics use the world's real gravity, not 9.81). The lower
+	/// threshold skips gentle slopes (contacts handle those); no ceiling check above the step on
+	/// purpose - the solver cancels the hop via contact if there is one.
 	/// </summary>
 	private static void ApplyStepUp(ScenePhysics physics, in CharacterBodyComponent shape,
 		Character character, BodyReference body, Vector3 worldVelocity)
@@ -357,9 +343,10 @@ public sealed class CharacterMotionDriver
 		var direction = horizontal / speed;
 		var feet = body.Pose.Position - new Vector3(0f, character.Height * 0.5f, 0f);
 
-		// Луч на полкорпуса впереди: ближе - капсула уже упёрлась и потеряла скорость, дальше -
-		// подскоки начинаются за метр до лестницы.
-		var origin = feet + direction * (character.Radius + 0.06f) +
+		// Ray half a body ahead: closer and the capsule has already hit and lost speed; farther
+		// and hops start a meter before the stairs. A horizontal capsule's "front" is its front
+		// end, not radius-from-center.
+		var origin = feet + direction * (character.Radius + character.Length * 0.5f + 0.06f) +
 			new Vector3(0f, shape.StepHeight + 0.05f, 0f);
 
 		var ground = physics.SampleGround(origin, -Vector3.UnitY, shape.StepHeight + 0.05f);
@@ -385,9 +372,9 @@ public sealed class CharacterMotionDriver
 	}
 
 	/// <summary>
-	/// Рулевое ИГРОКА: направление уже пришло в мире (перевод из клавиш и камеры - дело вьюпорта),
-	/// сюда остаётся скорость и та же дисциплина капсулы, что у скрипта круга: горизонталь задаётся,
-	/// вертикаль своя, ориентация тела гасится.
+	/// Player steering: the direction arrives already in world space (keys+camera mapping is the
+	/// viewport's job); same capsule discipline as the circle script - horizontal set, vertical
+	/// kept, body orientation suppressed.
 	/// </summary>
 	private void SteerPlayers(EntityStore store, ScenePhysics physics, float deltaSeconds)
 	{
@@ -406,16 +393,18 @@ public sealed class CharacterMotionDriver
 			var character = EnsureBody(entity, shape, position.value, physics, parentToWorld);
 			var body = physics.World.Simulation.Bodies[character.Body];
 
+			// Must run first: steering and rays below measure from the feet, which must be ABOVE the floor.
+			RescueFromUnderFloor(physics, character, body);
+
 			SeedFacing(character, rotation.value, move.Forward, parentToWorld);
 
 			var direction = new Vector3(Input.MoveWorld.X, 0f, Input.MoveWorld.Z);
 			float length = direction.Length();
 
-			// Целевое направление - из ввода, корпус доворачивается к нему с пределом, а СКОРОСТЬ
-			// идёт вдоль ДОВЁРНУТОГО направления - как в motion-семплах ozz, где движение
-			// интегрируется за поворотом (руль - угловая скорость), а не тело догоняет вектор
-			// скорости. На развороте персонаж режет дугу; с мгновенной скоростью по вводу он ехал
-			// боком, пока корпус доворачивался.
+			// Target direction comes from input; the torso turns toward it with a limit and
+			// VELOCITY follows the TURNED direction (as in ozz motion samples, where movement
+			// integrates behind the turn). On reversals the character carves an arc instead of
+			// sliding sideways while the torso catches up.
 			if (length > 1e-4f)
 			{
 				character.Facing = direction / length;
@@ -433,19 +422,18 @@ public sealed class CharacterMotionDriver
 
 			body.Velocity.Linear = new Vector3(world.X, body.Velocity.Linear.Y, world.Z);
 			body.Velocity.Angular = Vector3.Zero;
-			body.Pose.Orientation = Quaternion.Identity;
+			body.Pose.Orientation = BodyOrientation(character);
 			body.Awake = true;
 
-			// Заземлённость - одним лучом на кадр: её делят прыжок (можно ли), coyote time
-			// (только что можно было) и прижим к земле (см. ApplyGroundSnap).
+			// One groundedness ray per frame, shared by jump eligibility, coyote time and ground
+			// snapping (see ApplyGroundSnap).
 			var feet = body.Pose.Position - new Vector3(0f, character.Height * 0.5f, 0f);
 			var under = physics.SampleGround(
 				feet + new Vector3(0f, 0.05f, 0f), -Vector3.UnitY, 0.25f);
 			float gap = under.Hit ? feet.Y - under.Position.Y : float.MaxValue;
 
-			// Перевзвод coyote - только БЕЗ скорости вверх: только что прыгнувшее тело первые
-			// кадры ещё «у земли» по лучу, и без этой проверки каждый прыжок перевзводил бы окно -
-			// то есть дарил даблджамп в первые сотые доли полёта.
+			// Re-arm coyote only WITHOUT upward velocity: a body that just jumped still reads
+			// "near ground" for a few frames, and re-arming would grant a free double jump.
 			bool grounded = gap < 0.06f && body.Velocity.Linear.Y <= 0.1f;
 
 			character.CoyoteLeft = grounded
@@ -457,8 +445,7 @@ public sealed class CharacterMotionDriver
 				body.Velocity.Linear = new Vector3(
 					body.Velocity.Linear.X, move.JumpSpeed, body.Velocity.Linear.Z);
 
-				// Прыжок СЖИГАЕТ coyote time: иначе второе нажатие в первые сотые доли секунды
-				// полёта - это даблджамп, которого никто не заказывал.
+				// Jumping BURNS coyote time, or a second press early in flight is a double jump.
 				character.CoyoteLeft = 0f;
 			}
 			else
@@ -470,16 +457,63 @@ public sealed class CharacterMotionDriver
 		});
 	}
 
-	/// <summary>Окно coyote time. Одна десятая секунды - шесть кадров: столько игрок «не замечает»
-	/// между глазом и пальцем, дольше - уже прыжки с воздуха.</summary>
+	/// <summary>Coyote window; ~0.1 s (six frames) is what a player does not notice between eye and finger.</summary>
 	private const float CoyoteSeconds = 0.12f;
 
+	/// <summary>Rescue log cooldown: a body pinned under the floor would otherwise spam identical lines every frame.</summary>
+	private float _rescueLogCooldown;
+
 	/// <summary>
-	/// Прижим к земле на спусках: идущее тело, у которого под ногами появился МАЛЫЙ зазор (сход с
-	/// кочки, кромка ступени вниз), дотягивается к опоре вместо короткой баллистики - без прижима
-	/// персонаж на каждом спуске на мгновение зависает с лапами в воздухе. Порог сверху отделяет
-	/// спуск от честного полёта (прыжок, падение с высоты), проверка вертикальной скорости - от
-	/// только что случившегося прыжка (у него скорость вверх).
+	/// Rescues the capsule from under the floor. The floor is a ONE-SIDED mesh (see
+	/// PhysicsWorld.AddTriangleMesh): once the capsule center is below the plane the mesh stops
+	/// seeing it and the solver can never help - free fall forever. Detection is geometric: a
+	/// downward ray INSIDE the capsule's own column (center+radius down to feet) hitting a static
+	/// more than half a radius above the feet is impossible without penetration. This is the ONLY
+	/// place the body teleports; normal motion is velocity-driven. The ray deliberately reaches no
+	/// deeper than half a capsule: a body placed far under the floor should stay visible, not be
+	/// silently fixed.
+	/// </summary>
+	private void RescueFromUnderFloor(ScenePhysics physics, Character character, BodyReference body)
+	{
+		var feet = body.Pose.Position - new Vector3(0f, character.Height * 0.5f, 0f);
+		var origin = body.Pose.Position + new Vector3(0f, character.Radius, 0f);
+		var above = physics.SampleGround(origin, -Vector3.UnitY,
+			character.Radius + character.Height * 0.5f);
+
+		if (!above.Hit || above.Normal.Y < 0.3f)
+		{
+			return;
+		}
+
+		float depth = above.Position.Y - feet.Y;
+		if (depth <= character.Radius * 0.5f)
+		{
+			return;
+		}
+
+		body.Pose.Position = body.Pose.Position + new Vector3(0f, depth, 0f);
+
+		// Clamp vertical velocity at zero: accumulated fall speed would drive the body straight
+		// back under on the next step.
+		body.Velocity.Linear = new Vector3(body.Velocity.Linear.X,
+			MathF.Max(body.Velocity.Linear.Y, 0f), body.Velocity.Linear.Z);
+		body.Awake = true;
+		FloorRescues++;
+
+		if (_rescueLogCooldown <= 0f)
+		{
+			_rescueLogCooldown = 2f;
+			EngineLog.Add(LogLevel.Warning,
+				$"Character body was {depth:0.###} m under the floor and was lifted back (rescue #{FloorRescues}): " +
+				"the floor reached the physics after the body did, or something pushed the body through the one-sided static mesh.");
+		}
+	}
+
+	/// <summary>
+	/// Ground snap on descents: a moving body with a SMALL gap under its feet is pulled to the
+	/// support instead of a short ballistic hop - otherwise the character briefly floats on every
+	/// downhill edge. The upper threshold separates descent from genuine flight; the vertical
+	/// velocity check excludes a jump that just happened.
 	/// </summary>
 	private static void ApplyGroundSnap(BodyReference body, Vector3 worldVelocity, float gap)
 	{
@@ -489,9 +523,8 @@ public sealed class CharacterMotionDriver
 			return;
 		}
 
-		// Скоростью, а не позой - по общей дисциплине капсулы: телепорт проскочил бы контакт.
-		// Тяга пропорциональна зазору с потолком: постоянная большая тяга на миллиметровом зазоре
-		// вбивала бы тело в пол на каждом кадре.
+		// Velocity, not pose, per the capsule discipline; pull scales with the gap and is capped,
+		// or a constant strong pull would hammer the body into the floor every frame.
 		float pull = MathF.Min(gap * 30f, 1.5f);
 		body.Velocity.Linear = new Vector3(
 			body.Velocity.Linear.X,
@@ -500,13 +533,10 @@ public sealed class CharacterMotionDriver
 	}
 
 	/// <summary>
-	/// Ведёт цикл «идёт → падает → встаёт → идёт» (см. <see cref="FallRecoverComponent"/>).
-	/// Возвращает true, если персонажем сейчас управляет скрипт движения.
-	///
-	/// Тело скрипта и рэгдолл НЕ СОСУЩЕСТВУЮТ. Капсула, оставленная на время падения, дерётся с
-	/// костями за то же место: персонаж «лежит», подпираемый невидимым цилиндром, а на подъёме
-	/// выстреливает из него. Поэтому на падении тело снимается, а на подъёме заводится заново - уже
-	/// там, где персонаж оказался.
+	/// Drives the walk -> fall -> get up -> walk cycle (see <see cref="FallRecoverComponent"/>).
+	/// Returns true when the movement script currently controls the character. The script body and
+	/// the ragdoll never coexist: a capsule left in place fights the bones for the same space, so
+	/// the body is removed on fall and recreated on recovery where the character ended up.
 	/// </summary>
 	private bool UpdateFallRecover(Entity entity, ScenePhysics physics, AnimationDriver animation,
 		Vector3 modelForward, float deltaSeconds)
@@ -525,8 +555,8 @@ public sealed class CharacterMotionDriver
 					return true;
 				}
 
-				// Рэгдолл переводится в физику, тело снимается. Порядок важен: сняв тело раньше, мы
-				// на один кадр оставили бы персонажа вовсе без физики, и он успел бы провалиться.
+				// Order matters: enabling the ragdoll before removing the body avoids a frame with
+				// no physics at all, during which the character could fall through.
 				ragdoll.Enabled = true;
 				ragdoll.Physical = true;
 
@@ -539,10 +569,9 @@ public sealed class CharacterMotionDriver
 
 			case CharacterMotionState.Falling:
 			{
-				// Покой спрашивается НЕ РАНЬШЕ MinFallTime: тела рэгдолла заводятся с нулевой
-				// скоростью и в первом же кадре формально уже «успокоились» (см. MinFallTime).
-				// Дальше - покой ИЛИ потолок ожидания: рэгдолл, зацепившийся за геометрию, может
-				// подрагивать сколько угодно, и без потолка персонаж не встал бы никогда.
+				// Do not poll for rest before MinFallTime: ragdoll bodies spawn at zero velocity
+				// and formally look "settled" on the very first frame. After that: settled OR a
+				// timeout - a snagged ragdoll can jitter forever.
 				bool settled = fall.StateTime >= fall.MinFallTime &&
 					animation.IsRagdollSettled(entity.Id, fall.SettleSpeed);
 
@@ -551,18 +580,16 @@ public sealed class CharacterMotionDriver
 					return false;
 				}
 
-				// Персонаж встаёт ТАМ, ГДЕ ЛЕЖИТ: сущность всё это время стояла в точке падения, а
-				// тело уехало. Без переноса он вставал бы рывком обратно на место падения.
+				// The character gets up WHERE IT LIES: the entity stayed at the fall point while
+				// the body traveled, so the transform is moved to the body first.
 				if (animation.TryGetRagdollRootWorld(entity.Id, out var root))
 				{
 					var parentToWorld = PrefabSceneViewport.ParentToWorldMatrix(entity);
 					var local = ToLocal(root, parentToWorld);
 
-					// Высота - НЕ от кости (таз лежащего висит над полом на своей толщине, встать на
-					// ней значит зависнуть) и НЕ «с которой падал»: пол под кругом больше не ровный
-					// (кочка), и рэгдолл, съехавший со склона, вставал бы висящим в воздухе. Пол
-					// спрашивается лучом под местом, где персонаж лёг; промах луча (лёг за краем
-					// геометрии) оставляет прежнюю высоту - хуже от неё не станет.
+					// Height comes from a ground ray under the lying spot - not from the bone (the
+					// pelvis hovers at its own thickness) and not from the fall height (the floor
+					// may be uneven). A ray miss keeps the previous height.
 					ref var shape = ref entity.GetComponent<CharacterBodyComponent>();
 					float reach = MathF.Max(shape.Height, 0.1f);
 					var ground = physics.SampleGround(
@@ -574,11 +601,9 @@ public sealed class CharacterMotionDriver
 
 					entity.Position = new Position(local.X, y, local.Z);
 
-					// Встать ВДОЛЬ лежащего тела, а не докручиваться из поворота, с которым падал:
-					// укатившийся (или утолканный) рэгдолл лежит под произвольным углом, и подъём
-					// без разворота проворачивал корпус на весь этот угол. Снимок лежачей позы
-					// ребейзится уже в ПОВЁРНУТЫЙ трансформ (см. BeginRecovery ниже), поэтому
-					// видимая поза от разворота не двигается.
+					// Stand up ALONG the lying body, not the pre-fall rotation: a rolled ragdoll
+					// lies at an arbitrary angle. The lying-pose snapshot is rebased into the
+					// already-rotated transform (see BeginRecovery), so the visible pose does not move.
 					if (animation.TryGetLyingFacing(entity.Id, out var lyingForward))
 					{
 						entity.GetComponent<Rotation>().value = CircleMotion.FacingFor(modelForward,
@@ -586,8 +611,8 @@ public sealed class CharacterMotionDriver
 					}
 				}
 
-				// Клип подъёма - по фактической позе лёжки (спина/живот); заданный лишь один идёт
-				// на обе, пустые оба - процедурный морф, прежнее поведение.
+				// Get-up clip chosen by the actual lying side (back/belly); a single configured
+				// clip serves both, none means the procedural morph.
 				string getUpClip = animation.TryGetLyingSide(entity.Id, out bool onBack) && onBack
 					? fall.GetUpBackClip
 					: fall.GetUpBellyClip;
@@ -599,9 +624,8 @@ public sealed class CharacterMotionDriver
 						: fall.GetUpBellyClip;
 				}
 
-				// Рэгдолл обратно в режим анимации, поза - переходом от лежачей. Трансформ - УЖЕ
-				// ПЕРЕНЕСЁННЫЙ: снимок лежачей позы ребейзится в него (см. BeginRecovery), иначе
-				// поза прыгала бы на величину переноса в момент начала подъёма.
+				// Ragdoll back to animation mode; the transform passed is the ALREADY MOVED one so
+				// the lying-pose snapshot rebases without a visible jump (see BeginRecovery).
 				ragdoll.Physical = false;
 				animation.BeginRecovery(entity.Id, fall.GetUpDuration,
 					PrefabSceneViewport.ComputeWorldMatrix(entity), getUpClip ?? string.Empty);
@@ -618,12 +642,10 @@ public sealed class CharacterMotionDriver
 					return false;
 				}
 
-				// Рэгдолл ГАСИТСЯ, а не остаётся в режиме следования: kinematic-тела костей у
-				// идущего персонажа сидят ровно там же, где его капсула, и решатель каждый шаг
-				// выталкивал её из них - тело ехало 2.2-2.7 м/с при заданной 1 м/с и мотало его
-				// вокруг круга (радиус гулял 0.85..2.5). Выглядит это как «сломалось рулевое»,
-				// а рулевое исправно рулит телом с посторонней тягой. Заодно восстанавливается
-				// инвариант старта: у идущего персонажа рэгдолла нет, его включает падение.
+				// The ragdoll is DISABLED, not left following: kinematic bone bodies sit exactly
+				// where the capsule is, and the solver pushes the capsule out of them every step
+				// (measured 2.2-2.7 m/s at a commanded 1 m/s). Also restores the invariant that a
+				// walking character has no ragdoll until a fall enables it.
 				ragdoll.Enabled = false;
 
 				fall.State = CharacterMotionState.Moving;
@@ -634,9 +656,9 @@ public sealed class CharacterMotionDriver
 	}
 
 	/// <summary>
-	/// Переносит позы тел в трансформы сущностей. Звать ПОСЛЕ <see cref="ScenePhysics.Update"/> -
-	/// в этом и смысл разделения: до шага у тела поза прошлого кадра, и сцена рисовалась бы с
-	/// отставанием на кадр от собственной физики.
+	/// Copies body poses into entity transforms. Call AFTER <see cref="ScenePhysics.Update"/> -
+	/// before the step the body still holds last frame's pose and the scene would render a frame
+	/// behind its own physics.
 	/// </summary>
 	public void Apply(EntityStore? store, ScenePhysics? physics)
 	{
@@ -645,8 +667,8 @@ public sealed class CharacterMotionDriver
 			return;
 		}
 
-		// Обход по ТЕЛУ, а не по скрипту: скриптов движения уже два (круг и игрок), а перенос позы
-		// тела в трансформ у них одинаковый. Настройки доворота снял Steer - тот, кто телом рулил.
+		// Iterate by BODY, not by script: there are two movement scripts and the pose transfer is
+		// identical for both; turn settings were captured by whichever script steered.
 		store.Query<CharacterBodyComponent, Position, Rotation>().ForEachEntity(
 			(ref CharacterBodyComponent shape, ref Position position, ref Rotation rotation,
 				Entity entity) =>
@@ -670,9 +692,7 @@ public sealed class CharacterMotionDriver
 		});
 	}
 
-	/// <summary>Снимает все тела. Звать при выключении физики сцены и при смене префаба: хендлы
-	/// принадлежат КОНКРЕТНОЙ симуляции, и пережить её уничтожение не могут (см.
-	/// <see cref="AnimationDriver.DetachPhysics"/> - там та же причина).</summary>
+	/// <summary>Removes all bodies. Call when scene physics turns off or the prefab changes: handles belong to a specific simulation and cannot outlive it.</summary>
 	public void Clear(ScenePhysics? physics)
 	{
 		if (_characters.Count == 0)
@@ -696,14 +716,17 @@ public sealed class CharacterMotionDriver
 		ScenePhysics physics, Matrix4x4 parentToWorld)
 	{
 		float radius = MathF.Max(shape.Radius, 1e-3f);
-		float height = MathF.Max(shape.Height, radius * 2f);
+		float length = MathF.Max(shape.Length, 0f);
+
+		// A horizontal capsule (Length > 0) lies on its side: its height is exactly two radii and
+		// the authored Height is ignored (see CharacterBodyComponent.Length).
+		float height = length > 0f ? radius * 2f : MathF.Max(shape.Height, radius * 2f);
 
 		if (_characters.TryGetValue(entity.Id, out var existing))
 		{
-			// Сравнение точное, а не с допуском: размеры приезжают прямо из полей компонента и между
-			// кадрами либо не меняются вовсе, либо меняются рукой в инспекторе. Мёртвая зона нужна
-			// там, где величину РАЗЛАГАЮТ из матрицы (см. пересборку рэгдолла по масштабу сущности).
-			if (existing.Radius == radius && existing.Height == height)
+			// Exact comparison, no epsilon: sizes come straight from component fields and only
+			// change via the inspector; tolerances belong where values are decomposed from matrices.
+			if (existing.Radius == radius && existing.Height == height && existing.Length == length)
 			{
 				return existing;
 			}
@@ -711,31 +734,54 @@ public sealed class CharacterMotionDriver
 			RemoveCharacter(entity.Id, physics);
 		}
 
-		// Начальная поза - из трансформа сущности: автор поставил персонажа туда, где он должен
-		// начать, и старт из любой другой точки выглядел бы как рывок в момент запуска.
+		// Initial pose comes from the entity transform: starting anywhere else reads as a jump at Play.
 		var feet = Vector3.Transform(localPosition, parentToWorld);
 
 		var character = new Character
 		{
-			// Длина Bepu - это ЦИЛИНДРИЧЕСКАЯ часть, без полусфер: полная высота, переданная сюда как
-			// есть, дала бы капсулу на два радиуса выше заказанной, и персонаж парил бы над полом.
-			Shape = physics.World.AddCapsule(radius, MathF.Max(height - radius * 2f, 0f)),
+			// Bepu capsule length is the CYLINDRICAL part, without hemispheres: passing the full
+			// height would make the capsule two radii taller and float the character.
+			Shape = physics.World.AddCapsule(radius, length > 0f ? length : MathF.Max(height - radius * 2f, 0f)),
 			Radius = radius,
 			Height = height,
+			Length = length,
 			Facing = Vector3.UnitZ,
 		};
 
 		character.Body = physics.World.AddDynamic(
-			new RigidPose(feet + new Vector3(0f, height * 0.5f, 0f)), character.Shape,
+			new RigidPose(feet + new Vector3(0f, height * 0.5f, 0f), BodyOrientation(character)), character.Shape,
 			MathF.Max(shape.Mass, 1e-3f));
 
-		// Контакты персонажа - без трения. Трение гасило бы ровно ту скорость, которую скрипт задаёт
-		// каждый кадр (замерено: 12.4% пути за оборот), а «не скользить по полу» этому телу и не
-		// нужно - оно не катится и не съезжает, его горизонтальную скорость целиком задаёт код.
+		// Frictionless contacts: friction eats exactly the velocity the script sets every frame
+		// (measured 12.4% of the per-lap distance), and this body never rolls or slides on its own.
 		physics.World.SetVelocityDriven(character.Body, true);
 
 		_characters[entity.Id] = character;
 		return character;
+	}
+
+	/// <summary>
+	/// Capsule orientation. Vertical is identity (Bepu capsule axis is Y). Horizontal lies along
+	/// the SMOOTHED facing: a 90-degree rotation around Y x facing maps Y to the horizontal view
+	/// vector. Written every frame together with zeroed angular velocity - the body has no
+	/// rotation of its own, steering supplies it.
+	/// </summary>
+	private static Quaternion BodyOrientation(Character character)
+	{
+		if (character.Length <= 0f)
+		{
+			return Quaternion.Identity;
+		}
+
+		var facing = new Vector3(character.SmoothedFacing.X, 0f, character.SmoothedFacing.Z);
+		if (facing.LengthSquared() < 1e-8f)
+		{
+			facing = Vector3.UnitZ;
+		}
+
+		facing = Vector3.Normalize(facing);
+		var axis = Vector3.Normalize(Vector3.Cross(Vector3.UnitY, facing));
+		return Quaternion.CreateFromAxisAngle(axis, MathF.PI * 0.5f);
 	}
 
 	private void RemoveCharacter(int id, ScenePhysics physics)
@@ -749,12 +795,9 @@ public sealed class CharacterMotionDriver
 		physics.World.RemoveShape(character.Shape);
 	}
 
-	// --- Пространства ------------------------------------------------------------------------------
-	//
-	// Тело живёт в МИРЕ, а Position/Rotation сущности - в родительском пространстве. В демо-сцене
-	// корень префаба единичный, и разницы нет вовсе; но молчаливое допущение «они совпадают»
-	// сломалось бы ровно тогда, когда персонажа положат в сдвинутое поддерево, и выглядело бы это
-	// как «физика уехала», а не как «забыли про иерархию».
+	// Spaces: the body lives in WORLD space while entity Position/Rotation are in parent space.
+	// The demo prefab root is identity, but assuming they coincide would break the moment a
+	// character is placed under a transformed subtree.
 
 	private static Vector3 ToLocal(Vector3 world, Matrix4x4 parentToWorld) =>
 		Matrix4x4.Invert(parentToWorld, out var inverse) ? Vector3.Transform(world, inverse) : world;

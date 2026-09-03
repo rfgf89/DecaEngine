@@ -11,11 +11,9 @@ public struct DrawData
 	[FieldOffset(16)]
 	public Vector4 orientation;
 
-	/// <summary>xyz - ПОКОМПОНЕНТНЫЙ масштаб инстанса. Кулинг-сфера в BatchingInstancingCS обязана
-	/// масштабировать центр баундов меша именно им: прежний максимум (positionScale.w) на
-	/// неравномерном масштабе уносил центр на |bounds.center|*(max-фактический) от геометрии, и
-	/// повёрнутый инстанс со смещённым пивотом вылетал из фрустума теневого слайса punctual-света -
-	/// "тень не учитывает поворот". Максимум остаётся в positionScale.w для радиуса и LOD.</summary>
+	/// <summary>xyz = per-component instance scale. Culling in BatchingInstancingCS must scale the
+	/// mesh bounds center with this, not the max scale (positionScale.w, kept for radius/LOD):
+	/// the max shifts the center off non-uniform-scaled instances and breaks shadow culling.</summary>
 	[FieldOffset(32)]
 	public Vector4 scale3;
 };

@@ -15,23 +15,19 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Декод и вспомогательное: чтение glTF-корня, декод текстур и лестниц качества, средний base color. Часть <see cref="ModelImporter"/> - CPU-стороны импорта; ФАЗА потребления (GPU-финализация) и
-/// точки входа загрузки живут в <see cref="ModelLoader"/>.</summary>
+/// <summary>CPU-side glTF decode: root reading, texture and quality-ladder decode, average base
+/// color. GPU finalization and the load entry points live in <see cref="ModelLoader"/>.</summary>
 public static partial class ModelImporter
 {
-	/// <summary>Фоллбек для узлов, чья мировая матрица не раскладывается в TRS (shear от родительского
-	/// поворота поверх неравномерного масштаба - Matrix4x4.Decompose возвращает false): матрица
-	/// запекается прямо в копию вершин, инстанс получает identity-трансформ. Матрица приходит в
-	/// RH-конвенции glTF и переводится в LH движка сопряжением M*W*M (M = diag(1,1,-1)) - вершины
-	/// исходного меша уже отзеркалены по Z при чтении атрибутов.</summary>
+	// Fallback for nodes whose world matrix will not decompose to TRS: bake it into a vertex copy.
+	// The matrix arrives in glTF RH and is conjugated to engine LH by M*W*M, M = diag(1,1,-1).
 	private static int BakeMeshWithMatrix(PreparedModel prepared, int meshId, Matrix4x4 worldRh)
 	{
 		var source = prepared.Meshes[meshId];
 		var mirrorZ = Matrix4x4.CreateScale(1f, 1f, -1f);
 		var world = mirrorZ * worldRh * mirrorZ;
 
-		// Нормали - через inverse-transpose: под неравномерным масштабом/сдвигом прямое умножение
-		// уводит их с перпендикуляра к поверхности.
+		// Normals need inverse-transpose: non-uniform scale/shear breaks direct multiplication.
 		Matrix4x4.Invert(world, out var inverse);
 		var normalMatrix = Matrix4x4.Transpose(inverse);
 
@@ -51,10 +47,7 @@ public static partial class ModelImporter
 			max = Vector3.Max(max, vertex.Position);
 		}
 
-		// Зеркалящая матрица (отрицательный детерминант) обращает обход треугольников - без
-		// инверсии индексов culling выворачивает геометрию наизнанку. Свап покрывает и LOD-ы:
-		// их LodLevel-ы - диапазоны в этом же индекс-буфере. Знак битангента флипается по той же
-		// причине, что при базовом Z-зеркалировании (см. Vertex.Tangent).
+		// A mirroring matrix flips winding; without the index swap culling turns geometry inside out.
 		var indices = source.Indices;
 		if (world.GetDeterminant() < 0f && source.Topology == ModelLoader.MeshTopologyTriangles)
 		{
@@ -88,11 +81,7 @@ public static partial class ModelImporter
 		return v.LengthSquared() > 1e-12f ? Vector3.Normalize(v) : v;
 	}
 
-	/// <summary>Собирает PreparedTexture из заранее декодированных пикселей image (параллельный декод
-	/// в начале PrepareModel; кэш заодно дедуплицирует image, разделяемый несколькими
-	/// материалами/каналами - пиксельный массив шарится, дальше он только читается) + настроек
-	/// сэмплера. Сэмплер в glTF опционален (нет - значит wrap + linear по спеке): WaterBottle и
-	/// другие Khronos-семплы без явных сэмплеров роняли загрузку NRE.</summary>
+	// The glTF sampler is optional; absent means wrap + linear per spec.
 	private static PreparedTexture DecodeTexture(SharpGLTF.Schema2.Texture texture, int maxSize,
 		Dictionary<SharpGLTF.Schema2.Image, (byte[] Pixels, int Width, int Height)> decodedImages,
 		Dictionary<SharpGLTF.Schema2.Image, TextureStreamSource> streamSources,
@@ -108,8 +97,7 @@ public static partial class ModelImporter
 
 		if (streamSources != null)
 		{
-			// Стриминг: пикселей на этой фазе нет вовсе - слот получит 1x1-филлер, а первая ступень
-			// приедет из ModelStreamer. Страховка на канал, не учтённый пре-сбором usedImages.
+			// Streaming: no pixels in this phase; the slot gets a 1x1 filler until ModelStreamer runs.
 			if (!streamSources.TryGetValue(texture.PrimaryImage, out var streamSource))
 			{
 				streamSource = CreateStreamSource(texture.PrimaryImage, externalImagePaths);
@@ -122,7 +110,7 @@ public static partial class ModelImporter
 
 		if (!decodedImages.TryGetValue(texture.PrimaryImage, out var decoded))
 		{
-			// Страховка: канал, не учтённый пре-сбором usedImages, декодируется на месте.
+			// Channel missed by the usedImages pre-pass: decode it here.
 			decoded = DecodeImagePixels(texture.PrimaryImage, maxSize);
 			decodedImages[texture.PrimaryImage] = decoded;
 		}
@@ -133,15 +121,11 @@ public static partial class ModelImporter
 		return prepared;
 	}
 
-	/// <summary>Источник ре-декодов для стриминга: путь к ВНЕШНЕМУ файлу картинки, если он известен
-	/// (типовая .gltf-сцена - папка с PNG рядом), иначе копия встроенных байт (.glb / data-URI).
-	/// Путь предпочтительнее ровно по памяти: у Sponza сотни 4K-исходников, и держать их все в
-	/// managed-куче всю сессию - гигабайты на ровном месте.</summary>
+	// Prefer a file path over embedded bytes: holding hundreds of 4K sources in the managed heap
+	// for the whole session costs gigabytes.
 	private static TextureStreamSource CreateStreamSource(SharpGLTF.Schema2.Image image,
 		Dictionary<int, string> externalImagePaths)
 	{
-		// Внешний файл, чьё чтение мы подменили заглушкой при парсинге (см. LoadModelRoot): в
-		// памяти его нет вовсе, читаем с диска в момент апгрейда.
 		if (externalImagePaths != null && externalImagePaths.TryGetValue(image.LogicalIndex, out var path))
 		{
 			return new TextureStreamSource { FilePath = path };
@@ -153,27 +137,15 @@ public static partial class ModelImporter
 			return new TextureStreamSource { FilePath = sourcePath };
 		}
 
-		// Встроенная картинка (.glb / data-URI / bufferView) - её байты и так уже в памяти модели.
 		return new TextureStreamSource { EncodedBytes = image.Content.Content.ToArray() };
 	}
 
-	/// <summary>Минимальный валидный PNG 1x1 - заглушка вместо реального содержимого внешних
-	/// картинок при стриминге (см. <see cref="LoadModelRoot"/>).</summary>
+	// Minimal valid 1x1 PNG, substituted for external image content while streaming.
 	private static readonly byte[] StubPng = Convert.FromBase64String(
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
 
-	/// <summary>
-	/// Парсит glTF. В обычном режиме - как раньше. В режиме стриминга внешние файлы картинок НЕ
-	/// ЧИТАЮТСЯ ВОВСЕ: их содержимое подменяется 1x1-заглушкой, а на выход отдаётся карта
-	/// «логический индекс image -> путь к файлу», по которой стример читает нужную картинку с диска
-	/// в момент, когда она реально понадобилась материалу.
-	///
-	/// Это и была главная причина «сцена пустая, редактор висит две минуты»: SharpGLTF грузит
-	/// содержимое КАЖДОГО image при разборе документа, то есть Sponza затягивала в managed-кучу все
-	/// свои сотни мегабайт (а с Intel-версией - гигабайты) PNG ещё до того, как появлялась хоть
-	/// одна вершина, - и всё это до единого байта тут же становилось мусором, потому что декод
-	/// текстур в этой фазе уже не делается.
-	/// </summary>
+	// SharpGLTF eagerly loads every image while parsing, so in streaming mode external files are
+	// stubbed out and returned as an index -> path map for the streamer to read on demand.
 	private static ModelRoot LoadModelRoot(string modelPath, ModelLoadOptions options,
 		out Dictionary<int, string> externalImagePaths)
 	{
@@ -181,15 +153,14 @@ public static partial class ModelImporter
 
 		var settings = new ReadSettings { Validation = SharpGLTF.Validation.ValidationMode.TryFix };
 
-		// Только для текстового .gltf: у .glb картинки лежат внутри самого файла, подменять нечего.
+		// Text .gltf only: in .glb the images live inside the file, so there is nothing to stub.
 		if (!options.StreamTextures ||
 			!string.Equals(Path.GetExtension(modelPath), ".gltf", StringComparison.OrdinalIgnoreCase))
 		{
 			return ModelRoot.Load(modelPath, settings);
 		}
 
-		// URI картинок берём из JSON напрямую: порядок элементов "images" совпадает с
-		// ModelRoot.LogicalImages, а разбирать их через SharpGLTF мы как раз и не хотим.
+		// Image URIs come straight from JSON; "images" order matches ModelRoot.LogicalImages.
 		var baseDirectory = Path.GetDirectoryName(Path.GetFullPath(modelPath)) ?? Environment.CurrentDirectory;
 		var pathsByIndex = new Dictionary<int, string>();
 		var stubbedUris = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -223,7 +194,6 @@ public static partial class ModelImporter
 		}
 		catch (Exception)
 		{
-			// Не разобрали JSON сами - просто грузим обычным путём (медленно, но верно).
 			return ModelRoot.Load(modelPath, settings);
 		}
 
@@ -255,17 +225,11 @@ public static partial class ModelImporter
 		return context.ReadSchema2(Path.GetFileName(modelPath));
 	}
 
-	/// <summary>Декодирование картинки (PNG/JPG) + даунскейл до <paramref name="maxSize"/> (см.
-	/// ModelLoadOptions.MaxTextureSize). Чистый CPU без разделяемого состояния - зовётся из
-	/// Parallel.For в PrepareModel.</summary>
 	private static (byte[] Pixels, int Width, int Height) DecodeImagePixels(SharpGLTF.Schema2.Image image, int maxSize)
 		=> DecodeEncodedImage(image.Content.Content.ToArray(), maxSize);
 
-	/// <summary>Декод сжатой картинки (PNG/JPG) с даунскейлом до <paramref name="maxSize"/> (0 = без
-	/// лимита). Публичный - им же фоновые апгрейды стрим-текстур ре-декодируют сохранённые исходники
-	/// (см. <see cref="StreamedTextures"/>). Чистый CPU без разделяемого состояния - безопасен из
-	/// любого потока; учти, что декод идёт в ПОЛНОМ разрешении файла и только потом ужимается (stb
-	/// иначе не умеет) - пиковая память по одной задаче на 4K-исходнике ~64 МБ.</summary>
+	/// <summary>Decodes a PNG/JPG and downscales to maxSize (0 = no limit); thread-safe. stb decodes
+	/// at full resolution first, so peak memory is ~64 MB per 4K source.</summary>
 	public static (byte[] Pixels, int Width, int Height) DecodeEncodedImage(byte[] encodedBytes, int maxSize)
 	{
 		var decoded = ImageResult.FromMemory(encodedBytes, ColorComponents.RedGreenBlueAlpha);
@@ -281,20 +245,8 @@ public static partial class ModelImporter
 		return (pixels, width, height);
 	}
 
-	/// <summary>
-	/// Декод сжатой картинки СРАЗУ ВСЕЙ ЛЕСТНИЦЕЙ качества - от <paramref name="firstSize"/> до
-	/// <paramref name="maxSize"/> с шагом <paramref name="stepFactor"/> (степени двойки), в порядке
-	/// ВОЗРАСТАНИЯ. Существует ради прогрессивного стриминга (см. DecaEngine.Editor.ECS.ModelStore):
-	/// stb декодирует файл только в полном разрешении, поэтому ступень "64px" стоит ровно столько же,
-	/// сколько полный декод - и лестница из четырёх ступеней раньше означала ЧЕТЫРЕ полных декода
-	/// одного и того же файла. Здесь файл декодируется РОВНО ОДИН РАЗ, а ступени снимаются с той же
-	/// цепочки половинных даунскейлов, которую даунскейл до целевого размера и так проходит: младшие
-	/// ступени достаются практически даром.
-	///
-	/// Пустой список - декодировать нечего. Уровни отдаются отдельными массивами: потребитель заливает
-	/// их по одному, начиная с самого маленького (модель появляется в кадре сразу), и держит остаток в
-	/// памяти до заливки - см. ModelStore.PendingDecodeBytesBudget про потолок этого остатка.
-	/// </summary>
+	/// <summary>Decodes a whole quality ladder in one pass, ascending from firstSize to maxSize by
+	/// stepFactor. The file is decoded exactly once; lower levels come from the same halving chain.</summary>
 	public static List<(byte[] Pixels, int Width, int Height)> DecodeEncodedImageLadder(
 		byte[] encodedBytes, int maxSize, int firstSize, int stepFactor)
 	{
@@ -308,9 +260,7 @@ public static partial class ModelImporter
 			(pixels, width, height) = DownscaleHalf(pixels, width, height);
 		}
 
-		// Верхняя ступень - то, что получилось после даунскейла до потолка; ниже неё идут ступени,
-		// каждая в stepFactor раз мельче, пока не пройдена firstSize. Порядок в списке - по
-		// возрастанию, поэтому собираем с конца.
+		// Levels are collected largest-first and reversed, since the list must be ascending.
 		var levels = new List<(byte[] Pixels, int Width, int Height)> { (pixels, width, height) };
 		var halvings = 1;
 		for (int step = Math.Max(2, stepFactor); step > 2; step >>= 1)
@@ -337,9 +287,7 @@ public static partial class ModelImporter
 		return levels;
 	}
 
-	/// <summary>Бокс-фильтр 2x2 в один шаг вдвое - то же усреднение, что GPU GenerateMips, поэтому
-	/// картинка после даунскейла совпадает с тем, что сэмплер и так показал бы на этом мипе.
-	/// Нечётные размеры клампятся к краю (последние строка/столбец усредняются сами с собой).</summary>
+	// 2x2 box filter, matching GPU GenerateMips; odd sizes clamp to the edge.
 	private static (byte[] pixels, int width, int height) DownscaleHalf(byte[] pixels, int width, int height)
 	{
 		int newWidth = Math.Max(1, width / 2);
@@ -369,22 +317,15 @@ public static partial class ModelImporter
 		return (result, newWidth, newHeight);
 	}
 
-	/// <summary>Среднее линейное альбедо материала для <see cref="MaterialPbrFactors.AverageBaseColor"/>:
-	/// разреженное среднее по base color текстуре (sRGB → linear), умноженное на линейный фактор.
-	/// Без текстуры - просто фактор. Альфа (линейная, без sRGB) уходит в
-	/// <see cref="MaterialPbrFactors.AverageAlpha"/> - по ней probe-GI бейкер отличает реально
-	/// «дырявые» материалы (листва/трава/решётки, средняя альфа мала) от сплошных, которые
-	/// экспортер зачем-то пометил MASK/BLEND (камень с альфой ~1) - см. ProbeGiBaker.</summary>
+	// Sparse mean of the base color texture in linear space, times the linear factor.
+	// Alpha stays linear (no sRGB): the probe-GI baker uses it to detect cutout materials.
 	internal static Vector4 ComputeAverageBaseColor(PreparedMaterial pm)
 	{
 		EnsureAverageBaseColor(pm);
 		return pm.AverageBaseColorRgba.Value;
 	}
 
-	/// <summary>Считает <see cref="PreparedMaterial.AverageBaseColorRgba"/>, если он ещё не посчитан.
-	/// Вызывать ОБЯЗАТЕЛЬНО пока живы пиксели base color: и при обычной загрузке (лениво, из
-	/// BuildFactors), и перед записью .dmdl - у печки свой экземпляр PreparedModel, который через
-	/// финализацию не проходит, так что лениво он бы остался пустым и в кеш уехал бы фактор.</summary>
+	// Must be called while the base color pixels are still alive, including before writing .dmdl.
 	internal static void EnsureAverageBaseColor(PreparedMaterial pm)
 	{
 		if (pm.AverageBaseColorRgba.HasValue)
@@ -396,17 +337,8 @@ public static partial class ModelImporter
 		pm.SoftAlphaFraction = ComputeSoftAlphaFraction(pm);
 	}
 
-	/// <summary>Доля текселей base color с «промежуточной» альфой (0.1..0.9) - насколько альфа-канал
-	/// БИНАРЕН.
-	///
-	/// Отвечает на вопрос, который alphaMode не решает: у экспортов сплошь и листва, и накладные
-	/// декали помечены одним и тем же BLEND (Intel Sponza: LeafSpring, dirt_decal - все BLEND), а
-	/// вести себя в тени они обязаны противоположно. Листва - вырезка: альфа почти везде 0 или 1,
-	/// бинарная тень по ней осмысленна и нужна. Декаль грязи - мягкая размазка по всему диапазону,
-	/// бинарной тени у неё быть не может в принципе, и любая попытка её отбросить даёт тёмную кляксу
-	/// формы своей же текстуры на стене, к которой декаль приклеена.
-	///
-	/// -1 = не считалось (пикселей не было).</summary>
+	// Fraction of base color texels with alpha in 0.1..0.9, i.e. how binary the alpha channel is.
+	// Separates cutout foliage from soft decals, which alphaMode alone does not. -1 = no pixels.
 	private static float ComputeSoftAlphaFraction(PreparedMaterial pm)
 	{
 		var texture = pm.BaseColorTexture;
@@ -445,29 +377,14 @@ public static partial class ModelImporter
 		var texture = pm.BaseColorTexture;
 		if (texture?.Pixels == null || texture.Width <= 0 || texture.Height <= 0)
 		{
-			// Пикселей нет. Два разных случая, и путать их нельзя:
-			//
-			// 1. Текстуры у слота нет вовсе - материал целиком описан фактором, среднее и есть фактор.
-			//
-			// 2. Текстура ЕСТЬ, но пикселей нет: режим стриминга (см. ModelLoadOptions.StreamTextures -
-			//    им грузит Scene View) при ПРОМАХЕ кеша, то есть пока фоновый бейк не положил .dmdl со
-			//    средним. Здесь фактор - не ответ, а тихая ложь: у glTF-материалов он почти всегда
-			//    (1,1,1,1), то есть альфа выходит единицей, и по ней отбор «дырявой» геометрии
-			//    (AverageAlpha < 0.6, см. ModelViewportEnvironment и ProbeGi) молча выключается. Плата
-			//    за это - альфа-тест в тени пропадает у ВСЕЙ MASK/BLEND-геометрии: занавеси и накладные
-			//    планки грязи/потёков Intel Sponza начинают отбрасывать тень СПЛОШНЫМ квадратом, что на
-			//    стене читается крупными гладкими кляксами.
-			//
-			//    Поэтому неизвестная альфа объявляется НУЛЁМ - то есть «считать дырявым», - и только у
-			//    материалов, которые glTF пометил MASK/BLEND (AlphaCutoff > 0). Цена ошибки в эту
-			//    сторону - лишний дроу-колл на каскад у пары материалов, пока не приехал бейк; в
-			//    обратную - тот самый сплошной квад в тени. RGB при этом остаётся фактором: его
-			//    альфа-режим не касается, а по нему красит баунс probe-GI.
+			// No texture at all means the factor IS the mean. But a texture with no pixels yet
+			// (streaming, cache miss) must report alpha 0, i.e. "assume cutout", or the shadow
+			// alpha test silently switches off for all MASK/BLEND geometry. RGB stays the factor.
 			float unknownAlpha = texture != null && pm.AlphaCutoff > 0f ? 0f : pm.BaseColorFactor.W;
 			return new Vector4(factor, unknownAlpha);
 		}
 
-		// Каждый ~16-й пиксель: среднему хватает, а гигантские атласы не тормозят загрузку.
+		// Roughly every 16th pixel: enough for a mean without stalling on huge atlases.
 		int pixelCount = texture.Width * texture.Height;
 		int stride = Math.Max(1, pixelCount / 4096);
 		var sum = Vector3.Zero;
@@ -481,7 +398,7 @@ public static partial class ModelImporter
 				break;
 			}
 
-			// sRGB → linear тем же pow(2.2), что и шейдер (см. UnlitInstancedPS.hlsl).
+			// sRGB to linear via the same pow(2.2) the shader uses.
 			sum += new Vector3(
 				MathF.Pow(texture.Pixels[idx] / 255f, 2.2f),
 				MathF.Pow(texture.Pixels[idx + 1] / 255f, 2.2f),

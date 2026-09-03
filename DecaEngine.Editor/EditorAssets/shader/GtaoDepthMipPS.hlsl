@@ -1,14 +1,5 @@
-// Звено мип-цепочки линейных глубин GTAO (XeGTAO_DepthMIPFilter): вдвое уменьшает предыдущий
-// уровень. Главный пасс выбирает уровень по длине шага сэмпла - дальние сэмплы читают грубые
-// мипы, и это не оптимизация «на глазок», а способ не промахиваться мимо геометрии: одиночный
-// тап на большом расстоянии от точки попадает в случайный тексель, шумит от кадра к кадру и
-// пропускает тонкие объекты между тапами, тогда как фильтрованный мип несёт уже усреднённую
-// глубину всей накрытой области.
-//
-// Фильтр НЕ обычный бокс: усреднять глубины через силуэт бессмысленно (среднее между стеной и
-// фоном не лежит ни на одной из поверхностей). Вместо этого четыре глубины взвешиваются по тому
-// же falloff, что и сэмплы в главном пассе, относительно САМОЙ ДАЛЬНЕЙ из них: то, что дальше
-// радиуса влияния от дальнего плана, из среднего фактически выпадает.
+// GTAO linear-depth mip chain (XeGTAO_DepthMIPFilter): halves the previous level.
+// Not a box filter: depths weighted by main-pass falloff vs the farthest of the four.
 #include "Instancing.hlsl"
 #include "GtaoShared.hlsl"
 
@@ -20,8 +11,7 @@ cbuffer View
     ViewData viewData;
 }
 
-// Зеркалит AoConstantsData (SsaoPass.cs) - тот же кбуфер, что у главного пасса: фильтру нужен
-// мировой радиус, чтобы взвешивать глубины ровно тем же falloff.
+// Mirrors AoConstantsData (SsaoPass.cs): same world radius as the main pass.
 cbuffer AoConstants
 {
     float aoWorldRange;
@@ -30,18 +20,14 @@ cbuffer AoConstants
     float aoConstantsPad2;
 }
 
-// Размеры этого звена и его источника - зеркалит GtaoLevelData (SsaoPass.cs). Собственный размер
-// таргета неоткуда взять: viewData.viewport несёт полное разрешение кадра и после SetViewport на
-// звено не меняется.
+// Mirrors GtaoLevelData (SsaoPass.cs): viewData.viewport stays at full frame size.
 cbuffer GtaoLevel
 {
-    float4 gtaoTargetSize; // xy - размер, zw - 1/xy
+    float4 gtaoTargetSize; // xy = size, zw = 1/xy
     float4 gtaoSourceSize;
 }
 
-// Радиус фильтра мипов чуть уже радиуса самого эффекта - подобрано эмпирически (XeGTAO,
-// depthRangeScaleFactor): усреднять до самой границы влияния значит затягивать в мип геометрию,
-// вклад которой в этой точке уже почти нулевой.
+// XeGTAO depthRangeScaleFactor: filter radius stays slightly under the effect radius.
 static const float DepthRangeScaleFactor = 0.75;
 
 struct VSOutput
@@ -79,8 +65,7 @@ PSOutput Main(in VSOutput input)
     float weight2 = saturate((maxDepth - depth2) * falloffMul + falloffAdd);
     float weight3 = saturate((maxDepth - depth3) * falloffMul + falloffAdd);
 
-    // Самая дальняя глубина всегда имеет вес 1 (её разница с maxDepth нулевая), так что сумма
-    // весов не выродится в ноль даже когда все четыре тапа разъехались за радиус.
+    // The farthest depth always weighs 1, so the sum can never collapse to zero.
     float weightSum = weight0 + weight1 + weight2 + weight3;
     float filtered = (weight0 * depth0 + weight1 * depth1 + weight2 * depth2 + weight3 * depth3) / weightSum;
 

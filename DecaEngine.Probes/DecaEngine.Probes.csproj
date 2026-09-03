@@ -1,16 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<!--
-		Headless-пробники: численные отчёты, которыми проверяется движок без GUI и без глаз.
-		Их вывод - эталоны в tools/baselines, а сверяет их tools/Run-ProbeSuite.ps1.
+		Headless probes: the numeric reports the engine is verified with, without a GUI and without
+		eyes. Their output becomes the baselines in tools/baselines, checked by
+		tools/Run-ProbeSuite.ps1.
 
-		Сюда переехали те пробники, которым от редактора не нужно НИЧЕГО: физика, процедурная
-		анимация, гуманоидная разметка, рэгдолл, отчёт по анимации и сверка CPU/GPU-обхода probe GI.
-		Лёжа в DecaEngine.Editor, они имели доступ ко всем его внутренностям - и то, что они им не
-		пользовались, ничем не было закреплено. Теперь закреплено компилятором.
+		The probes that moved here are the ones that need NOTHING from the editor: physics,
+		procedural animation, humanoid mapping, ragdoll, the animation report and the CPU/GPU probe
+		GI traversal comparison. While they sat in DecaEngine.Editor they had access to all of its
+		internals - and the fact that they did not use it was enforced by nothing. Now the compiler
+		enforces it.
 
-		Оставшиеся семь (PreviewProbe, ScenePhysicsProbe, FullLoopProbe и другие) держатся за
-		вьюпорты редактора и переедут, когда сам редактор станет библиотекой, а exe - тонким.
+		The remaining seven (PreviewProbe, ScenePhysicsProbe, FullLoopProbe and others) hold on to
+		the editor viewports and will move once the editor itself becomes a library and the exe
+		becomes thin.
 	-->
 	<ItemGroup>
 		<ProjectReference Include="..\DecaEngine.Animation\DecaEngine.Animation.csproj" />

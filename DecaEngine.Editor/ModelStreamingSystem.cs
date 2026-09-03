@@ -11,41 +11,14 @@ using DecaEngine.Scene;
 
 namespace DecaEngine.Editor.ECS
 {
-	/// <summary>
-	/// Per-environment (<see cref="ModelViewportEnvironment"/>) instantiation layer over the
-	/// process-wide <see cref="ModelStore"/>: loading, decoding, GPU-texture streaming and the actual
-	/// residency lifetime of a <see cref="ModelLoader"/> all live in the store now (one copy per
-	/// (path, options) for the WHOLE editor, see its class-doc). This class only tracks, PER
-	/// ENVIRONMENT, which models it currently wants resident (radius-based streaming, same as before),
-	/// the <see cref="ModelStore.Handle"/> that represents this environment's claim on each one, and
-	/// this environment's OWN registrations in ITS OWN <see cref="DiligentBatchRenderer"/> - a material
-	/// set (<see cref="ModelStore.AcquireMaterialSet"/>) plus the resulting MeshId/MaterialId/BatchId
-	/// maps.
-	///
-	/// A <see cref="Resident"/>'s store <see cref="Resident.StoreHandle"/> is held for as long as the
-	/// LOCAL reference count is non-zero, AND kept a while longer even at zero (the store's own
-	/// <see cref="ModelStore.UnloadAfterSeconds"/> hysteresis - not duplicated here) - so a
-	/// <see cref="Release"/> immediately followed by a fresh <see cref="Acquire"/> of the same path (the
-	/// camera oscillating at the edge of <see cref="StreamRadius"/>) is nearly free: the model is still
-	/// resident in the store, and this environment's Mesh/Material/Batch registrations were never torn
-	/// down, so nothing needs re-registering. Registrations are torn down ONLY in reaction to
-	/// <see cref="ModelStore.BeforeModelEvicted"/> - i.e. only when the model ACTUALLY leaves the GPU
-	/// (see <see cref="OnStoreModelEvicted"/>), which for a normal idle-out only happens once every
-	/// handle across every environment has let go.
-	///
-	/// Кадровый привод - <see cref="ModelStreamingSystem"/> в SystemRoot окружения: она каждый кадр
-	/// читает позицию камеры из ECS-стора и зовёт <see cref="Tick"/> (priority bookkeeping only now -
-	/// см. class-doc <see cref="ModelStore.Tick"/> про то, кто на самом деле шагает загрузку/стриминг
-	/// текстур один раз за кадр). Потребители (превью, префабы) берут модель через
-	/// <see cref="Acquire"/>/<see cref="Release"/> и следят за <see cref="Resident.Ready"/>.
-	/// </summary>
+	/// <summary>Per-environment instantiation layer over the process-wide <see cref="ModelStore"/>:
+	/// tracks which models this environment wants resident and its own batch-renderer registrations.
+	/// Registrations are torn down only on <see cref="ModelStore.BeforeModelEvicted"/>, so a
+	/// Release/Acquire round-trip at the streaming radius edge is nearly free.</summary>
 	public sealed class ModelStreamer
 	{
-		/// <summary>Локальное (для ЭТОГО окружения) состояние одного файла модели: регистрации в ЕГО
-		/// батч-рендерере (MeshIds/MaterialIds/BatchCache) плюс ссылка на разделяемый
-		/// <see cref="ModelLoader"/>, которым владеет <see cref="ModelStore"/>. Переживает
-		/// Release/Acquire без переrегистрации, пока <see cref="ModelStore"/> не выселит саму модель -
-		/// см. class-doc.</summary>
+		/// <summary>This environment's registrations for one model file plus a reference to the
+		/// shared <see cref="ModelLoader"/> owned by the store.</summary>
 		public sealed class Resident
 		{
 			public readonly string Path;
@@ -54,37 +27,28 @@ namespace DecaEngine.Editor.ECS
 			public readonly Dictionary<int, MaterialId> MaterialIds = new();
 			public readonly Dictionary<(int, int), BatchId> BatchCache = new();
 
-			/// <summary>Офсеты скин-стримов мешей в GPU-буфере скиннинга (ключ - индекс меша).
-			/// Меша нет в словаре = меш статический. Живёт рядом с MeshIds по той же причине: это
-			/// регистрация модели в батч-рендерере, и снимается она вместе с ней.</summary>
+			/// <summary>This environment's material set. All constant pushes, rebinds and probe
+			/// atlases must go here, never into model.materialObjects (owned by the first claimant).</summary>
+			public OrderedDictionary<int, IMaterialObject>? Materials;
+
+			/// <summary>Mesh index to skin-stream offset in the GPU skinning buffer; absent = static.</summary>
 			public readonly Dictionary<int, int> SkinBases = new();
 
 			public string? Error;
 
-			/// <summary>Мировая точка, по которой считается приоритет загрузки (расстояние до камеры).
-			/// Потребитель обновляет её при движении своей сущности.</summary>
+			/// <summary>World point the load priority (distance to camera) is measured from.</summary>
 			public Vector3 Anchor;
 
 			internal int RefCount;
 
-			/// <summary>Заявка ЭТОГО окружения на модель в столе - живёт, пока RefCount &gt; 0 (см.
-			/// <see cref="EnsureStoreHandle"/>/<see cref="Release"/>); null, если сейчас нет активной
-			/// заявки (либо ещё не потребовалась, либо путь оказался с ошибкой - см. Error).</summary>
 			internal ModelStore.Handle? StoreHandle;
 
-			/// <summary>Текстуры модели доведены до целевого качества - см.
-			/// <see cref="ModelStore.ModelTexturesReady"/>. Именно этим (а не одной лишь регистрацией
-			/// геометрии) гейтится <see cref="Ready"/>.</summary>
 			internal bool TexturesReady;
 
-			/// <summary>Модель зарегистрирована в батч-рендерере этого окружения (MeshIds/MaterialIds/
-			/// BatchCache заполнены). ПОКАЗЫВАТЬ её ещё рано - для этого есть <see cref="Ready"/>.</summary>
+			/// <summary>Registered in this environment's batch renderer; not yet safe to show.</summary>
 			public bool Registered => Model != null;
 
-			/// <summary>Модель можно инстанцировать: она зарегистрирована И её текстуры доехали до
-			/// целевого качества. Раньше здесь стояло просто Model != null, и модель появлялась в кадре
-			/// на 1x1-филлерах, домигивая текстуры ступенями 64/256/1024 десятки кадров - см.
-			/// <see cref="ModelStore.ModelTexturesReady"/> о том, почему показ ждёт текстуры.</summary>
+			/// <summary>Safe to instantiate: registered AND textures upgraded to target quality.</summary>
 			public bool Ready => Model != null && TexturesReady;
 
 			public bool Failed => Error != null;
@@ -102,37 +66,24 @@ namespace DecaEngine.Editor.ECS
 		private ModelViewportEnvironment _env;
 		private Vector3 _cameraPos;
 
-		// Скретч выселения абандонированных/ошибочных записей - без аллокаций на кадр.
 		private readonly List<Resident> _evictScratch = new();
 
-		// Скретч резидентов, ставших готовыми в этом Tick - событие шлётся вне обхода _models.
 		private readonly List<Resident> _readyScratch = new();
 
-		/// <summary>Гистерезис выгрузки: уже резидентная модель отпускается только за
-		/// <see cref="StreamRadius"/> * этот множитель - иначе на самой границе радиуса она бы
-		/// грузилась и выгружалась каждый шаг камеры.</summary>
+		/// <summary>Unload happens only past StreamRadius * this, to stop thrashing at the edge.</summary>
 		public const float StreamOutHysteresis = 1.15f;
 
-		/// <summary>Радиус стриминга от камеры (мировые единицы): дальше него потребители через
-		/// <see cref="ShouldBeResident"/> отпускают модель, ближе - берут. Бесконечность = грузить
-		/// всё независимо от камеры (камера тогда влияет только на ПОРЯДОК загрузки, через приоритет
-		/// в столе).</summary>
+		/// <summary>Streaming radius from the camera in world units; infinity = load everything.</summary>
 		public float StreamRadius { get; set; } = float.PositiveInfinity;
 
-		/// <summary>Модель этого окружения догрузилась и зарегистрирована в его батч-рендерере -
-		/// можно инстанцировать.</summary>
+		/// <summary>A model of this environment is registered and ready to instantiate.</summary>
 		public event Action<Resident>? ModelReady;
 
-		/// <summary>Стол СЕЙЧАС снимет регистрации батч-рендерера этого окружения для ОДНОЙ конкретной
-		/// модели (см. <see cref="ModelStore.BeforeModelEvicted"/>): подписчик обязан снять свои
-		/// инстанс-сущности, ссылающиеся ИМЕННО на этот <see cref="Resident"/> (сравнение по ссылке -
-		/// см. <see cref="Resident"/>), пока его BatchId-ы ещё валидны. Другие резиденты этим событием
-		/// не затронуты - в отличие от прежней версии (полный сброс на любое частичное выселение), см.
-		/// задачу про сужение ResidencyResetting.</summary>
+		/// <summary>Fired before one model's registrations are dropped, while its BatchIds are still
+		/// valid: subscribers must remove instance entities referencing exactly this resident.</summary>
 		public event Action<Resident>? ResidencyResetting;
 
-		/// <summary>Сброс завершён для этой модели - подписчик может инстанцировать её заново (или
-		/// признать её окончательно ушедшей).</summary>
+		/// <summary>The reset finished for this model; it can be instantiated again.</summary>
 		public event Action<Resident>? ResidencyReset;
 
 		public ModelStreamer(ModelViewportEnvironment env, ModelStore store, IGraphicsApi graphicsApi,
@@ -143,19 +94,16 @@ namespace DecaEngine.Editor.ECS
 			_graphicsApi = graphicsApi;
 			_optionsFactory = optionsFactory;
 
-			// Живут всю сессию редактора вместе с этим ModelStreamer-ом (он не пересоздаётся при
-			// RecreateEnvironment - меняется только _env) - отписка не требуется.
+			// Live for the whole editor session with this streamer - no unsubscribe needed.
 			_store.ModelReady += OnStoreModelReady;
 			_store.ModelTexturesReady += OnStoreModelTexturesReady;
 			_store.BeforeModelEvicted += OnStoreModelEvicted;
 		}
 
-		/// <summary>Резидентный кеш на чтение - вьюпортам для обхода загруженных моделей
-		/// (материалы, probe-GI и т.п.). Не мутировать.</summary>
+		/// <summary>Read-only resident cache. Do not mutate.</summary>
 		public IReadOnlyDictionary<string, Resident> Models => _models;
 
-		/// <summary>Есть ли незавершённая работа (модель запрошена, но ещё не готова к показу - стол
-		/// либо её ещё не выдал, либо не догнал качество текстур - и не признана ошибочной).</summary>
+		/// <summary>Some model is requested but neither ready to show nor failed.</summary>
 		public bool HasPendingLoads
 		{
 			get
@@ -172,11 +120,10 @@ namespace DecaEngine.Editor.ECS
 			}
 		}
 
-		/// <summary>Позиция камеры последнего Tick - от неё считаются приоритеты и радиус стриминга.</summary>
+		/// <summary>Camera position of the last Tick; priorities and radius are measured from it.</summary>
 		public Vector3 CameraPosition => _cameraPos;
 
-		/// <summary>Решение стриминга для точки: держать ли модель с якорем <paramref name="anchor"/>
-		/// резидентной при текущей камере. С гистерезисом - см. <see cref="StreamOutHysteresis"/>.</summary>
+		/// <summary>Whether a model anchored at this point should stay resident, with hysteresis.</summary>
 		public bool ShouldBeResident(Vector3 anchor, bool currentlyResident)
 		{
 			if (float.IsPositiveInfinity(StreamRadius))
@@ -188,9 +135,7 @@ namespace DecaEngine.Editor.ECS
 			return distance <= (currentlyResident ? StreamRadius * StreamOutHysteresis : StreamRadius);
 		}
 
-		/// <summary>Берёт ссылку на модель файла (загрузка/финализация/стриминг текстур - целиком в
-		/// <see cref="ModelStore"/>, по приоритету камеры). Каждому Acquire обязан соответствовать
-		/// <see cref="Release"/>.</summary>
+		/// <summary>Takes a reference to a model file; every Acquire needs a matching Release.</summary>
 		public Resident Acquire(string path, Vector3 anchor)
 		{
 			if (!_models.TryGetValue(path, out var resident))
@@ -206,10 +151,7 @@ namespace DecaEngine.Editor.ECS
 			return resident;
 		}
 
-		/// <summary>Отпускает ссылку. НЕ трогает регистрации/модель немедленно - см. class-doc: модель
-		/// (и это окружение регистрация) остаётся валидной, пока стол сам не решит её выселить
-		/// (<see cref="OnStoreModelEvicted"/>), что обычно происходит намного позже (гистерезис стола,
-		/// либо модель ещё нужна другому окружению).</summary>
+		/// <summary>Drops a reference. Registrations stay valid until the store actually evicts.</summary>
 		public void Release(Resident resident)
 		{
 			resident.RefCount = Math.Max(0, resident.RefCount - 1);
@@ -221,13 +163,8 @@ namespace DecaEngine.Editor.ECS
 			}
 		}
 
-		/// <summary>
-		/// Кадровый шаг (главный поток, под GPU-локом): обновляет приоритет загрузки/апгрейда текстур
-		/// этого окружения для стола (расстояние до камеры) и забывает локально абандонированные/
-		/// ошибочные записи. Саму загрузку/финализацию/стриминг текстур шагает
-		/// <see cref="ModelStore.Tick"/> - ОДИН раз за кадр на весь процесс (см. EditorManager), а не
-		/// отсюда, иначе бюджет "одна финализация за кадр" считался бы отдельно на каждое окружение.
-		/// </summary>
+		/// <summary>Per-frame step (main thread, under the GPU lock): updates store priorities and
+		/// forgets abandoned entries. Loading itself is stepped once per frame by ModelStore.Tick.</summary>
 		public void Tick(float deltaTime, Vector3 cameraPos)
 		{
 			_cameraPos = cameraPos;
@@ -240,17 +177,15 @@ namespace DecaEngine.Editor.ECS
 					_store.SetPriority(resident.StoreHandle, DistanceToCamera(resident));
 				}
 
-				// Подстраховка к событиям стола: заявка, поданная на УЖЕ резидентную (и уже готовую по
-				// текстурам) запись, никаких событий не получит - стол шлёт их один раз на модель, а не
-				// на каждый handle.
+				// The store fires events once per model, not per handle: a claim on an already
+				// resident model gets none, so poll here too.
 				if (SyncResident(resident))
 				{
 					_readyScratch.Add(resident);
 				}
 			}
 
-			// Событие - вне обхода _models: подписчик на нём инстанцирует модель и вполне может взять
-			// новые заявки (Acquire мутирует словарь).
+			// Fired outside the _models walk: subscribers may Acquire, which mutates the dictionary.
 			foreach (var resident in _readyScratch)
 			{
 				ModelReady?.Invoke(resident);
@@ -262,9 +197,7 @@ namespace DecaEngine.Editor.ECS
 
 		private float DistanceToCamera(Resident resident) => Vector3.Distance(resident.Anchor, _cameraPos);
 
-		/// <summary>Заводит заявку этого окружения на модель в столе, если её ещё нет и путь не помечен
-		/// окончательно ошибочным (см. Resident.Error - тот же приём, что был в столе/старом стримере:
-		/// однажды распознанный неподдерживаемый формат больше не переспрашивается).</summary>
+		// A path that once failed is never retried (Resident.Error).
 		private void EnsureStoreHandle(Resident resident)
 		{
 			if (resident.StoreHandle != null || resident.Error != null)
@@ -276,26 +209,18 @@ namespace DecaEngine.Editor.ECS
 			if (handle.Failed)
 			{
 				resident.Error = handle.Error;
-				_store.Release(handle); // путь безнадёжен - незачем держать заявку на мёртвую запись
+				_store.Release(handle);
 				return;
 			}
 
 			resident.StoreHandle = handle;
 		}
 
-		/// <summary>Модель СТОЛА догрузилась (в общем-то любая, для любого окружения процесса) -
-		/// проверяем, не наша ли это заявка, и если да - регистрируем в СВОЁМ батч-рендерере. Показывать
-		/// её пока рано: <see cref="ModelReady"/> ждёт текстур (см. <see cref="OnStoreModelTexturesReady"/>).</summary>
 		private void OnStoreModelReady(ModelLoader model) => SyncStoreModel(model);
 
-		/// <summary>Текстуры модели стола доехали до целевого качества (см.
-		/// <see cref="ModelStore.ModelTexturesReady"/>) - если это наша заявка, модель наконец можно
-		/// показывать: шлём <see cref="ModelReady"/> и открываем <see cref="Resident.Ready"/>.</summary>
 		private void OnStoreModelTexturesReady(ModelLoader model) => SyncStoreModel(model);
 
-		/// <summary>Ищет резидента, чья заявка ссылается на эту модель стола, и догоняет его состояние
-		/// (регистрация и/или готовность текстур). Пути - уникальные ключи, так что резидент максимум
-		/// один.</summary>
+		// Paths are unique keys, so at most one resident matches.
 		private void SyncStoreModel(ModelLoader model)
 		{
 			foreach (var resident in _models.Values)
@@ -316,11 +241,7 @@ namespace DecaEngine.Editor.ECS
 			}
 		}
 
-		/// <summary>Догоняет состояние резидента по его заявке в столе: регистрирует модель в батч-
-		/// рендерере этого окружения, как только стол её выдал, и отдельно - открывает
-		/// <see cref="Resident.Ready"/>, когда текстуры доехали. Возвращает true РОВНО ОДИН раз - в тот
-		/// вызов, где резидент стал готов к показу (звать <see cref="ModelReady"/> - дело вызывающего:
-		/// подписчик может брать новые заявки, а значит мутировать <see cref="_models"/>).</summary>
+		// Returns true exactly once: on the call where the resident becomes ready to show.
 		private bool SyncResident(Resident resident)
 		{
 			if (resident.StoreHandle == null || resident.Error != null || resident.TexturesReady)
@@ -358,10 +279,7 @@ namespace DecaEngine.Editor.ECS
 			return true;
 		}
 
-		/// <summary>Стол СЕЙЧАС выселит эту модель (см. <see cref="ModelStore.BeforeModelEvicted"/>) -
-		/// если это НАША заявка (сравнение по ссылке), снимаем регистрации ИМЕННО этого резидента в
-		/// своём батч-рендерере. Другие резиденты не трогаются - партиционное выселение, а не сброс
-		/// всего окружения (см. class-doc про сужение прежнего ResidencyResetting).</summary>
+		// Partitioned eviction: only the matching resident's registrations are dropped.
 		private void OnStoreModelEvicted(ModelLoader model)
 		{
 			Resident? found = null;
@@ -376,9 +294,7 @@ namespace DecaEngine.Editor.ECS
 
 			if (found == null)
 			{
-				// Либо это окружение никогда не регистрировало эту модель, либо уже само сняло
-				// регистрацию раньше (Release уронил RefCount до нуля и отпустил handle стола ДО того,
-				// как стол реально дошёл до выселения - см. Release/EnsureStoreHandle).
+				// Never registered here, or already unregistered by an earlier Release.
 				return;
 			}
 
@@ -390,6 +306,7 @@ namespace DecaEngine.Editor.ECS
 			found.MeshIds.Clear();
 			found.MaterialIds.Clear();
 			found.BatchCache.Clear();
+			found.Materials = null;
 			found.StoreHandle = null;
 
 			_env.Pipeline.InvalidateGraph();
@@ -402,12 +319,10 @@ namespace DecaEngine.Editor.ECS
 			ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, model, resident.MeshIds, resident.MaterialIds,
 				_env.SharedResources.EnvMapSampler, _env.SceneCopyTarget, _env.EnvironmentMap, materials,
 				_env.SharedResources.SceneColorSampler, resident.SkinBases);
+			resident.Materials = materials;
 		}
 
-		/// <summary>Записи без ссылок, которые так и не дожили до готовности (заявка снята Release-ом
-		/// ДО того, как стол успел её выдать) или окончательно ошибочные (Resident.Error) - забываем,
-		/// иначе словарь копит мусор по путям, мимо которых камера просто проехала (тот же приём, что
-		/// раньше делал стол/стример при отмене фоновой загрузки).</summary>
+		// Forget unreferenced entries that never became ready, else the dictionary grows forever.
 		private void EvictAbandoned()
 		{
 			_evictScratch.Clear();
@@ -425,15 +340,8 @@ namespace DecaEngine.Editor.ECS
 			}
 		}
 
-		/// <summary>
-		/// Полная очистка ЭТОГО окружения: сбрасывает батч-рендерер целиком (дешевле, чем гонять
-		/// UnregisterModel по каждой когда-либо зарегистрированной записи - см. тот же приём в
-		/// DiligentBatchRenderer.ResetRegistrations) и отпускает заявки стола на все резиденты. Модели
-		/// сами по себе НЕ освобождаются здесь - это теперь дело стола (Release просто снимает заявку
-		/// этого окружения; резидентность в других окружениях/гистерезис стола решают, когда модель
-		/// реально уйдёт с GPU). Вызывающий обязан снять СВОИ инстанс-сущности (и записи, ссылающиеся
-		/// на резидентов) ДО этого вызова - см. PrefabSceneViewport.ClearScene/ModelPreviewViewport.LoadModel.
-		/// </summary>
+		/// <summary>Clears this environment: resets the batch renderer and releases all store claims.
+		/// The caller must remove its own instance entities BEFORE calling this.</summary>
 		public void ClearAll()
 		{
 			var anyRegistered = false;
@@ -448,8 +356,8 @@ namespace DecaEngine.Editor.ECS
 
 			if (anyRegistered)
 			{
-				// Кадры с ресурсами старых регистраций могут быть в полёте - без ожидания GPU сброс
-				// батч-рендерера роняет драйвер (та же дисциплина, что была в прежнем ClearAll).
+				// Frames using the old registrations may be in flight; resetting without waiting
+				// for the GPU crashes the driver.
 				_env.DilApi.ImmediateContext.Flush();
 				_env.DilApi.ImmediateContext.WaitForIdle();
 				_env.BatchRenderer.ResetRegistrations();
@@ -468,6 +376,7 @@ namespace DecaEngine.Editor.ECS
 				resident.MeshIds.Clear();
 				resident.MaterialIds.Clear();
 				resident.BatchCache.Clear();
+				resident.Materials = null;
 			}
 
 			_models.Clear();
@@ -478,14 +387,8 @@ namespace DecaEngine.Editor.ECS
 			}
 		}
 
-		/// <summary>Переезд в пересозданное окружение. Вызывающий уже дождался GPU и освободил старое
-		/// окружение целиком (его батч-рендерер умер вместе с регистрациями - сбрасывать нечего).
-		/// <paramref name="dropModels"/> - выбросить и сами заявки стола (например, анизотропия
-		/// печётся в сэмплеры при загрузке - кеш непригоден, опции загрузки другие, значит и запись в
-		/// столе другая); иначе резидентные модели просто перерегистрируются в новый батч-рендерер по
-		/// уже готовым данным (без перечитывания с диска - ModelLoader тот же самый, только
-		/// материалы этого окружения строятся заново, см. <see cref="ModelStore.AcquireMaterialSet"/>),
-		/// а незавершённые загрузки продолжаются в столе как ни в чём не бывало.</summary>
+		/// <summary>Moves to a recreated environment. dropModels also discards the store claims (e.g.
+		/// anisotropy is baked into samplers at load time, so the cached entry is unusable).</summary>
 		public void MigrateEnvironment(ModelViewportEnvironment newEnv, bool dropModels)
 		{
 			_env = newEnv;
@@ -507,12 +410,12 @@ namespace DecaEngine.Editor.ECS
 
 			foreach (var resident in _models.Values)
 			{
-				// Записи о сущностях старого стора забыты вызывающим - ссылки начнутся заново с
-				// первого Acquire по новому окружению.
+				// Old-store entity records are gone; references restart at the first Acquire.
 				resident.RefCount = 0;
 				resident.MeshIds.Clear();
 				resident.MaterialIds.Clear();
 				resident.BatchCache.Clear();
+				resident.Materials = null;
 
 				if (resident.Model == null)
 				{
@@ -521,10 +424,8 @@ namespace DecaEngine.Editor.ECS
 
 				try
 				{
-					// Материалы старого окружения умерли вместе с его батч-рендерером - этот резидент
-					// уже когда-то брал набор у стола (см. ModelStore.AcquireMaterialSet), поэтому
-					// повторный запрос гарантированно вернёт СВЕЖИЙ дополнительный набор, а не украдёт
-					// первичный у кого-то другого.
+					// A repeat request returns a fresh secondary material set, never steals the
+					// primary one from another environment.
 					RegisterResident(resident, resident.Model);
 				}
 				catch (Exception ex)
@@ -539,14 +440,9 @@ namespace DecaEngine.Editor.ECS
 		}
 	}
 
-	/// <summary>
-	/// ECS-привод стриминга: каждый кадр берёт позицию камеры окружения из стора (первая сущность с
-	/// <see cref="CameraComponent"/>) и шагает <see cref="ModelStreamer.Tick"/> (приоритеты для стола -
-	/// см. его class-doc, сама загрузка теперь шагается централизованно из EditorManager). Добавляется
-	/// в SystemRoot окружения ПОСЛЕДНЕЙ (после GpuInstanceBufferSystem/культинга): готовая модель
-	/// инстанцируется следующим кадром, зато финализация/регистрация не вклинивается между записью
-	/// инстанс-буферов и раскладкой батчей текущего кадра.
-	/// </summary>
+	/// <summary>ECS driver for streaming. Must be added to the environment's SystemRoot LAST, after
+	/// GpuInstanceBufferSystem/culling, so registration never lands mid-frame between the instance
+	/// buffer write and the batch layout.</summary>
 	public sealed class ModelStreamingSystem : QuerySystem<CameraComponent>
 	{
 		private readonly ModelStreamer _streamer;

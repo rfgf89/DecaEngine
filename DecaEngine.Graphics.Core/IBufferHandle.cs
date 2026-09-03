@@ -1,6 +1,3 @@
-// Единственный файл проекта, живший вообще БЕЗ namespace: IBufferHandle, BufferInfo,
-// BufferHandleType и HandleAccess лежали в глобальном пространстве и были видны отовсюду без
-// using - потому никто и не замечал.
 using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;

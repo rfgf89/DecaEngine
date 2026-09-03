@@ -1,18 +1,8 @@
 namespace DecaEngine.Graphics.Assets;
 
-/// <summary>
-/// Фоновая печка ассетов: одна очередь, один рабочий поток пониженного приоритета на весь процесс.
-///
-/// Ставится в очередь ПРОМАХ кеша. Сама загрузка при этом идёт обычным путём и ничего не ждёт -
-/// в этом вся идея: включение пайплайна не имеет права сделать первое открытие модели медленнее,
-/// чем оно было без него. Печка догоняет в фоне, и уже следующее открытие идёт из кеша.
-///
-/// Поток ровно один, и это не экономия на спичках. Бейк - это полный декод всех картинок модели
-/// плюс BC-кодирование, то есть и сотни мегабайт пиковой памяти, и все ядра под нагрузкой. Две
-/// такие задачи параллельно (а в редакторе легко ткнуть подряд в пять моделей в браузере ассетов)
-/// удваивают пик памяти и отбирают у рендера ровно то время, ради которого фоновая печка и
-/// затевалась.
-/// </summary>
+/// <summary>Background asset baking: one queue, one low-priority worker per process.</summary>
+// Exactly one thread: a bake decodes every texture and BC-encodes it, so two in parallel would
+// double peak memory and steal the cores the queue exists to protect.
 public static class AssetBakeQueue
 {
 	private sealed record Job(string ModelPath, ModelLoadOptions Options, string ModelKey);
@@ -20,16 +10,14 @@ public static class AssetBakeQueue
 	private static readonly Lock Gate = new();
 	private static readonly Queue<Job> Pending = new();
 
-	/// <summary>Ключи, уже поставленные в очередь или обработанные за эту сессию. Держит очередь от
-	/// повторов: браузер ассетов переоткрывает одну и ту же модель десятки раз за сессию, и без
-	/// этого фильтра каждая попытка ставила бы ещё одну задачу на уже идущий бейк.</summary>
+	// Keys queued or handled this session; keeps repeated opens from re-queuing a running bake.
 	private static readonly HashSet<string> Seen = new(StringComparer.Ordinal);
 
 	private static readonly CancellationTokenSource ShutdownSource = new();
 	private static Thread _worker;
 	private static bool _draining;
 
-	/// <summary>Сколько задач ждёт очереди - для индикатора в редакторе.</summary>
+	/// <summary>Number of jobs still waiting, for the editor indicator.</summary>
 	public static int PendingCount
 	{
 		get
@@ -41,8 +29,7 @@ public static class AssetBakeQueue
 		}
 	}
 
-	/// <summary>Сообщения об ошибках бейка. Бейк фоновый и НЕ обязан валить загрузку - модель
-	/// прекрасно грузится и без кеша, - но и молчать о том, что кеш никогда не наполнится, нельзя.</summary>
+	/// <summary>Raised when a bake fails; loading itself is unaffected.</summary>
 	public static event Action<string, Exception> BakeFailed;
 
 	internal static void Enqueue(string modelPath, ModelLoadOptions options, string modelKey)
@@ -63,9 +50,7 @@ public static class AssetBakeQueue
 					IsBackground = true,
 					Name = "DecaEngine asset bake",
 
-					// Ниже нормального намеренно: печка соревнуется за ядра с потоком рендера и с
-					// фоновыми загрузками других моделей, а её результат нужен не сейчас, а в
-					// следующей сессии. Проигрывать эту гонку - правильное поведение.
+					// Deliberately below normal: the result is needed next session, not now.
 					Priority = ThreadPriority.BelowNormal,
 				};
 
@@ -74,18 +59,10 @@ public static class AssetBakeQueue
 		}
 	}
 
-	/// <summary>Останавливает печку. Текущая задача дорабатывает до ближайшей точки отмены; всё
-	/// записанное на диск остаётся валидным (контейнеры пишутся атомарно, см. DtexFile.Write).</summary>
+	/// <summary>Stops the queue; anything already on disk stays valid (atomic writes).</summary>
 	public static void Stop() => ShutdownSource.Cancel();
 
-	/// <summary>
-	/// Блокирует вызывающего, пока очередь не опустеет (или не выйдет <paramref name="timeout"/>).
-	/// Возвращает true, если печка успела всё.
-	///
-	/// Для UI это НЕ путь - там очередь и нужна затем, чтобы никто её не ждал. Нужно пробникам и
-	/// пакетному прогреву кеша («запечь весь проект»), где смысл запуска ровно в том, чтобы дождаться
-	/// результата.
-	/// </summary>
+	/// <summary>Blocks until the queue drains; for probes and batch prewarm, never for UI.</summary>
 	public static bool WaitForIdle(TimeSpan timeout)
 	{
 		var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
@@ -134,8 +111,7 @@ public static class AssetBakeQueue
 			}
 			catch (Exception ex)
 			{
-				// Провал бейка одной модели не должен ни валить редактор, ни останавливать очередь:
-				// битый или экзотический glTF - это норма жизни, а остальные модели ни при чём.
+				// One bad model must not stop the queue.
 				BakeFailed?.Invoke(job.ModelPath, ex);
 			}
 			finally
@@ -156,15 +132,9 @@ public static class AssetBakeQueue
 			return;
 		}
 
-		// Модель готовится ЗАНОВО, а не переиспользуется из уже идущей загрузки, и это осознанно.
-		// Тот PreparedModel уезжает на поток рендера, где его пиксели заливаются в текстуры и тут же
-		// освобождаются, - трогать его отсюда значило бы гонку на каждом буфере. Повторная подготовка
-		// стоит одного лишнего разбора на модель ЗА ВСЮ ЕЁ ЖИЗНЬ, зато не имеет разделяемого
-		// состояния вовсе.
-		//
-		// Стриминг для бейка выключается: он существует ради быстрого первого кадра и намеренно НЕ
-		// декодирует картинки, а печь нечего без пикселей. CacheDirectory снимается, чтобы подготовка
-		// не ушла в кеш рекурсивно.
+		// The model is prepared from scratch on purpose: the in-flight PreparedModel belongs to
+		// the render thread, which frees its pixels. Streaming is off (a bake needs pixels) and
+		// CacheDirectory is cleared so preparation does not recurse into the cache.
 		var bakeOptions = job.Options with { StreamTextures = false, CacheDirectory = null };
 
 		var prepared = ModelImporter.PrepareForBake(job.ModelPath, bakeOptions, token);

@@ -1,11 +1,9 @@
-// Общее тело SSAO-пасса превью (см. SsaoPS.hlsl / SsaoMsaaPS.hlsl - обёртки определяют макрос
-// DEPTH_FETCH под одиночный или мультисемпловый депт). Экранное затемнение по глубине: даёт
-// контактное затемнение между РАЗНЫМИ объектами (фигура на доске), которого запечённый AO из
-// glTF дать не может. Полноэкранный треугольник (SkyBackgroundVS), выход - grayscale AO.
+// Shared SSAO body (SsaoPS.hlsl / SsaoMsaaPS.hlsl wrappers define DEPTH_FETCH for
+// single vs multisample depth). Fullscreen triangle (SkyBackgroundVS), grayscale AO out.
 //
-// Реконструкция позиции: проекция превью - infinite reversed-Z (см.
-// RenderingComponents.MakePerspectiveReversedZ: z_clip = near, w = z_view), поэтому
-// z_view = near / depth. FOV фиксирован (ModelViewportEnvironment.CameraFovDegrees = 45).
+// Position reconstruction assumes infinite reversed-Z (MakePerspectiveReversedZ:
+// z_clip = near, w = z_view), so z_view = near / depth. FOV fixed at 45 deg
+// (ModelViewportEnvironment.CameraFovDegrees).
 #include "Instancing.hlsl"
 
 cbuffer View
@@ -13,19 +11,15 @@ cbuffer View
     ViewData viewData;
 }
 
-// Мировой радиус влияния AO: доля габаритного радиуса модели, пушится после её кадрирования
-// (см. ModelPreviewViewport.FrameAll -> SsaoPassResources.SetWorldRange). С ним контактная тень
-// не схлопывается при приближении камеры - в легаси-режиме (0, никто не пушил: probe без модели,
-// сторонние потребители) радиус живёт в долях экрана, а falloff в долях глубины точки, и при
-// зуме нависающая геометрия (корона ферзя и т.п.) выпадала из радиуса поиска.
-// Паддинг тремя скалярами, НЕ float3: float3 по смещению 4 нарушает 16-байтное выравнивание
-// std140/SPIR-V - легализация шейдера на Vulkan падала ("Failed to legalize SPIR-V shader"),
-// и AO-пасс работал как undefined behavior. Зеркалит AoConstantsData (SsaoPass.cs).
+// Mirrors AoConstantsData (SsaoPass.cs).
+// Padding as three scalars, NOT float3: float3 at offset 4 breaks std140/SPIR-V
+// 16-byte alignment and Vulkan shader legalization fails.
 cbuffer AoConstants
 {
+    // World AO radius: fraction of the model's bounding radius (pushed by
+    // ModelPreviewViewport.FrameAll); 0 = legacy screen-fraction mode.
     float aoWorldRange;
-    // Живые ручки окна Graphics (см. SsaoPassResources.SetStrength): множитель интенсивности и
-    // нижний предел видимости. 0 / отрицательное = дефолты ниже (кбуфер вне превью нулевой).
+    // Graphics-window knobs (SsaoPassResources.SetStrength); <= 0 means defaults below.
     float aoPower;
     float aoFloor;
     float aoConstantsPad2;
@@ -33,7 +27,7 @@ cbuffer AoConstants
 
 static const float PI = 3.14159265359;
 static const float TanHalfFov = 0.41421356; // tan(45deg / 2)
-static const float NearPlane = 0.05;        // CameraData near в ModelViewportEnvironment
+static const float NearPlane = 0.05;        // CameraData near in ModelViewportEnvironment
 
 struct VSOutput
 {
@@ -69,7 +63,7 @@ PSOutput Main(in VSOutput input)
     float2 viewportSize = viewData.viewport.zw;
     int2 pixel = int2(input.pos.xy);
 
-    // Фон (reversed-Z очищается нулём) не затеняется.
+    // Background (reversed-Z clears to 0) is not shaded.
     float centerRaw = DEPTH_FETCH(pixel);
     if (centerRaw < 1e-6)
     {
@@ -79,8 +73,8 @@ PSOutput Main(in VSOutput input)
 
     float3 P = ViewPosAt(pixel, viewportSize);
 
-    // Нормаль из соседних глубин; из пар +/-1 берётся меньшая разница, чтобы не ловить обрывы
-    // на силуэтах (классический трюк depth-normal реконструкции).
+    // Depth-normal reconstruction: pick the smaller of the +/-1 differences to
+    // avoid silhouette discontinuities.
     float3 dxA = ViewPosAt(pixel + int2(1, 0), viewportSize) - P;
     float3 dxB = P - ViewPosAt(pixel - int2(1, 0), viewportSize);
     float3 dyA = ViewPosAt(pixel + int2(0, 1), viewportSize) - P;
@@ -93,17 +87,16 @@ PSOutput Main(in VSOutput input)
         N = -N;
     }
 
-    // Спиральные тапы в экранном радиусе (масштаб-инвариантно: радиус в долях экрана, а
-    // falloff - в долях глубины точки, так что модели любого размера затеняются одинаково).
     const int TapCount = 10;
-    const float ScreenRadius = 0.045;   // доля высоты экрана
-    const float RangeFraction = 0.18;   // дальность влияния в долях z точки
+    const float ScreenRadius = 0.045;   // fraction of screen height
+    const float RangeFraction = 0.18;   // falloff range as fraction of point depth
     const float Bias = 0.08;
     const float Intensity = 1.15;
 
-    // Мировой режим: falloff идёт до aoWorldRange, а радиус спирали - его проекция в пиксели на
-    // глубине точки (клэмп сверху, чтобы экстремальный зум не разгонял шаг тапов до всего
-    // экрана, снизу - чтобы вдали спираль не вырождалась). Легаси (aoWorldRange = 0) - как раньше.
+    // World mode: falloff up to aoWorldRange, spiral radius is its pixel projection
+    // at the point's depth (clamped so zoom cannot blow the tap step up to the
+    // whole screen or collapse it at distance). Legacy (aoWorldRange = 0) is
+    // screen-relative.
     float range = aoWorldRange > 0.0 ? aoWorldRange : RangeFraction * P.z;
     float radiusPixels = aoWorldRange > 0.0
         ? clamp(aoWorldRange * viewportSize.y / (2.0 * TanHalfFov * P.z), 2.0, 0.25 * viewportSize.y)
@@ -114,7 +107,7 @@ PSOutput Main(in VSOutput input)
     [unroll]
     for (int t = 0; t < TapCount; t++)
     {
-        float angle = noise + t * 2.39996; // золотой угол
+        float angle = noise + t * 2.39996; // golden angle
         float radius = (t + 0.5) / TapCount * radiusPixels;
         int2 tap = pixel + int2(round(float2(cos(angle), sin(angle)) * radius));
 

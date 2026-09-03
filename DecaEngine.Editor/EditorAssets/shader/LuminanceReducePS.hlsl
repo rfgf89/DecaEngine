@@ -1,6 +1,5 @@
-// Звено редукции лог-яркости: источник ровно в 8 раз больше таргета по каждой оси, так что 8x8
-// тапов покрывают его ПОЛНОСТЬЮ (в отличие от подвыборки init-пасса). Цепочка превью:
-// 64x64 -> 8x8 -> 1x1, один и тот же шейдер с разными привязками (см. EyeAdaptationPass.cs).
+// Log-luminance reduction step: the source is exactly 8x the target per axis, so 8x8 taps cover it
+// fully. Chain is 64x64 -> 8x8 -> 1x1, same shader with different bindings.
 #include "EyeAdaptationCommon.hlsl"
 
 Texture2D    _LumTex;

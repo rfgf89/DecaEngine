@@ -8,25 +8,13 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>
-/// GPU-скиннинг: диспетчеризация SkinningCS.hlsl, которая переписывает bind-позу скиннед-мешей в
-/// отведённые каждому инстансу участки мега-буфера вершин.
-///
-/// Живёт отдельным классом, а не полями <see cref="DiligentBatchRenderer"/>, по одной причине: ему
-/// нужен ровно один чужой ресурс - сам мега-буфер вершин, - а всё остальное (скин-стрим, палитра,
-/// список регионов) существует только ради скиннинга и в батч-рендерере было бы шумом.
-///
-/// ВСЯ работа кадра идёт ОДНОЙ диспетчеризацией на все скиннед-инстансы: команды рендера
-/// заморожены (см. DiligentBatchRenderer), и диспетчеризация на инстанс требовала бы перезаписи
-/// командного буфера при каждом появлении и исчезновении персонажа. Регион, которому принадлежит
-/// поток, шейдер находит бинарным поиском по префиксным суммам.
-/// </summary>
+/// <summary>GPU skinning: one dispatch per frame writes deformed vertices into the mega vertex buffer.</summary>
 public sealed class DiligentSkinningPass
 {
-	/// <summary>Тредов в группе. Зеркалит numthreads в SkinningCS.hlsl - менять только парой.</summary>
+	// Mirrors numthreads in SkinningCS.hlsl - change both together.
 	private const int GroupSize = 64;
 
-	/// <summary>Зеркало SkinRegion в SkinningCS.hlsl. Один регион - один скиннед-инстанс.</summary>
+	// Mirrors SkinRegion in SkinningCS.hlsl. One region per skinned instance.
 	[StructLayout(LayoutKind.Sequential)]
 	private struct SkinRegion
 	{
@@ -52,8 +40,7 @@ public sealed class DiligentSkinningPass
 	private readonly DiligentComputeMaterial _material;
 	private readonly DiligentBufferHandle _constantsBuffer;
 
-	// Скин-стримы всех зарегистрированных мешей, склеенные подряд, - тот же приём, что у мега-буфера
-	// вершин: один буфер на сцену, каждый меш знает свой офсет.
+	// Skin streams of all meshes concatenated: one buffer per scene, each mesh knows its offset.
 	private readonly List<SkinVertex> _skinStreamCpu = new();
 	private DiligentBufferHandle _skinStreamBuffer;
 	private int _skinStreamCapacity;
@@ -64,8 +51,7 @@ public sealed class DiligentSkinningPass
 	private int _regionsCapacity;
 	private bool _regionsDirty = true;
 
-	// Палитра всех инстансов подряд, по четыре Vector4 на матрицу (см. SkinPalette в шейдере о том,
-	// почему не Matrix4x4).
+	// All instance palettes concatenated, four Vector4 per matrix (see SkinPalette in the shader).
 	private readonly List<Vector4> _paletteCpu = new();
 	private DiligentBufferHandle _paletteBuffer;
 	private int _paletteCapacity;
@@ -92,12 +78,10 @@ public sealed class DiligentSkinningPass
 		_material.SetBuffer("SkinConstants", _constantsBuffer);
 	}
 
-	/// <summary>Есть ли что скиннить в этом кадре. Потребитель пропускает и диспетчеризацию, и
-	/// переходы состояний ресурсов - у статической сцены проход обязан стоить ровно ноль.</summary>
+	/// <summary>Whether this frame has anything to skin; a static scene must cost exactly zero.</summary>
 	public bool HasWork => _regions.Count > 0 && _threadCount > 0;
 
-	/// <summary>Кладёт скин-стрим меша в общий буфер и возвращает его начало. Зовётся один раз на
-	/// меш при регистрации модели, а не на инстанс: веса у всех инстансов одного меша общие.</summary>
+	/// <summary>Appends a mesh skin stream and returns its base; call once per mesh, not per instance.</summary>
 	public int RegisterSkinStream(ReadOnlySpan<SkinVertex> skin)
 	{
 		int skinBase = _skinStreamCpu.Count;
@@ -109,20 +93,12 @@ public sealed class DiligentSkinningPass
 		return skinBase;
 	}
 
-	/// <summary>
-	/// Заводит скиннед-инстанс: участок мега-буфера <paramref name="destBaseVertex"/> будет каждый
-	/// кадр переписываться деформированной копией <paramref name="sourceBaseVertex"/>. Возвращает
-	/// офсет палитры инстанса (В МАТРИЦАХ) - его же потребитель передаёт в
-	/// <see cref="SetPalette"/>.
-	/// </summary>
+	/// <summary>Registers a skinned instance and returns its palette offset, measured in matrices.</summary>
 	public int AddInstance(int sourceBaseVertex, int destBaseVertex, int vertexCount, int skinBase, int jointCount)
 	{
 		int paletteOffset = _paletteCpu.Count / 4;
 
-		// Палитра инстанса резервируется сразу: регионы и палитра индексируются независимо, и
-		// «дырка» в палитре, оставленная под ещё не посчитанную позу, читалась бы шейдером как
-		// нулевые матрицы - персонаж схлопнулся бы в точку до первого обновления позы. Единичные
-		// матрицы дают bind-позу, то есть корректный кадр даже без аниматора.
+		// Reserve identity matrices up front: an unwritten palette slot would collapse the mesh.
 		for (int i = 0; i < jointCount; i++)
 		{
 			AppendMatrix(Matrix4x4.Identity);
@@ -135,29 +111,24 @@ public sealed class DiligentSkinningPass
 			VertexCount = (uint)vertexCount,
 			SkinBase = (uint)skinBase,
 			PaletteOffset = (uint)paletteOffset,
-			// FirstThread проставляется в RebuildThreadOffsets: он зависит от ВСЕХ регионов сразу.
+			// FirstThread is filled by RebuildThreadOffsets: it depends on all regions at once.
 		});
 
 		_regionsDirty = true;
 		_paletteDirty = true;
 
-		// Префиксные суммы пересчитываются ПРЯМО ЗДЕСЬ, а не лениво в Execute: от них зависит
-		// _threadCount, по которому потребитель решает, звать ли Execute вообще (см. HasWork), -
-		// ленивый пересчёт сделал бы это условие вечно ложным.
+		// Must run here, not lazily in Execute: HasWork gates Execute on _threadCount.
 		RebuildThreadOffsets();
 		return paletteOffset;
 	}
 
-	/// <summary>Обновляет палитру одного инстанса (обычно - результат
-	/// <see cref="SkeletonPose.SkinMatrices"/> текущего кадра).</summary>
+	/// <summary>Updates the skinning palette of one instance for the current frame.</summary>
 	public void SetPalette(int paletteOffset, ReadOnlySpan<Matrix4x4> matrices)
 	{
 		int start = paletteOffset * 4;
 		int needed = start + matrices.Length * 4;
 
-		// Палитра длиннее зарезервированного - признак того, что скелет инстанса не тот, под который
-		// он регистрировался. Молча обрезать нельзя: обрезанная палитра даёт не «чуть хуже», а
-		// вывернутые кости, причём у СОСЕДНЕГО инстанса, чей участок затёрли бы.
+		// Throw rather than clamp: an overlong palette would corrupt the neighbouring instance.
 		if (needed > _paletteCpu.Count)
 		{
 			throw new ArgumentException(
@@ -178,8 +149,7 @@ public sealed class DiligentSkinningPass
 		_paletteDirty = true;
 	}
 
-	/// <summary>Полный сброс - под <see cref="DiligentBatchRenderer.ResetRegistrations"/>: офсеты
-	/// регионов указывают в мега-буфер, который там пересоздаётся с нуля.</summary>
+	/// <summary>Drops all registrations; required whenever the mega vertex buffer is rebuilt.</summary>
 	public void Reset()
 	{
 		_skinStreamCpu.Clear();
@@ -200,8 +170,7 @@ public sealed class DiligentSkinningPass
 		_paletteCpu.Add(new Vector4(m.M41, m.M42, m.M43, m.M44));
 	}
 
-	/// <summary>Префиксные суммы вершин по регионам: по ним шейдер находит свой регион (см.
-	/// FindRegion). Пересчитываются только при изменении набора регионов.</summary>
+	// Prefix sums of vertex counts; the shader binary-searches them to find its region.
 	private void RebuildThreadOffsets()
 	{
 		uint thread = 0;
@@ -216,18 +185,8 @@ public sealed class DiligentSkinningPass
 		_threadCount = (int)thread;
 	}
 
-	/// <summary>
-	/// Заливает изменившиеся буферы и диспетчеризует скиннинг. Мега-буфер вершин приходит
-	/// параметром: он живёт в батч-рендерере и пересоздаётся при росте, так что кешировать его
-	/// здесь значило бы держать ссылку на уже отпущенный объект.
-	///
-	/// Диспетчеризация идёт ImmediateContext-ом, МИМО замороженного графа, - ровно как заливка
-	/// самих мега-буферов (см. DiligentBatchRenderer.UpdateMegaBufferRange). Причин две. Во-первых,
-	/// число групп зависит от суммарного числа скиннимых вершин, и в замороженной команде оно
-	/// протухало бы при появлении персонажа в кадре. Во-вторых, скиннинг обязан отработать ДО
-	/// ВСЕГО, что читает геометрию, - а её читают и каскады теней, и forward, и трассировка; здесь
-	/// это выходит само собой, без вклинивания в порядок пассов графа.
-	/// </summary>
+	// Dispatched on the immediate context, bypassing the frozen graph: group count varies per frame.
+	/// <summary>Uploads dirty buffers and dispatches skinning; must run before any geometry read.</summary>
 	public void Execute(DiligentBufferHandle megaVertexBuffer)
 	{
 		if (megaVertexBuffer == null || !HasWork)
@@ -241,33 +200,24 @@ public sealed class DiligentSkinningPass
 
 		_material.SetBuffer("MegaVertices", megaVertexBuffer);
 
-		// Константы заливаются ImmediateContext-ом, как и остальные буферы прохода: они меняются
-		// только при появлении/исчезновении скиннед-инстансов, то есть заведомо не внутри реплея
-		// замороженного командного буфера.
 		UploadConstants(new SkinConstants
 		{
 			RegionCount = (uint)_regions.Count,
 			ThreadCount = (uint)_threadCount,
 		});
 
-		// Все буферы прохода обязаны существовать К МОМЕНТУ диспетчеризации. Создание буфера может
-		// провалиться (у Diligent это не исключение, а сообщение в лог и обёртка с пустым нативным
-		// объектом), и тогда SRB остаётся с непривязанной переменной, а DispatchCompute падает по
-		// доступу. Пропустить кадр честнее: персонаж останется в bind-позе, а причина будет видна
-		// в логе создания буфера, а не в стеке падения, где виновника уже нет.
+		// Diligent reports buffer creation failure via the log, not an exception; an unbound SRB
+		// variable would crash DispatchCompute, so skip the frame instead.
 		if (_skinStreamBuffer?.Buffer == null || _regionsBuffer?.Buffer == null ||
 			_paletteBuffer?.Buffer == null || megaVertexBuffer.Buffer == null)
 		{
-			Console.WriteLine("[skinning] проход пропущен: не создан один из буферов " +
+			Console.WriteLine("[skinning] pass skipped: one of the buffers was not created " +
 				$"(stream={_skinStreamBuffer?.Buffer != null}, regions={_regionsBuffer?.Buffer != null}, " +
 				$"palette={_paletteBuffer?.Buffer != null}, mega={megaVertexBuffer.Buffer != null})");
 			return;
 		}
 
-		// Переходы состояний ресурсов делает сам Dispatch: CommitShaderResources идёт с
-		// ResourceStateTransitionMode.Transition, то есть мега-буфер уезжает в UnorderedAccess перед
-		// диспетчеризацией, а обратно в вершинный его переведёт SetVertexBuffers отрисовки - там
-		// режим перехода тот же.
+		// Dispatch transitions the mega buffer to UnorderedAccess; SetVertexBuffers moves it back.
 		_material.Dispatch((uint)((_threadCount + GroupSize - 1) / GroupSize), 1, 1);
 	}
 
@@ -278,8 +228,7 @@ public sealed class DiligentSkinningPass
 			return;
 		}
 
-		// Скин-стрим неизменен после регистрации меша, поэтому растим буфер тем же приёмом, что и
-		// мега-буферы: с запасом (x2) и с доливкой только нового хвоста.
+		// Skin data never changes after registration, so grow x2 and upload only the new tail.
 		if (_skinStreamBuffer == null || _skinStreamCpu.Count > _skinStreamCapacity)
 		{
 			_skinStreamCapacity = Math.Max(_skinStreamCpu.Count, Math.Max(1024, _skinStreamCapacity * 2));
@@ -348,9 +297,7 @@ public sealed class DiligentSkinningPass
 			_material.SetBuffer("SkinPalette", _paletteBuffer);
 		}
 
-		// Палитра переписывается ЦЕЛИКОМ каждый кадр, где хоть одна поза изменилась: считать
-		// диапазоны изменившихся инстансов дороже, чем залить пару десятков килобайт, а любая
-		// пропущенная матрица - это кость, застрявшая в позе прошлого кадра.
+		// Whole palette is re-uploaded: tracking dirty ranges costs more than a few dozen KB.
 		UploadList(_paletteBuffer, CollectionsMarshal.AsSpan(_paletteCpu), 0);
 		_paletteDirty = false;
 	}
@@ -371,8 +318,7 @@ public sealed class DiligentSkinningPass
 
 		fixed (T* ptr = items.Slice(from))
 		{
-			// Заливка идёт ImmediateContext-ом, как и у мега-буферов: она обязана произойти ДО
-			// реплея замороженных команд кадра, а не внутри него.
+			// Immediate context: the upload must happen before the frozen commands are replayed.
 			_api.ImmediateContext.UpdateBuffer(buffer.Buffer,
 				(uint)(from * sizeof(T)), (uint)(count * sizeof(T)), new IntPtr(ptr),
 				global::Diligent.ResourceStateTransitionMode.Transition);

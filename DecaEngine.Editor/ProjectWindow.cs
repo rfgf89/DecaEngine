@@ -4,12 +4,7 @@ using Hexa.NET.ImGui;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// Окно "Project" отвечает за конфигурацию текущего загруженного проекта: имя, версия,
-	/// иконка и т.д. — то, что и положено проектному окну. Загрузка/сборка/запуск сборки
-	/// проекта вынесены в <see cref="ProjectSession"/> (см. также <see cref="MenuBarWindow"/>,
-	/// который инициирует загрузку проекта через сессию).
-	/// </summary>
+	/// <summary>Editor window for the loaded project's configuration: name, version, icon.</summary>
 	public class ProjectWindow : ImGuiDockingWindow
 	{
 		private readonly ProjectSession _session;
@@ -68,8 +63,7 @@ namespace DecaEngine.Editor
 			ImGui.SameLine();
 			if (ImGui.Button("..."))
 			{
-				// TODO: открыть диалог выбора файла иконки (см. OpenFolderDialog в MenuBarWindow
-				// как пример существующей интеграции с Hexa.NET.ImGui.Widgets.Dialogs).
+				// Icon file picker is not wired up yet.
 			}
 
 			DrawIconPreview(projectDirectory);

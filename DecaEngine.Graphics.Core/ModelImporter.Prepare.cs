@@ -15,17 +15,14 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>CPU-фаза: разбор glTF в PreparedModel - меши, LOD-ы, скелет, клипы, материалы. Часть <see cref="ModelImporter"/> - CPU-стороны импорта; ФАЗА потребления (GPU-финализация) и
-/// точки входа загрузки живут в <see cref="ModelLoader"/>.</summary>
+/// <summary>CPU phase: parses glTF into a PreparedModel - meshes, LODs, skeleton, clips, materials.</summary>
 public static partial class ModelImporter
 {
 	internal static PreparedModel PrepareModel(string modelPath, ModelLoadOptions options,
 		IProgress<float> progress, CancellationToken cancellationToken)
 	{
-		// Ассет-пайплайн. При ПОПАДАНИИ всё, что ниже, не выполняется вовсе: ни разбора glTF, ни
-		// декода картинок, ни meshopt, ни упрощения под LOD - только чтение линейного .dmdl. Именно
-		// эти четыре фазы и составляют почти всё время загрузки, и все они - чистые функции от
-		// исходника и опций, то есть считать их заново при каждом открытии сцены незачем.
+		// On a cache hit nothing below runs: parse, decode, meshopt and LOD are pure functions of
+		// the source plus options, and together they are almost all of the load time.
 		var cache = options.Cache;
 		if (cache != null)
 		{
@@ -38,13 +35,11 @@ public static partial class ModelImporter
 				return cooked;
 			}
 
-			// Промах. Загрузка НЕ ждёт печку и идёт дальше обычным путём - включение пайплайна не
-			// имеет права сделать первое открытие модели медленнее, чем оно было без него.
+			// Miss: the load does NOT wait for the bake, so enabling the pipeline can never make
+			// the first open of a model slower.
 			AssetBakeQueue.Enqueue(modelPath, options, modelKey);
 		}
 
-		// Строгая валидация SharpGLTF на больших сценах заметно небесплатна; TryFix заодно чинит
-		// мелкие огрехи экспортёров вместо жёсткого отказа.
 		var swPhase = System.Diagnostics.Stopwatch.StartNew();
 		var model = LoadModelRoot(modelPath, options, out var externalImagePaths);
 		cancellationToken.ThrowIfCancellationRequested();
@@ -53,11 +48,8 @@ public static partial class ModelImporter
 		prepared.MsParse = swPhase.ElapsedMilliseconds;
 		swPhase.Restart();
 
-		// Картинки, на которые реально ссылаются декодируемые ниже каналы материалов. Декод (PNG/JPG +
-		// даунскейл) - самая дорогая CPU-фаза загрузки: параллелится по уникальным image, материалы
-		// ниже берут готовые пиксели из кэша. Кэш заодно убирает повторный декод одного image,
-		// разделяемого несколькими материалами/каналами (типовая ORM-текстура: у MetallicRoughness и
-		// Occlusion один и тот же image - раньше он декодировался дважды).
+		// Deduplicated so a shared image (e.g. one ORM texture used by both MetallicRoughness and
+		// Occlusion) is decoded once; decode is the most expensive CPU phase of the load.
 		var usedImages = new List<SharpGLTF.Schema2.Image>();
 		{
 			var seenImages = new HashSet<SharpGLTF.Schema2.Image>();
@@ -84,21 +76,14 @@ public static partial class ModelImporter
 			}
 		}
 
-		// Стриминг текстур: в фоновой фазе НЕ ДЕКОДИРУЕТСЯ НИ ОДНА картинка. Декод (PNG/JPG +
-		// даунскейл) - самая дорогая CPU-фаза загрузки и главный вкладчик в пиковую память, и именно
-		// он раньше держал сцену пустой всё время загрузки. Материалы строятся сразу с 1x1-филлерами
-		// (кейворды шейдера при этом ТЕ ЖЕ - они ставятся по наличию текстуры в glTF, а не по
-		// наличию пикселей, так что апгрейд не трогает PSO), геометрия появляется почти сразу, а
-		// пиксели приезжают ступенями из ModelStreamer.
-		//
-		// Источник ре-декода - ПУТЬ к файлу картинки, если она внешняя (типовая .gltf-сцена вроде
-		// Sponza: папка с PNG рядом), и только для встроенных (.glb / data-URI) копируются байты.
-		// Иначе сотни 4K-исходников Sponza жили бы в managed-памяти всё время сессии.
+		// Streaming: this phase decodes NOTHING. Materials get 1x1 fillers, and shader keywords
+		// stay the same (they follow texture presence in glTF, not pixels), so PSOs are untouched.
+		// External images are re-decoded from their PATH; only embedded ones keep their bytes.
 		int decodeMaxSize = options.MaxTextureSize;
 		Dictionary<SharpGLTF.Schema2.Image, TextureStreamSource> streamSources = null;
 		if (options.StreamTextures)
 		{
-			decodeMaxSize = 0; // ничего не декодируем в этой фазе
+			decodeMaxSize = 0;
 			streamSources = new Dictionary<SharpGLTF.Schema2.Image, TextureStreamSource>();
 			foreach (var image in usedImages)
 			{
@@ -112,15 +97,9 @@ public static partial class ModelImporter
 			var decodedResults = new (byte[] Pixels, int Width, int Height)[usedImages.Count];
 			int imagesDone = 0;
 
-			// Параллелизм ОГРАНИЧЕН, и это не про загрузку CPU, а про ПАМЯТЬ. Декод идёт в полном
-			// разрешении файла и только потом ужимается до MaxTextureSize (stb иначе не умеет), то
-			// есть каждый поток держит в пике полноразмерную RGBA-копию: для 4K это 64 МБ. Без
-			// ограничения Parallel.For берёт по потоку на ядро, и на 16-32-поточной машине это
-			// 1-2 ГБ ОДНИХ ТОЛЬКО промежуточных буферов - поверх того, что уже накоплено
-			// декодированным (см. ниже: decodedResults держит ВСЕ картинки до конца фазы).
-			//
-			// Четыре потока сохраняют почти всю выгоду распараллеливания (декод упирается в память,
-			// а не в ALU) и срезают этот пик до сотен мегабайт.
+			// Capped for MEMORY, not CPU: stb decodes at full resolution before the downscale, so
+			// each thread peaks at a full RGBA copy (64 MB for 4K). One thread per core would mean
+			// 1-2 GB of intermediates alone; decode is memory-bound, so four keep most of the win.
 			var decodeOptions = new ParallelOptions
 			{
 				CancellationToken = cancellationToken,
@@ -145,8 +124,6 @@ public static partial class ModelImporter
 		prepared.MsDecode = swPhase.ElapsedMilliseconds;
 		swPhase.Restart();
 
-		// Weight the big background phases (texture decode above, then materials and meshes) roughly
-		// by count so the progress bar moves at a believable pace instead of jumping straight to 50%.
 		int materialCount = Math.Max(1, model.LogicalMaterials.Count);
 
 		for (var index = 0; index < model.LogicalMaterials.Count; index++)
@@ -174,9 +151,7 @@ public static partial class ModelImporter
 				preparedMaterial.BaseColorTexture = DecodeTexture(baseColorTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
 			}
 
-			// PBR metallic-roughness scalars for the editor's Lighting preview (see MaterialPbr).
-			// PreparedMaterial's field initializers already hold the glTF spec defaults (white/1/1),
-			// so only explicitly-authored channel parameters are read here.
+			// Field initializers already hold the glTF spec defaults, so only authored values read.
 			var baseColorChannel = logicalMaterial.FindChannel("BaseColor");
 			if (baseColorChannel.HasValue)
 			{
@@ -196,7 +171,7 @@ public static partial class ModelImporter
 				_ => 0f,
 			};
 
-			// Сам режим - ОТДЕЛЬНЫМ полем: порог выше его теряет (см. PreparedMaterial.AlphaMode).
+			// Kept as its own field: the cutoff above cannot express the mode.
 			preparedMaterial.AlphaMode = logicalMaterial.Alpha switch
 			{
 				AlphaMode.MASK => MaterialAlphaMode.Mask,
@@ -226,9 +201,7 @@ public static partial class ModelImporter
 					}
 				}
 
-				// Game-ready assets typically keep the factors at 1 and put the real per-texel values
-				// into the metallic-roughness texture (G = roughness, B = metallic) - without sampling
-				// it the preview would treat everything as polished-then-fully-rough metal.
+				// Channel convention: G = roughness, B = metallic.
 				var mrTexture = channel.Texture;
 				if (mrTexture?.PrimaryImage != null)
 				{
@@ -236,14 +209,11 @@ public static partial class ModelImporter
 				}
 			}
 
-			// KHR_materials_ior / KHR_materials_dispersion - SharpGLTF мапит их прямо в свойства
-			// материала (IndexOfRefraction по умолчанию 1.5, Dispersion 0 = выключена).
+			// KHR_materials_ior / KHR_materials_dispersion: default IOR 1.5, dispersion 0 = off.
 			preparedMaterial.Ior = logicalMaterial.IndexOfRefraction;
 			preparedMaterial.Dispersion = logicalMaterial.Dispersion;
 
-			// KHR_materials_transmission: только скалярный factor - текстуру трансмиссии превью не
-			// сэмплирует, а полноценной рефракции у него нет (см. UnlitInstancedPS.hlsl, там
-			// аппроксимация "фон сквозь тонированное стекло").
+			// KHR_materials_transmission: scalar factor only - the preview has no real refraction.
 			var transmissionChannel = logicalMaterial.FindChannel("Transmission");
 			if (transmissionChannel.HasValue)
 			{
@@ -256,9 +226,7 @@ public static partial class ModelImporter
 				}
 			}
 
-			// KHR_materials_sheen: велюровый "световой ворс" (Charlie-лоб в шейдере). Цвет и своя
-			// шероховатость - двумя каналами SharpGLTF. Параметры матчатся по ТИПУ значения (в каждом
-			// канале ровно один нетекстурный параметр) - имена ключей у SharpGLTF внутренние.
+			// Matched by value TYPE, not name: SharpGLTF's parameter key names are internal.
 			var sheenColorChannel = logicalMaterial.FindChannel("SheenColor");
 			if (sheenColorChannel.HasValue)
 			{
@@ -283,9 +251,7 @@ public static partial class ModelImporter
 				}
 			}
 
-			// KHR_materials_specular: перекраска/ослабление диэлектрического F0 (сатин и прочие ткани
-			// с цветным бликом). specularColorFactor может быть >1 (ChairDamaskPurplegold: [1,0.25,2]) -
-			// кламп произойдёт в шейдере ПОСЛЕ умножения на F0 от IOR, как велит спека.
+			// specularColorFactor may exceed 1; per spec the shader clamps after multiplying by F0.
 			var specularColorChannel = logicalMaterial.FindChannel("SpecularColor");
 			if (specularColorChannel.HasValue)
 			{
@@ -310,9 +276,8 @@ public static partial class ModelImporter
 				}
 			}
 
-			// KHR_materials_volume: Beer-Lambert затухание сквозь толщу стекла. Толщину берём только
-			// фактором (thicknessTexture не сэмплируется), показатель степени thickness/attenuationDistance
-			// предвычисляем здесь - шейдеру нужен один float4 (rgb цвет, w показатель).
+			// KHR_materials_volume: Beer-Lambert. Packed for the shader as float4(rgb, exponent),
+			// where exponent = thickness / attenuationDistance.
 			float volumeThickness = 0f;
 			float attenuationDistance = 0f;
 			var attenuationColor = Vector3.One;
@@ -329,9 +294,7 @@ public static partial class ModelImporter
 					}
 				}
 
-				// Толщина в текстуре (G-канал по спеке) - множитель поверх factor-а; без неё
-				// плотное стекло глушит просвет равномерно, и тонкие детали (гребни, шипы)
-				// теряют характерную "светящуюся" прозрачность.
+				// Thickness texture is the G channel per spec, multiplying the factor.
 				var thicknessTexture = thicknessChannel.Value.Texture;
 				if (thicknessTexture?.PrimaryImage != null)
 				{
@@ -359,9 +322,7 @@ public static partial class ModelImporter
 				? new Vector4(attenuationColor, volumeThickness / attenuationDistance)
 				: new Vector4(1f, 1f, 1f, 0f);
 
-			// Запечённый ambient occlusion (R-канал по спеке, часто общая ORM-текстура с MR) +
-			// occlusionStrength. Глушит ambient/env-термы в порах и складках - без него фигуры
-			// выглядят "пластиково чистыми". Прямой свет по спеке AO не трогает.
+			// Baked AO is the R channel per spec; it attenuates ambient/env only, never direct light.
 			var occlusionChannel = logicalMaterial.FindChannel("Occlusion");
 			if (occlusionChannel.HasValue)
 			{
@@ -373,9 +334,7 @@ public static partial class ModelImporter
 					}
 				}
 
-				// AO часто запечён под уникальную развёртку ВТОРОГО UV-канала (texCoord 1, см.
-				// ChairDamaskPurplegold) - сэмпл по UV0 кладёт затемнения в случайные места.
-				// Каналы выше 1 в вершине не хранятся - клампятся в TEXCOORD_1.
+				// AO is often baked against UV1; sets above 1 are not stored per vertex, so clamp.
 				preparedMaterial.OcclusionUvSet = Math.Clamp(occlusionChannel.Value.TextureCoordinate, 0, 1);
 
 				var occlusionTexture = occlusionChannel.Value.Texture;
@@ -385,9 +344,7 @@ public static partial class ModelImporter
 				}
 			}
 
-			// Нормал-мапа (tangent-space, линейная - без sRGB-декода) + normalScale. Без неё весь
-			// авторский микрорельеф (кладка, резьба, прожилки) теряется - поверхность шейдится
-			// только геометрической нормалью.
+			// Tangent-space normal map: linear, never sRGB-decoded.
 			var normalChannel = logicalMaterial.FindChannel("Normal");
 			if (normalChannel.HasValue)
 			{
@@ -406,11 +363,38 @@ public static partial class ModelImporter
 				}
 			}
 
-			// KHR_texture_transform: смещение/масштаб/поворот UV, заданные материалом (Khronos-семпл
-			// ChairDamaskPurplegold: scale 3x3 + rotation 0.1 на дереве/ткани - без учёта текстуры
-			// тайлятся втрое крупнее и без поворота волокон). Одна трансформация на материал: с
-			// baseColor-канала, фоллбек normal/MR. Предвычисляется в 2x2-матрицу + offset по формуле
-			// спеки M = Translation * Rotation * Scale.
+			// emissiveFactor and KHR_materials_emissive_strength collapse into one linear RGB here.
+			var emissiveChannel = logicalMaterial.FindChannel("Emissive");
+			if (emissiveChannel.HasValue)
+			{
+				var emissiveRgb = Vector3.Zero;
+				float emissiveStrength = 1f;
+				foreach (var parameter in emissiveChannel.Value.Parameters)
+				{
+					if (parameter.Value is Vector3 emissive)
+					{
+						emissiveRgb = emissive;
+					}
+					else if (parameter.Name == "EmissiveStrength")
+					{
+						emissiveStrength = Convert.ToSingle(parameter.Value);
+					}
+				}
+
+				preparedMaterial.EmissiveFactor = emissiveRgb * emissiveStrength;
+
+				// Per spec the factor multiplies the texture, so a zero factor makes it pointless.
+				var emissiveTexture = preparedMaterial.EmissiveFactor != Vector3.Zero
+					? emissiveChannel.Value.Texture
+					: null;
+				if (emissiveTexture?.PrimaryImage != null)
+				{
+					preparedMaterial.EmissiveTexture = DecodeTexture(emissiveTexture, decodeMaxSize, decodedImages, streamSources, externalImagePaths);
+				}
+			}
+
+			// KHR_texture_transform, one per material: baked to a 2x2 matrix plus offset following
+			// the spec's M = Translation * Rotation * Scale.
 			foreach (var channelName in new[] { "BaseColor", "Normal", "MetallicRoughness" })
 			{
 				var transform = logicalMaterial.FindChannel(channelName)?.TextureTransform;
@@ -429,15 +413,9 @@ public static partial class ModelImporter
 				break;
 			}
 
-			// Preview-friendly fallback: a material with neither a metallic-roughness texture nor
-			// authored factors lands on the glTF spec defaults (metallic 1, roughness 1), i.e. a metal
-			// with no diffuse and a lobe-less specular - it renders as if unlit (ambient only). A
-			// neutral dielectric reads far closer to what the author meant.
-			//
-			// ВАЖНО: только когда НЕ авторский НИ ОДИН фактор. IsDefault у SharpGLTF означает
-			// "значение равно дефолту", а не "не записан в JSON" - материал с явным metallic=1 +
-			// roughness=0 (зеркало, см. PrimitiveModeNormalsTest) выглядит как "metallic не авторский",
-			// но авторский roughness выдаёт осознанный metal-workflow, и глушить его в диэлектрик нельзя.
+			// Deliberate deviation: the spec defaults (metallic 1, roughness 1) render as unlit, so
+			// fall back to a neutral dielectric - but only if NEITHER factor was authored, since
+			// SharpGLTF's IsDefault means "equals the default", not "absent from the JSON".
 			if (preparedMaterial.MetallicRoughnessTexture == null && !metallicAuthored && !roughnessAuthored)
 			{
 				preparedMaterial.MetallicFactor = 0f;
@@ -454,15 +432,12 @@ public static partial class ModelImporter
 		var primitiveToMeshIdMap = new Dictionary<MeshPrimitive, int>();
 		var meshWork = new List<MeshWorkItem>();
 
-		// Скелет и клипы - ДО обхода примитивов: скин-стрим вершин переводит локальные индексы скина
-		// в индексы джойнтов скелета, значит скелет к этому моменту обязан существовать.
+		// Must precede the primitive walk: the skin stream remaps local skin indices to joints.
 		prepared.Skeleton = SkinningImport.BuildSkeleton(model, out var nodeToJoint);
 		prepared.Animations.AddRange(SkinningImport.BuildAnimations(model, prepared.Skeleton, nodeToJoint));
 
-		// Скин висит на УЗЛЕ, а не на примитиве, но скин-стрим нужен именно примитиву - отсюда
-		// предпроход. Один и тот же примитив под двумя узлами с разными скинами разрешается в пользу
-		// первого: glTF такое допускает, живые ассеты - нет, а тащить в PreparedMesh вариант на скин
-		// значило бы дублировать всю геометрию ради несуществующего случая.
+		// Skins hang off NODES, not primitives. A primitive shared by two differently-skinned nodes
+		// resolves to the first: glTF allows it, real assets don't, and per-skin copies are costly.
 		var primitiveToSkin = new Dictionary<MeshPrimitive, Skin>();
 		foreach (var node in model.LogicalNodes)
 		{
@@ -499,10 +474,8 @@ public static partial class ModelImporter
 					continue;
 				}
 
-				// Топология примитива (см. MeshTopology*-константы): точки/линии рисуются клонами
-				// материала с PSO соответствующей топологии (см. BuildFromPrepared /
-				// ModelViewportGeometry.RegisterModelResources) - батч-рендерер группирует дроу по
-				// материалу, так что отдельный материал на топологию не требует его переделки.
+				// Points/lines get material clones carrying a PSO for their topology, since the
+				// batch renderer groups draws by material.
 				int topology = primitive.DrawPrimitiveType switch
 				{
 					PrimitiveType.TRIANGLES => ModelLoader.MeshTopologyTriangles,
@@ -514,8 +487,7 @@ public static partial class ModelImporter
 				};
 				if (topology < 0)
 				{
-					// TRIANGLE_STRIP/FAN не поддержаны - раньше такие примитивы рисовались как
-					// triangle list (мусор), теперь честно пропускаются.
+					// TRIANGLE_STRIP/FAN are unsupported.
 					continue;
 				}
 
@@ -532,10 +504,8 @@ public static partial class ModelImporter
 				var colors = colorsAccessor?.AsColorArray();
 				var indices = indexAccessor?.AsIndicesArray();
 
-				// glTF - правосторонняя система (+Z на зрителя), движок - левосторонняя: без
-				// зеркалирования Z вся геометрия рендерится отражённой (текст задом наперёд, см.
-				// PrimitiveModeNormalsTest). Вместе с инверсией Z у треугольников меняется winding -
-				// он разворачивается ниже, чтобы фронт-фейсы остались фронт-фейсами.
+				// glTF is right-handed, the engine left-handed: Z is mirrored here and triangle
+				// winding is flipped below to keep front faces facing front.
 				var sourceVertices = new Vertex[positions.Count];
 				for (int i = 0; i < positions.Count; i++)
 				{
@@ -544,11 +514,8 @@ public static partial class ModelImporter
 					var normal = normals != null && i < normals.Count ? normals[i] : Vector3.UnitY;
 					var color = colors != null && i < colors.Count ? colors[i] : Vector4.One;
 
-					// Авторский glTF TANGENT (vec4, w = знак битангента). Направление зеркалируется
-					// по Z вместе с позициями/нормалями, а w ИНВЕРТИРУЕТСЯ: зеркало меняет
-					// ориентацию базиса (det = -1), и cross(N, T) в пространстве движка смотрит
-					// против зеркалированного битангента. Без авторских тангентов w временно 1 -
-					// GenerateTangents ниже перезапишет и направление, и знак.
+					// TANGENT is vec4 with w = bitangent sign; w is INVERTED alongside the Z mirror
+					// because mirroring flips basis handedness (det = -1).
 					var tangent = tangents != null && i < tangents.Count
 						? new Vector4(tangents[i].X, tangents[i].Y, -tangents[i].Z, -tangents[i].W)
 						: new Vector4(1f, 0f, 0f, 1f);
@@ -564,8 +531,7 @@ public static partial class ModelImporter
 					};
 				}
 
-				// Точки/линии в glTF почти всегда неиндексированные (см. PrimitiveModeNormalsTest) -
-				// батч-рендерер рисует только DrawIndexedIndirect, поэтому синтезируем 0..N-1.
+				// The batch renderer only issues DrawIndexedIndirect, so synthesize 0..N-1.
 				uint[] sourceIndices;
 				if (indices != null)
 				{
@@ -580,15 +546,11 @@ public static partial class ModelImporter
 					}
 				}
 
-				// A glTF logical mesh with multiple primitives (e.g. one node using several materials)
-				// becomes multiple sub-meshes here, one per primitive - without a per-primitive suffix
-				// they'd all inherit the same logicalMesh.Name and be indistinguishable in the sub-mesh
-				// list (same label for every entry, even though each is a distinct piece of geometry).
+				// One sub-mesh per primitive; the suffix keeps them distinguishable by name.
 				var meshName = logicalMesh.Primitives.Count > 1 ? $"{baseMeshName}.{primitiveIndex}" : baseMeshName;
 
-				// Тяжёлая чистая CPU-обработка (winding/нормали/тангенты/meshopt/LOD) вынесена в
-				// параллельную фазу ниже - здесь только чтение SharpGLTF (не потокобезопасно) и
-				// сбор сырья по примитивам. meshId примитива = индекс work-item-а.
+				// This loop only reads SharpGLTF (not thread-safe); the heavy work runs in parallel
+				// below. A primitive's meshId is its work-item index.
 				primitiveToMeshIdMap[primitive] = meshWork.Count;
 				meshWork.Add(new MeshWorkItem
 				{
@@ -599,7 +561,7 @@ public static partial class ModelImporter
 					HasUv = uvsAccessor != null,
 					HasNormals = normalsAccessor != null,
 					HasTangents = tangents != null,
-					// Читается ЗДЕСЬ, а не в параллельной фазе ниже: SharpGLTF не потокобезопасен.
+					// Read HERE, not in the parallel phase: SharpGLTF is not thread-safe.
 					SourceSkin = primitiveToSkin.TryGetValue(primitive, out var primitiveSkin)
 						? SkinningImport.ReadSkinVertices(primitive, primitiveSkin, nodeToJoint, sourceVertices.Length)
 						: null,
@@ -607,7 +569,6 @@ public static partial class ModelImporter
 			}
 		}
 
-		// Обработка примитивов независима и не трогает SharpGLTF - параллелится целиком.
 		var preparedMeshes = new PreparedMesh[meshWork.Count];
 		int primitivesDone = 0;
 		Parallel.For(0, meshWork.Count, new ParallelOptions { CancellationToken = cancellationToken }, workIndex =>
@@ -624,16 +585,12 @@ public static partial class ModelImporter
 					(sourceIndices[t + 1], sourceIndices[t + 2]) = (sourceIndices[t + 2], sourceIndices[t + 1]);
 				}
 
-				// Примитив без NORMAL-аксессора: по спеке glTF шейдится FLAT (per-face). Вершины
-				// развариваются по треугольникам, каждая получает нормаль своей грани - ровно
-				// гранёный "диско-шар" эталонного вьювера. Усреднение по вершинам (прошлая
-				// версия) давало гладкую сферу, но швы дублированных вершин расходились
-				// полосами в отражениях.
+				// No NORMAL accessor means FLAT (per-face) shading per the glTF spec, so vertices
+				// are unwelded per triangle.
 				if (!work.HasNormals)
 				{
 					var flatVertices = new Vertex[sourceIndices.Length];
-					// Скин разваривается ВМЕСТЕ с геометрией: индексы вершин переписываются на
-					// 0..N-1, и стрим, оставшийся в старой индексации, раздал бы вершинам чужие кости.
+					// The skin must be unwelded WITH the geometry: indices are rewritten to 0..N-1.
 					var flatSkin = sourceSkin != null ? new SkinVertex[sourceIndices.Length] : null;
 
 					for (int t = 0; t + 2 < sourceIndices.Length; t += 3)
@@ -679,12 +636,8 @@ public static partial class ModelImporter
 
 			if (work.Topology == ModelLoader.MeshTopologyTriangles)
 			{
-				// Must run before Optimize/GenerateLods reorder/remap vertices - it needs the
-				// pristine per-triangle winding to compute per-triangle tangents, but the resulting
-				// per-vertex Tangent then rides along automatically through any later remap (it's
-				// just another Vertex field, opaque to Meshopt's vertex-remap/simplify passes).
-				// Только фоллбек: авторский glTF TANGENT (уже в вершинах, со знаком w) точнее
-				// генерации - он согласован с запечкой нормал-мапы (MikkTSpace и пр.).
+				// Must run before Optimize/GenerateLods remap vertices: it needs pristine
+				// per-triangle winding. Fallback only - authored tangents match the normal-map bake.
 				if (!work.HasTangents)
 				{
 					MeshUtility.GenerateTangents(sourceVertices, sourceIndices);
@@ -705,9 +658,8 @@ public static partial class ModelImporter
 				}
 				else
 				{
-					// Скиннед-меш проходит те же проходы, но СШИТОЙ вершиной: meshopt переставляет,
-					// склеивает и выбрасывает вершины, не отдавая наружу полную таблицу перестановки,
-					// и параллельный скин-стрим после этого разъезжается с геометрией (см. IMeshVertex).
+					// Skinned meshes go through the same passes with skin data PACKED into the
+					// vertex: meshopt reorders and welds without exposing a full remap table.
 					var packed = MeshUtility.PackSkinned(finalVertices, finalSkin);
 
 					if (options.OptimizeMesh)
@@ -743,8 +695,7 @@ public static partial class ModelImporter
 
 		prepared.Meshes.AddRange(preparedMeshes);
 
-		// Кэш запечённых мешей для нераскладываемых матриц (см. ниже): один меш под несколькими
-		// узлами с ОДИНАКОВОЙ мировой матрицей пекётся однажды.
+		// One mesh under several nodes with the SAME world matrix is baked only once.
 		var bakedMeshCache = new Dictionary<(int MeshId, Matrix4x4 World), int>();
 
 		foreach (var node in model.LogicalNodes)
@@ -754,14 +705,12 @@ public static partial class ModelImporter
 				continue;
 			}
 
-			// Decompose ПРОВЕРЯЕТСЯ: мировая матрица глубокой иерархии (родительский поворот поверх
-			// неравномерного масштаба - Intel Sponza) содержит shear, в TRS не представимый.
-			// Decompose тогда возвращает false и МУСОР в out-параметрах - геометрия таких узлов
-			// съезжала и перекашивалась. Фоллбек - запечь матрицу прямо в вершины (см. BakeMeshWithMatrix).
+			// A deep hierarchy can produce shear, which TRS cannot express; Decompose then returns
+			// false and GARBAGE in its out params, so fall back to baking the matrix into vertices.
 			bool trsValid = Matrix4x4.Decompose(node.WorldMatrix, out var scale, out var rotation, out var translation);
 
-			// Та же RH->LH конвертация, что и для вершин выше: зеркалим Z трансляции, а поворот
-			// сопрягаем отражением M*R*M (M = diag(1,1,-1)), что для кватерниона даёт (-x,-y,z,w).
+			// Same RH->LH conversion as the vertices: conjugating by diag(1,1,-1) turns the
+			// quaternion into (-x,-y,z,w).
 			translation.Z = -translation.Z;
 			rotation = new Quaternion(-rotation.X, -rotation.Y, rotation.Z, rotation.W);
 
@@ -769,12 +718,8 @@ public static partial class ModelImporter
 			{
 				if (primitiveToMeshIdMap.TryGetValue(primitive, out int meshId))
 				{
-					// Скиннед-примитив: по спеке glTF трансформация узла с мешом ИГНОРИРУЕТСЯ - меш
-					// живёт в пространстве скина, и всё положение задают джойнты. Запечь сюда
-					// WorldMatrix значило бы применить трансформацию узла дважды (второй раз - через
-					// матрицы джойнтов), и персонаж уезжал бы вдвое дальше от начала координат.
-					// Инстанс остаётся единичным: мировое размещение задаёт трансформ ENTITY, а поза -
-					// палитра скиннинг-матриц.
+					// Per glTF spec the node transform of a skinned mesh is IGNORED - the joints
+					// carry it, so baking WorldMatrix here would apply it twice.
 					if (prepared.Meshes[meshId].SkinVertices != null)
 					{
 						prepared.Instances.Add(new InstanceData
@@ -808,8 +753,7 @@ public static partial class ModelImporter
 					var material = primitive.Material;
 					int materialId = material?.LogicalIndex ?? -1;
 
-					// Не-треугольная топология: инстанс ссылается на материал-клон с подходящим PSO
-					// (создаётся в BuildFromPrepared по этому реестру).
+					// Non-triangle topology points at a material clone carrying a matching PSO.
 					int topology = prepared.Meshes[meshId].Topology;
 					if (topology != ModelLoader.MeshTopologyTriangles)
 					{
@@ -834,8 +778,8 @@ public static partial class ModelImporter
 	}
 
 
-	/// <summary>Подготовка МИМО кеша - вход для фоновой печки (см. <see cref="AssetBakeQueue"/>).
-	/// Рекурсии не даёт сам вызывающий: он снимает CacheDirectory в переданных опциях.</summary>
+	// Cache-bypassing entry point for the background baker; the caller clears CacheDirectory so
+	// this cannot recurse.
 	internal static PreparedModel PrepareForBake(string modelPath, ModelLoadOptions options,
 		CancellationToken cancellationToken) => PrepareModel(modelPath, options, null, cancellationToken);
 }

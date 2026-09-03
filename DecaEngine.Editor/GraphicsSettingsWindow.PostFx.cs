@@ -12,24 +12,20 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Пост-эффекты кадра: цветокоррекция, блум, туман, объёмный свет, автоэкспозиция. Часть <see cref="GraphicsSettingsWindow"/> - файл на тему,
-/// поля и применение изменений живут в основном файле.</summary>
+/// <summary>Post-effect sections of the Graphics window: grade, bloom, fog, volumetrics, exposure.</summary>
 public partial class GraphicsSettingsWindow
 {
-	/// <summary>Цветокоррекция и виньетка (см. ColorGradePass). Единственное место, где художник
-	/// вообще может править палитру кадра: до этого пасса в движке не было ни насыщенности, ни
-	/// баланса белого, ни тонировки - только то, что зашито в текстуры.</summary>
 	private void DrawColorGradeSection()
 	{
 		ImGui.Spacing();
 
 		var grade = _settings.PreviewColorGrade;
-		if (ImGui.Checkbox("Цветокоррекция", ref grade))
+		if (ImGui.Checkbox("Color grading", ref grade))
 		{
 			_settings.PreviewColorGrade = grade;
 			_changed = true;
 		}
-		Tooltip("Финальный пасс по готовому кадру: насыщенность, контраст, баланс белого,\nтонировка теней и светов, виньетка.\nС дефолтными значениями кадр НЕ меняется - коррекцию набираешь сам.\nРаботает и в HDR, и в LDR.");
+		Tooltip("Final pass over the finished frame: saturation, contrast, white balance,\nshadow and highlight tinting, vignette.\nAt default values the frame is UNCHANGED - the grade is yours to dial in.\nWorks in both HDR and LDR.");
 
 		if (!grade)
 		{
@@ -37,113 +33,112 @@ public partial class GraphicsSettingsWindow
 		}
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Тон (live):");
+		ImGui.TextDisabled("Tone (live):");
 
 		var saturation = _settings.GradeSaturation;
-		if (Slider("Насыщенность", ref saturation, 0f, 2f, "%.2f"))
+		if (Slider("Saturation", ref saturation, 0f, 2f, "%.2f"))
 		{
 			_settings.GradeSaturation = saturation;
 		}
-		Tooltip("1 - как есть, 0 - серый кадр, выше 1 - ярче цвета.\nГлавная ручка против перенасыщенных материалов: единый приглушённый\nконверт с одним-двумя акцентами читается дороже, чем десяток чистых цветов.");
+		Tooltip("1 - as is, 0 - greyscale frame, above 1 - more vivid colours.\nThe main tool against oversaturated materials: one muted envelope with one or two\naccents reads richer than a dozen pure colours.");
 
 		var contrast = _settings.GradeContrast;
-		if (Slider("Контраст", ref contrast, 0f, 2f, "%.2f"))
+		if (Slider("Contrast", ref contrast, 0f, 2f, "%.2f"))
 		{
 			_settings.GradeContrast = contrast;
 		}
-		Tooltip("Разведение тёмного и светлого вокруг среднего тона. 1 - без изменений.");
+		Tooltip("Spreads darks and lights around the mid tone. 1 - no change.");
 
 		var gamma = _settings.GradeGamma;
-		if (Slider("Гамма", ref gamma, 0.2f, 3f, "%.2f"))
+		if (Slider("Gamma", ref gamma, 0.2f, 3f, "%.2f"))
 		{
 			_settings.GradeGamma = gamma;
 		}
-		Tooltip("Средние тона: больше - светлее середина при тех же чёрном и белом.");
+		Tooltip("Mid tones: higher lifts the midpoint while keeping black and white in place.");
 
 		var temperature = _settings.GradeTemperature;
-		if (Slider("Температура", ref temperature, -1f, 1f, "%.2f"))
+		if (Slider("Temperature", ref temperature, -1f, 1f, "%.2f"))
 		{
 			_settings.GradeTemperature = temperature;
 		}
-		Tooltip("Минус - холоднее (в синеву), плюс - теплее (в янтарь).\nНормирована по яркости: экспозицию не трогает, компенсировать не придётся.");
+		Tooltip("Negative - cooler (toward blue), positive - warmer (toward amber).\nLuminance-normalised: exposure is untouched, no compensation needed.");
 
 		var tint = _settings.GradeTint;
-		if (Slider("Оттенок", ref tint, -1f, 1f, "%.2f"))
+		if (Slider("Tint", ref tint, -1f, 1f, "%.2f"))
 		{
 			_settings.GradeTint = tint;
 		}
-		Tooltip("Минус - в зелёный, плюс - в пурпурный. Вторая ось баланса белого.");
+		Tooltip("Negative - toward green, positive - toward magenta. The second white balance axis.");
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Тонировка (live):");
+		ImGui.TextDisabled("Tinting (live):");
 
 		var shadows = new Vector3(_settings.GradeShadowR, _settings.GradeShadowG, _settings.GradeShadowB);
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.ColorEdit3("Тени", ref shadows))
+		if (ImGui.ColorEdit3("Shadows", ref shadows))
 		{
 			_settings.GradeShadowR = shadows.X;
 			_settings.GradeShadowG = shadows.Y;
 			_settings.GradeShadowB = shadows.Z;
 			_changed = true;
 		}
-		Tooltip("АДДИТИВНАЯ тонировка: поднимает именно чёрное, светов не касается.\nНейтраль - чёрный. Классический приём: увести тени в холодное.");
+		Tooltip("ADDITIVE tint: lifts the blacks only, leaves highlights alone.\nNeutral is black. Classic move: push shadows toward cool.");
 
 		var highlights = new Vector3(_settings.GradeHighlightR, _settings.GradeHighlightG, _settings.GradeHighlightB);
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.ColorEdit3("Света", ref highlights))
+		if (ImGui.ColorEdit3("Highlights", ref highlights))
 		{
 			_settings.GradeHighlightR = highlights.X;
 			_settings.GradeHighlightG = highlights.Y;
 			_settings.GradeHighlightB = highlights.Z;
 			_changed = true;
 		}
-		Tooltip("МУЛЬТИПЛИКАТИВНАЯ тонировка: красит светлое, чёрное остаётся чёрным.\nНейтраль - белый. В паре с холодными тенями даёт тёплый ключ.");
+		Tooltip("MULTIPLICATIVE tint: colours the lights, black stays black.\nNeutral is white. Paired with cool shadows it gives a warm key.");
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Виньетка (live):");
+		ImGui.TextDisabled("Vignette (live):");
 
 		var vignette = _settings.VignetteIntensity;
-		if (Slider("Сила", ref vignette, 0f, 1f, "%.2f"))
+		if (Slider("Strength", ref vignette, 0f, 1f, "%.2f"))
 		{
 			_settings.VignetteIntensity = vignette;
 		}
-		Tooltip("Притемнение к краям кадра. 0 - выключена.\nЧасть того, почему кадр читается как СКОМПОНОВАННЫЙ, а не как скриншот.");
+		Tooltip("Darkening toward the frame edges. 0 - off.\nPart of why a frame reads as COMPOSED rather than as a screenshot.");
 
 		var vignetteRadius = _settings.VignetteRadius;
-		if (Slider("Радиус", ref vignetteRadius, 0.1f, 1.5f, "%.2f"))
+		if (Slider("Radius", ref vignetteRadius, 0.1f, 1.5f, "%.2f"))
 		{
 			_settings.VignetteRadius = vignetteRadius;
 		}
-		Tooltip("Размер чистой зоны в центре. Больше - виньетка отступает к краям.");
+		Tooltip("Size of the clean area in the centre. Larger pushes the vignette out to the edges.");
 
 		var vignetteSmooth = _settings.VignetteSmoothness;
-		if (Slider("Мягкость", ref vignetteSmooth, 0.01f, 1f, "%.2f"))
+		if (Slider("Smoothness", ref vignetteSmooth, 0.01f, 1f, "%.2f"))
 		{
 			_settings.VignetteSmoothness = vignetteSmooth;
 		}
-		Tooltip("Ширина перехода. Малые значения дают видимое кольцо - обычно нужно мягко.");
+		Tooltip("Width of the transition. Small values show a visible ring - usually you want it soft.");
 
 		var vignetteRound = _settings.VignetteRoundness;
-		if (Slider("Круглость", ref vignetteRound, 0f, 1f, "%.2f"))
+		if (Slider("Roundness", ref vignetteRound, 0f, 1f, "%.2f"))
 		{
 			_settings.VignetteRoundness = vignetteRound;
 		}
-		Tooltip("1 - круг с поправкой на формат кадра, 0 - овал, растянутый по всему кадру.");
+		Tooltip("1 - a circle corrected for the frame's aspect, 0 - an oval stretched across the frame.");
 	}
 
-	/// <summary>Блум - оптическое рассеяние (см. BloomPass). Сама галка уровня окружения (пасс
-	/// владеет своей цепочкой таргетов), всё остальное живое.</summary>
+	// The toggle is environment-level (the pass owns its target chain); the rest is live.
 	private void DrawBloomSection()
 	{
 		ImGui.Spacing();
 
 		var bloom = _settings.PreviewBloom;
-		if (ImGui.Checkbox("Блум", ref bloom))
+		if (ImGui.Checkbox("Bloom", ref bloom))
 		{
 			_settings.PreviewBloom = bloom;
 			_changed = true;
 		}
-		Tooltip("Свечение вокруг ярких мест. Не «делает ярче» - делает источник ЧИТАЕМЫМ КАК СВЕТ:\nдисплей не способен показать лампу ярче белой бумаги, и разницу между ними\nглазу передаёт именно рассеяние в оптике.");
+		Tooltip("Glow around bright areas. It does not \"make things brighter\" - it makes a source READ AS LIGHT:\na display cannot show a lamp brighter than white paper, and it is the scattering in the optics\nthat conveys the difference to the eye.");
 
 		if (!bloom)
 		{
@@ -153,47 +148,46 @@ public partial class GraphicsSettingsWindow
 		ImGui.Spacing();
 
 		var threshold = _settings.BloomThreshold;
-		if (Slider("Порог", ref threshold, 0f, 4f, "%.2f"))
+		if (Slider("Threshold", ref threshold, 0f, 4f, "%.2f"))
 		{
 			_settings.BloomThreshold = threshold;
 		}
-		Tooltip("Яркость, выше которой начинается свечение, в ОТОБРАЖАЕМЫХ единицах.\n1.0 - светятся только настоящие пересветы (то, что дисплей уже не покажет ярче).\nПривязан к авто-экспозиции, поэтому не зависит от абсолютной яркости сцены.\nНиже 1.0 - светиться начинает и то, что пересветом не является.");
+		Tooltip("Brightness above which the glow starts, in DISPLAY units.\n1.0 - only true overexposure glows (what the display cannot show any brighter).\nTied to auto exposure, so it does not depend on the scene's absolute brightness.\nBelow 1.0 things that are not overexposed start to glow too.");
 
 		var knee = _settings.BloomKnee;
-		if (Slider("Мягкость порога", ref knee, 0.0001f, 1f, "%.3f"))
+		if (Slider("Threshold knee", ref knee, 0.0001f, 1f, "%.3f"))
 		{
 			_settings.BloomKnee = knee;
 		}
-		Tooltip("Ширина плавного перехода вокруг порога.\nБез него на градиенте видна ступенька: поверхность светлеет, и ровно на пороге\nу неё вдруг включается ореол.");
+		Tooltip("Width of the soft transition around the threshold.\nWithout it a gradient shows a step: a surface brightens and exactly at the threshold\na halo suddenly switches on.");
 
 		var radius = _settings.BloomRadius;
-		if (Slider("Радиус", ref radius, 0f, 4f, "%.2f"))
+		if (Slider("Radius", ref radius, 0f, 4f, "%.2f"))
 		{
 			_settings.BloomRadius = radius;
 		}
-		Tooltip("Ширина тента при сборке цепочки вверх.\nБольше - мягче и дальше растекается ореол; 0 - только билинейная выборка,\nи между уровнями видны кольца.");
+		Tooltip("Tent filter width while combining the chain upward.\nLarger spreads the halo softer and further; 0 uses plain bilinear sampling\nand rings appear between levels.");
 
 		var intensity = _settings.BloomIntensity;
-		if (Slider("Интенсивность", ref intensity, 0f, 3f, "%.2f"))
+		if (Slider("Intensity", ref intensity, 0f, 3f, "%.2f"))
 		{
 			_settings.BloomIntensity = intensity;
 		}
-		Tooltip("Сколько ореола подмешивать в кадр. Нормирована на число звеньев цепочки,\nпоэтому не скачет при смене разрешения вьюпорта.");
+		Tooltip("How much halo to blend into the frame. Normalised by the number of chain levels,\nso it does not jump when the viewport resolution changes.");
 	}
 
-	/// <summary>Атмосферный туман - воздушная перспектива (см. FogPass). Сама галка - уровня
-	/// окружения (пассу нужны депт и scene-copy), всё остальное живое.</summary>
+	// The toggle is environment-level (the pass needs depth and a scene copy); the rest is live.
 	private void DrawFogSection()
 	{
 		ImGui.Spacing();
 
 		var fog = _settings.PreviewFog;
-		if (ImGui.Checkbox("Атмосферный туман", ref fog))
+		if (ImGui.Checkbox("Atmospheric fog", ref fog))
 		{
 			_settings.PreviewFog = fog;
 			_changed = true;
 		}
-		Tooltip("Воздушная перспектива: дальние планы теряют контраст и уходят в дымку.\nГлавный источник ощущения ГЛУБИНЫ в кадре - никакая GI его не заменяет.");
+		Tooltip("Aerial perspective: distant planes lose contrast and fade into haze.\nThe main source of the sense of DEPTH in a frame - no amount of GI replaces it.");
 
 		if (!fog)
 		{
@@ -202,323 +196,313 @@ public partial class GraphicsSettingsWindow
 
 		ImGui.Spacing();
 
-		// Логарифмический: рабочая зона плотности - тысячные доли, и на линейной шкале она
-		// занимала бы пару пикселей у левого края (та же причина, что у Ambient boost).
+		// Logarithmic: the useful density range is thousandths, invisible on a linear slider.
 		var density = _settings.FogDensity;
-		if (Slider("Плотность", ref density, 0.0002f, 0.5f, "%.4f",
+		if (Slider("Density", ref density, 0.0002f, 0.5f, "%.4f",
 			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.FogDensity = density;
 		}
-		Tooltip("Главная ручка. Плотность на опорной высоте, 1/единица мира.\nМасштабно-зависима: сцене в десятки единиц нужны сотые, отдельной модели - десятые.");
+		Tooltip("The main knob. Density at the reference height, per world unit.\nScale dependent: a scene tens of units across needs hundredths, a single model tenths.");
 
 		var heightFalloff = _settings.FogHeightFalloff;
-		if (Slider("Спад по высоте", ref heightFalloff, 0f, 1f, "%.3f"))
+		if (Slider("Height falloff", ref heightFalloff, 0f, 1f, "%.3f"))
 		{
 			_settings.FogHeightFalloff = heightFalloff;
 		}
-		Tooltip("Как быстро дымка редеет вверх.\n0 - однородный туман без высотного профиля;\nбольше - низкая стелющаяся пелена, из которой торчат верхушки геометрии.");
+		Tooltip("How fast the haze thins out with height.\n0 - uniform fog with no height profile;\nhigher - a low ground layer with the tops of geometry sticking out.");
 
 		var heightRef = _settings.FogHeightRef;
-		if (Slider("Опорная высота", ref heightRef, -50f, 50f, "%.1f"))
+		if (Slider("Reference height", ref heightRef, -50f, 50f, "%.1f"))
 		{
 			_settings.FogHeightRef = heightRef;
 		}
-		Tooltip("Высота (Y мира), на которой плотность равна заданной выше.\nОбычно - уровень пола сцены.");
+		Tooltip("Height (world Y) at which the density equals the value set above.\nUsually the scene's floor level.");
 
 		var start = _settings.FogStartDistance;
-		if (Slider("Ближняя отсечка", ref start, 0f, 50f, "%.1f"))
+		if (Slider("Start distance", ref start, 0f, 50f, "%.1f"))
 		{
 			_settings.FogStartDistance = start;
 		}
-		Tooltip("Дистанция, до которой тумана нет вовсе.\nБез неё дымка садится на самые ближние предметы и мылит их.");
+		Tooltip("Distance up to which there is no fog at all.\nWithout it the haze settles onto the nearest objects and blurs them.");
 
 		var maxDistance = _settings.FogMaxDistance;
-		if (Slider("Предельная дальность", ref maxDistance, 10f, 5000f, "%.0f",
+		if (Slider("Max distance", ref maxDistance, 10f, 5000f, "%.0f",
 			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.FogMaxDistance = maxDistance;
 		}
-		Tooltip("Потолок дальности. Её же получает НЕБО - у фона глубины нет,\nи без этого горизонт остался бы единственным местом без дымки.");
+		Tooltip("Distance cap. The SKY gets the same value - the background has no depth,\nand without this the horizon would be the only place with no haze.");
 
 		var maxOpacity = _settings.FogMaxOpacity;
-		if (Slider("Потолок плотности", ref maxOpacity, 0f, 1f, "%.2f"))
+		if (Slider("Max opacity", ref maxOpacity, 0f, 1f, "%.2f"))
 		{
 			_settings.FogMaxOpacity = maxOpacity;
 		}
-		Tooltip("Сколько дымка вправе закрыть дальний план.\n1 - полностью, меньше - сквозь туман всегда что-то видно.");
+		Tooltip("How far the haze may hide the distance.\n1 - completely, less - something is always visible through the fog.");
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Цвет:");
+		ImGui.TextDisabled("Color:");
 
 		var color = new Vector3(_settings.FogColorR, _settings.FogColorG, _settings.FogColorB);
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.ColorEdit3("Цвет среды", ref color))
+		if (ImGui.ColorEdit3("Medium color", ref color))
 		{
 			_settings.FogColorR = color.X;
 			_settings.FogColorG = color.Y;
 			_settings.FogColorB = color.Z;
 			_changed = true;
 		}
-		Tooltip("Тень дымки - то, во что уходит дальний план ВНЕ стороны солнца.\nСизый/голубоватый читается как даль, тёплый - как пыль или смог.");
+		Tooltip("The shadow side of the haze - what the distance fades into AWAY from the sun.\nSlate blue reads as distance, warm reads as dust or smog.");
 
 		var sunColor = new Vector3(_settings.FogSunColorR, _settings.FogSunColorG, _settings.FogSunColorB);
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.ColorEdit3("Цвет подсветки", ref sunColor))
+		if (ImGui.ColorEdit3("Inscatter color", ref sunColor))
 		{
 			_settings.FogSunColorR = sunColor.X;
 			_settings.FogSunColorG = sunColor.Y;
 			_settings.FogSunColorB = sunColor.Z;
 			_changed = true;
 		}
-		Tooltip("Цвет дымки в сторону солнца. Обычно теплее и ярче цвета среды.");
+		Tooltip("Haze colour toward the sun. Usually warmer and brighter than the medium colour.");
 
 		var sunStrength = _settings.FogSunStrength;
-		if (Slider("Сила подсветки", ref sunStrength, 0f, 1f, "%.2f"))
+		if (Slider("Inscatter strength", ref sunStrength, 0f, 1f, "%.2f"))
 		{
 			_settings.FogSunStrength = sunStrength;
 		}
-		Tooltip("Ради этого туман и ставят: дымка перестаёт быть серой пеленой\nи начинает светиться со стороны источника. 0 - одноцветный туман.");
+		Tooltip("This is why fog is used at all: the haze stops being a grey veil\nand starts to glow on the light's side. 0 - single-colour fog.");
 
 		var sunSharpness = _settings.FogSunSharpness;
-		if (Slider("Резкость пятна", ref sunSharpness, 1f, 64f, "%.1f",
+		if (Slider("Inscatter sharpness", ref sunSharpness, 1f, 64f, "%.1f",
 			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.FogSunSharpness = sunSharpness;
 		}
-		Tooltip("Малые значения - широкое мягкое свечение на полнеба,\nбольшие - компактный ореол вокруг диска.");
+		Tooltip("Low values give a wide soft glow across half the sky,\nhigh values a compact halo around the disk.");
 	}
 
-	/// <summary>Объёмный свет - god rays и объёмный туман (см. VolumetricLightPass). Сама галка -
-	/// уровня окружения (пассу нужны депт, scene-copy и shadow map), всё остальное живое.</summary>
+	// Toggle is environment-level (needs depth, scene copy and shadow map); the rest is live.
 	private void DrawVolumetricSection()
 	{
 		ImGui.Spacing();
 
 		var volumetric = _settings.PreviewVolumetric;
-		if (ImGui.Checkbox("Объёмный свет", ref volumetric))
+		if (ImGui.Checkbox("Volumetric light", ref volumetric))
 		{
 			_settings.PreviewVolumetric = volumetric;
 			_changed = true;
 		}
-		Tooltip("Световые столбы (god rays) и светящийся объёмный туман.\n" +
-			"Рейкмарш вдоль луча с выборкой каскадных теней в каждой точке -\n" +
-			"поэтому столбы точно повторяют геометрию, отбрасывающую тень.\n" +
-			"Не заменяет атмосферный туман и не конфликтует с ним: тот отвечает\n" +
-			"за дальнюю дымку, этот - за рассеянный свет.");
+		Tooltip("Light shafts (god rays) and glowing volumetric fog.\n" +
+			"A ray march that samples the cascaded shadow map at every step -\n" +
+			"so the shafts follow the shadow-casting geometry exactly.\n" +
+			"It neither replaces nor conflicts with atmospheric fog: that one handles\n" +
+			"distant haze, this one scattered light.");
 
 		if (!volumetric)
 		{
 			return;
 		}
 
-		// Тени - не опция этой секции, а условие существования эффекта: без них выборка идёт по
-		// неинициализированному shadow map, и сила тени принудительно занулена на CPU (см.
-		// VolumetricLightPassResources.SetParams). Сказать об этом прямо дешевле, чем оставить
-		// человека крутить ползунок, который ничего не делает.
+		// Without a shadow pass the CPU forces shadow strength to zero, so the sliders do nothing.
 		if (!_viewport.VolumetricShadowsAvailable && _sceneViewport?.VolumetricShadowsAvailable != true)
 		{
-			ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "Теней нет - столбов не будет");
-			Tooltip("Марш берёт тени из каскадного shadow map. Без теневого пасса остаётся\n" +
-				"только ровный объёмный туман - включите тени в секции Sun & Shadows.");
+			ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "No shadows - no light shafts");
+			Tooltip("The march reads shadows from the cascaded shadow map. Without the shadow pass\n" +
+				"only flat volumetric fog remains - enable shadows in the Sun & Shadows section.");
 		}
 
 		ImGui.Spacing();
 
-		// Логарифмический по той же причине, что у плотности тумана: рабочая зона - сотые доли.
+		// Logarithmic: the useful range is hundredths, as with fog density.
 		var density = _settings.VolumetricDensity;
-		if (Slider("Плотность среды", ref density, 0.0005f, 1f, "%.4f",
+		if (Slider("Medium density", ref density, 0.0005f, 1f, "%.4f",
 			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.VolumetricDensity = density;
 		}
-		Tooltip("Главная ручка. Сколько вещества в воздухе, 1/единица мира.\n" +
-			"Больше - плотнее столбы и мутнее кадр.");
+		Tooltip("The main knob. How much matter is in the air, per world unit.\n" +
+			"Higher gives denser shafts and a hazier frame.");
 
 		var sunIntensity = _settings.VolumetricSunIntensity;
-		if (Slider("Сила лучей", ref sunIntensity, 0f, 8f, "%.2f"))
+		if (Slider("Shaft strength", ref sunIntensity, 0f, 8f, "%.2f"))
 		{
 			_settings.VolumetricSunIntensity = sunIntensity;
 		}
-		Tooltip("Яркость СОЛНЕЧНОГО рассеяния - это и есть god rays.\n" +
-			"Именно её режет тень: где тени нет, столб светится.");
+		Tooltip("Brightness of SUN scattering - this is what god rays are.\n" +
+			"It is what shadow cuts away: where there is no shadow, the shaft glows.");
 
 		var anisotropy = _settings.VolumetricAnisotropy;
-		if (Slider("Анизотропия", ref anisotropy, -0.95f, 0.95f, "%.2f"))
+		if (Slider("Anisotropy", ref anisotropy, -0.95f, 0.95f, "%.2f"))
 		{
 			_settings.VolumetricAnisotropy = anisotropy;
 		}
-		Tooltip("Направленность рассеяния (фазовая функция Хеньи-Гринштейна).\n" +
-			"0.6..0.85 - как реальная дымка: столбы вспыхивают при взгляде ПРОТИВ солнца.\n" +
-			"0 - ровное свечение со всех сторон. Отрицательные - рассеяние назад (редко нужно).\n" +
-			"Общую яркость не меняет, только перераспределяет её по направлениям.");
+		Tooltip("Directionality of the scattering (Henyey-Greenstein phase function).\n" +
+			"0.6..0.85 behaves like real haze: shafts flare when looking TOWARD the sun.\n" +
+			"0 - even glow from every direction. Negative - back-scattering (rarely needed).\n" +
+			"It does not change total brightness, only how it is distributed by direction.");
 
 		var shadowStrength = _settings.VolumetricShadowStrength;
-		if (Slider("Сила тени", ref shadowStrength, 0f, 1f, "%.2f"))
+		if (Slider("Shadow strength", ref shadowStrength, 0f, 1f, "%.2f"))
 		{
 			_settings.VolumetricShadowStrength = shadowStrength;
 		}
-		Tooltip("Насколько тень режет лучи. 1 - настоящие столбы с чёткими краями,\n" +
-			"0 - тень игнорируется и остаётся однородный объёмный туман.");
+		Tooltip("How strongly shadow cuts the shafts. 1 - real shafts with crisp edges,\n" +
+			"0 - shadow is ignored and only uniform volumetric fog remains.");
 
 		var punctualScatter = _settings.VolumetricPunctualScatter;
-		if (Slider("Свет ламп в среде", ref punctualScatter, 0f, 4f, "%.2f"))
+		if (Slider("Punctual light scatter", ref punctualScatter, 0f, 4f, "%.2f"))
 		{
 			_settings.VolumetricPunctualScatter = punctualScatter;
 		}
-		Tooltip("Рассеяние света point/spot-источников: конус спота и ореол лампы в дымке.\n" +
-			"1 - физическая доля (яркость берётся из самих светов), 0 - среда видит только\n" +
-			"солнце и небо. Тени ламп режут конус той же «Силой тени», что и солнечные.");
+		Tooltip("Scattering from point/spot lights: a spot's cone and a lamp's halo in the haze.\n" +
+			"1 - the physical amount (brightness comes from the lights themselves), 0 - the medium\n" +
+			"sees only sun and sky. Lamp shadows cut the cone using the same Shadow strength.");
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Качество марша:");
+		ImGui.TextDisabled("March quality:");
 
-		// Верх = кламп путей применения и пасса (Clamp(4, 256)): прежние 192 оставляли верхнюю
-		// четверть диапазона недостижимой из окна.
+		// Upper bound must match the pass clamp, Clamp(4, 256).
 		var steps = _settings.VolumetricSteps;
-		if (SliderInt("Шагов", ref steps, 8, 256))
+		if (SliderInt("Steps", ref steps, 8, 256))
 		{
 			_settings.VolumetricSteps = steps;
 		}
-		Tooltip("Главная ручка ЦЕНЫ пасса - шаги считаются на каждый пиксель.\n" +
-			"На яркость НЕ влияет (интеграл берётся аналитически по отрезку),\n" +
-			"только на гладкость границ: мало шагов - зернистые края столбов.\n" +
-			"32-64 обычно достаточно, выше 96 разница почти не видна.");
+		Tooltip("The main COST knob of the pass - the steps run per pixel.\n" +
+			"It does NOT affect brightness (the integral is analytic over each segment),\n" +
+			"only edge smoothness: too few steps give grainy shaft edges.\n" +
+			"32-64 is usually enough, above 96 the difference is barely visible.");
 
 		var maxDistance = _settings.VolumetricMaxDistance;
-		if (Slider("Дальность марша", ref maxDistance, 10f, 2000f, "%.0f",
+		if (Slider("March distance", ref maxDistance, 10f, 2000f, "%.0f",
 			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.VolumetricMaxDistance = maxDistance;
 		}
-		Tooltip("Докуда идёт луч. Шагов фиксированное число, поэтому вдвое большая\n" +
-			"дальность = вдвое более крупный шаг и более рваные столбы.\n" +
-			"Держите в пределах последнего каскада теней: дальше него столбы\n" +
-			"выключаются разом (за каскадами всё считается освещённым).");
+		Tooltip("How far the ray travels. The step count is fixed, so twice the distance\n" +
+			"means twice the step size and more ragged shafts.\n" +
+			"Keep it within the last shadow cascade: beyond it the shafts switch off\n" +
+			"all at once (everything past the cascades counts as lit).");
 
 		var start = _settings.VolumetricStartDistance;
-		if (Slider("Ближняя отсечка", ref start, 0f, 20f, "%.2f"))
+		if (Slider("Start distance", ref start, 0f, 20f, "%.2f"))
 		{
 			_settings.VolumetricStartDistance = start;
 		}
-		Tooltip("С какой дистанции начинать марш.\nУ самой камеры среда даёт только шум и съедает шаги.");
+		Tooltip("Distance at which the march begins.\nRight at the camera the medium only adds noise and eats steps.");
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Оптика среды:");
+		ImGui.TextDisabled("Medium optics:");
 
 		var scattering = _settings.VolumetricScattering;
-		if (Slider("Рассеяние", ref scattering, 0f, 4f, "%.2f"))
+		if (Slider("Scattering", ref scattering, 0f, 4f, "%.2f"))
 		{
 			_settings.VolumetricScattering = scattering;
 		}
-		Tooltip("Во сколько раз плотность превращается в СВЕТ.\nОбщий множитель яркости всего эффекта.");
+		Tooltip("How strongly density turns into LIGHT.\nA global brightness multiplier for the whole effect.");
 
 		var extinction = _settings.VolumetricExtinction;
-		if (Slider("Экстинкция", ref extinction, 0.01f, 4f, "%.2f",
+		if (Slider("Extinction", ref extinction, 0.01f, 4f, "%.2f",
 			ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.VolumetricExtinction = extinction;
 		}
-		Tooltip("Насколько среда ГАСИТ проходящий сквозь неё свет.\n" +
-			"Разведена с рассеянием намеренно: низкая экстинкция при высоком рассеянии\n" +
-			"даёт светящиеся столбы без замутнения кадра - физически такого вещества\n" +
-			"не бывает, но запрос «лучи есть, а даль не в молоке» самый частый.");
+		Tooltip("How strongly the medium ABSORBS light passing through it.\n" +
+			"Deliberately decoupled from scattering: low extinction with high scattering\n" +
+			"gives glowing shafts without hazing up the frame - no real substance behaves\n" +
+			"that way, but \"shafts yes, milky distance no\" is the most common request.");
 
 		var maxOpacity = _settings.VolumetricMaxOpacity;
-		if (Slider("Потолок плотности", ref maxOpacity, 0f, 1f, "%.2f"))
+		if (Slider("Max opacity", ref maxOpacity, 0f, 1f, "%.2f"))
 		{
 			_settings.VolumetricMaxOpacity = maxOpacity;
 		}
-		Tooltip("Сколько среда вправе съесть от исходного кадра.\n1 - до полного молока, меньше - сквозь неё всегда что-то видно.");
+		Tooltip("How much of the original frame the medium may consume.\n1 - all the way to full milk, less - something is always visible through it.");
 
 		var heightFalloff = _settings.VolumetricHeightFalloff;
-		if (Slider("Спад по высоте", ref heightFalloff, 0f, 1f, "%.3f"))
+		if (Slider("Height falloff", ref heightFalloff, 0f, 1f, "%.3f"))
 		{
 			_settings.VolumetricHeightFalloff = heightFalloff;
 		}
-		Tooltip("Как быстро среда редеет вверх.\n0 - однородный объём;\nбольше - низкая стелющаяся пелена, в которой лучи видны только у пола.");
+		Tooltip("How fast the medium thins out with height.\n0 - uniform volume;\nhigher - a low ground layer where shafts are only visible near the floor.");
 
 		var heightRef = _settings.VolumetricHeightRef;
-		if (Slider("Опорная высота", ref heightRef, -50f, 50f, "%.1f"))
+		if (Slider("Reference height", ref heightRef, -50f, 50f, "%.1f"))
 		{
 			_settings.VolumetricHeightRef = heightRef;
 		}
-		Tooltip("Высота (Y мира), на которой плотность равна заданной выше.\nОбычно - уровень пола сцены.");
+		Tooltip("Height (world Y) at which the density equals the value set above.\nUsually the scene's floor level.");
 
 		ImGui.Spacing();
-		ImGui.TextDisabled("Цвет:");
+		ImGui.TextDisabled("Color:");
 
 		var sunColor = new Vector3(_settings.VolumetricSunColorR, _settings.VolumetricSunColorG,
 			_settings.VolumetricSunColorB);
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.ColorEdit3("Цвет лучей", ref sunColor))
+		if (ImGui.ColorEdit3("Shaft color", ref sunColor))
 		{
 			_settings.VolumetricSunColorR = sunColor.X;
 			_settings.VolumetricSunColorG = sunColor.Y;
 			_settings.VolumetricSunColorB = sunColor.Z;
 			_changed = true;
 		}
-		Tooltip("Цвет самих столбов. Обычно берётся от солнца - тёплый на закате.");
+		Tooltip("Colour of the shafts themselves. Usually taken from the sun - warm at sunset.");
 
 		var ambientColor = new Vector3(_settings.VolumetricAmbientColorR,
 			_settings.VolumetricAmbientColorG, _settings.VolumetricAmbientColorB);
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.ColorEdit3("Цвет в тени", ref ambientColor))
+		if (ImGui.ColorEdit3("Shadow color", ref ambientColor))
 		{
 			_settings.VolumetricAmbientColorR = ambientColor.X;
 			_settings.VolumetricAmbientColorG = ambientColor.Y;
 			_settings.VolumetricAmbientColorB = ambientColor.Z;
 			_changed = true;
 		}
-		Tooltip("Цвет среды ТАМ, КУДА СОЛНЦЕ НЕ ДОШЛО - свет неба, тени его не режут.\nОбычно холоднее цвета лучей.");
+		Tooltip("Colour of the medium WHERE THE SUN DOES NOT REACH - sky light, unaffected by shadow.\nUsually cooler than the shaft colour.");
 
 		var ambientIntensity = _settings.VolumetricAmbientIntensity;
-		if (Slider("Сила в тени", ref ambientIntensity, 0f, 3f, "%.2f"))
+		if (Slider("Shadow intensity", ref ambientIntensity, 0f, 3f, "%.2f"))
 		{
 			_settings.VolumetricAmbientIntensity = ambientIntensity;
 		}
-		Tooltip("Без неё среда в тени абсолютно чёрная,\nи столбы читаются как вырезанные ножницами, а не как свет в дымке.");
+		Tooltip("Without it the medium is pitch black in shadow\nand the shafts read as cut out with scissors instead of light in haze.");
 
 		var ambientFloor = _settings.VolumetricAmbientShadowFloor;
-		if (Slider("Небо в тени", ref ambientFloor, 0f, 1f, "%.2f"))
+		if (Slider("Sky in shadow", ref ambientFloor, 0f, 1f, "%.2f"))
 		{
 			_settings.VolumetricAmbientShadowFloor = ambientFloor;
 		}
-		Tooltip("Во сколько раз свечение слабее там, куда солнце не дошло.\n" +
-			"ГЛАВНАЯ ручка против «молока»: на 1 крытый интерьер светится наравне\n" +
-			"с залитым солнцем двором, кадр теряет контраст и насыщенность целиком.\n" +
-			"0.1..0.2 - свечение живёт только у проёмов, интерьер остаётся плотным.");
+		Tooltip("How much dimmer the glow is where the sun does not reach.\n" +
+			"The MAIN knob against milkiness: at 1 a covered interior glows as much as a\n" +
+			"sunlit courtyard and the whole frame loses contrast and saturation.\n" +
+			"0.1..0.2 keeps the glow near openings only and the interior stays dense.");
 	}
 
 	private void DrawExposureSection()
 	{
-		// Кривая - ПЕРЕД галкой авто-экспозиции и вне её ветки: она действует в обоих режимах
-		// (в LDR её применяет сам UnlitInstancedPS, в HDR - TonemapPass), а авто-экспозиция по
-		// умолчанию выключена. Спрячь её внутрь - и главная ручка «почему плоско» осталась бы
-		// недоступной в дефолтной конфигурации.
+		// Outside the auto-exposure branch: the curve applies in both LDR and HDR modes.
 		var curveLabels = new[] { "PBR Neutral", "ACES (filmic)", "AgX (filmic)" };
 		var curve = Math.Clamp(_settings.ToneCurve, 0, curveLabels.Length - 1);
 		if (curve != _settings.ToneCurve)
 		{
-			// Кламп только для показа оставлял окно врущим: комбо на "PBR Neutral", в настройках -
-			// прежний мусорный индекс, и шейдер берёт свою ветку по нему.
+			// Write the clamp back: the shader branches on the stored index, not on the combo.
 			_settings.ToneCurve = curve;
 			_changed = true;
 		}
 
 		ImGui.SetNextItemWidth(180 * _scale);
-		if (ImGui.Combo("Кривая тонмапа", ref curve, curveLabels, curveLabels.Length))
+		if (ImGui.Combo("Tonemap curve", ref curve, curveLabels, curveLabels.Length))
 		{
 			_settings.ToneCurve = curve;
 			_changed = true;
 		}
-		Tooltip("PBR Neutral - эталон glTF: ниже ~0.76 тождественна, то есть НАРОЧНО не добавляет\n" +
-			"ни контраста, ни глубины теней. Правильно для оценки материала и ровно поэтому\n" +
-			"кадр с ней читается плоским.\n\n" +
-			"ACES - классическая киношная кривая: контраст в средних тонах, глубокий носок,\n" +
-			"укатанные света. Уводит оттенок насыщенных ярких цветов (оранжевый в жёлтый).\n\n" +
-			"AgX - тот же фильмический контраст, но БЕЗ сдвига оттенка: пересвет уходит в белый\n" +
-			"через десатурацию, а не через смену тона. Обычно лучший выбор для «покрасивее».");
+		Tooltip("PBR Neutral - the glTF reference: identity below ~0.76, i.e. it DELIBERATELY adds\n" +
+			"neither contrast nor shadow depth. Correct for judging materials, and exactly why\n" +
+			"the frame reads flat with it.\n\n" +
+			"ACES - the classic filmic curve: mid-tone contrast, a deep toe, rolled-off highlights.\n" +
+			"It shifts the hue of saturated bright colours (orange toward yellow).\n\n" +
+			"AgX - the same filmic contrast but WITHOUT the hue shift: overexposure goes to white\n" +
+			"through desaturation rather than a hue change. Usually the best \"make it pretty\" choice.");
 
 		ImGui.Spacing();
 
@@ -528,7 +512,7 @@ public partial class GraphicsSettingsWindow
 			_settings.PreviewEyeAdaptation = eyeAdaptation;
 			_changed = true;
 		}
-		Tooltip("Замер средней яркости готового кадра + временное сглаживание: экспозиция приводит сцену\nк Key value, как глаз привыкает к свету. Переводит превью на HDR-конвейер (линейный кадр,\nтонемап отдельным пассом) - конвейер перестраивается на месте, модель не перезагружается.");
+		Tooltip("Measures the mean brightness of the finished frame and smooths it over time: exposure brings\nthe scene to Key value the way an eye adapts to light. Switches the preview to the HDR pipeline\n(linear frame, tonemap as a separate pass) - the pipeline is rebuilt in place, no model reload.");
 
 		if (!eyeAdaptation)
 		{
@@ -542,42 +526,42 @@ public partial class GraphicsSettingsWindow
 		{
 			_settings.EyeAdaptationKey = key;
 		}
-		Tooltip("Средняя яркость, к которой экспонируется кадр. 0.18 - фотографический средне-серый;\nвыше - светлее вся картинка целиком.");
+		Tooltip("Mean brightness the frame is exposed to. 0.18 is photographic middle grey;\nhigher brightens the whole image.");
 
 		var ev = _settings.EyeAdaptationExposureCompensation;
 		if (Slider("Exposure compensation (EV)", ref ev, -4f, 4f, "%.2f"))
 		{
 			_settings.EyeAdaptationExposureCompensation = ev;
 		}
-		Tooltip("Художественная поправка в стопах поверх авто-экспозиции: +1 EV - вдвое светлее.");
+		Tooltip("Artistic offset in stops on top of auto exposure: +1 EV is twice as bright.");
 
 		var minLum = _settings.EyeAdaptationMinLuminance;
 		if (Slider("Min luminance", ref minLum, 0.001f, 1f, "%.3f", ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.EyeAdaptationMinLuminance = minLum;
 		}
-		Tooltip("Нижняя граница ИЗМЕРЕННОЙ яркости: без неё почти чёрный кадр\n(камера уткнулась в стену) вытягивается в шум.");
+		Tooltip("Lower bound on the MEASURED luminance: without it a nearly black frame\n(the camera pressed against a wall) is stretched into noise.");
 
 		var maxLum = _settings.EyeAdaptationMaxLuminance;
 		if (Slider("Max luminance", ref maxLum, 0.1f, 64f, "%.2f", ImGuiSliderFlags.AlwaysClamp | ImGuiSliderFlags.Logarithmic))
 		{
 			_settings.EyeAdaptationMaxLuminance = maxLum;
 		}
-		Tooltip("Верхняя граница измеренной яркости - от провала сцены в чёрный,\nкогда в кадр попадает солнце.");
+		Tooltip("Upper bound on the measured luminance - keeps the scene from crushing to black\nwhen the sun enters the frame.");
 
 		var speedUp = _settings.EyeAdaptationSpeedUp;
 		if (Slider("Adapt speed (to light)", ref speedUp, 0.1f, 10f, "%.2f"))
 		{
 			_settings.EyeAdaptationSpeedUp = speedUp;
 		}
-		Tooltip("Скорость привыкания к более СВЕТЛОМУ кадру, 1/сек («зажмуриться»).");
+		Tooltip("Adaptation speed toward a BRIGHTER frame, per second (\"squinting\").");
 
 		var speedDown = _settings.EyeAdaptationSpeedDown;
 		if (Slider("Adapt speed (to dark)", ref speedDown, 0.1f, 10f, "%.2f"))
 		{
 			_settings.EyeAdaptationSpeedDown = speedDown;
 		}
-		Tooltip("Скорость привыкания к более ТЁМНОМУ кадру, 1/сек.\nПривычно медленнее подъёма - так же ведёт себя глаз.");
+		Tooltip("Adaptation speed toward a DARKER frame, per second.\nUsually slower than the way up - that is how the eye behaves.");
 	}
 
 }

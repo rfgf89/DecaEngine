@@ -1,8 +1,8 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <!--
-        Библиотека, а не exe. Точка входа живёт в DecaEngine.Editor.App - только так на редактор
-        может сослаться проект пробников, которому нужны его вьюпорты.
+        A library, not an exe. The entry point lives in DecaEngine.Editor.App - that is the only way
+        the probes project, which needs the editor viewports, can reference the editor.
     -->
     <PropertyGroup>
         <OutputType>Library</OutputType>
@@ -24,14 +24,15 @@
 
     <ItemGroup>
       <PackageReference Include="Hexa.NET.ImGui.Widgets" Version="1.2.18" />
-      <!-- Явный пин против ABI-рассинхрона: Widgets тянет ImGuizmo 2.2.8.4, а ImGui у нас прямой
-           ссылкой 2.2.10-prerelease. Нативный cimguizmo 2.2.8.4 читает структуру контекста cimgui
-           2.2.10 - это и было «редкое 0xC0000005 в BeginFrameNative»: не гонка, а раскладка памяти,
-           совпадающая через раз. Версия ОБЯЗАНА совпадать с Hexa.NET.ImGui (см. ImGui.Core). -->
+      <!-- Explicit pin against an ABI mismatch: Widgets pulls in ImGuizmo 2.2.8.4, while our ImGui
+           is a direct reference to 2.2.10-prerelease. Native cimguizmo 2.2.8.4 then reads a cimgui
+           2.2.10 context struct - that was the "intermittent 0xC0000005 in BeginFrameNative": not a
+           race, but a memory layout that lined up only half the time. The version MUST match
+           Hexa.NET.ImGui (see ImGui.Core). -->
       <PackageReference Include="Hexa.NET.ImGuizmo" Version="2.2.10-prerelease" />
       <PackageReference Include="Microsoft.Build.Runtime" Version="18.6.3" ExcludeAssets="runtime;contentFiles" />
-      <!-- Транзитивный пин: MSBuild-пакеты тянут 10.0.3 с известной уязвимостью (NU1903,
-           GHSA-23rf-6693-g89p). Прямая ссылка поднимает до исправленной версии. -->
+      <!-- Transitive pin: the MSBuild packages pull in 10.0.3, which has a known vulnerability
+           (NU1903, GHSA-23rf-6693-g89p). A direct reference bumps it to the fixed version. -->
       <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.11" />
     </ItemGroup>
 	

@@ -4,13 +4,8 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Owns the GPU resources for the final HDR -&gt; display conversion: exposure from
-/// <see cref="EyeAdaptationPassResources"/>, the PBR Neutral curve and the manual sRGB encode
-/// (см. TonemapPS.hlsl), из линейного <see cref="PipelineRenderTargets.HdrColorTarget"/> в
-/// отображаемый <see cref="PipelineRenderTargets.ColorTarget"/>. Создаётся один раз
-/// <see cref="GraphicsPipelineSimple"/> вместе с HDR-конвейером - тот же паттерн владения, что у
-/// <see cref="SsaoPassResources"/>. В LDR-режиме пасса нет вовсе, и те же две операции делает сам
-/// UnlitInstancedPS.hlsl.</summary>
+/// <summary>GPU resources for the final HDR -&gt; display conversion: exposure, tonemap curve and
+/// the manual sRGB encode. In LDR mode this pass is absent and UnlitInstancedPS.hlsl does both.</summary>
 public sealed class TonemapPassResources : IReleaseObject
 {
 	internal IMaterialObject Material { get; }
@@ -21,8 +16,7 @@ public sealed class TonemapPassResources : IReleaseObject
 		var vs = graphicsApi.CreateShader("Tonemap Fullscreen VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Tonemap PS", "EditorAssets/shader", "TonemapPS.hlsl", ShaderObjectType.Pixel);
 
-		// Таргет тонемапа - ОТОБРАЖАЕМЫЙ RGBA8 (его сэмплируют ImGui и readback превью-пробы), без
-		// депта и без MSAA: кадр к этому моменту уже отрезолвлен (см. ForwardPass).
+		// Displayable RGBA8, no depth and no MSAA: the frame is already resolved by this point.
 		var state = graphicsApi.CreateGraphicsState(new GraphicsStateInfo
 		{
 			Name = "Tonemap PSO",
@@ -34,10 +28,7 @@ public sealed class TonemapPassResources : IReleaseObject
 			InputLayout = [],
 		});
 
-		// Тонемап - точка апскейла конвейера: при масштабе рендера меньше 1 HDR-кадр меньше
-		// отображаемого таргета, и билинейный сэмпл по UV поднимает его до display-разрешения
-		// (см. GraphicsPipelineSimple.SetRenderScale). При 1:1 UV попадает ровно в центры текселей,
-		// и фильтр вырождается в точное чтение - отдельная ветка не нужна.
+		// Tonemap is the pipeline's upscale point: bilinear lifts a sub-scale HDR frame to display.
 		var sampler = graphicsApi.CreateSampler(
 			name: "Tonemap Scene Sampler",
 			filter: TextureFilter.Linear,
@@ -53,28 +44,23 @@ public sealed class TonemapPassResources : IReleaseObject
 		Material.SetImmutableSampler("_SceneTex", sampler);
 		Material.SetTexture("_AdaptTex", adaptationTarget);
 
-		// Иначе cbuffer остался бы с мусором до первого пуша - пасс рисует с первого кадра
-		// (см. SsaoPassResources).
+		// The pass draws from frame one, so the cbuffer must not stay uninitialized.
 		SetParams(0.18f, 0f);
 	}
 
-	/// <summary>Layout кбуфера "TonemapConstants" в TonemapPS.hlsl - ровно 16 байт.</summary>
+	// Must match the "TonemapConstants" cbuffer layout in TonemapPS.hlsl.
 	private struct TonemapConstantsData
 	{
 		public float Key;
 		public float ExposureCompensation;
 
-		/// <summary>&gt;0.5 - копировать кадр как есть (см. <see cref="SetPassthrough"/>).</summary>
+		// Flags below are floats: >0.5 means on.
 		public float Passthrough;
 
-		/// <summary>Режим кривой (см. Tonemap.hlsl): 0 - PBR Neutral, 1 - ACES, 2 - AgX.</summary>
+		// Curve id, see Tonemap.hlsl: 0 PBR Neutral, 1 ACES, 2 AgX.
 		public float Curve;
 
-		/// <summary>&gt;0.5 - экспозиция по замеренной яркости, иначе ручная (см.
-		/// <see cref="SetAutoExposure"/>).</summary>
 		public float AutoExposure;
-
-		/// <summary>&gt;0.5 - альфа кадра форсируется в 1 (см. <see cref="SetForceOpaque"/>).</summary>
 		public float ForceOpaque;
 
 		public float Pad2;
@@ -88,28 +74,23 @@ public sealed class TonemapPassResources : IReleaseObject
 	private bool _autoExposure = true;
 	private bool _forceOpaque;
 
-	/// <summary>Форсировать альфу кадра в 1: нативный апскейлер (FSR) альфу не переносит - его
-	/// выход приходит с alpha 0, и композит превью по альфе выкидывал бы весь кадр. Живая ручка,
-	/// ставится конвейером вместе с выбором входа тонемапа (см. GraphicsPipelineSimple.RebuildGraph).
-	/// Цена: в FSR-режиме превью теряет прозрачный фон - подложка ImGui закрыта кадром целиком.</summary>
+	/// <summary>Forces frame alpha to 1; required after FSR, whose output carries alpha 0.</summary>
 	public void SetForceOpaque(bool forceOpaque)
 	{
 		_forceOpaque = forceOpaque;
 		PushConstants();
 	}
 
-	/// <summary>Экспонировать кадр по ЗАМЕРЕННОЙ яркости (<see cref="EyeAdaptationPassResources"/>) или
-	/// по одной лишь экспокоррекции. Живая ручка - именно ею и работает тумблер авто-экспозиции, см.
-	/// <see cref="PipelineFeatures.EyeAdaptation"/>: цепочка замера остаётся в графе в любом случае,
-	/// меняется только то, смотрит ли на неё тонемап.</summary>
+	/// <summary>Switches between measured-luminance and manual exposure; the measuring chain stays
+	/// in the graph either way.</summary>
 	public void SetAutoExposure(bool autoExposure)
 	{
 		_autoExposure = autoExposure;
 		PushConstants();
 	}
 
-	/// <summary>Те же key value и экспокоррекция, что уходят в <see cref="EyeAdaptationPassResources.SetParams"/>:
-	/// адаптация меряет яркость, а приводит к ней кадр уже тонемап.</summary>
+	/// <summary>Key value and exposure compensation; must match
+	/// <see cref="EyeAdaptationPassResources.SetParams"/>.</summary>
 	public void SetParams(float key, float exposureCompensation)
 	{
 		_key = key;
@@ -117,18 +98,15 @@ public sealed class TonemapPassResources : IReleaseObject
 		PushConstants();
 	}
 
-	/// <summary>Отладочные режимы превью (каналы нормалей/UV, AO debug view, probe debug) пишут в
-	/// кадр УЖЕ отображаемые значения - экспозиция и кривая исказили бы ровно то, что смотрят как
-	/// есть. Живая ручка (см. ModelPreviewViewport.ApplyGraphicsSettings).</summary>
+	/// <summary>Copies the frame through untouched, for debug views that already write display
+	/// values.</summary>
 	public void SetPassthrough(bool passthrough)
 	{
 		_passthrough = passthrough;
 		PushConstants();
 	}
 
-	/// <summary>Кривая тонмапа (см. Tonemap.hlsl): 0 - PBR Neutral, 1 - ACES, 2 - AgX. Живая ручка -
-	/// выбор рантаймный, вариантов шейдера под кривые нет (пересборка всех PSO превью на каждое
-	/// движение выпадающего списка того не стоит).</summary>
+	/// <summary>Tonemap curve: 0 PBR Neutral, 1 ACES, 2 AgX. Runtime branch, not a shader variant.</summary>
 	public void SetCurve(int curve)
 	{
 		_curve = curve;
@@ -149,9 +127,8 @@ public sealed class TonemapPassResources : IReleaseObject
 		Material.SetConstant("TonemapConstants", ref data, HandleAccess.Pixel);
 	}
 
-	/// <summary>Перепривязывает HDR-кадр ПОСЛЕ его Resize - Resize пересоздаёт нативную текстуру, и
-	/// SRB иначе держал бы уничтоженную (см. ModelPreviewViewport.ResizeTargets). 1x1-таргет
-	/// адаптации не ресайзится.</summary>
+	/// <summary>Call after resizing the HDR target: resize recreates the native texture, so the
+	/// SRB would otherwise hold a destroyed one.</summary>
 	public void RebindTargets(IGpuTexture hdrColorTarget)
 	{
 		Material.SetTexture("_SceneTex", hdrColorTarget);
@@ -163,12 +140,8 @@ public sealed class TonemapPassResources : IReleaseObject
 	}
 }
 
-/// <summary>
-/// Render-graph pass that converts the linear HDR frame into the displayable color target: exposure
-/// from the auto-adaptation value measured by <see cref="EyeAdaptationPass"/>, then the PBR Neutral
-/// curve and the sRGB encode. Последний пасс кадра - после него ColorTarget уже в display-space,
-/// каким его ждут ImGui и readback превью-пробы.
-/// </summary>
+/// <summary>Converts the linear HDR frame into the displayable color target. Must run last:
+/// after it ColorTarget is in display space.</summary>
 public sealed class TonemapPass : RenderGraphPass<TonemapPass.PassData>
 {
 	public override string Name => "Tonemap Pass";
@@ -191,7 +164,6 @@ public sealed class TonemapPass : RenderGraphPass<TonemapPass.PassData>
 		_viewPortRef = viewPortRef;
 	}
 
-	/// <summary>Объявляет графу таргеты пасса - см. <see cref="ForwardPass.Setup"/>.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		builder.ReadTarget(builder.ImportTexture(_hdrColorTarget));

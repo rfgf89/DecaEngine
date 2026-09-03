@@ -1,11 +1,7 @@
 namespace DecaEngine.Core.Assets
 {
-	/// <summary>
-	/// Restricts which asset file extensions an <see cref="AssetRef"/> component field accepts when
-	/// dropped from AssetBrowserWindow. Without this attribute, ComponentFieldEditor accepts any
-	/// dragged asset path. Extensions are matched case-insensitively and may be given with or
-	/// without the leading dot (e.g. "png" or ".png").
-	/// </summary>
+	/// <summary>Restricts which asset extensions an <see cref="AssetRef"/> field accepts on drop;
+	/// matched case-insensitively, leading dot optional.</summary>
 	[AttributeUsage(AttributeTargets.Field)]
 	public sealed class AssetTypeAttribute : Attribute
 	{

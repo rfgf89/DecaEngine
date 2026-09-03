@@ -4,12 +4,7 @@ public abstract class InputDevice : IInputDevice
 {
 	public uint deviceId { get; set; }
 
-	// Несколько подписчиков (например, ImGuiRender и FlyCameraSystem) могут слушать одно и то же
-	// событие (скажем, MouseEvent.RightButton). Раньше здесь был Dictionary<Enum, InputAction>,
-	// и повторный AddListener на тот же ключ молча ЗАМЕНЯЛ предыдущего подписчика - из-за этого,
-	// например, правая кнопка мыши доставалась только одной системе, а остальные (в т.ч. ImGui,
-	// а значит и контекстные меню) её вообще не получали. Список подписчиков на событие устраняет
-	// эту проблему.
+	// A list per event: several systems legitimately listen to the same event.
 	protected readonly Dictionary<Enum, List<InputAction>> _actions = new ();
 
 	public void AddListener(Enum actionEvent, InputAction inputAction)

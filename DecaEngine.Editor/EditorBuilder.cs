@@ -5,30 +5,19 @@ using Microsoft.Build.Evaluation;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Шаблон нового проекта: что положить в его Assets помимо кода.
-///
-/// Enum, а не строка из списка окна: шаблон выбирают в UI, а исполняет его сборщик, и связывать их
-/// текстом означало бы, что переименование пункта в списке молча превращает выбор в «пустой
-/// проект».
-/// </summary>
+/// <summary>What a new project gets in its Assets folder besides code.</summary>
 public enum ProjectTemplate
 {
-	/// <summary>Только код: игровой класс и хост. Ассетов нет.</summary>
+	/// <summary>Code only: game class and host, no assets.</summary>
 	Empty,
 
-	/// <summary>Демо-сцена анимации и физики (см. <see cref="SamplePrefabBuilder"/>): площадка со
-	/// ступенями и пандусом, четыре персонажа под разные слои стека, пара светов.</summary>
+	/// <summary>Animation and physics sample scene.</summary>
 	AnimationSample,
 }
 
 public class EditorBuilder
 {
-	/// <summary>
-	/// Создаёт проект. <paramref name="log"/> - куда писать ход генерации ассетов: из редактора это
-	/// консоль редактора, из командной строки - обычная. Без него сообщения о том, что демо-сцена не
-	/// собралась, уходили бы в пустоту ровно там, где их и надо читать.
-	/// </summary>
+	/// <summary>Creates a project and returns the path to its solution file.</summary>
 	public string Build(string projectName, string outputPath,
 		ProjectTemplate template = ProjectTemplate.Empty, Action<string>? log = null)
 	{
@@ -73,11 +62,8 @@ public class EditorBuilder
 		return slnPath;
 	}
 
-	/// <summary>
-	/// Кладёт ассеты шаблона. Идёт ПОСЛЕДНИМ шагом и в try: проект к этому моменту уже собран и
-	/// открывается, а не собравшаяся демо-сцена - это «проект без сцены», а не «проект не создан».
-	/// Ронять созданный проект из-за содержимого его Assets было бы худшим из возможных обменов.
-	/// </summary>
+	// Runs last and inside try: a failed sample scene means a project without a scene,
+	// not a failed project.
 	private static void WriteTemplateAssets(string gameProjectDir, ProjectTemplate template, Action<string>? log)
 	{
 		if (template == ProjectTemplate.Empty)
@@ -85,8 +71,7 @@ public class EditorBuilder
 			return;
 		}
 
-		// Assets лежит рядом с csproj игрового проекта - именно оттуда редактор берёт ассеты
-		// (см. ProjectSession.AssetsPath).
+		// Assets sits next to the game csproj: that is where the editor looks for them.
 		string assets = Path.Combine(gameProjectDir, "Assets");
 
 		try
@@ -95,23 +80,17 @@ public class EditorBuilder
 		}
 		catch (Exception ex)
 		{
-			log?.Invoke($"[sample] демо-сцена не создана: {ex.Message}");
+			log?.Invoke($"[sample] demo scene not created: {ex.Message}");
 		}
 	}
 
-	/// <summary>
-	/// Прописывает ссылки на проекты движка ПРЯМО В csproj, без запуска dotnet.
-	///
-	/// Раньше это делал <c>dotnet add reference</c> - по запуску на каждую ссылку. Движок это два
-	/// десятка проектов, и создание проекта стоило 39 запусков dotnet и 17 секунд; при ОТКРЫТИИ
-	/// проекта (см. ProjectSession) те же запуски шли впустую и печатали в консоль два десятка
-	/// строк «Project already has a reference to ...».
-	///
-	/// Правка XML своими руками отвечает и за скорость, и за тот мусор в консоли: сравнение «что уже
-	/// есть» теперь наше, и ссылки добавляются ровно те, которых нет.
-	/// </summary>
+	/// <summary>Adds engine project references straight into the csproj XML.</summary>
+	// Editing the XML instead of running `dotnet add reference` per project: two dozen engine
+	// projects cost 39 dotnet launches and 17 seconds.
 	public static void AttachEngineReferences(string csprojPath)
 	{
+		MigrateGeneratedSources(csprojPath);
+
 		var enginePaths = GetEngineProjectPaths(csprojPath);
 		if (enginePaths.Count == 0)
 		{
@@ -120,11 +99,8 @@ public class EditorBuilder
 
 		var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
 
-		// СВОЯ коллекция, а не глобальная. Глобальная кеширует ProjectRootElement по пути и отдаёт
-		// снимок, сделанный при первом открытии, - а csproj между открытиями правят и мы сами, и
-		// dotnet. Именно это и ломало проверку: закешированный (ещё пустой) файл не содержал ни
-		// одной ссылки, все они считались отсутствующими, и на каждое открытие проекта редактор
-		// заново просил dotnet добавить то, что уже добавлено.
+		// Own collection: the global one caches ProjectRootElement per path and would hand back
+		// a stale snapshot of a csproj that both we and dotnet rewrite between opens.
 		using var collection = new ProjectCollection();
 		var project = ProjectRootElement.Open(csprojPath, collection);
 
@@ -159,8 +135,7 @@ public class EditorBuilder
 				continue;
 			}
 
-			// ОТНОСИТЕЛЬНЫЙ путь - как это делает dotnet: проект с абсолютными путями к движку
-			// перестаёт собираться, стоит перенести папку с ним на другую машину.
+			// Relative path, like dotnet writes: absolute paths break on another machine.
 			project.AddItem("ProjectReference", Path.GetRelativePath(projectDir, full));
 			changed = true;
 		}
@@ -168,6 +143,60 @@ public class EditorBuilder
 		if (changed)
 		{
 			project.Save(csprojPath);
+		}
+	}
+
+	/// <summary>Rewrites editor-generated usings to the current engine namespaces.</summary>
+	// Only top-level template files and only known strings; user code is left alone.
+	public static void MigrateGeneratedSources(string csprojPath)
+	{
+		var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
+		if (projectDir == null || !Directory.Exists(projectDir))
+		{
+			return;
+		}
+
+		foreach (var file in Directory.GetFiles(projectDir, "*.cs", SearchOption.TopDirectoryOnly))
+		{
+			string text;
+			try
+			{
+				text = File.ReadAllText(file);
+			}
+			catch (IOException)
+			{
+				continue;
+			}
+
+			var updated = text.Replace("using DecaEngine.Graphics.Core;", "using DecaEngine.Graphics;");
+
+			// Bridge and backend types moved out of DecaEngine.Core; anchor is in both templates.
+			const string anchor = "using DecaEngine.Core;";
+			if (updated.Contains(anchor))
+			{
+				var newline = updated.Contains("\r\n") ? "\r\n" : "\n";
+				var extra = new List<string>();
+				if ((updated.Contains("GameHostBridge") || updated.Contains("IGraphicsApi") || updated.Contains("GameBehaviour")) &&
+					!updated.Contains("using DecaEngine.Graphics;"))
+				{
+					extra.Add("using DecaEngine.Graphics;");
+				}
+				if (updated.Contains("DiligentGraphicsApi") && !updated.Contains("using DecaEngine.Graphics.Diligent;"))
+				{
+					extra.Add("using DecaEngine.Graphics.Diligent;");
+				}
+				if (extra.Count > 0)
+				{
+					int at = updated.IndexOf(anchor, StringComparison.Ordinal) + anchor.Length;
+					updated = updated.Insert(at, newline + string.Join(newline, extra));
+				}
+			}
+
+			if (!string.Equals(updated, text, StringComparison.Ordinal))
+			{
+				File.WriteAllText(file, updated);
+				Console.WriteLine($"[migrate] {file}: usings updated to the engine's current namespaces");
+			}
 		}
 	}
 
@@ -216,7 +245,7 @@ public class EditorBuilder
 		                using System.Numerics;
 		                using DecaEngine;
 		                using DecaEngine.Core;
-		                using DecaEngine.Graphics.Core;
+		                using DecaEngine.Graphics;
 
 		                namespace {{rootNamespace}};
 
@@ -293,6 +322,8 @@ public class EditorBuilder
 		                using System.Numerics;
 		                using DecaEngine;
 		                using DecaEngine.Core;
+		                using DecaEngine.Graphics;
+		                using DecaEngine.Graphics.Diligent;
 		                using DecaEngine.Sdl;
 		                using Friflo.Engine.ECS;
 		                using {{rootNamespace}};
@@ -392,8 +423,7 @@ public class EditorBuilder
 
 	private static void EnableProjectFeatures(string csprojPath)
 	{
-		// Своя коллекция - по той же причине, что в AttachEngineReferences: глобальная отдаёт
-		// закешированный снимок файла, который между вызовами правит dotnet.
+		// Own collection, same reason as AttachEngineReferences: the global one caches stale XML.
 		using var collection = new ProjectCollection();
 		var project = ProjectRootElement.Open(csprojPath, collection)!;
 		var propertyGroup = project.PropertyGroups.FirstOrDefault() ?? project.AddPropertyGroup();

@@ -1,19 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<!--
-		Сцена: ECS-компоненты и системы, из которых складывается кадр, - трансформы и рендер-данные,
-		кулинг, свет и планировщик теневых слайсов, анимационные и геймплейные компоненты, мост к
-		физике.
+		The scene: the ECS components and systems a frame is assembled from - transforms and render
+		data, culling, lights and the shadow slice scheduler, animation and gameplay components, the
+		bridge to physics.
 
-		Жило в DecaEngine.Editor вперемешку с окнами. Разница видна по тому, ЧТО осталось: в
-		редакторе задержались ровно те системы, которые завязаны на редакторские сущности -
-		ModelStore, превью-окружение вьюпорта, настройки теней превью. Всё остальное к редактору
-		отношения не имело: те же самые компоненты и системы крутит headless-проба и будет крутить
-		игра.
+		This used to live in DecaEngine.Editor, mixed in with the windows. What stayed behind tells
+		the story: the editor kept exactly those systems tied to editor-only entities - ModelStore,
+		the viewport preview environment, preview shadow settings. Nothing else had anything to do
+		with the editor: the very same components and systems are driven by the headless probes, and
+		will be driven by the game.
 
-		Бэкенда здесь НЕТ: сцена собирает кадр через IBatchRenderer и структуры кадра из
-		Graphics.Core (DrawData, GPURenderInstance, BatchSubset, ShadowLayout). Какой именно рендерер
-		их исполняет - выбор того, кто сцену создаёт.
+		There is NO backend here: the scene builds a frame through IBatchRenderer and the frame
+		structs from Graphics.Core (DrawData, GPURenderInstance, BatchSubset, ShadowLayout). Which
+		renderer executes them is up to whoever creates the scene.
 	-->
 	<ItemGroup>
 		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />

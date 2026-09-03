@@ -29,22 +29,14 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		public int BaseVertex;
 		public UnsafeArray* LodLevels;
 
-		/// <summary>Сколько вершин меша лежит в мега-буфере начиная с <see cref="BaseVertex"/>.
-		/// Нужен скиннингу: он выделяет инстансу приёмник ровно такого же размера и копирует туда
-		/// bind-позу (см. <see cref="RegisterSkinnedInstance"/>).</summary>
+		// Mesh vertex count in the mega-buffer from BaseVertex; skinning sizes per-instance copies from it.
 		public int VertexCount;
 	}
 
 	public readonly OrderedDictionary<int, MaterialDrawRange> _materialDrawRanges = new();
 	private bool _isDrawRangesCacheDirty = true;
 
-	// Батчи, отсортированные по materialId - раньше пересчитывались LINQ OrderBy в
-	// CheckAndReallocateBuffers И ОТДЕЛЬНО в UpdateDrawRangesCache на каждый вызов, где нужен был
-	// порядок (CheckAndReallocateBuffers дёргается КАЖДЫЙ кадр из ForwardPass/ShadowPass, а его
-	// OrderBy срабатывал всякий раз, когда менялось содержимое инстансов - т.е. почти каждый кадр
-	// во время стриминга - а не только когда менялся сам набор батчей). Общий кэш + грязный флаг,
-	// который трогают только CreateBatch/Remove/ResetRegistrations, убирает и сам пересчёт (кроме
-	// как при реальном изменении набора), и аллокацию List на каждый вызов.
+	// Batches sorted by materialId, cached: recomputing per frame allocated and re-sorted needlessly.
 	private readonly List<KeyValuePair<int, IndirectBatch>> _sortedBatchesCache = new();
 	private bool _isSortedBatchesCacheDirty = true;
 
@@ -56,12 +48,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	private DiligentBufferHandle? _megaVertexBufferGPU;
 	private DiligentBufferHandle? _megaIndexBufferGPU;
 
-	// Ёмкость (в элементах) GPU-буферов и то, сколько CPU-элементов УЖЕ залито в них - суб-аллокация
-	// с запасом по хвосту, как у инстанс-буферов (см. _instanceBufferSectorCapacity): без этого
-	// UpdateGpuMegaBuffers пересоздавал и перезаливал ВЕСЬ мега-буфер целиком на регистрацию КАЖДОГО
-	// меша, даже если добавился один маленький меш к сцене, где уже миллионы вершин - именно это и
-	// вызывало хитчи стриминга. Растим капасити редко (x2, см. UpdateMegaBufferRange), а в обычном
-	// случае заливаем только НОВЫЙ хвост (uploadedCount..currentCount).
+	// GPU capacity vs uploaded count: tail sub-allocation (grow x2 rarely, upload only the new
+	// tail) avoids re-uploading the whole mega-buffer on every mesh registration.
 	private int _megaVertexBufferCapacity;
 	private int _megaIndexBufferCapacity;
 	private int _megaVertexUploadedCount;
@@ -74,13 +62,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private readonly UnsafeList* _perMeshData;
 
-	// Per-BATCH снимок PerMeshData, реально уходящий на GPU в _meshBatchDataBuffer: куллинг-шейдер
-	// (BatchingInstancingCS.hlsl) индексирует MeshBatchData по batchId инстанса, а _perMeshData
-	// индексирован по meshId. Пока модель регистрируется один раз, id совпадают (оба считаются с 0
-	// в одном порядке) и заливка _perMeshData "как есть" случайно работала; но при перезаселении
-	// сцены (превью сабмеша -> обратно целая модель, см. ModelPreviewViewport) меши регистрируются
-	// заново и нумерации расходятся - шейдер читал ЧУЖОЙ physicalCommandOffset/bounds и инкрементил
-	// чужие draw-команды (пустой рендер сабмеша, случайные куски сетки у целой модели).
+	// Per-BATCH snapshot of PerMeshData for the GPU: the culling shader (BatchingInstancingCS.hlsl)
+	// indexes MeshBatchData by batchId, while _perMeshData is indexed by meshId - the two diverge
+	// once a scene is repopulated, so uploading _perMeshData as-is reads wrong offsets/bounds.
 	private UnsafeArray* _perBatchData;
 
 	private UnsafeArray* _indirectDatas;
@@ -96,27 +80,22 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private DiligentBufferHandle? _indirectArgsBuffers;
 
-	// Материалы, помеченные как transmissive/transparent (см. SetMaterialTransparent) - рисуются
-	// отдельной петлёй TransparentOnly после снятия копии колор-таргета (см. ForwardPass).
+	// Materials drawn in the separate TransparentOnly loop after the color-target copy (ForwardPass).
 	private readonly HashSet<int> _transparentMaterials = new();
 
 
 
-	// Формат цветового таргета геометрии - пекётся во все PSO. Unknown =
-	// брать формат свопчейна (главная сцена); превью в HDR-режиме передаёт RGBA16F.
+	// Geometry color-target format baked into all PSOs; Unknown = use the swap-chain format.
 	private readonly TextureObjectFormat _colorFormat = TextureObjectFormat.Unknown;
 
 	private TextureObjectFormat RenderColorFormat =>
 		_colorFormat != TextureObjectFormat.Unknown ? _colorFormat : _api.SwapChainColorFormat;
 
-	// PSO геометрии несут MRT-слоты G-buffer-а отражений - см. параметр конструктора.
 	private readonly bool _reflectionGbuffer;
 
-	/// <summary>Пекутся ли в геометрические PSO MRT-слоты G-buffer-а отражений (см. конструктор).</summary>
+	/// <summary>Whether geometry PSOs carry the reflection G-buffer MRT slots (see constructor).</summary>
 	public bool ReflectionGbuffer => _reflectionGbuffer;
 
-	/// <summary>Список форматов цветовых таргетов геометрических PSO - один цветовой, либо
-	/// цветовой + два слота G-buffer-а отражений (см. PipelineRenderTargets).</summary>
 	private TextureObjectFormat[] GeometryTargetFormats => _reflectionGbuffer
 		? [RenderColorFormat, TextureObjectFormat.R16G16B16A16Float, TextureObjectFormat.R16G16B16A16Float]
 		: [RenderColorFormat];
@@ -126,48 +105,31 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	private readonly DiligentBufferHandle? _cullConstantsBuffer;
 	private readonly IComputeMaterial _cullingMaterial;
 
-	// Кластеризация punctual-светов (LightClusterCS.hlsl): пул светов кадра + counts/indices
-	// фроксел-сетки. Буферы фиксированного размера (LightClusters), создаются один раз в конструкторе;
-	// доступ Compute|Pixel - компьют пишет через UAV, пиксельные шейдеры батч-материалов читают SRV.
+	// Punctual light clustering (LightClusterCS.hlsl): fixed-size froxel buffers; compute writes
+	// UAV, batch-material pixel shaders read SRV.
 	private readonly DiligentBufferHandle? _punctualLightsBuffer;
 	private readonly DiligentBufferHandle? _clusterCountsBuffer;
 	private readonly DiligentBufferHandle? _clusterIndicesBuffer;
 	private readonly IComputeMaterial _lightClusterMaterial;
 
-	// viewProj-матрицы теневых слайсов punctual-светов - SRV пиксельному шейдеру (сэмплинг теней в
-	// кластерной петле UnlitInstancedPS); заливается раз в кадр из стабильной памяти
-	// (RenderCamerasData.punctualShadowMatrices, замороженная команда).
+	// Punctual shadow slice viewProj matrices (SRV); uploaded once per frame from stable memory
+	// because the frozen command re-reads the pointer on every replay.
 	private readonly DiligentBufferHandle? _punctualShadowMatricesBuffer;
 
 	private readonly int _instanceBufferSectorCapacity = 64;
 	private int _instanceBufferCapacity = 0;
 	private int _meshBatchDataCapacity = 0;
 
-	/// <summary>
-	/// DECA_ANIM_LOG=1 - подробный лог пути скиннинга: регистрация инстансов, диспетчеризация и,
-	/// главное, ИДЕНТИЧНОСТЬ буферов. Печатается HashCode нативных обёрток: команды графа держат
-	/// ссылку на конкретный объект, и смена номера между записью и исполнением - прямое
-	/// доказательство того, что буфер пересоздали под уже записанными командами. Без этого номера
-	/// «буфер тот же или уже другой» по логу не определить.
-	/// </summary>
+	// DECA_ANIM_LOG=1: verbose skinning-path log; buffer hash codes prove whether a buffer was
+	// recreated underneath already-recorded graph commands.
 	private static readonly bool AnimLog = Environment.GetEnvironmentVariable("DECA_ANIM_LOG") == "1";
 
-	/// <summary>
-	/// Ставить ли UAV на мега-буфер вершин (нужен только compute-скиннингу). Выставляется редактором
-	/// из той же настройки, что и сам скиннинг: с выключенным скиннингом буфер обязан создаваться
-	/// БАЙТ В БАЙТ так же, как до появления скиннинга, иначе выключение не является чистым откатом
-	/// и им нельзя локализовать проблему.
-	/// </summary>
+	/// <summary>Adds a UAV to the mega vertex buffer (compute skinning only); with skinning off
+	/// the buffer must be created byte-identically to the pre-skinning layout.</summary>
 	public static bool SkinningUav { get; set; } = true;
 
-	/// <summary>
-	/// Пишет строку диагностики в консоль И в файл рядом с экзешником, сбрасывая его сразу.
-	///
-	/// Файл здесь не дублирование ради удобства, а необходимость: падение происходит в нативном
-	/// вызове и убивает процесс без раскрутки, поэтому буферизованный вывод консоли теряет как раз
-	/// последние строки - те самые, ради которых лог и включали. Открытие-закрытие на строку
-	/// расточительно, но диагностика включается вручную и живёт секунды.
-	/// </summary>
+	// Writes to console AND a flushed file: native crashes kill the process before buffered
+	// console output reaches the last (most important) lines.
 	private static void AnimWrite(string message)
 	{
 		Console.WriteLine(message);
@@ -179,29 +141,21 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		}
 		catch (IOException)
 		{
-			// Лог диагностики не должен ронять кадр: занятый файл - не повод падать.
+			// A busy log file must not take the frame down.
 		}
 	}
 
 	private static string Id(DiligentBufferHandle? buffer) =>
 		buffer == null ? "null" : $"#{buffer.GetHashCode():X}";
 
-	/// <summary>Ёмкость буфера счётчиков батчей. Растёт только вверх и с запасом - см.
-	/// CheckAndReallocateBuffers о том, почему точное соответствие числу батчей опасно.</summary>
+	// Batch counters capacity: grow-only with slack (exact sizing recreates buffers under
+	// recorded commands, see CheckAndReallocateBuffers).
 	private int _batchCountersCapacity = 0;
 
 	private int _totalCommands = 0;
 
-	// NOTE: these must be INSTANCE fields, not static. Each DiligentBatchRenderer owns its own
-	// _perMeshData/_meshInfos/_materialObjects/_indirectBatches registries, which are indexed (or,
-	// for _perMeshData, positionally *appended*) starting from 0 - see Register()/CreateBatch().
-	// When these counters used to be `static`, a second DiligentBatchRenderer instance (e.g. the
-	// editor's off-screen ModelPreviewViewport render graph, created after the main scene's
-	// renderer had already registered N meshes) would hand out mesh/material/batch ids continuing
-	// from the main renderer's counters instead of starting at 0, while _perMeshData in the new
-	// instance is still empty/short - causing UnsafeList.GetPtr(..., batch.mesh.meshId) in
-	// CheckAndReallocateBuffers() to index far past the end of that renderer's own (much smaller)
-	// _perMeshData list.
+	// Must be INSTANCE fields: each renderer's registries are indexed from 0, so static counters
+	// would make a second renderer hand out ids past the end of its own _perMeshData.
 	private int gMeshIndex;
 	private int gMaterialIndex;
 	private int gBatchIndex;
@@ -213,15 +167,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	private bool _isDrawBatchCmdDirty = true;
 
-	// Set whenever RenderResourceManager registers/unregisters an instance on an EXISTING batch
-	// (e.g. switching which sub-mesh is shown in ModelPreviewViewport re-populates a batch that
-	// was already created for a previously-visited sub-mesh). CheckAndReallocateBuffers only
-	// re-uploads _instancesSubset to the GPU and rebakes each batch's FirstInstanceLocation when
-	// `buffersRecreated` is true (new batch / capacity growth) - without this flag, re-selecting
-	// a previously-visited sub-mesh left the GPU-side instance buffer and indirect draw offsets
-	// exactly as they were the last time a buffer was actually recreated, so the compute culling
-	// pass kept compacting/drawing whichever sub-mesh's instances happened to be live back then
-	// instead of the newly selected one.
+	// Set when instances change on an EXISTING batch: without it, instance data and indirect
+	// offsets are only re-uploaded when a buffer is recreated, leaving stale instances live.
 	private bool _instancesContentDirty = true;
 	public void MarkInstancesContentDirty() => _instancesContentDirty = true;
 
@@ -230,18 +177,11 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	public int ShadowCascadeCount => ShadowRenderer.MaxCascades;
 
-	/// <summary>Рендерер каскадных теней мирового света - наружу только ради отладочного
-	/// ридбека shadow map (см. PreviewProbe, DECA_PROBE_SHADOWDUMP).</summary>
+	/// <summary>Cascaded sun-shadow renderer; exposed only for debug shadow-map readback.</summary>
 	public ShadowRenderer WorldShadowRenderer => _shadowRenderer;
 
-	/// <param name="colorFormat">Формат цветового таргета, в который рисует геометрия - тоже пекётся
-	/// во все PSO. Unknown = формат свопчейна; офскрин-превью в HDR-режиме передаёт сюда RGBA16F
-	/// (см. PipelineRenderTargets.RenderColorFormat).</param>
-	/// <param name="reflectionGbuffer">Добавляет во все геометрические PSO два MRT-слота тонкого
-	/// G-buffer-а отражений (RGBA16F, см. PipelineRenderTargets.NormalRoughnessTarget). Обязан
-	/// совпадать с тем, биндит ли ForwardPass эти таргеты: на Vulkan пайплайн с числом аттачментов,
-	/// отличным от привязанного, ломает рендер-пасс. Шейдеру писать в слоты не обязательно -
-	/// вариант без FEATURE_REFLECTION_GBUFFER просто оставляет их очищенными.</param>
+	/// <summary>reflectionGbuffer must match whether ForwardPass binds those targets: on Vulkan a
+	/// PSO whose attachment count differs from the bound set breaks the render pass.</summary>
 	public DiligentBatchRenderer(DiligentGraphicsApi api,
 		TextureObjectFormat colorFormat = TextureObjectFormat.Unknown, bool reflectionGbuffer = false)
 	{
@@ -283,13 +223,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				access = HandleAccess.Compute | HandleAccess.Pixel,
 			});
 
-		// Шаг элемента - Vector4, а НЕ Matrix4x4: пиксельный шейдер читает слайс как четыре
-		// row-major строки (UnlitInstancedPS.hlsl::LoadPunctualShadowMatrix). Матрицу в элементе
-		// структурного буфера держать нельзя - её majorness там не подчиняется PackMatrixRowMajor и
-		// отличается у D3D12 и Vulkan, из-за чего тени punctual-светов не работали на D3D12 вообще.
-		// Содержимое буфера при этом не меняется: заливка идёт тем же UpdateBuffer<Matrix4x4> по
-		// массиву RenderCamerasData.punctualShadowMatrices, байты те же, меняется только объявленный
-		// шаг вью.
+		// Element stride is Vector4, NOT Matrix4x4: matrix majorness in structured-buffer elements
+		// ignores PackMatrixRowMajor and differs between D3D12 and Vulkan; the shader reads four
+		// row-major rows instead (UnlitInstancedPS.hlsl::LoadPunctualShadowMatrix).
 		_punctualShadowMatricesBuffer = (DiligentBufferHandle)_api.CreateBuffer<Vector4>(
 			LightClusters.MaxShadowSlices * 4,
 			new BufferInfo
@@ -312,34 +248,17 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		Skinning = new DiligentSkinningPass(_api);
 	}
 
-	/// <summary>GPU-скиннинг сцены (см. <see cref="DiligentSkinningPass"/>). Живёт здесь, потому что
-	/// пишет он в мега-буфер вершин, которым владеет рендерер.</summary>
+	/// <summary>Scene GPU skinning; lives here because it writes into the renderer-owned mega vertex buffer.</summary>
 	public DiligentSkinningPass Skinning { get; }
 
-	/// <summary>
-	/// Диспетчеризует скиннинг всех зарегистрированных скиннед-инстансов. Зовётся раз в кадр ПЕРЕД
-	/// исполнением графа: и тени, и forward, и трассировка читают уже деформированную геометрию
-	/// (см. <see cref="DiligentSkinningPass.Execute"/>).
-	///
-	/// ВАЖНО ПРО ПОРЯДОК: вызывать строго ДО записи команд кадра (у сцены редактора это значит до
-	/// SystemRoot.Update, внутри которого CullingAndRenderSystem их пишет). Причина в заливке ниже:
-	/// UpdateGpuMegaBuffers на пути РОСТА пересоздаёт мега-буфер и отпускает старый, а уже
-	/// записанные команды держат ссылку именно на старый объект - вызов после записи освобождал
-	/// буфер прямо под ними, и кадр падал в DrawIndexedIndirect по освобождённой памяти
-	/// (0xC0000005 при появлении скиннед-модели в сцене).
-	/// </summary>
-	/// <summary>
-	/// Снимок счётчиков, от которых зависит переселение нативных массивов indirect-команд
-	/// (см. CheckAndReallocateBuffers). Нужен для диагностики падения в UpdateBuffer внутри
-	/// ЗАМОРОЖЕННОЙ команды: та держит указатель на _indirectDatas/_cpuBatchCounters и перечитывает
-	/// его при каждом реплее, поэтому любое их перевыделение под уже записанными командами - это
-	/// чтение освобождённой памяти. Растущее здесь число прямо называет источник роста.
-	/// </summary>
+	/// <summary>Snapshot of the counters whose growth forces native indirect-array reallocation.</summary>
 	public string DiagCounters =>
 		$"meshes={gMeshIndex} batches={_indirectBatches.Count} instances={_instancesSubset.instances.Length} " +
 		$"commands={_totalCommands} megaVerts={(_megaVertexBufferCPU.IsCreated ? _megaVertexBufferCPU.Count : 0)} " +
 		$"instCap={_instanceBufferCapacity} meshBatchCap={_meshBatchDataCapacity}";
 
+	/// <summary>Dispatches skinning; must run BEFORE frame command recording - mega-buffer growth
+	/// recreates the buffer that already-recorded commands reference.</summary>
 	public void ExecuteSkinning()
 	{
 		if (!Skinning.HasWork)
@@ -347,17 +266,15 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			return;
 		}
 
-		// Мега-буфер обязан быть залит до диспетчеризации: приёмник скиннед-инстанса появляется в
-		// нём той же регистрацией, что и регион, и до заливки в GPU-буфере его просто нет.
+		// Mega-buffer must be uploaded before dispatch: the skinned destination region does not
+		// exist in the GPU buffer until then.
 		var megaBefore = _megaVertexBufferGPU;
 		UpdateGpuMegaBuffers();
 
 		if (AnimLog)
 		{
-			// Смена номера мега-буфера здесь означает, что заливка его ПЕРЕСОЗДАЛА - а на него
-			// ссылаются уже записанные команды отрисовки.
 			AnimWrite($"[anim] ExecuteSkinning: mega {Id(megaBefore)}" +
-				(ReferenceEquals(megaBefore, _megaVertexBufferGPU) ? "" : $" -> {Id(_megaVertexBufferGPU)} ПЕРЕСОЗДАН") +
+				(ReferenceEquals(megaBefore, _megaVertexBufferGPU) ? "" : $" -> {Id(_megaVertexBufferGPU)} RECREATED") +
 				$", indirect={Id(_indirectArgsBuffers)}, counters={Id(_batchCountersBuffer)}, {DiagCounters}");
 		}
 
@@ -448,9 +365,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		int baseVertex = _megaVertexBufferCPU.Count;
 		uint firstIndex = (uint)_megaIndexBufferCPU.Count;
 
-		// Копирование БЛОКОМ, а не поэлементно: у сцены уровня Sponza это миллионы вершин и десятки
-		// миллионов индексов, то есть десятки миллионов вызовов Add, каждый из которых ещё и мог
-		// вызвать рост ёмкости удвоением с перекопированием всего накопленного.
+		// Block copy, not per-element Add: Sponza-scale scenes mean tens of millions of Adds.
 		var vertexCount = UnsafeArray.GetLength(vertices);
 		var indexCount = UnsafeArray.GetLength(indices);
 
@@ -488,21 +403,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return new MeshId(meshId);
 	}
 
-	/// <summary>
-	/// Заводит СКИННЕД-ИНСТАНС меша: отдельный участок мега-буфера вершин, который каждый кадр
-	/// переписывает <see cref="DiligentSkinningPass"/> деформированной копией bind-позы. Возвращает
-	/// новый meshId (индексы и LOD-уровни разделяются с исходным мешом - меняется только baseVertex)
-	/// и офсет палитры инстанса.
-	///
-	/// Копия на ИНСТАНС, а не на меш: два персонажа с одной моделью стоят в разных позах, и общий
-	/// приёмник означал бы, что второй затирает первого. Цена - vertexCount вершин VRAM на
-	/// персонажа; за неё покупается то, что скиннед-меш для всего остального движка (кулинг,
-	/// индиректные дроу, тени, BVH RT-отражений) остаётся обычным мешем.
-	///
-	/// Приёмник инициализируется bind-позой, а не нулями: между регистрацией и первой
-	/// диспетчеризацией скиннинга проходит кадр, и нулевой приёмник дал бы вспышку схлопнутой в
-	/// точку геометрии.
-	/// </summary>
+	/// <summary>Registers a per-INSTANCE skinned copy of a mesh region in the mega vertex buffer;
+	/// shares indices/LODs with the source (only baseVertex changes). The copy is seeded with the
+	/// bind pose - a zeroed region would flash collapsed geometry for a frame.</summary>
 	public (MeshId Mesh, int PaletteOffset) RegisterSkinnedInstance(MeshId sourceMesh, int jointCount, int skinBase)
 	{
 		var source = _meshInfos[sourceMesh.meshId];
@@ -510,9 +413,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		if (source.VertexCount > 0)
 		{
-			// Копирование ВНУТРИ одного списка: AddRange по указателю в него же сломался бы при
-			// росте ёмкости (указатель на старую память), поэтому bind-поза сначала снимается в
-			// промежуточный массив.
+			// Copy within one list: AddRange from a pointer into the same list breaks on growth,
+			// so the bind pose is staged through a temp array.
 			var bindPose = new Vertex[source.VertexCount];
 			for (int i = 0; i < bindPose.Length; i++)
 			{
@@ -535,8 +437,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			LodLevels = source.LodLevels,
 		};
 
-		// PerMeshData индексируется meshId и обязан существовать для КАЖДОГО зарегистрированного
-		// меша: куллинг-шейдер читает его по batchId, и пропуск сдвинул бы всю таблицу.
+		// PerMeshData must exist for EVERY registered mesh; a gap would shift the whole table.
 		var perMesh = UnsafeList.Get<PerMeshData>(_perMeshData, sourceMesh.meshId);
 		UnsafeList.Add(_perMeshData, perMesh);
 
@@ -552,7 +453,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			AnimWrite($"[anim] RegisterSkinnedInstance: src mesh={sourceMesh.meshId} -> new mesh={meshId}, " +
 				$"baseVertex {source.BaseVertex}->{destBaseVertex}, verts={source.VertexCount}, " +
 				$"indices[{source.FirstIndex}..+{source.IndexCount}], joints={jointCount}, palette={paletteOffset}; " +
-				$"после: {DiagCounters}");
+				$"after: {DiagCounters}");
 		}
 
 		return (new MeshId(meshId), paletteOffset);
@@ -571,8 +472,6 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		material.SetBuffer("GPURenderInstances", _gpuInstancesDataBuffer, HandleAccess.Vertex);
 
-		// Результаты кластеризации светов - пиксельному шейдеру (SRV): пул светов + counts/indices
-		// фроксел-сетки (см. UnlitInstancedPS.hlsl, петля clustered-шейдинга).
 		material.SetBuffer("PunctualLights", _punctualLightsBuffer, HandleAccess.Pixel);
 		material.SetBuffer("ClusterCounts", _clusterCountsBuffer, HandleAccess.Pixel);
 		material.SetBuffer("ClusterIndices", _clusterIndicesBuffer, HandleAccess.Pixel);
@@ -601,11 +500,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		SetAllCommandsDirty();
 	}
 
-	/// <summary>Кэш _indirectBatches, отсортированный по materialId (см. <see cref="_sortedBatchesCache"/>).
-	/// Пересчитывается только когда меняется НАБОР батчей; переупорядочение/добавление ИНСТАНСОВ
-	/// существующих батчей его не трогает. Тай-брейк по ключу (индексу батча) воспроизводит порядок
-	/// прежнего `_indirectBatches.OrderBy(...)` - OrderBy стабилен, а OrderedDictionary итерируется в
-	/// порядке добавления, то есть по возрастанию индекса батча.</summary>
+	// Sorted by materialId with batch-index tie-break: must reproduce stable OrderBy order.
 	private List<KeyValuePair<int, IndirectBatch>> GetSortedBatches()
 	{
 		if (_isSortedBatchesCacheDirty)
@@ -628,29 +523,12 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return _sortedBatchesCache;
 	}
 
-	/// <summary>Выбрасывает ВСЕ регистрации меша/материала/батча и накопленную геометрию, возвращая
-	/// рендерер в состояние сразу после создания.
-	///
-	/// Для СЦЕНЫ с несколькими резидентными моделями снятие ОДНОЙ модели без трогания остальных
-	/// делает <see cref="UnregisterModel"/> - id плотные и никогда не переиспользуются, так что
-	/// удаление подмножества id других не сдвигает. Этот же (полный) сброс остаётся нужен
-	/// потребителю, который держит ровно ОДНУ модель за раз (превью, бейкер иконок): дешевле
-	/// обнулить счётчики id и мега-буферы CPU целиком, чем гонять UnregisterModel по всем
-	/// когда-либо зарегистрированным id, и он же переиспользуется в ClearAll как более грубый, но
-	/// проверенный путь.
-	///
-	/// Мега-буферы GPU у этого пути ПОЛНОСТЬЮ пересоздаются на следующий UpdateGpuMegaBuffers (см.
-	/// сброс капасити/uploaded-счётчиков ниже) - в отличие от обычной регистрации, которая теперь
-	/// доливает только новый хвост (см. UpdateMegaBufferRange).
-	///
-	/// Вызывающий ОБЯЗАН сперва дождаться GPU (Flush + WaitForIdle) и пересобрать граф: старые
-	/// MeshId/MaterialId/BatchId становятся недействительными, а замороженные команды на них
-	/// ссылаются.</summary>
+	/// <summary>Drops ALL mesh/material/batch registrations and geometry. Caller MUST first wait
+	/// for the GPU (Flush + WaitForIdle) and rebuild the graph: old ids become invalid while
+	/// frozen commands still reference them.</summary>
 	public void ResetRegistrations()
 	{
-		// Мега-буферы CPU освобождаются, а не очищаются: Clear сохранил бы ёмкость, накопленную под
-		// все прошлые модели, - а это ровно та память, ради которой сброс и делается. Следующий
-		// Register создаст их заново под размер новой модели (см. проверку IsCreated в Register).
+		// Dispose, not Clear: Clear would keep the capacity this reset exists to reclaim.
 		if (_megaVertexBufferCPU.IsCreated)
 		{
 			_megaVertexBufferCPU.Dispose();
@@ -663,21 +541,14 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			_megaIndexBufferCPU = default;
 		}
 
-		// GPU-буферы отпускаем здесь же: UpdateGpuMegaBuffers пересоздаст их по _isMeshBuffersDirty,
-		// а держать до тех пор буфер с геометрией уже несуществующих мешей незачем.
 		_megaVertexBufferGPU?.Release();
 		_megaVertexBufferGPU = null;
 		_megaIndexBufferGPU?.Release();
 		_megaIndexBufferGPU = null;
 
-		// Капасити/uploaded-счётчики суб-аллокатора мега-буферов (см. поля выше) - без сброса первая
-		// же регистрация новой модели унаследовала бы капасити прошлой сцены (не баг, просто лишний
-		// запас памяти на один цикл роста).
-		// Регионы скиннинга указывают офсетами в мега-буфер, которого больше нет.
+		// Skinning regions hold offsets into a mega-buffer that no longer exists.
 		Skinning.Reset();
 
-		// Ёмкости батч-буферов - вместе с остальными: их буферы отпускаются полным сбросом ниже, и
-		// сохранённый запас указывал бы на несуществующие ресурсы.
 		_batchCountersCapacity = 0;
 
 		_megaVertexBufferCapacity = 0;
@@ -685,8 +556,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		_megaVertexUploadedCount = 0;
 		_megaIndexUploadedCount = 0;
 
-		// Сброс обязан быть ПОЛНЫМ: оставь любую из коллекций непустой - и её ключи разойдутся с
-		// заново выданными с нуля индексами.
+		// Reset must be TOTAL: any non-empty collection desyncs its keys from re-issued ids.
 		_meshInfos.Clear();
 		_materialObjects.Clear();
 		_indirectBatches.Clear();
@@ -705,19 +575,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		SetAllCommandsDirty();
 	}
 
-	/// <summary>См. <see cref="DiligentBatchRenderer.UnregisterModel"/>: партиционное выселение ОДНОЙ модели.
-	/// mesh/material/batch id плотные и никогда не переиспользуются (см. комментарий у
-	/// <see cref="ResetRegistrations"/>), поэтому снятие id из соответствующих словарей не требует
-	/// сдвига чужих id - ничего их не переиндексирует. Материалы явно Release-ятся (SRB/PSO/свои
-	/// константные буферы - НЕ общие View/Light/GPURenderInstances и т.п., они у материала не в
-	/// собственности, см. DiligentMaterial.SetBuffer/Release); геометрия снятых мешей в мега-буфере
-	/// НЕ освобождается - её диапазон просто больше ни на один батч не ссылается, до суб-аллокатора
-	/// это неиспользуемая, но безопасная память.
-	///
-	/// Вызывающий ОБЯЗАН снять инстанс-сущности, ссылающиеся на удаляемые batchId, ДО этого вызова
-	/// (см. интерфейсный комментарий) - иначе на следующем CheckAndReallocateBuffers индирект-буферы
-	/// пересоздадутся под уменьшившийся _totalCommands/batchCount, а старые инстансы будут указывать
-	/// на офсеты вне их границ.</summary>
+	/// <summary>Evicts ONE model. Ids are dense and never reused, so removals shift nothing; mesh
+	/// geometry stays (unreferenced) in the mega-buffer. Caller MUST remove instance entities
+	/// referencing the batchIds BEFORE this call, or stale instances index out of bounds.</summary>
 	public void UnregisterModel(IEnumerable<BatchId> batchIds, IEnumerable<MaterialId> materialIds,
 		IEnumerable<MeshId> meshIds)
 	{
@@ -754,30 +614,25 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		SetAllCommandsDirty();
 	}
 
-	/// <summary>Привязывает общий View-кбуфер (обновляемый SetupViewData) к материалу, который НЕ
-	/// регистрируется как батч-материал - например, фуллскрин-скай превью (см. ForwardPass): ему
-	/// нужна камера, но Register() тянет за собой лишние ресурсы (инстанс-буферы, тени).</summary>
+	/// <summary>Binds the shared View cbuffer to a material that is not a registered batch material.</summary>
 	public void BindViewConstants(IMaterialObject material)
 	{
 		((DiligentMaterial)material).SetBuffer("View", _viewConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.BindShadowResources"/>: кбуфер Light + массив shadow
-	/// map фуллскрин-материалу, минуя Register().</summary>
+	/// <summary>See <see cref="IBatchRenderer.BindShadowResources"/>.</summary>
 	public void BindShadowResources(IMaterialObject material)
 	{
 		var diligentMaterial = (DiligentMaterial)material;
 		diligentMaterial.SetBuffer("Light", _lightConstantsBuffer, HandleAccess.Vertex | HandleAccess.Pixel);
 		_shadowRenderer.SetShadowResources(material);
 
-		// Пул punctual-светов и матрицы их слайсов - фуллскрин-пассам, которые рассеивают свет
-		// ламп в среде (VolumetricCommon.hlsl). Шейдеры без этих объявлений привязку игнорируют -
-		// как и карты punctual-теней в SetShadowResources выше.
+		// Shaders lacking these declarations ignore the bindings.
 		diligentMaterial.SetBuffer("PunctualLights", _punctualLightsBuffer, HandleAccess.Pixel);
 		diligentMaterial.SetBuffer("PunctualShadowMatrices", _punctualShadowMatricesBuffer, HandleAccess.Pixel);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.SetMaterialAlphaTestedShadow"/>.</summary>
+	/// <summary>See <see cref="IBatchRenderer.SetMaterialAlphaTestedShadow"/>.</summary>
 	public void SetMaterialAlphaTestedShadow(int materialId, DecaEngine.Graphics.ModelLoader.BaseColorBinding baseColor,
 		float alphaCutoff)
 	{
@@ -790,22 +645,19 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			alphaCutoff, baseColor.Stream);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
+	/// <summary>See <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
 	public void SetMaterialShadowCasting(int materialId, bool casts) =>
 		_shadowRenderer.SetMaterialShadowCasting(materialId, casts);
 
-	/// <summary>См. <see cref="IBatchRenderer.TransitionShadowMapsForRead"/>. DepthRead, а не
-	/// ShaderResource - см. комментарий в ShadowRenderer.ExecuteDrawShadows.</summary>
+	/// <summary>DepthRead, not ShaderResource - see ShadowRenderer.ExecuteDrawShadows.</summary>
 	public void TransitionShadowMapsForRead(ICommandBuffer cmd)
 	{
 		cmd.TransitionResource(_shadowRenderer.ShadowMapsTarget, ResourceState.DepthRead);
 	}
 
-	// После каждого UpdateBuffer - явный барьер CopyDest -> ConstantBuffer. Без него между
-	// копией констант и дроу/диспатчами нет зависимости, и D3D12 вправе слить НЕСКОЛЬКО
-	// апдейтов одного кбуфера в пачку до исполнения дроу: теневые каскады (4 апдейта View/Light
-	// за пасс, см. ShadowPass) рендерились с матрицами ЧУЖИХ каскадов - слайсы 1/3 выходили
-	// побитовыми копиями 0/2. На Vulkan драйвер прощал, на D3D12 - нет (видно в RenderDoc).
+	// Explicit CopyDest -> ConstantBuffer barrier after each UpdateBuffer: without it D3D12 may
+	// coalesce several cbuffer updates before the draws execute (shadow cascades got each other's
+	// matrices); Vulkan happened to forgive it.
 
 	public unsafe void SetupViewData(ICommandBuffer? cmd, ref ViewData viewData)
 	{
@@ -874,21 +726,9 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			buffersRecreated = true;
 		}
 
-		// Рост ТОЛЬКО ВВЕРХ и с запасом (x2), как у инстанс-буферов выше. Прежнее условие сравнивало
-		// размер на точное неравенство, поэтому пересоздание случалось на КАЖДОЕ изменение числа
-		// батчей - в том числе на +1 и на уменьшение. А пересоздание здесь ставит buffersRecreated,
-		// который ниже пересоздаёт буфер indirect-аргументов и переселяет _indirectDatas: ровно те
-		// объекты, на которые ссылаются УЖЕ ЗАПИСАННЫЕ команды (теневой проход пишет их раньше
-		// forward-а). Отсюда и падение в DrawIndexedIndirect с живой managed-обёрткой и мёртвым
-		// нативным объектом за ней. С запасом перевыделение становится редким, а лишние элементы
-		// буфера просто не адресуются: куллинг-шейдер читает счётчики по batchId < числа батчей.
-		// Рост ТОЛЬКО ВВЕРХ и с запасом (x2), как у инстанс-буферов выше. Прежнее условие сравнивало
-		// размер на точное неравенство, поэтому пересоздание случалось на КАЖДОЕ изменение числа
-		// батчей - в том числе на +1 и на уменьшение, - а оно тянет за собой пересоздание буфера
-		// indirect-аргументов и переселение _indirectDatas, на которые ссылаются уже записанные
-		// команды. Запас здесь безопасен: лишние счётчики нулевые, а куллинг-шейдер адресует их по
-		// batchId в пределах реального числа батчей. (У буфера indirect-команд запас, наоборот,
-		// НЕДОПУСТИМ - см. ниже: он заливается целиком, и хвост уехал бы мусорными командами.)
+		// Grow-only with 2x slack: exact sizing recreated the indirect-args buffer and
+		// _indirectDatas under already-recorded commands. Slack is safe here (extra counters are
+		// zero and unaddressed); the indirect-command buffer itself must NOT have slack (below).
 		int batchCount = _indirectBatches.Count;
 		if (_batchCountersBuffer == null || batchCount > _batchCountersCapacity)
 		{
@@ -899,16 +739,20 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			buffersRecreated = true;
 		}
 
-		// _meshBatchDataBuffer is indexed by BATCH id on the GPU (the culling shader reads
-		// MeshBatchData[instance.batchId], see _perBatchData above), so it must cover every batch id
-		// ever handed out - batch ids are dense 0..gBatchIndex-1 and never removed, so gBatchIndex is
-		// exactly the required length. Sizing it by mesh count (as before) desynced from batch ids as
-		// soon as a scene was repopulated (preview switching model/sub-mesh) and mesh/batch numbering
-		// diverged.
+		// _meshBatchDataBuffer is indexed by BATCH id on the GPU, so it must cover every id ever
+		// handed out: ids are dense 0..gBatchIndex-1, so gBatchIndex is the required length.
 		int batchTotal = gBatchIndex;
 		if (batchTotal > _meshBatchDataCapacity)
 		{
 			_meshBatchDataCapacity = batchTotal;
+			buffersRecreated = true;
+		}
+
+		// _indirectDatas must be EXACTLY _totalCommands long (upload loop relies on it); exact
+		// inequality is deliberate - the indirect-command buffer is uploaded whole, no slack.
+		int commandCapacity = _indirectDatas == null ? 0 : UnsafeArray.GetLength(_indirectDatas);
+		if (commandCapacity != _totalCommands)
+		{
 			buffersRecreated = true;
 		}
 
@@ -917,12 +761,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		if (buffersRecreated)
 		{
-			// Буфер indirect-команд и парный ему CPU-массив - РОВНО по числу команд, без запаса.
-			// Запас здесь недопустим: массив заливается в буфер ЦЕЛИКОМ (см.
-			// ClearIndirectDrawBuffers), и неинициализированный хвост уехал бы в него мусорными
-			// командами отрисовки - то есть DrawIndexedIndirect с произвольными смещениями.
-			// У счётчиков батчей запас безопасен (лишние элементы нулевые и не адресуются), а здесь -
-			// нет, и это не симметричные случаи.
+			// Exactly _totalCommands, no slack: the array is uploaded WHOLE, so an uninitialized
+			// tail would become garbage draw commands.
 			CreateIndirectBuffer(ref _indirectArgsBuffers, _totalCommands);
 			UnsafeArray.Resize<DrawIndexedIndirectCommand>(ref _indirectDatas, _totalCommands);
 
@@ -932,9 +772,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		if (AnimLog && buffersRecreated)
 		{
-			// Самая важная строка лога: здесь ресурсы ПЕРЕСОЗДАНЫ. Если после неё нет пересборки
-			// графа, все ранее записанные команды держат уже освобождённые объекты.
-			AnimWrite($"[anim] CheckAndReallocateBuffers: ПЕРЕСОЗДАНЫ буферы -> " +
+			AnimWrite($"[anim] CheckAndReallocateBuffers: buffers RECREATED -> " +
 				$"indirect={Id(_indirectArgsBuffers)}, counters={Id(_batchCountersBuffer)}, " +
 				$"meshBatch={Id(_meshBatchDataBuffer)}, instances={Id(_inputIndirectInstancesBuffer)}; {DiagCounters}\n" +
 				$"{Environment.StackTrace}");
@@ -957,10 +795,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 				var meshInfo = _meshInfos[batch.mesh.meshId];
 
-				// Копия per-mesh данных ПОД ЭТОТ батч со своим physicalCommandOffset: раньше offset
-				// писался прямо в общий _perMeshData[meshId], так что два батча одного меша (один меш
-				// с разными материалами) затирали offset друг друга - последний выигрывал, и инстансы
-				// обоих батчей инкрементили одну и ту же draw-команду.
+				// Per-batch copy: writing the offset into shared _perMeshData[meshId] lets two
+				// batches of one mesh clobber each other's physicalCommandOffset.
 				var pmd = *UnsafeList.GetPtr<PerMeshData>(_perMeshData, batch.mesh.meshId);
 				pmd.physicalCommandOffset = commandOffset;
 				UnsafeArray.Set(_perBatchData, batchIndex, pmd);
@@ -1053,27 +889,21 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		return new CullResult(_finallyInstancesBuffer, _indirectArgsBuffers, _gpuInstancesDataBuffer, _materialDrawRanges);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.SetupPunctualLights"/>: заливка пула punctual-светов
-	/// кадра. Команда замороженная - указатель на UnsafeArray перечитывается на каждом реплее,
-	/// память обязана быть стабильной (см. ViewSubset.punctualLights).</summary>
+	/// <summary>Frozen command re-reads the pointer on each replay - memory must be stable.</summary>
 	public void SetupPunctualLights(ICommandBuffer cmd, UnsafeArray* lights)
 	{
 		if (lights == null) return;
 		cmd.UpdateBuffer<PunctualLight>(_punctualLightsBuffer, lights);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.SetupPunctualShadowMatrices"/>: заливка viewProj-матриц
-	/// теневых слайсов кадра. Команда замороженная - память обязана быть стабильной
-	/// (см. ViewSubset.punctualShadowMatrices).</summary>
+	/// <summary>Frozen command re-reads the pointer on each replay - memory must be stable.</summary>
 	public void SetupPunctualShadowMatrices(ICommandBuffer cmd, UnsafeArray* matrices)
 	{
 		if (matrices == null) return;
 		cmd.UpdateBuffer<Matrix4x4>(_punctualShadowMatricesBuffer, matrices);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.ExecuteDrawPunctualShadow"/>: запись одного слайса
-	/// теней punctual-света по последним SetupCullData/SetupLightData (CascadeMatrix0 = viewProj
-	/// слайса, см. PunctualShadowScheduler).</summary>
+	/// <summary>Draws one punctual shadow slice using the last SetupCullData/SetupLightData.</summary>
 	public void ExecuteDrawPunctualShadow(ICommandBuffer cmd, CullResult cullResult, int sliceIndex)
 	{
 		if (_instancesSubset.instances.Length == 0 || _totalCommands == 0)
@@ -1087,16 +917,14 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			cullResult, (uint)sliceIndex);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.TransitionPunctualShadowsForRead"/>.</summary>
+	/// <summary>See <see cref="IBatchRenderer.TransitionPunctualShadowsForRead"/>.</summary>
 	public void TransitionPunctualShadowsForRead(ICommandBuffer cmd)
 	{
 		_shadowRenderer.TransitionPunctualShadowsForRead(cmd);
 	}
 
-	/// <summary>См. <see cref="IBatchRenderer.ExecuteLightClustering"/>: раскладка отрезка пула
-	/// текущей камеры (границы - в LightData.ClusterParams последнего SetupLightData) по
-	/// фроксел-кластерам. Пустой отрезок не повод пропускать диспатч: ClusterCounts надо
-	/// занулить, иначе шейдинг прочтёт кластеры прошлой камеры.</summary>
+	/// <summary>Must dispatch even for an empty light range: ClusterCounts has to be zeroed or
+	/// shading reads the previous camera's clusters.</summary>
 	public void ExecuteLightClustering(ICommandBuffer cmd)
 	{
 		cmd.TransitionResource(_punctualLightsBuffer, ResourceState.UnorderedAccess);
@@ -1121,9 +949,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 	void IBatchRenderer.ExecuteDrawPunctualShadow(ICommandBuffer cmd, ICullResult cullResult, int sliceIndex) =>
 		ExecuteDrawPunctualShadow(cmd, (CullResult)cullResult, sliceIndex);
 
-	/// <summary>См. <see cref="IBatchRenderer.SetMaterialTransparent"/>. Влияет только на выбор
-	/// диапазонов в <see cref="ExecuteDrawBatching(ICommandBuffer, CullResult, BatchDrawFilter)"/> -
-	/// PSO/стейты материала не трогает.</summary>
+	/// <summary>Only affects draw-range selection in ExecuteDrawBatching; does not touch PSO/states.</summary>
 	public void SetMaterialTransparent(MaterialId materialId, bool transparent) =>
 		SetMaterialTransparent(materialId.materialId, transparent);
 
@@ -1135,28 +961,20 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		if (changed)
 		{
-			// Замороженные команды ForwardPass-а записаны с уже разбитыми на opaque/transparent
-			// петлями дроу - изменение принадлежности материала требует перезаписи.
+			// Frozen ForwardPass commands bake the opaque/transparent split - must re-record.
 			SetAllCommandsDirty();
 		}
 	}
 
-	/// <summary>Раньше пересоздавала и заливала ОБА мега-буфера ЦЕЛИКОМ на любую регистрацию меша -
-	/// то есть открытие N-й модели во время стриминга стоило O(вся геометрия, когда-либо
-	/// зарегистрированная), и по аллокации GPU-памяти, и по копированию. Теперь - суб-аллокация с
-	/// запасом по хвосту (см. <see cref="UpdateMegaBufferRange{T}"/>): буфер растёт редко (x2), а
-	/// обычная регистрация мешей просто доливает свой хвост в уже готовый буфер.</summary>
+	// Tail sub-allocation: buffers grow rarely (x2); normal registration uploads only the new tail.
 	private void UpdateGpuMegaBuffers()
 	{
 		if (!_isMeshBuffersDirty) return;
 
 		if (_megaVertexBufferCPU.IsCreated)
 		{
-			// HandleAccess.Compute добавляет буферу UAV: в него ПИШЕТ скиннинг (SkinningCS.hlsl),
-			// оставаясь при этом вершинным буфером для отрисовки. Флаг НЕ безусловный: он меняет
-			// описание буфера ВСЕЙ геометрии сцены, а не только скиннед-мешей, и при выключенном
-			// скиннинге буфер обязан создаваться ровно так же, как до появления скиннинга вообще -
-			// иначе выключение перестаёт быть чистым откатом и не годится для локализации проблем.
+			// UAV flag only when skinning is on: with it off the buffer must match the
+			// pre-skinning description exactly so disabling is a clean rollback.
 			UpdateMegaBufferRange<Vertex>(ref _megaVertexBufferGPU, ref _megaVertexBufferCapacity,
 				ref _megaVertexUploadedCount, _megaVertexBufferCPU.Count, _megaVertexBufferCPU.GetNative(),
 				BufferHandleType.Vertex, SkinningUav ? HandleAccess.Compute : default, "Mega Vertex Buffer");
@@ -1171,26 +989,12 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 		_isMeshBuffersDirty = false;
 
-		// Заливка мега-буферов идёт МИМО замороженного графа (через ImmediateContext, см.
-		// UpdateMegaBufferRange) прямо перед реплеем текущего кадра, так что перезаписывать
-		// SetVertexBuffers/SetIndexBuffer нужно только когда сменился САМ ОБЪЕКТ буфера (редкий путь
-		// роста в UpdateMegaBufferRange). Но раньше буфер пересоздавался ВСЕГДА - на всякий случай
-		// сохраняем прежнюю (более консервативную) гарантию инвалидации графа для обоих путей: цена
-		// лишней перезаписи команд на порядки меньше цены лишней перезаливки мега-буфера, которую мы
-		// как раз и убираем.
+		// Conservative: invalidate the graph on both paths, even when the buffer object survived.
 		SetAllCommandsDirty();
 	}
 
-	/// <summary>Суб-аллокация одного мега-буфера (вершин или индексов) с запасом по хвосту - тот же
-	/// приём, что у инстанс-буферов (см. _instanceBufferSectorCapacity). <paramref name="cpuList"/>
-	/// уже содержит ВСЮ накопленную геометрию (старую и новую) - Register() только аппендит в него.
-	///
-	/// Рост капасити (буфера ещё нет или он стал мал) - редкий путь: пересоздаёт GPU-буфер В ЗАПАС
-	/// (x2) и заливает CPU-список ЦЕЛИКОМ. Старый буфер отпускается обычным Release (не разделяемая
-	/// память, на которую ссылались бы замороженные команды поверх ссылки на объект - см.
-	/// UpdateGpuMegaBuffers) - лишнего WaitForIdle здесь не требуется. Обычный путь (капасити хватает)
-	/// заливает ТОЛЬКО новый хвост (<paramref name="uploadedCount"/>..<paramref name="currentCount"/>) -
-	/// именно это убирает перезаливку всей когда-либо загруженной геометрии на каждую регистрацию.</summary>
+	// Tail sub-allocation: cpuList holds all accumulated geometry, but only the new tail is
+	// uploaded unless capacity grows (x2), which re-uploads the whole list.
 	private unsafe void UpdateMegaBufferRange<T>(ref DiligentBufferHandle? gpuBuffer, ref int capacity,
 		ref int uploadedCount, int currentCount, UnsafeList* cpuList, BufferHandleType bufferType,
 		HandleAccess access, string name)
@@ -1206,12 +1010,10 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 			if (AnimLog)
 			{
-				// Путь РОСТА: буфер пересоздан и заливается ЦЕЛИКОМ. Если эта строка печатается
-				// каждый кадр, значит геометрия сцены перезаливается покадрово - это сотни мегабайт
-				// динамической памяти за кадр, выбранный хип, вынужденный idle GPU и, следом,
-				// сорванный учёт кадров в полёте (см. ошибки валидации про командный буфер in use).
-				AnimWrite($"[anim] MegaBuffer '{name}': РОСТ до {newCapacity} эл., " +
-					$"полная заливка {(long)currentCount * Unsafe.SizeOf<T>() / (1024 * 1024)} МБ");
+				// Growth path: if this prints every frame, scene geometry is being re-uploaded
+				// per frame - hundreds of MB of dynamic memory and a forced GPU idle.
+				AnimWrite($"[anim] MegaBuffer '{name}': GROWTH to {newCapacity} elems, " +
+					$"full upload {(long)currentCount * Unsafe.SizeOf<T>() / (1024 * 1024)} MB");
 			}
 
 			if (currentCount > 0)
@@ -1227,7 +1029,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		{
 			if (AnimLog)
 			{
-				AnimWrite($"[anim] MegaBuffer '{name}': доливка хвоста {currentCount - uploadedCount} эл.");
+				AnimWrite($"[anim] MegaBuffer '{name}': tail top-up {currentCount - uploadedCount} elems");
 			}
 
 			_api.ImmediateContext.UpdateBuffer(gpuBuffer.Buffer, (uint)(uploadedCount * Unsafe.SizeOf<T>()),
@@ -1240,7 +1042,7 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 			return;
 		}
 
-		// ResourceStateTracker - внутренняя кухня бэкенда, работает в нативных состояниях Diligent.
+		// ResourceStateTracker is backend-internal and works in native Diligent states.
 		_stateTracker.SetState(gpuBuffer.Buffer, global::Diligent.ResourceState.CopyDest);
 	}
 
@@ -1286,7 +1088,6 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		SetAllCommandsDirty();
 
 #if DEBUG
-		// Временная диагностика (см. PreviewProbe): раскладка индирект-диапазонов по материалам.
 		if (Environment.GetEnvironmentVariable("DECA_BATCH_DEBUG") == "1")
 		{
 			foreach (var kvp in _materialDrawRanges)
@@ -1319,18 +1120,15 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 		UpdateGpuMegaBuffers();
 		UpdateDrawRangesCache();
 
-		// DepthRead, а не ShaderResource - см. комментарий в ShadowRenderer.ExecuteDrawShadows.
+		// DepthRead, not ShaderResource - see ShadowRenderer.ExecuteDrawShadows.
 		cmd.TransitionResource(_shadowRenderer.ShadowMapsTarget, ResourceState.DepthRead);
 
-		// VertexBuffer/IndirectArgument переходы не нужны: их вставляют сами SetVertexBuffers и
-		// DrawIndexedIndirect ниже. Инстанс-данные же читает вершинный шейдер через SRB.
 		cmd.TransitionResource(cullResult.FinallyInstancesBuffer, ResourceState.VertexBuffer);
 		cmd.TransitionResource(cullResult.GpuInstancesDataBuffer, ResourceState.ShaderResource);
 		cmd.TransitionResource(cullResult.IndirectArgsBuffers, ResourceState.IndirectArgument);
 
-		// Результаты кластеризации светов (UAV после ExecuteLightClustering) - на чтение пиксельным
-		// шейдером. Переход здесь, а не в кластеризации: сюда приходит КАЖДЫЙ рисующий путь,
-		// включая превью без кластеризации (тогда буферы просто остаются нулевыми).
+		// Light-cluster buffers move to read here, not in clustering: every draw path passes here,
+		// including previews that never cluster.
 		cmd.TransitionResource(_punctualLightsBuffer, ResourceState.ShaderResource);
 		cmd.TransitionResource(_clusterCountsBuffer, ResourceState.ShaderResource);
 		cmd.TransitionResource(_clusterIndicesBuffer, ResourceState.ShaderResource);
@@ -1364,7 +1162,29 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 
 	public IStateObject GetBaseState()
 	{
-		return _api.CreateGraphicsState(new GraphicsStateInfo
+		return _api.CreateGraphicsState(BuildBaseStateInfo());
+	}
+
+	/// <summary><see cref="GetBaseState"/> for alpha-blended materials: straight-alpha blending on
+	/// slot 0 only, depth test on but depth WRITE off, so transparents stay out of the opaque depth
+	/// that SSR, fog and motion vectors read.</summary>
+	public IStateObject GetBlendedState()
+	{
+		var info = BuildBaseStateInfo();
+		info.Name = "Instancing PSO (blend)";
+		info.BlendState = BlendStateInfo.AlphaBlend;
+		info.DepthStencilState = new DepthStencilStateInfo
+		{
+			DepthEnable = true,
+			DepthFunc = ComparisonFunctionType.Greater,
+			DepthWriteEnable = false,
+		};
+		return _api.CreateGraphicsState(info);
+	}
+
+	private GraphicsStateInfo BuildBaseStateInfo()
+	{
+		return new GraphicsStateInfo
 		{
 			Name = "Instancing PSO",
 			RenderTargetFormats = GeometryTargetFormats,
@@ -1379,17 +1199,16 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
-				// TEXCOORD_1 (Vertex.TexCoord1) - идёт последним в структуре вершины, поэтому и в
-				// объявлении слота 0 последний: Diligent пакует авто-оффсеты по порядку элементов.
+				// TEXCOORD_1 is last in Vertex, so it must be last here too: Diligent packs
+				// auto-offsets in element order.
 				new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
 			]
-		});
+		};
 	}
 
-	/// <summary>Вариант <see cref="GetBaseState"/> с другой примитивной топологией (точки/линии
-	/// glTF-примитивов, см. ModelLoader.MeshTopology*) и без backface culling - у точек и линий
-	/// нет лицевой стороны.</summary>
+	/// <summary><see cref="GetBaseState"/> for point/line topologies, with culling off since
+	/// points and lines have no facing.</summary>
 	public IStateObject GetTopologyState(PrimitiveTopologyType topology)
 	{
 		return _api.CreateGraphicsState(new GraphicsStateInfo
@@ -1407,21 +1226,16 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
-				// TEXCOORD_1 (Vertex.TexCoord1) - идёт последним в структуре вершины, поэтому и в
-				// объявлении слота 0 последний: Diligent пакует авто-оффсеты по порядку элементов.
+				// TEXCOORD_1 is last in Vertex, so it must be last here too: Diligent packs
+				// auto-offsets in element order.
 				new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
 			]
 		});
 	}
 
-	/// <summary>
-	/// Same layout as <see cref="GetBaseState"/>, but rasterized as wireframe with no backface
-	/// culling and a GreaterEqual depth test - used by <see cref="DecaEngine.Editor.ModelPreviewViewport"/>'s
-	/// "Highlight + Wireframe" mode to draw an edge overlay on top of an already-drawn, depth-coincident
-	/// solid pass of the same geometry (GreaterEqual lets the overlay pass depth-test equal to what the
-	/// solid pass already wrote, instead of failing/z-fighting against it).
-	/// </summary>
+	/// <summary>Wireframe <see cref="GetBaseState"/>, culling off; GreaterEqual depth so the overlay
+	/// passes against the depth-coincident solid pass instead of z-fighting it.</summary>
 	public IStateObject GetWireframeState()
 	{
 		return _api.CreateGraphicsState(new GraphicsStateInfo
@@ -1439,8 +1253,8 @@ public unsafe class DiligentBatchRenderer : IReleaseObject, IBatchRenderer
 				new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
-				// TEXCOORD_1 (Vertex.TexCoord1) - идёт последним в структуре вершины, поэтому и в
-				// объявлении слота 0 последний: Diligent пакует авто-оффсеты по порядку элементов.
+				// TEXCOORD_1 is last in Vertex, so it must be last here too: Diligent packs
+				// auto-offsets in element order.
 				new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 				new InputLayoutElementInfo { InputIndex = 3, BufferSlot = 1, NumComponents = 1, ValueType = InputElementValueType.Int32, IsNormalized = false, Frequency = InputElementFrequencyType.PerInstance }
 			]

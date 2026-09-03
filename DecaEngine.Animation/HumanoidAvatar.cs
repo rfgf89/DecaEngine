@@ -6,15 +6,9 @@ using DecaEngine.Core;
 namespace DecaEngine.Animation;
 
 /// <summary>
-/// Слоты humanoid-скелета. Смысл всей затеи в том, чтобы системы говорили «левая стопа», а не
-/// <c>b_LeftFoot01_017</c>: имя джойнта - свойство КОНКРЕТНОЙ модели, и всё, что настроено по именам
-/// (foot IK, рэгдолл, привязка оружия, ретаргетинг клипов), приходится настраивать заново под каждый
-/// риг и переделывать после каждого переэкспорта.
-///
-/// Набор намеренно совпадает по составу с общепринятым (Unity/FBX humanoid): не ради совместимости
-/// форматов, а потому что он проверен временем - меньший не покрывает плечи и носки, без которых не
-/// работает ни ретаргетинг, ни foot IK, а больший требует от художника размечать кости, которых в
-/// половине ригов просто нет.
+/// Humanoid skeleton slots so systems can say "left foot" instead of a rig-specific joint name.
+/// The set matches the common Unity/FBX humanoid layout: anything smaller misses shoulders and
+/// toes (needed by retargeting and foot IK), anything bigger demands bones half the rigs lack.
 /// </summary>
 public enum HumanoidBone
 {
@@ -55,47 +49,44 @@ public enum HumanoidSide
 	Right,
 }
 
-/// <summary>Справочник о слотах: что обязательно, к какой стороне и цепочке относится. Таблицей, а не
-/// разбором имени enum-а: имена слотов - это удобство чтения, а не данные, и выводить из них логику
-/// значит сломать её первым же переименованием.</summary>
+/// <summary>Slot metadata table; kept as data rather than derived from enum names, which are readability, not semantics.</summary>
 public static class HumanoidBones
 {
 	public readonly record struct Info(HumanoidBone Bone, string Title, bool Required, HumanoidSide Side);
 
 	/// <summary>
-	/// Обязательными помечены только те слоты, без которых humanoid перестаёт быть humanoid-ом:
-	/// таз, позвоночник, голова и обе цепочки конечностей. Шея, грудь, плечи и носки - НЕ обязательны
-	/// осознанно: в реальных ригах их часто нет вовсе (шея слита с головой, ключицы отсутствуют), и
-	/// требовать их значит объявить сломанными половину нормальных моделей.
+	/// Only slots without which a humanoid stops being one are required. Neck, chest, shoulders
+	/// and toes are deliberately optional: real rigs often lack them entirely, and requiring them
+	/// would declare half of normal models broken.
 	/// </summary>
 	public static readonly Info[] All =
 	[
-		new(HumanoidBone.Hips, "Таз", true, HumanoidSide.None),
-		new(HumanoidBone.Spine, "Позвоночник", true, HumanoidSide.None),
-		new(HumanoidBone.Chest, "Грудь", false, HumanoidSide.None),
-		new(HumanoidBone.UpperChest, "Верх груди", false, HumanoidSide.None),
-		new(HumanoidBone.Neck, "Шея", false, HumanoidSide.None),
-		new(HumanoidBone.Head, "Голова", true, HumanoidSide.None),
+		new(HumanoidBone.Hips, "Hips", true, HumanoidSide.None),
+		new(HumanoidBone.Spine, "Spine", true, HumanoidSide.None),
+		new(HumanoidBone.Chest, "Chest", false, HumanoidSide.None),
+		new(HumanoidBone.UpperChest, "Upper chest", false, HumanoidSide.None),
+		new(HumanoidBone.Neck, "Neck", false, HumanoidSide.None),
+		new(HumanoidBone.Head, "Head", true, HumanoidSide.None),
 
-		new(HumanoidBone.LeftShoulder, "Плечо (ключица) L", false, HumanoidSide.Left),
-		new(HumanoidBone.LeftUpperArm, "Плечо L", true, HumanoidSide.Left),
-		new(HumanoidBone.LeftLowerArm, "Предплечье L", true, HumanoidSide.Left),
-		new(HumanoidBone.LeftHand, "Кисть L", true, HumanoidSide.Left),
+		new(HumanoidBone.LeftShoulder, "Shoulder (clavicle) L", false, HumanoidSide.Left),
+		new(HumanoidBone.LeftUpperArm, "Upper arm L", true, HumanoidSide.Left),
+		new(HumanoidBone.LeftLowerArm, "Forearm L", true, HumanoidSide.Left),
+		new(HumanoidBone.LeftHand, "Hand L", true, HumanoidSide.Left),
 
-		new(HumanoidBone.RightShoulder, "Плечо (ключица) R", false, HumanoidSide.Right),
-		new(HumanoidBone.RightUpperArm, "Плечо R", true, HumanoidSide.Right),
-		new(HumanoidBone.RightLowerArm, "Предплечье R", true, HumanoidSide.Right),
-		new(HumanoidBone.RightHand, "Кисть R", true, HumanoidSide.Right),
+		new(HumanoidBone.RightShoulder, "Shoulder (clavicle) R", false, HumanoidSide.Right),
+		new(HumanoidBone.RightUpperArm, "Upper arm R", true, HumanoidSide.Right),
+		new(HumanoidBone.RightLowerArm, "Forearm R", true, HumanoidSide.Right),
+		new(HumanoidBone.RightHand, "Hand R", true, HumanoidSide.Right),
 
-		new(HumanoidBone.LeftUpperLeg, "Бедро L", true, HumanoidSide.Left),
-		new(HumanoidBone.LeftLowerLeg, "Голень L", true, HumanoidSide.Left),
-		new(HumanoidBone.LeftFoot, "Стопа L", true, HumanoidSide.Left),
-		new(HumanoidBone.LeftToes, "Носок L", false, HumanoidSide.Left),
+		new(HumanoidBone.LeftUpperLeg, "Thigh L", true, HumanoidSide.Left),
+		new(HumanoidBone.LeftLowerLeg, "Shin L", true, HumanoidSide.Left),
+		new(HumanoidBone.LeftFoot, "Foot L", true, HumanoidSide.Left),
+		new(HumanoidBone.LeftToes, "Toes L", false, HumanoidSide.Left),
 
-		new(HumanoidBone.RightUpperLeg, "Бедро R", true, HumanoidSide.Right),
-		new(HumanoidBone.RightLowerLeg, "Голень R", true, HumanoidSide.Right),
-		new(HumanoidBone.RightFoot, "Стопа R", true, HumanoidSide.Right),
-		new(HumanoidBone.RightToes, "Носок R", false, HumanoidSide.Right),
+		new(HumanoidBone.RightUpperLeg, "Thigh R", true, HumanoidSide.Right),
+		new(HumanoidBone.RightLowerLeg, "Shin R", true, HumanoidSide.Right),
+		new(HumanoidBone.RightFoot, "Foot R", true, HumanoidSide.Right),
+		new(HumanoidBone.RightToes, "Toes R", false, HumanoidSide.Right),
 	];
 
 	public static Info Of(HumanoidBone bone) => All[(int)bone];
@@ -104,18 +95,16 @@ public static class HumanoidBones
 }
 
 /// <summary>
-/// Аватар: соответствие слотов humanoid именам джойнтов КОНКРЕТНОГО рига.
-///
-/// Хранит ИМЕНА, а не индексы, по той же причине, по которой имена хранят компоненты анимации:
-/// индексы зависят от порядка узлов в glTF и молча разъезжаются при переэкспорте модели - анимация
-/// после этого продолжает работать, но гнёт не те кости. Индексы получаются на месте, из скелета
-/// (<see cref="Resolve"/>), и живут ровно столько, сколько живёт этот скелет.
+/// Avatar: mapping of humanoid slots to joint NAMES of a specific rig. Names, not indices:
+/// indices depend on glTF node order and silently shift on re-export, after which animation still
+/// plays but bends the wrong bones. Indices are resolved on the spot from a skeleton
+/// (<see cref="Resolve"/>) and live only as long as that skeleton does.
 /// </summary>
 public sealed class HumanoidAvatar
 {
 	private readonly string[] _joints = new string[(int)HumanoidBone.Count];
 
-	/// <summary>Имя джойнта в слоте; пусто - слот не назначен.</summary>
+	/// <summary>Joint name in the slot; empty means unassigned.</summary>
 	public string this[HumanoidBone bone]
 	{
 		get => _joints[(int)bone] ?? string.Empty;
@@ -125,16 +114,11 @@ public sealed class HumanoidAvatar
 	public bool IsAssigned(HumanoidBone bone) => !string.IsNullOrEmpty(_joints[(int)bone]);
 
 	/// <summary>
-	/// Референсная поза рига: локальные TRS по ИМЕНАМ костей. Пусто - позу ещё не снимали.
-	///
-	/// Это опорная точка ретаргетинга: повороты переносятся между ригами не абсолютно, а как
-	/// ОТКЛОНЕНИЕ от референсной позы (<c>цель = целевой_реф * (источник_реф⁻¹ * источник)</c>).
-	/// Без неё «поднятая рука» одного рига означала бы у другого что угодно - лишь бы кватернионы
-	/// совпали.
-	///
-	/// Хранятся ВСЕ кости скелета, а не только размеченные слоты: между слотами почти всегда есть
-	/// промежуточные звенья (скрутки предплечья, вспомогательные узлы таза), и без них модельную
-	/// позу слота не восстановить - цепочка от корня оборвётся на первом же неразмеченном узле.
+	/// Reference pose of the rig: local TRS keyed by bone NAME; empty until captured. It anchors
+	/// retargeting - rotations transfer as a DEVIATION from the reference pose
+	/// (target = target_ref * (source_ref^-1 * source)). ALL skeleton bones are stored, not just
+	/// mapped slots: intermediate links (forearm twists, pelvis helpers) are needed to rebuild a
+	/// slot's model pose from the root.
 	/// </summary>
 	public readonly Dictionary<string, Transform> ReferenceLocals = new(StringComparer.Ordinal);
 
@@ -167,10 +151,9 @@ public sealed class HumanoidAvatar
 	}
 
 	/// <summary>
-	/// Разворачивает имена в индексы джойнтов скелета. -1 - слот не назначен ИЛИ такой кости в
-	/// скелете нет; различать эти два случая вызывающему не нужно, а вот показать их по-разному
-	/// обязан редактор (см. <see cref="HumanoidValidation"/>): «не назначено» - работа не сделана,
-	/// «нет такой кости» - аватар от другой модели.
+	/// Resolves names to skeleton joint indices. -1 means the slot is unassigned OR the bone does
+	/// not exist in this skeleton; callers need not distinguish, but the editor must display the
+	/// two cases differently (see <see cref="HumanoidValidation"/>).
 	/// </summary>
 	public int[] Resolve(PreparedSkeleton skeleton)
 	{
@@ -185,20 +168,16 @@ public sealed class HumanoidAvatar
 	}
 }
 
-/// <summary>Найденная проблема аватара. Отдельным типом, а не строкой: редактор подсвечивает
-/// проблемный слот, а для этого ему нужен сам слот, а не текст про него.</summary>
+/// <summary>Detected avatar problem; a typed record rather than a string so the editor can highlight the offending slot.</summary>
 public readonly record struct HumanoidIssue(HumanoidBone Bone, string Message, bool Fatal);
 
 public static class HumanoidValidation
 {
 	/// <summary>
-	/// Проверяет аватар против скелета. Ловит ровно то, что иначе проявляется уже в кадре и выглядит
-	/// как ошибка анимации: незаполненные обязательные слоты, кости от другой модели, одна и та же
-	/// кость в двух слотах и разорванные цепочки.
-	///
-	/// Разрыв цепочки - самая коварная из четырёх: аватар выглядит заполненным, каждая кость
-	/// существует, а «голень» при этом не потомок «бедра», и любая система, считающая цепочку ноги
-	/// непрерывной (two-bone IK, рэгдолл), даёт бессмыслицу без единой ошибки.
+	/// Validates an avatar against a skeleton: missing required slots, bones from another model,
+	/// the same bone in two slots, and broken chains. A broken chain is the sneakiest - every
+	/// bone exists yet the shin is not a descendant of the thigh, so two-bone IK and ragdolls
+	/// produce nonsense without a single error.
 	/// </summary>
 	public static List<HumanoidIssue> Validate(HumanoidAvatar avatar, PreparedSkeleton skeleton)
 	{
@@ -213,7 +192,7 @@ public static class HumanoidValidation
 			{
 				if (info.Required)
 				{
-					issues.Add(new HumanoidIssue(info.Bone, "обязательный слот не назначен", true));
+					issues.Add(new HumanoidIssue(info.Bone, "required slot is not assigned", true));
 				}
 
 				continue;
@@ -222,11 +201,11 @@ public static class HumanoidValidation
 			if (resolved[index] < 0)
 			{
 				issues.Add(new HumanoidIssue(info.Bone,
-					$"кости '{avatar[info.Bone]}' нет в скелете - аватар от другой модели?", true));
+					$"bone '{avatar[info.Bone]}' is not in the skeleton - avatar from another model?", true));
 			}
 		}
 
-		// Дубли: одна кость в двух слотах.
+		// Duplicates: one bone in two slots.
 		for (int i = 0; i < resolved.Length; i++)
 		{
 			if (resolved[i] < 0)
@@ -239,7 +218,7 @@ public static class HumanoidValidation
 				if (resolved[i] == resolved[j])
 				{
 					issues.Add(new HumanoidIssue((HumanoidBone)j,
-						$"та же кость, что в слоте {HumanoidBones.Of((HumanoidBone)i).Title}", true));
+						$"same bone as in slot {HumanoidBones.Of((HumanoidBone)i).Title}", true));
 				}
 			}
 		}
@@ -283,22 +262,15 @@ public static class HumanoidValidation
 		}
 
 		issues.Add(new HumanoidIssue(descendant,
-			$"не потомок слота {HumanoidBones.Of(ancestor).Title} - цепочка разорвана", true));
+			$"not a descendant of slot {HumanoidBones.Of(ancestor).Title} - chain is broken", true));
 	}
 }
 
 /// <summary>
-/// Автоматическая разметка аватара по скелету.
-///
-/// Сначала ТОПОЛОГИЯ, потом имена, а не наоборот. Имена в ригах врут чаще, чем строение: их
-/// переименовывают, локализуют, пишут с опечатками, а вот таз всегда остаётся узлом, из которого
-/// расходятся три ветви, и стопа всегда третья по цепочке вниз. Имена здесь нужны для того, чего
-/// топология дать не может в принципе, - для РАЗЛИЧЕНИЯ СТОРОН: левая и правая ноги топологически
-/// неотличимы.
-///
-/// Результат ОБЯЗАН показываться человеку и правиться руками (см. окно Humanoid). Молчаливый
-/// автомат здесь - это анимация, которая играет, но гнёт не те кости, а такую ошибку ищут в
-/// ретаргетинге, а не в разметке.
+/// Automatic avatar mapping from skeleton topology. Topology first, names second: rig names lie
+/// more often than structure, but only names can tell LEFT from RIGHT - the sides are
+/// topologically identical. The result must be shown to a human and hand-corrected (Humanoid
+/// window): a silent mistake here looks like a retargeting bug, not a mapping bug.
 /// </summary>
 public static class HumanoidAutoMap
 {
@@ -331,13 +303,9 @@ public static class HumanoidAutoMap
 
 		var branches = new List<int>(children[hips]);
 
-		// Позвоночник - ветвь с САМЫМ ВЫСОКИМ кончиком: голова у любого скелета выше всего, и это
-		// свойство, которое не зависит ни от имён, ни от числа звеньев.
-		//
-		// Именно по МАКСИМУМУ, а не по минимуму. Разница не косметическая: у четвероногого передние
-		// лапы висят на позвоночнике, то есть САМАЯ НИЗКАЯ точка его поддерева - пол, и отбор по
-		// минимуму уводил позвоночник в хвост (проверено на Fox: слот «Позвоночник» уезжал в
-		// b_Tail01_012, и дальше рушилась вся разметка).
+		// The spine is the branch with the HIGHEST tip - the head tops any skeleton. Maximum, not
+		// minimum: on a quadruped the front legs hang off the spine, so its lowest point is the
+		// floor, and a minimum-based pick sent the spine into the tail (seen on Fox).
 		int spine = -1;
 		float bestTop = float.NegativeInfinity;
 
@@ -356,9 +324,8 @@ public static class HumanoidAutoMap
 			MapSpine(avatar, skeleton, children, positions, spine);
 		}
 
-		// Ноги - две ветви с самыми НИЗКИМИ кончиками среди оставшихся. Не «все, кроме позвоночника»:
-		// из таза выходят ещё хвост, юбка и полы плаща, и взять их за ноги значит получить
-		// персонажа, стоящего на хвосте.
+		// Legs are the two branches with the LOWEST tips among the rest - not "everything but the
+		// spine": tails, skirts and coat flaps also leave the hips.
 		var rest = branches.FindAll(branch => branch != spine);
 		rest.Sort((a, b) => TipExtent(a, children, positions, highest: false)
 			.CompareTo(TipExtent(b, children, positions, highest: false)));
@@ -374,11 +341,9 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Снимает повторные назначения одной и той же кости, оставляя первое по порядку слотов.
-	///
-	/// Дубль - это всегда ошибка разметки, и оставить его значит отдать наружу аватар, у которого
-	/// «голень» и «предплечье» - одна кость: two-bone IK по такому решает бессмыслицу, ничем не
-	/// жалуясь. Пустой слот честнее: он виден в окне красным и в валидации отдельной строкой.
+	/// Removes duplicate assignments, keeping the first by slot order. A duplicate is always a
+	/// mapping error; an empty slot is honest - it shows red in the window and in validation,
+	/// while a duplicate feeds nonsense to two-bone IK silently.
 	/// </summary>
 	private static void DropDuplicates(HumanoidAvatar avatar)
 	{
@@ -393,7 +358,7 @@ public static class HumanoidAutoMap
 		}
 	}
 
-	// --- Топология ---------------------------------------------------------------------------------
+	// --- Topology ----------------------------------------------------------------------------------
 
 	private static List<int>[] BuildChildren(PreparedSkeleton skeleton)
 	{
@@ -416,10 +381,9 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Таз - ПЕРВЫЙ сверху узел, из которого расходятся три и более ветви. Именно первый: у многих
-	/// ригов корень скелета - служебный узел («Armature», «root», «Reference»), у него тоже бывает
-	/// несколько детей, и взять его за таз значит промахнуться на всю иерархию. Три ветви - это
-	/// позвоночник и две ноги; узел с двумя ветвями тазом быть не может.
+	/// The hips are the FIRST node from the top with three or more branches (spine plus two
+	/// legs). First, specifically: many rigs have a utility root ("Armature", "root") that also
+	/// has several children, and picking it misses the whole hierarchy.
 	/// </summary>
 	private static int FindHips(PreparedSkeleton skeleton, List<int>[] children)
 	{
@@ -431,8 +395,8 @@ public static class HumanoidAutoMap
 			}
 		}
 
-		// Рига без развилки на тазе не бывает у человекоподобного, но бывает у обрезанного
-		// (только верх тела). Тогда таз - корень: лучше разметить половину, чем ничего.
+		// No hip fork happens only on truncated rigs (upper body only); then the hips are the
+		// root - mapping half is better than nothing.
 		for (int i = 0; i < skeleton.JointCount; i++)
 		{
 			if (skeleton.Parents[i] < 0)
@@ -444,9 +408,7 @@ public static class HumanoidAutoMap
 		return -1;
 	}
 
-	/// <summary>Самая высокая (или самая низкая) точка поддерева ветви. По кончикам, а не по самой
-	/// кости: первое звено ноги и первое звено позвоночника выходят из таза почти на одной высоте, а
-	/// вот их кончики - стопа и голова - разнесены на весь рост.</summary>
+	/// <summary>Highest (or lowest) point of a branch subtree. Tips, not the bone itself: leg and spine roots leave the hips at nearly one height, but their tips span the full body.</summary>
 	private static float TipExtent(int joint, List<int>[] children, Vector3[] positions, bool highest)
 	{
 		float extent = positions[joint].Y;
@@ -460,9 +422,7 @@ public static class HumanoidAutoMap
 		return extent;
 	}
 
-	/// <summary>Раскладывает цепочку позвоночника от таза до головы по слотам. Голова - самый
-	/// дальний потомок по этой ветви; всё, что между тазом и головой, распределяется по числу
-	/// звеньев: у рига из двух звеньев это Spine+Head, из пяти - вплоть до UpperChest и Neck.</summary>
+	/// <summary>Maps the spine chain from hips to head; the head is the farthest descendant on the branch, intermediate links distribute by link count.</summary>
 	private static void MapSpine(HumanoidAvatar avatar, PreparedSkeleton skeleton, List<int>[] children,
 		Vector3[] positions, int spineRoot)
 	{
@@ -473,9 +433,9 @@ public static class HumanoidAutoMap
 		{
 			chain.Add(current);
 
-			// Вверх по ветви с самым ВЫСОКИМ кончиком. Не по самой длинной: на груди позвоночник
-			// ветвится на шею и две руки, и цепочка «плечо-предплечье-кисть-пальцы» ДЛИННЕЕ, чем
-			// «шея-голова», - разметка уезжала в руку и объявляла головой кисть.
+			// Follow the branch with the HIGHEST tip, not the longest: at the chest the spine
+			// forks into neck and arms, and the arm chain is LONGER than neck+head - a
+			// longest-branch walk declared the hand to be the head.
 			int next = -1;
 			float bestTop = float.NegativeInfinity;
 
@@ -499,9 +459,8 @@ public static class HumanoidAutoMap
 
 		avatar[HumanoidBone.Head] = skeleton.JointNames[chain[^1]];
 
-		// Промежуточные слоты заполняются ПО ВАЖНОСТИ: сначала позвоночник, потом шея, потом грудь.
-		// Так на коротком риге (Spine + Head) заполняется именно Spine, а не Chest, которого у него
-		// нет физически.
+		// Intermediate slots fill BY IMPORTANCE: spine, then neck, then chest - so a short rig
+		// (Spine + Head) fills Spine, not a Chest it physically lacks.
 		var middle = chain.GetRange(0, chain.Count - 1);
 
 		if (middle.Count == 0)
@@ -539,8 +498,7 @@ public static class HumanoidAutoMap
 		return depth + 1;
 	}
 
-	/// <summary>Руки - две боковые ветви, отходящие от груди/шеи. Ищутся от той кости позвоночника, у
-	/// которой ветвлений больше всего: это и есть грудь, независимо от того, как она названа.</summary>
+	/// <summary>Arms are the two side branches off the chest/neck, searched from the most-branching spine bone regardless of its name.</summary>
 	private static void MapArms(HumanoidAvatar avatar, PreparedSkeleton skeleton, List<int>[] children,
 		Vector3[] positions)
 	{
@@ -550,17 +508,16 @@ public static class HumanoidAutoMap
 			return;
 		}
 
-		// Ветвь позвоночника исключается из кандидатов: она уже размечена, и без исключения шея
-		// уехала бы в руку.
+		// The spine branch is excluded from candidates - it is already mapped, and without the
+		// exclusion the neck would land in an arm slot.
 		int neck = avatar.IsAssigned(HumanoidBone.Neck) ? skeleton.FindJoint(avatar[HumanoidBone.Neck]) : -1;
 		int head = avatar.IsAssigned(HumanoidBone.Head) ? skeleton.FindJoint(avatar[HumanoidBone.Head]) : -1;
 
 		var candidates = new List<int>();
 		foreach (int child in children[chest])
 		{
-			// Из кандидатов выброшены и ветвь позвоночника, и уже размеченные ноги. Ноги - потому
-			// что грудью может оказаться сам таз (риг без шеи и груди), и тогда в руки уехали бы
-			// именно они.
+			// Both the spine branch and already-mapped legs are excluded: the chest may turn out
+			// to be the hips themselves (a rig with no neck/chest), and the legs would become arms.
 			if (child != neck && child != head && !IsAncestorOf(skeleton, child, head) &&
 				!IsAssignedJoint(avatar, skeleton, child))
 			{
@@ -573,8 +530,8 @@ public static class HumanoidAutoMap
 			return;
 		}
 
-		// Из всех боковых ветвей берутся две САМЫЕ ДЛИННЫЕ: у рига с грудью может висеть что угодно
-		// (плащ, ремень, рюкзак), но длиннее руки среди них обычно ничего нет.
+		// Take the two LONGEST side branches: a chest can carry anything (cape, belt, backpack),
+		// but usually nothing there is longer than an arm.
 		candidates.Sort((a, b) => ChainDepth(b, children).CompareTo(ChainDepth(a, children)));
 		var arms = candidates.GetRange(0, 2);
 
@@ -582,12 +539,10 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Кость, от которой отходят руки, - ПЕРВАЯ СВЕРХУ кость позвоночника с ветвлением.
-	///
-	/// Именно первая по списку предпочтения, а не «та, у которой детей больше всего». Разница
-	/// решающая: у таза детей обычно больше, чем у груди (позвоночник, две ноги, хвост), и отбор по
-	/// максимуму объявлял грудью ТАЗ - после чего руками становились ноги, а ноги оставались
-	/// неразмеченными (проверено на Fox: в слоты рук уезжали задние лапы).
+	/// The bone the arms branch from: the FIRST branching spine bone by preference order, not the
+	/// one with the most children - the hips usually have more children than the chest (spine,
+	/// two legs, tail), and a max-children pick declared the HIPS to be the chest, mapping hind
+	/// legs into arm slots (seen on Fox).
 	/// </summary>
 	private static int FindChestJoint(HumanoidAvatar avatar, PreparedSkeleton skeleton, List<int>[] children)
 	{
@@ -642,12 +597,10 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Раскладывает две симметричные ветви по левому и правому слоту и размечает их звенья.
-	///
-	/// Сторона определяется ПО ИМЕНИ, и только если имя молчит - по знаку X. Наоборот нельзя:
-	/// «право» и «лево» зависят от того, куда персонаж смотрит, а это соглашение модели, которое из
-	/// геометрии не выводится. Имя же его прямо называет - и именно поэтому автомат по одной
-	/// топологии принципиально не может развести стороны сам.
+	/// Assigns two symmetric branches to left/right slots and maps their links. Side comes from
+	/// the NAME first and only then from the X sign: left/right depend on which way the model
+	/// faces, a convention geometry cannot express - which is exactly why pure topology cannot
+	/// tell the sides apart.
 	/// </summary>
 	private static void AssignSides(HumanoidAvatar avatar, PreparedSkeleton skeleton, List<int>[] children,
 		Vector3[] positions, List<int> branches, bool arms)
@@ -675,9 +628,9 @@ public static class HumanoidAutoMap
 		}
 		else
 		{
-			// Соглашение: персонаж смотрит вдоль +Z, левая сторона - в сторону +X. Угадать здесь
-			// нельзя, поэтому в окне Humanoid есть кнопка «поменять стороны» - и это честнее, чем
-			// молча ошибиться в половине случаев.
+			// Convention: the character faces +Z, left is toward +X. This cannot be guessed, so
+			// the Humanoid window has a swap-sides button - more honest than silently being wrong
+			// half the time.
 			firstIsLeft = positions[first].X > positions[second].X;
 		}
 
@@ -686,12 +639,9 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Размечает одну конечность. Ключевой вопрос здесь один - есть ли у руки КЛЮЧИЦА: цепочка из
-	/// четырёх звеньев начинается с неё, из трёх - сразу с плеча. Различить их иначе нельзя, а
-	/// ошибка сдвигает всю руку на слот и выглядит как «плечо назначено на предплечье».
-	///
-	/// У ноги обратная ситуация: лишнее звено приходит В КОНЦЕ (носок), поэтому список слотов у неё
-	/// всегда один и тот же, а недостающие просто не заполняются.
+	/// Maps one limb. For arms the key question is whether a CLAVICLE exists: a four-link chain
+	/// starts with it, a three-link one starts at the upper arm - misjudging shifts the whole arm
+	/// by a slot. A leg's extra link comes at the END (toes), so its slot list is fixed.
 	/// </summary>
 	private static void MapLimb(HumanoidAvatar avatar, PreparedSkeleton skeleton, List<int>[] children,
 		int rootJoint, bool arm, HumanoidSide side)
@@ -728,12 +678,9 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Собирает цепочку конечности от корневого звена вниз.
-	///
-	/// Спуск - по самой длинной ветви (у стопы есть носок, у кисти пальцы), но с ДВУМЯ
-	/// ограничителями. Первый: остановка на кости, из которой расходятся три и более ветви, - это
-	/// кисть с пальцами, и без остановки цепочка руки уезжала бы в мизинец. Второй: потолок в
-	/// четыре звена - больше в humanoid-слоты не укладывается.
+	/// Collects a limb chain from the root link down along the longest branch, with two stops:
+	/// a bone with three or more branches (a hand with fingers - otherwise the arm chain runs
+	/// into the pinky) and a cap of four links (more do not fit humanoid slots).
 	/// </summary>
 	private static List<int> LimbChain(List<int>[] children, int rootJoint)
 	{
@@ -769,12 +716,9 @@ public static class HumanoidAutoMap
 	}
 
 	/// <summary>
-	/// Раскладывает цепочку по слотам ЯВНЫМ списком.
-	///
-	/// Явным, а не арифметикой «корневой слот плюс номер звена»: слоты идут в enum-е подряд только
-	/// внутри одной конечности, и пятое звено руки при таком счёте писалось в первый слот СЛЕДУЮЩЕЙ
-	/// (проверено: кость стопы приезжала в «ключицу R»). Ошибка выглядит как случайная разметка, а
-	/// не как выход за границу.
+	/// Assigns a chain to slots via an EXPLICIT list, not "root slot plus link index" arithmetic:
+	/// slots are only contiguous within one limb, and index math wrote a fifth arm link into the
+	/// first slot of the NEXT limb - an error that looks like random mapping.
 	/// </summary>
 	private static void Assign(HumanoidAvatar avatar, PreparedSkeleton skeleton, List<int> chain,
 		ReadOnlySpan<HumanoidBone> slots)
@@ -787,11 +731,11 @@ public static class HumanoidAutoMap
 		}
 	}
 
-	// --- Имена -------------------------------------------------------------------------------------
+	// --- Names -------------------------------------------------------------------------------------
 
 	/// <summary>
-	/// Доразметка по именам: заполняет ТОЛЬКО пустые слоты. Именно только пустые - топология уже
-	/// сказала своё слово, и переписывать её именем значит проиграть ровно там, где имена и врут.
+	/// Name-based fill-in for EMPTY slots only: topology has already spoken, and overriding it by
+	/// name would lose exactly where names lie.
 	/// </summary>
 	private static void MapByName(HumanoidAvatar avatar, PreparedSkeleton skeleton)
 	{
@@ -826,8 +770,8 @@ public static class HumanoidAutoMap
 
 				foreach (string keyword in keywords)
 				{
-					// Кратчайшее подходящее имя: у «neck» и «neck_twist_01» первое почти всегда и
-					// есть настоящая кость, а второе - вспомогательная.
+					// Shortest matching name wins: between "neck" and "neck_twist_01" the former
+					// is almost always the real bone.
 					if (name.Contains(keyword, StringComparison.Ordinal) && name.Length < bestLength)
 					{
 						best = joint;
@@ -880,9 +824,8 @@ public static class HumanoidAutoMap
 	};
 
 	/// <summary>
-	/// Сторона по имени. Проверяются и слова целиком, и односимвольные маркеры в РАЗДЕЛИТЕЛЯХ
-	/// (<c>_l</c>, <c>.r</c>, <c>l_</c>) - но именно в разделителях: голая буква «l» встречается в
-	/// половине имён костей, и искать её где попало значит объявить левыми все кости рига.
+	/// Side from the name. Whole words and single-letter markers are checked, but the letter only
+	/// AT SEPARATORS (_l, .r, l_): a bare "l" occurs in half of all bone names.
 	/// </summary>
 	public static HumanoidSide SideFromName(string name)
 	{
@@ -923,15 +866,11 @@ public static class HumanoidAutoMap
 		return HumanoidSide.None;
 	}
 
-	/// <summary>Префиксы экспортёров, которые снимаются ЦЕЛИКОМ, вместе со своим разделителем. Именно
-	/// с разделителем: снимать голую букву «b» из <c>b_Head</c> и заодно из <c>ball</c> - это
-	/// превратить «ball» в «all» и потерять носок.</summary>
+	/// <summary>Exporter prefixes stripped WHOLE, including their separator: stripping a bare "b" would turn "ball" into "all" and lose the toes.</summary>
 	private static readonly string[] RawPrefixes =
 		["mixamorig:", "mixamorig", "b_", "bone_", "def-", "def_", "org-", "org_", "bip01_", "bip_"];
 
-	/// <summary>Имя без регистра, разделителей, цифр и префиксов экспортёров. Цифры выбрасываются
-	/// намеренно: <c>Spine01</c>, <c>spine_1</c> и <c>Spine</c> - одна и та же кость, а нумерация
-	/// звеньев всё равно восстанавливается топологией, а не именем.</summary>
+	/// <summary>Name without case, separators, digits and exporter prefixes; digits go on purpose - Spine01/spine_1/Spine are one bone, link numbering is recovered from topology.</summary>
 	public static string Normalize(string name)
 	{
 		if (string.IsNullOrEmpty(name))

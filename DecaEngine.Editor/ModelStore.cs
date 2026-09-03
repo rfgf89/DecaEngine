@@ -11,64 +11,22 @@ using UnsafeCollections.Collections.Unsafe;
 namespace DecaEngine.Editor.ECS
 {
 	/// <summary>
-	/// Device-level, refcounted store of loaded models: today every viewport (Scene View, Model
-	/// Preview, the icon baker - see <see cref="DecaEngine.Editor.ECS.ModelStreamer"/>/
-	/// <see cref="DecaEngine.Editor.ModelIconBaker"/>) parses the same .gltf, decodes and uploads the
-	/// same textures/geometry SEPARATELY, once per environment. <see cref="ModelStore"/> is the single
-	/// point that owns <see cref="ModelLoader"/> instances (geometry, textures, CPU-side material data -
-	/// all SHAREABLE, see class-doc below) for the whole editor process: one <see cref="IGraphicsApi"/>
-	/// device, one store, keyed by (absolute path, <see cref="ModelLoadOptions.Signature"/>).
-	///
-	/// What IS shared across every acquirer of the same key: <see cref="IMeshObject"/> geometry,
-	/// <see cref="IGpuTexture"/>s, samplers, shaders (already deduped device-wide by
-	/// <see cref="IGraphicsApi.CreateSharedShader"/>), and all CPU-side parsed data (instances, bounds,
-	/// <see cref="MaterialPbrFactors"/>, MeshHasUv). What is NOT shared: <see cref="IMaterialObject"/> -
-	/// registering a material into a <see cref="DecaEngine.Graphics.Diligent.DiligentBatchRenderer"/> MUTATES it (rebinds
-	/// View/Light/GPURenderInstances/cluster buffers to THAT renderer's constant buffers), and PSOs bake
-	/// per-environment SampleCount/RenderTargetFormats. Each acquirer that wants to render the model
-	/// builds its OWN material set via <see cref="ModelLoader.BuildAdditionalMaterialSet"/> (the FIRST
-	/// acquirer may just use <see cref="ModelLoader.materialObjects"/>, built as a side effect of the
-	/// load itself) and registers THAT into its own batch renderer - see
-	/// <see cref="DecaEngine.Editor.ModelViewportGeometry.RegisterModelResources"/>'s
-	/// <c>materials</c> parameter.
-	///
-	/// Options MUST match exactly (<see cref="ModelLoadOptions.Signature"/>) for two acquirers to share
-	/// one entry: anisotropy/MipLodBias/MaxTextureSize/etc. are baked into immutable samplers and the
-	/// texture decoder at LOAD time, so mismatched options are not interchangeable and get their own,
-	/// separate <see cref="ModelLoader"/>.
-	///
-	/// Refcounting: <see cref="Acquire"/> returns a <see cref="Handle"/> that the caller must eventually
-	/// pass to <see cref="Release"/> - exactly once. Multiple handles for the same key share one
-	/// underlying entry/<see cref="ModelLoader"/>; the entry stays resident while any handle references
-	/// it, plus <see cref="UnloadAfterSeconds"/> after the last one lets go (hysteresis against a
-	/// consumer that acquires/releases the same model every frame).
-	///
-	/// Release protocol (preserved from <see cref="DecaEngine.Editor.ECS.ModelStreamer"/>, see its class-doc):
-	/// wait for GPU / ensure no frozen command references the resources -&gt; drop instances -&gt;
-	/// unregister from batch renderer -&gt; <see cref="ModelLoader.Release"/> -&gt;
-	/// Pipeline.InvalidateGraph. The first three steps are ENVIRONMENT-specific (which batch renderer,
-	/// which graph) and stay the caller's job: <see cref="BeforeModelEvicted"/> fires - synchronously,
-	/// before the model's GPU resources are torn down - so every subscriber gets a chance to unregister
-	/// ITS OWN registrations of that <see cref="ModelLoader"/> (compare by reference) before this store
-	/// proceeds. The store itself only does the last two steps, and even <see cref="ModelLoader.Release"/>
-	/// is deferred a few ticks (<see cref="RetireTicks"/>) - the engine has no in-flight-frame fence, so
-	/// a barrier-free eviction (see <see cref="EvictIdle"/>) must assume the GPU can still be reading the
-	/// model's buffers/textures for a few more frames after the CPU-side unregistration above.
+	/// Refcounted, device-wide store of loaded models keyed by (absolute path, options signature).
+	/// Geometry, textures, samplers, shaders and CPU-side parsed data are shared across acquirers;
+	/// IMaterialObject sets are NOT - registering into a batch renderer mutates them, so each
+	/// acquirer builds its own set via <see cref="AcquireMaterialSet"/>. Eviction is barrier-free:
+	/// there is no in-flight-frame fence, so GPU releases are deferred by <see cref="RetireTicks"/>
+	/// and <see cref="BeforeModelEvicted"/> subscribers must unregister synchronously.
 	/// </summary>
 	public sealed class ModelStore
 	{
-		/// <summary>Caller-held reference to one (path, options) entry. Acquire/Release must be paired 1:1;
-		/// multiple handles for the same key are independent refcount units sharing one <see cref="Entry"/>.</summary>
+		/// <summary>Caller-held reference to one (path, options) entry; Acquire/Release must pair 1:1.</summary>
 		public sealed class Handle
 		{
 			internal readonly Entry Entry;
 			internal bool Released;
 
-			/// <summary>Priority hint for load/finalize/texture-upgrade ordering - LOWER loads first (e.g.
-			/// distance to the requester's camera). An entry's effective priority is the MINIMUM across all
-			/// its live handles, so the most urgent requester wins regardless of who else also holds it.
-			/// Update via <see cref="ModelStore.SetPriority"/> as the requester's own priority changes
-			/// (camera movement, etc.) - a stale value only affects load ORDER, never correctness.</summary>
+			/// <summary>Load-order hint, LOWER loads first; entry priority is the minimum over its handles.</summary>
 			internal float Priority;
 
 			public string Path => Entry.Path;
@@ -93,11 +51,7 @@ namespace DecaEngine.Editor.ECS
 			public ModelLoader? Model;
 			public string? Error;
 
-			/// <summary>Permanently latched by the FIRST <see cref="AcquireMaterialSet"/> call on this
-			/// entry (never reset while the entry lives - a NEW entry after reload starts fresh): decides
-			/// whether that call (and every call after it, from any handle) gets the model's own
-			/// <see cref="ModelLoader.materialObjects"/> or a freshly built <see cref="ModelLoader.BuildAdditionalMaterialSet"/>
-			/// set. See <see cref="AcquireMaterialSet"/>.</summary>
+			/// <summary>Latched by the first AcquireMaterialSet call; later calls always build fresh sets.</summary>
 			internal bool PrimaryMaterialSetTaken;
 
 			internal readonly List<Handle> Handles = new();
@@ -105,29 +59,16 @@ namespace DecaEngine.Editor.ECS
 			internal ModelLoader.ModelLoadRequest? Request;
 			internal CancellationTokenSource? Cts;
 
-			/// <summary>See <see cref="DecaEngine.Editor.ECS.ModelStreamer.Resident.Finalizing"/>: FinalizeChunk
-			/// already created part of the GPU resources - abandoning mid-finalize leaks them (no rollback),
-			/// so an in-progress finalization is always driven to completion even for a now-unreferenced
-			/// entry; eviction happens the normal way afterwards.</summary>
+			/// <summary>FinalizeChunk has created partial GPU resources; abandoning mid-finalize leaks them, so it always runs to completion.</summary>
 			internal bool Finalizing;
 
-			/// <summary>Латч "модель можно показывать": КАЖДАЯ её стрим-текстура дошла минимум до
-			/// <see cref="ModelStore.ShowTextureSize"/> (или ждать дальше бессмысленно - см.
-			/// <see cref="ModelStore.TextureWaitTimeoutSeconds"/>/бюджет). До него потребители модель НЕ
-			/// показывают (см. <see cref="ModelStore.ModelTexturesReady"/> и
-			/// <see cref="DecaEngine.Editor.ECS.ModelStreamer.Resident.Ready"/>): иначе она появляется в
-			/// кадре с 1x1-филлерами в слотах - то самое "мигание" текстур. ПОЛНОГО качества латч не
-			/// ждёт: дальше оно догоняет ступенями фоном (см. <see cref="TryStartTextureUpgrade"/>).
-			/// Латчится один раз на запись; после выселения запись создаётся заново с чистого листа.</summary>
+			/// <summary>Latched once every streamed texture reached ShowTextureSize (or waiting is pointless); consumers must not show the model before this or it appears with 1x1 fillers.</summary>
 			internal bool TexturesReady;
 
-			/// <summary>Сколько секунд эта запись уже ждёт готовности текстур (см. <see cref="TexturesReady"/>) -
-			/// страховка от вечно невидимой модели.</summary>
+			/// <summary>Seconds spent waiting for TexturesReady; guards against a forever-invisible model.</summary>
 			internal float TextureWaitSeconds;
 
-			/// <summary>Сколько текстур модели провалили декод. Модель при этом показывается БЕЛОЙ (в
-			/// слотах остаются 1x1-филлеры), и без сводки это выглядит как «стриминг не догрузил», хотя
-			/// декодер просто не понял формат файла.</summary>
+			/// <summary>Count of failed texture decodes; without a summary the white model looks like a streaming stall.</summary>
 			internal int TextureDecodeFailures;
 
 			public bool Ready => Model != null;
@@ -162,13 +103,11 @@ namespace DecaEngine.Editor.ECS
 		private readonly Dictionary<string, Entry> _entries = new(StringComparer.OrdinalIgnoreCase);
 		private readonly IGraphicsApi _graphicsApi;
 
-		// Скретчи Tick-а - без аллокаций на кадр (см. тот же приём в ModelStreamer).
+		// Tick scratch lists - no per-frame allocations.
 		private readonly List<Entry> _startScratch = new();
 		private readonly List<Entry> _evictScratch = new();
 
-		/// <summary>Фоновый декод ОДНОЙ текстуры сразу всей лестницей качества (см.
-		/// <see cref="ModelImporter.DecodeEncodedImageLadder"/>): файл читается и декодируется ровно один
-		/// раз за всю жизнь текстуры, а не по разу на ступень.</summary>
+		/// <summary>One background decode produces the whole quality ladder; the file is read and decoded exactly once per texture lifetime.</summary>
 		private sealed class TextureUpgradeJob
 		{
 			public required Entry Entry;
@@ -178,9 +117,7 @@ namespace DecaEngine.Editor.ECS
 			public required System.Threading.Tasks.Task<List<ModelLoader.StreamedTextureLevel>> DecodeTask;
 		}
 
-		/// <summary>Декодированные, но ещё не залитые ступени одной текстуры - по возрастанию размера.
-		/// Заливаются по одной за тик (см. <see cref="UploadPendingLevels"/>): первая (самая мелкая)
-		/// открывает показ модели, остальные догоняют качество уже в кадре.</summary>
+		/// <summary>Decoded but not yet uploaded levels of one texture, ascending by size; uploaded one per tick.</summary>
 		private sealed class PendingTextureLevels
 		{
 			public required Entry Entry;
@@ -191,89 +128,58 @@ namespace DecaEngine.Editor.ECS
 			public int Next;
 		}
 
-		/// <summary>Фоновые декоды, идущие ПРЯМО СЕЙЧАС (до <see cref="MaxConcurrentTextureDecodes"/>
-		/// штук) - чистый CPU в пуле потоков.</summary>
+		/// <summary>Background decodes currently running (up to MaxConcurrentTextureDecodes), pure CPU on the thread pool.</summary>
 		private readonly List<TextureUpgradeJob> _textureJobs = new();
 
-		/// <summary>Готовые ступени, ждущие заливки на GPU. Их суммарный вес (<see cref="_pendingLevelBytes"/>)
-		/// и притормаживает новые декоды - см. <see cref="PendingDecodeBytesBudget"/>.</summary>
+		/// <summary>Decoded levels awaiting GPU upload; their total bytes throttle new decodes (see PendingDecodeBytesBudget).</summary>
 		private readonly List<PendingTextureLevels> _pendingLevels = new();
 
 		private long _pendingLevelBytes;
 
-		/// <summary>Апгрейды упёрлись в <see cref="TextureMemoryBudgetBytes"/> - ждать готовности текстур
-		/// дальше бессмысленно, ждущие записи объявляются готовыми как есть (лучше показать модель в
-		/// текущем качестве, чем не показать вовсе).</summary>
+		/// <summary>Upgrades hit TextureMemoryBudgetBytes: pending entries are declared ready as-is rather than waiting forever.</summary>
 		private bool _upgradesStalled;
 
-		/// <summary>Заменённые апгрейдами GPU-текстуры, ждущие отложенного Release - см. class-doc:
-		/// движок не ждёт GPU на партиционном выселении, поэтому старая текстура должна пережить ещё
-		/// несколько тиков после того, как все SRB перестали на неё ссылаться.</summary>
+		/// <summary>Replaced GPU textures awaiting deferred Release: the GPU may still read them for a few frames (no fence).</summary>
 		private readonly List<(IGpuTexture Texture, int TicksLeft)> _retiredTextures = new();
 
-		/// <summary>Модели, выселенные <see cref="EvictIdle"/> и ждущие отложенного
-		/// <see cref="ModelLoader.Release"/> - тем же приёмом, что и <see cref="_retiredTextures"/>.</summary>
+		/// <summary>Evicted models awaiting deferred ModelLoader.Release, same reason as _retiredTextures.</summary>
 		private readonly List<(ModelLoader Model, int TicksLeft)> _retiredModels = new();
 
 		private const int RetireTicks = 8;
 
 		public int TextureStepFactor { get; set; } = 4;
 
-		/// <summary>Первая ступень качества - её же ждёт показ модели (см. <see cref="ShowTextureSize"/>):
-		/// маленький декод с диска стоит копейки и приезжает за считанные кадры.</summary>
+		/// <summary>First quality step; showing the model waits for it, and a tiny decode arrives in a few frames.</summary>
 		public int InitialTextureSize { get; set; } = 64;
 
-		/// <summary>Минимальная сторона текстур, при которой модель уже можно показывать (см.
-		/// <see cref="Entry.TexturesReady"/>): ждать ПОЛНОГО качества незачем - модель появляется на
-		/// первой ступени, а дальше качество догоняет фоном ступенями. Ждать нужно ровно того, чтобы в
-		/// слотах не остались 1x1-филлеры: именно белые филлеры и выглядели как мигание текстур при
-		/// появлении модели, а не переход 64 -&gt; 256 -&gt; 1024.</summary>
+		/// <summary>Minimum texture side at which the model may be shown; quality catches up in the background afterwards.</summary>
 		public int ShowTextureSize { get; set; } = 64;
 
-		/// <summary>Потолок ВРЕМЕНИ на заливки текстур за тик для УЖЕ показанной модели, мс. Именно
-		/// время, а не число заливок: стоимость одной заливки зависит от размера ступени на два порядка
-		/// (64px против 2048px), поэтому счётчик "N штук за тик" либо режет пропускную способность на
-		/// мелких ступенях, либо пропускает рывок на крупных. Ограничение по времени даёт ровно то, что
-		/// нужно - предсказуемую долю кадра.</summary>
+		/// <summary>Per-tick texture upload budget in ms for already-shown models. Time, not count: upload cost varies two orders of magnitude with level size.</summary>
 		public float TextureUploadMillisecondsPerTick { get; set; } = 1.5f;
 
-		/// <summary>То же для тиков, в которых есть модели, ЖДУЩИЕ показа: их текстуры - не косметика, а
-		/// задержка появления модели, и рывок здесь не виден, потому что самой модели в кадре ещё нет.
-		/// Отсюда и куда более щедрый бюджет.</summary>
+		/// <summary>Same budget while any model is still waiting to be shown - much more generous, since its textures gate visibility.</summary>
 		public float PendingTextureUploadMillisecondsPerTick { get; set; } = 6f;
 
-		/// <summary>Сколько фоновых декодов может идти одновременно. Декод - чистый CPU в пуле, и именно
-		/// он определяет и задержку появления модели, и скорость догрузки качества: у ассетов с 4K-PNG
-		/// (десятки мегабайт на файл, разжатие только в полном разрешении) это на порядок дороже всего
-		/// остального в стриминге. По умолчанию - почти все ядра, оставляя пару главному потоку и
-		/// пулу.</summary>
+		/// <summary>Concurrent background decodes; decode is the dominant streaming cost (4K PNGs only decompress at full resolution).</summary>
 		public int MaxConcurrentTextureDecodes { get; set; } = Math.Max(2, Environment.ProcessorCount - 2);
 
-		/// <summary>Потолок CPU-памяти под декодированные, но ещё не залитые ступени (см.
-		/// <see cref="_pendingLevels"/>). Декоды кратно быстрее заливок, поэтому без него лестницы всех
-		/// текстур модели скопились бы в куче разом. Держать надо с запасом на число параллельных
-		/// декодов: одна лестница 4K-текстуры с потолком 2048 - это ~22 МБ, и слишком тесный потолок
-		/// просто не даёт декодам стартовать (они ждут заливок), обнуляя параллелизм.</summary>
+		/// <summary>CPU-memory cap for decoded-but-unuploaded levels. Too tight a cap stalls decodes entirely (one 4K ladder is ~22 MB).</summary>
 		public long PendingDecodeBytesBudget { get; set; } = 512L << 20;
 
-		/// <summary>Потолок ожидания текстур для ещё не показанной модели: за это время она объявляется
-		/// готовой в том качестве, до которого успела дойти. Страховка от вечно невидимой модели, если
-		/// апгрейды застопорились (декод падает, исходник недоступен и т.п.).</summary>
+		/// <summary>Max wait for texture readiness of a not-yet-shown model before declaring it ready at current quality.</summary>
 		public float TextureWaitTimeoutSeconds { get; set; } = 8f;
 
-		/// <summary>Целевая сторона, если <see cref="ModelLoadOptions.MaxTextureSize"/> = 0 (без лимита).</summary>
+		/// <summary>Target side when ModelLoadOptions.MaxTextureSize is 0 (unlimited).</summary>
 		private const int DefaultTextureTargetSize = 4096;
 
-		/// <summary>Ниже этой стороны потолок качества не опускается: смысла нет - модель в таком
-		/// качестве уже неотличима от размытого пятна, а память экономится копеечная.</summary>
+		/// <summary>The quality ceiling never drops below this side; savings below it are negligible.</summary>
 		private const int MinQualityCeiling = 256;
 
-		/// <summary>Потолок качества текущего тика (см. <see cref="ComputeQualityCeiling"/>).</summary>
+		/// <summary>This tick's quality ceiling (see ComputeQualityCeiling).</summary>
 		private int _qualityCeiling = DefaultTextureTargetSize;
 
-		/// <summary>Потолок памяти под стримленные текстуры суммарно по ВСЕМ резидентным моделям
-		/// (см. тот же тумблер в ModelStreamer - здесь он общий на весь процесс, а не на одно
-		/// окружение, ровно потому что модели теперь резидентны РАЗ, а не на каждое окружение).</summary>
+		/// <summary>Memory cap for streamed textures across ALL resident models - process-wide, since models are resident once, not per environment.</summary>
 		public long TextureMemoryBudgetBytes { get; set; } = 1024L << 20;
 
 		private long _textureBytes;
@@ -281,28 +187,16 @@ namespace DecaEngine.Editor.ECS
 
 		public int MaxConcurrentLoads { get; set; } = 2;
 
-		/// <summary>Сколько секунд запись с нулём живых Handle остаётся резидентной, прежде чем быть
-		/// выселенной с GPU - буфер против дребезга Acquire/Release в одном и том же кадре.</summary>
+		/// <summary>Seconds a zero-refcount entry stays resident before GPU eviction; hysteresis against per-frame Acquire/Release churn.</summary>
 		public float UnloadAfterSeconds { get; set; } = 4f;
 
-		/// <summary>Модель догрузилась и её ПЕРВЫЙ материал набор (<see cref="ModelLoader.materialObjects"/>)
-		/// готов - можно строить дополнительные наборы (<see cref="ModelLoader.BuildAdditionalMaterialSet"/>)
-		/// и регистрировать инстансы. Не сообщает КАКОЙ handle стал готов (их может быть несколько на
-		/// одну запись) - подписчик сам решает, относится ли это к его пути/handle-у.</summary>
+		/// <summary>Model finished loading and its primary material set is ready. Does not say WHICH handle; subscribers filter by path/handle themselves.</summary>
 		public event Action<ModelLoader>? ModelReady;
 
-		/// <summary>Текстуры модели доведены до целевого качества (или ждать дальше бессмысленно - см.
-		/// <see cref="Entry.TexturesReady"/>): ТОЛЬКО С ЭТОГО МОМЕНТА модель имеет смысл показывать -
-		/// до него её материалы стоят на 1x1-филлерах/низких ступенях, и появление в кадре выглядит как
-		/// мигание текстур. Всегда приходит ПОСЛЕ <see cref="ModelReady"/> для той же модели (регистрация
-		/// в батч-рендерере нужна раньше - именно её материалы принимают горячие замены).</summary>
+		/// <summary>Model textures reached show quality; only from this point should the model be displayed. Always fires AFTER ModelReady for the same model.</summary>
 		public event Action<ModelLoader>? ModelTexturesReady;
 
-		/// <summary>Запись сейчас будет выселена с GPU (см. class-doc про протокол Release): подписчик
-		/// обязан СИНХРОННО, до возврата из обработчика, снять все свои регистрации (инстансы, батчи,
-		/// материалы) этой конкретной модели (сравнение по ссылке) в СВОЁМ батч-рендерере и вызвать
-		/// Pipeline.InvalidateGraph на своих окружениях - store дальше сам сделает
-		/// <see cref="ModelLoader.Release"/> (отложенно, см. <see cref="RetireTicks"/>).</summary>
+		/// <summary>Entry is about to be evicted; subscribers MUST synchronously unregister their registrations of this model (compare by reference) before returning.</summary>
 		public event Action<ModelLoader>? BeforeModelEvicted;
 
 		public ModelStore(IGraphicsApi graphicsApi)
@@ -310,8 +204,7 @@ namespace DecaEngine.Editor.ECS
 			_graphicsApi = graphicsApi;
 		}
 
-		/// <summary>Диагностика - сколько (path, options) записей сейчас в столе (резидентных или ещё
-		/// грузящихся).</summary>
+		/// <summary>Number of (path, options) entries currently resident or loading.</summary>
 		public int EntryCount => _entries.Count;
 
 		private static string NormalizePath(string path)
@@ -325,11 +218,9 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		private static string MakeKey(string normalizedPath, ModelLoadOptions options) =>
-			normalizedPath + "" + options.Signature();
+			normalizedPath + "" + options.Signature();
 
-		/// <summary>Берёт ссылку на модель файла с данными опциями загрузки (загрузка стартует из Tick).
-		/// Каждому Acquire обязан соответствовать РОВНО ОДИН <see cref="Release"/> с ВОЗВРАЩЁННЫМ handle.
-		/// <paramref name="priority"/> - см. <see cref="Handle.Priority"/>.</summary>
+		/// <summary>Acquires a reference to the model (load starts from Tick); each Acquire needs exactly one Release with the returned handle.</summary>
 		public Handle Acquire(string path, ModelLoadOptions options, float priority = 0f)
 		{
 			var normalizedPath = NormalizePath(path);
@@ -355,8 +246,7 @@ namespace DecaEngine.Editor.ECS
 			return handle;
 		}
 
-		/// <summary>Отпускает handle. Модель НЕ выгружается немедленно - см. <see cref="UnloadAfterSeconds"/>.
-		/// Идемпотентно повторному вызову на уже освобождённом handle - no-op.</summary>
+		/// <summary>Releases the handle; the model is not unloaded immediately (see UnloadAfterSeconds). Idempotent.</summary>
 		public void Release(Handle handle)
 		{
 			if (handle.Released)
@@ -377,15 +267,10 @@ namespace DecaEngine.Editor.ECS
 			return model != null;
 		}
 
-		/// <summary>Текстуры модели этого handle доведены до целевого качества - см.
-		/// <see cref="Entry.TexturesReady"/>/<see cref="ModelTexturesReady"/>. false для ещё не
-		/// загруженной модели.</summary>
+		/// <summary>True once this handle's model textures reached show quality; false for a not-yet-loaded model.</summary>
 		public bool AreTexturesReady(Handle handle) => handle.Entry.TexturesReady;
 
-		/// <summary>Однострочный срез состояния стриминга - для отладочных прогонов (см. FullLoopProbe).
-		/// Нужен потому, что снаружи видно только результат («часть текстур белая»), а причин у него
-		/// несколько и они не различимы: не стартовал декод, ждёт заливки, упёрлись в бюджет памяти,
-		/// запись выселена.</summary>
+		/// <summary>One-line streaming state snapshot for debug probes; distinguishes the several indistinguishable causes of white textures.</summary>
 		public string DescribeStreamingState()
 		{
 			var entries = 0;
@@ -410,9 +295,8 @@ namespace DecaEngine.Editor.ECS
 						atZero++;
 					}
 
-					// Сравнение с потолком, а не с сырым MaxTextureSize: под бюджетом памяти "готово" -
-					// это дойти до потолка, и иначе дамп показывал бы atTarget=0 у полностью догруженной
-					// модели.
+					// Compare against the ceiling, not raw MaxTextureSize: under a memory budget
+					// "done" means reaching the ceiling.
 					if (stream.CurrentSize >= TargetSizeFor(stream))
 					{
 						atTarget++;
@@ -439,17 +323,10 @@ namespace DecaEngine.Editor.ECS
 
 		/// <summary>
 		/// Hands the caller ONE independent set of <see cref="IMaterialObject"/>s for a ready model
-		/// (<see cref="Handle.Ready"/> must be true) to register into ITS OWN batch renderer - see the
-		/// class-doc invariant: materials cannot be shared across environments. The FIRST call ever made
-		/// on this handle's entry (by this handle or any other acquirer of the same key - whichever gets
-		/// there first) gets the model's own <see cref="ModelLoader.materialObjects"/>, built as a side
-		/// effect of the load; every call after that, from any handle, gets a fresh
-		/// <see cref="ModelLoader.BuildAdditionalMaterialSet"/> set instead. The decision is latched on
-		/// the ENTRY (<see cref="Entry.PrimaryMaterialSetTaken"/>), not the handle, so it is safe (and
-		/// expected - see <see cref="DecaEngine.Editor.ECS.ModelStreamer.MigrateEnvironment"/>) to call
-		/// this again later on the SAME handle after its previous set was abandoned (e.g. the environment
-		/// it was registered into was recreated): the second call always gets a fresh additional set,
-		/// never steals the primary one back.
+		/// to register into its own batch renderer - materials cannot be shared across environments.
+		/// The first call on an entry gets the model's own materialObjects; every later call gets a
+		/// fresh BuildAdditionalMaterialSet set. Latched on the ENTRY, so re-calling on the same
+		/// handle after abandoning its set always yields a fresh additional set.
 		/// </summary>
 		public OrderedDictionary<int, IMaterialObject> AcquireMaterialSet(Handle handle)
 		{
@@ -471,10 +348,9 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>
-		/// Кадровый шаг (главный/GPU поток, под GPU-локом - как и <see cref="DecaEngine.Editor.ECS.ModelStreamer.Tick"/>):
-		/// запуск очередных загрузок по приоритету, опрос фоновых Prepare-задач, финализация ОДНОЙ
-		/// модели за кадр, прогрессивный стриминг текстур (ОДНА заливка за тик - на ВСЕ резидентные
-		/// модели процесса разом, а не на окружение, см. class-doc) и выселение простаивающих записей.
+		/// Per-frame step (main/GPU thread, under the GPU lock): starts queued loads by priority,
+		/// polls background prepare tasks, finalizes ONE model per frame, streams texture quality
+		/// and evicts idle entries.
 		/// </summary>
 		public void Tick(float deltaTime)
 		{
@@ -546,8 +422,8 @@ namespace DecaEngine.Editor.ECS
 					continue;
 				}
 
-				// Запись разлюбили, пока грузилась (все Release прежде готовности) - глушим фоновый
-				// декод. Начатую финализацию не бросаем (см. Entry.Finalizing).
+				// All handles released before the load finished - cancel the background decode.
+				// An in-progress finalization is never abandoned (see Entry.Finalizing).
 				if (entry.RefCount <= 0 && !entry.Finalizing)
 				{
 					entry.Cts?.Cancel();
@@ -606,7 +482,7 @@ namespace DecaEngine.Editor.ECS
 
 			if (model == null)
 			{
-				return; // порция кадра исчерпана - продолжение следующим кадром
+				return; // frame budget exhausted - continues next frame
 			}
 
 			FinishRequest(best);
@@ -625,31 +501,20 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>
-		/// Прогрессивный стриминг качества текстур - см. <see cref="DecaEngine.Editor.ECS.ModelStreamer.PumpTextureUpgrades"/>,
-		/// та же механика (декод в фоне, заливка/горячая замена здесь по одной за тик), но на уровне
-		/// ВСЕГО стола: одна очередь на процесс вместо одной на окружение, что попутно чинит гонку двух
-		/// окружений, апгрейдящих одну и ту же (теперь РАЗДЕЛЯЕМУЮ) StreamedTexture независимо. Горячая
-		/// замена сама фанаутится на все живые наборы материалов - см. <see cref="ModelLoader.StreamedTexture.Bindings"/>,
-		/// куда каждый набор (первый и любой из <see cref="ModelLoader.BuildAdditionalMaterialSet"/>)
-		/// дописывает свою привязку при постройке.
-		///
-		/// В отличие от ModelStreamer здесь НЕТ дистанционного потолка качества (TargetSizeForDistance):
-		/// стол не знает камер отдельных окружений - апгрейд всегда идёт до <see cref="ModelLoadOptions.MaxTextureSize"/>,
-		/// упорядоченный по <see cref="Entry.BestPriority"/> (приоритет ближайшего интересанта).
-		///
-		/// Записи, ещё не дошедшие до <see cref="Entry.TexturesReady"/> (модель загружена, но потребители
-		/// её НЕ показывают - см. <see cref="ModelTexturesReady"/>), обслуживаются ВНЕ ОЧЕРЕДИ: их первая
-		/// ступень - это не косметика, а условие появления модели в кадре. Ступень при этом обычная,
-		/// маленькая (<see cref="InitialTextureSize"/>) - показ не ждёт полного качества.
+		/// Progressive texture quality streaming: background decode, one upload/hot-swap per tick,
+		/// one queue for the whole process (which also fixes the race of two environments upgrading
+		/// the same shared StreamedTexture). Hot swaps fan out to all live material sets via
+		/// StreamedTexture.Bindings. There is no distance-based quality cap here - the store does
+		/// not know per-environment cameras; upgrades go to MaxTextureSize ordered by BestPriority.
+		/// Entries not yet TexturesReady are served out of order: their first level gates visibility.
 		/// </summary>
 		private void PumpTextureUpgrades()
 		{
 			_qualityCeiling = ComputeQualityCeiling();
 
-			// Флаг сбрасывается ДО всей прокачки, а не внутри StartTextureUpgrades: его выставляет и
-			// заливка (UploadNextLevel), и старт декода, а читает - AnnounceTextureReadiness уже ПОСЛЕ
-			// прокачки. Сброс в конце обнулял бы отказ, случившийся на заливке, и страховка "показать в
-			// текущем качестве при упёршемся бюджете" не срабатывала бы вовсе.
+			// Reset BEFORE the whole pump, not inside StartTextureUpgrades: both uploads and decode
+			// starts set the flag, and AnnounceTextureReadiness reads it AFTER the pump. Resetting
+			// at the end would erase a stall that happened during upload.
 			_upgradesStalled = false;
 
 			CollectTextureDecodes();
@@ -657,10 +522,7 @@ namespace DecaEngine.Editor.ECS
 			StartTextureUpgrades();
 		}
 
-		/// <summary>Забирает результаты завершившихся фоновых декодов. Декод отдаёт СРАЗУ ВСЮ лестницу
-		/// качества (см. <see cref="ModelImporter.DecodeEncodedImageLadder"/>), поэтому здесь остаётся
-		/// только переложить готовые ступени в очередь заливки - это перекладывание ссылок, бюджета тика
-		/// оно не тратит (его тратит <see cref="UploadPendingLevels"/>).</summary>
+		/// <summary>Collects finished background decodes; moving levels to the upload queue is just reference shuffling and costs no tick budget.</summary>
 		private void CollectTextureDecodes()
 		{
 			for (int i = 0; i < _textureJobs.Count; )
@@ -688,9 +550,8 @@ namespace DecaEngine.Editor.ECS
 				{
 					job.Stream.ReleaseCpuData();
 
-					// Подробности - только про ПЕРВУЮ сбойную текстуру модели: причина у всех обычно
-					// одна (неподдерживаемый формат), и 76 почти одинаковых строк лишь топят её в
-					// консоли. Сводку по модели даёт AnnounceTextureReadiness.
+					// Log details only for the FIRST failed texture; the cause is usually shared
+					// (unsupported format) and AnnounceTextureReadiness prints the per-model summary.
 					if (job.Entry.TextureDecodeFailures++ == 0)
 					{
 						EngineLog.Add(LogLevel.Warning,
@@ -710,8 +571,8 @@ namespace DecaEngine.Editor.ECS
 
 			if (levels == null || levels.Count == 0)
 			{
-				// Декодировать было нечего (исходник пропал/пуст) - иначе текстура вечно считалась бы
-				// "ещё не готовой" и держала бы показ модели.
+				// Nothing to decode (source missing/empty) - otherwise the texture would count as
+				// "not ready" forever and block showing the model.
 				job.Stream.ReleaseCpuData();
 				return;
 			}
@@ -731,11 +592,7 @@ namespace DecaEngine.Editor.ECS
 			});
 		}
 
-		/// <summary>Заливает готовые ступени на GPU и горячо подменяет текстуры во всех живых привязках,
-		/// пока не выйдет бюджет ВРЕМЕНИ тика (<see cref="TextureUploadMillisecondsPerTick"/>, а пока
-		/// есть ждущие показа модели - <see cref="PendingTextureUploadMillisecondsPerTick"/>). Раньше
-		/// здесь стоял счётчик "N заливок за тик"; на ассете из 82 текстур 4K это выливалось в сотни
-		/// тиков ожидания при том, что сама заливка занимала доли миллисекунды - бюджет простаивал.</summary>
+		/// <summary>Uploads ready levels and hot-swaps textures until the per-tick TIME budget runs out; a count-based budget either starves small levels or hitches on large ones.</summary>
 		private void UploadPendingLevels()
 		{
 			if (_pendingLevels.Count == 0)
@@ -743,8 +600,8 @@ namespace DecaEngine.Editor.ECS
 				return;
 			}
 
-			// Бюджет тика - по времени. Щедрый режим включается ровно тогда, когда хоть одна модель ещё
-			// ждёт показа: пока её нет в кадре, заливки не могут дать видимого рывка.
+			// Generous budget kicks in exactly while some model still waits to be shown: it is not
+			// in frame yet, so uploads cannot cause a visible hitch.
 			var anyPending = false;
 			foreach (var queued in _pendingLevels)
 			{
@@ -761,11 +618,9 @@ namespace DecaEngine.Editor.ECS
 
 			var clock = System.Diagnostics.Stopwatch.StartNew();
 
-			// Два прохода, и порядок здесь - это прямо задержка появления модели. Сначала текстуры, у
-			// которых в слоте ещё 1x1-филлер (ниже ShowTextureSize): пока хоть одна такая есть, модель
-			// не показывается вовсе, и потратить тик на 512 -&gt; 1024 у соседней текстуры значит отложить
-			// показ ВСЕЙ модели ради качества, которого никто пока не видит. Второй проход - уже
-			// косметика: догон качества сверху.
+			// Two passes; the order IS the model-appearance latency. First: textures still on 1x1
+			// fillers (below ShowTextureSize) - while any exists the model is hidden entirely.
+			// Second pass is cosmetic quality catch-up.
 			for (int pass = 0; pass < 2; pass++)
 			{
 				for (int i = 0; i < _pendingLevels.Count; )
@@ -797,8 +652,8 @@ namespace DecaEngine.Editor.ECS
 
 					var result = UploadNextLevel(queued);
 
-					// Пауза - это упор в бюджет ПАМЯТИ, а не в бюджет времени: ступень осталась в очереди
-					// и дождётся освобождения памяти, а тик идёт дальше к тем, кто залиться может.
+					// Paused means the MEMORY budget, not the time budget: the level stays queued
+					// and the tick moves on to uploads that can proceed.
 					if (result == LevelUpload.Paused)
 					{
 						i++;
@@ -818,18 +673,16 @@ namespace DecaEngine.Editor.ECS
 
 		private enum LevelUpload
 		{
-			/// <summary>Ступень залита, в очереди есть ещё.</summary>
+			/// <summary>Level uploaded, more remain in the queue.</summary>
 			Uploaded,
 
-			/// <summary>Не хватает бюджета текстурной памяти. Очередь НЕ выбрасывается: исходник уже
-			/// разжат, повторить заливку позже стоит копейки, а выбросить - значит заморозить текстуру
-			/// на текущем качестве навсегда (декод больше не начнётся, см. IsUpgradeInFlight/HasSource).</summary>
+			/// <summary>Texture memory budget exceeded. The queue is kept: dropping it would freeze the texture at current quality forever (no new decode starts).</summary>
 			Paused,
 
-			/// <summary>Лестница пройдена до конца - стриминг этой текстуры окончен.</summary>
+			/// <summary>Ladder fully uploaded - streaming of this texture is done.</summary>
 			Finished,
 
-			/// <summary>Заливка сорвалась - повторять нечем.</summary>
+			/// <summary>Upload failed - nothing left to retry with.</summary>
 			Failed,
 		}
 
@@ -848,7 +701,7 @@ namespace DecaEngine.Editor.ECS
 					continue;
 				}
 
-				// Проверка ДО изъятия ступени из очереди: при отказе она должна остаться на месте.
+				// Check BEFORE dequeuing the level: on refusal it must stay in place.
 				var delta = EstimateTextureBytes(size, stream.IsBlockCompressed) -
 					EstimateTextureBytes(stream.CurrentSize, stream.IsBlockCompressed);
 				if (_textureBytes + delta > TextureMemoryBudgetBytes)
@@ -860,8 +713,8 @@ namespace DecaEngine.Editor.ECS
 
 				try
 				{
-					// Ступень сама знает, чем она является: RGBA8 из декода (мипы достроит GPU) или
-					// готовый BC-хвост из .dtex (мипы уже в ней). См. ModelLoader.StreamedTextureLevel.
+					// The level knows what it is: decoded RGBA8 (GPU builds mips) or a baked BC
+					// tail from .dtex (mips included). See ModelLoader.StreamedTextureLevel.
 					var gpuTexture = _graphicsApi.CreateTexture(
 						level.ToCpuTextureData($"Stream {level.Width}x{level.Height}"));
 
@@ -895,22 +748,17 @@ namespace DecaEngine.Editor.ECS
 			return LevelUpload.Finished;
 		}
 
-		/// <summary>Снимает ступень с очереди и сразу отпускает её массив: до заливки остатка лестницы
-		/// может пройти много тиков, и держать уже ненужный уровень в CPU-памяти незачем.</summary>
+		/// <summary>Dequeues a level and releases its array immediately; keeping tens of MB in CPU memory until the ladder finishes is wasteful.</summary>
 		private void ConsumeLevel(PendingTextureLevels queued)
 		{
 			var index = queued.Next++;
 
 			_pendingLevelBytes -= queued.Levels[index]?.ByteLength ?? 0;
 
-			// Ссылка на данные ступени рвётся сразу, а не по завершении всей лестницы: у Sponza это
-			// десятки мегабайт, которые иначе досидели бы в куче до последней ступени.
 			queued.Levels[index] = null!;
 		}
 
-		/// <summary>Выбрасывает очередь ступеней целиком (залита последняя, запись умерла или заливка
-		/// сорвалась) и закрывает стриминг текстуры: лестница декодируется РАЗ И НАВСЕГДА, так что после
-		/// неё исходник больше не нужен ни при каком исходе.</summary>
+		/// <summary>Drops the whole level queue and closes streaming for the texture: the ladder is decoded once and for all, so the source is never needed again.</summary>
 		private void DropPendingLevels(int index)
 		{
 			var queued = _pendingLevels[index];
@@ -937,14 +785,11 @@ namespace DecaEngine.Editor.ECS
 				$"Model store: texture memory budget reached ({_textureBytes >> 20} MB) - quality upgrades paused.");
 		}
 
-		/// <summary>Доводит число фоновых декодов до <see cref="MaxConcurrentTextureDecodes"/> - декод
-		/// это чистый CPU в пуле, и именно он определяет, как быстро ещё не показанная модель доедет
-		/// до <see cref="Entry.TexturesReady"/>.</summary>
+		/// <summary>Tops background decodes up to MaxConcurrentTextureDecodes; decode speed gates how fast a hidden model reaches TexturesReady.</summary>
 		private void StartTextureUpgrades()
 		{
-			// Декоды придерживаются, пока уже готовые ступени не залиты: лестница целиком лежит в
-			// CPU-памяти до заливки, и без этого потолка 69 текстур Sponza разом дали бы сотни мегабайт
-			// мусора (заливка идёт единицами за тик и заведомо медленнее декодов).
+			// Hold decodes while decoded levels await upload: the whole ladder sits in CPU memory
+			// until uploaded, and uploads are far slower than decodes.
 			if (_pendingLevelBytes >= PendingDecodeBytesBudget)
 			{
 				return;
@@ -973,8 +818,8 @@ namespace DecaEngine.Editor.ECS
 
 				var priority = entry.BestPriority;
 
-				// Модель, которую ещё никто не показывает, важнее любого повышения качества уже видимой:
-				// её текстуры - условие появления в кадре вообще, а не косметика.
+				// A model nobody can show yet outranks any quality upgrade of a visible one: its
+				// textures gate visibility, they are not cosmetic.
 				var pending = !entry.TexturesReady;
 
 				foreach (var stream in entry.Model.StreamedTextures)
@@ -1012,9 +857,8 @@ namespace DecaEngine.Editor.ECS
 
 			var targetSize = TargetSizeFor(bestStream);
 
-			// Первая ступень бюджету обязана поместиться - иначе модель вообще не появится; остальные
-			// проверяются по одной при заливке (см. UploadNextLevel), поэтому упёршийся бюджет обрывает
-			// лестницу, а не отменяет её целиком.
+			// The first level must fit the budget or the model never appears; later levels are
+			// checked one by one at upload, so a full budget truncates the ladder, not cancels it.
 			var firstSize = Math.Min(Math.Max(16, InitialTextureSize), targetSize);
 			var delta = EstimateTextureBytes(firstSize, bestStream.IsBlockCompressed) -
 				EstimateTextureBytes(bestStream.CurrentSize, bestStream.IsBlockCompressed);
@@ -1025,11 +869,9 @@ namespace DecaEngine.Editor.ECS
 				return false;
 			}
 
-			// ОДИН декод на всю жизнь текстуры: stb умеет разжимать только в полном разрешении, поэтому
-			// ступень "64px" стоит ровно столько же, сколько полная, и лестница из отдельных декодов
-			// означала бы N полных разжатий одного файла (это и делало появление модели МЕДЛЕННЕЕ, чем
-			// загрузка сразу в целевом качестве). Все ступени снимаются с одной цепочки даунскейлов и
-			// заливаются по одной - см. ModelImporter.DecodeEncodedImageLadder и UploadPendingLevels.
+			// ONE decode per texture lifetime: stb only decompresses at full resolution, so a
+			// "64px" step costs the same as full quality and per-step decodes would mean N full
+			// decompressions of one file. All steps come from one downscale chain.
 			var source = bestStream;
 			var stepFactor = Math.Max(2, TextureStepFactor);
 			_textureJobs.Add(new TextureUpgradeJob
@@ -1067,23 +909,16 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>
-		/// Лестница качества прямо из запечённой .dtex - без декода вообще, одним чтением с диска.
-		///
-		/// Мип-уровни лежат в файле от большого к малому, поэтому «текстура в размере S» - это хвост
-		/// цепочки от соответствующего уровня до конца файла. Отсюда две вещи, которых стриминг из
-		/// PNG дать не может. Во-первых, читается РОВНО столько, сколько нужно целевому качеству: при
-		/// потолке 512 у .dtex с верхним уровнем 2048 нулевой уровень (три четверти файла) не
-		/// касается диска вовсе. Во-вторых, все ступени - это подмассивы ОДНОГО прочитанного хвоста,
-		/// то есть каждая следующая ступень стоит ноль I/O и ноль CPU: ступень 64 -&gt; 256 -&gt; 1024 не
-		/// перечитывает и не пережимает ничего.
+		/// Quality ladder straight from a baked .dtex - no decode, one disk read. Mips are stored
+		/// large-to-small, so "texture at size S" is the tail of the chain: only the needed tail is
+		/// read, and every step is a sub-array of that one read (zero extra I/O and CPU per step).
 		/// </summary>
 		private static List<ModelLoader.StreamedTextureLevel> BuildBakedLadder(
 			ModelLoader.StreamedTexture stream, int targetSize, int firstSize, int stepFactor)
 		{
 			var levels = new List<ModelLoader.StreamedTextureLevel>();
 
-			// Уровень целевого качества - самый ВЕРХНИЙ (наименьший индекс) из нужных, с него и
-			// начинается хвост.
+			// The target-quality level is the TOPMOST (smallest index) needed; the tail starts there.
 			int topLevel = DtexFile.LevelForSize(stream.DtexWidth, stream.DtexHeight, targetSize);
 
 			var payload = DtexFile.TryReadFromLevel(stream.DtexPath, topLevel);
@@ -1092,12 +927,12 @@ namespace DecaEngine.Editor.ECS
 				return levels;
 			}
 
-			// Ступени идут снизу вверх по качеству, то есть от последних уровней хвоста к первому.
+			// Steps go bottom-up in quality, i.e. from the last tail levels toward the first.
 			int firstIndex = DtexFile.LevelForSize(payload.Width, payload.Height, firstSize);
 			firstIndex = Math.Min(firstIndex, payload.Mips.Length - 1);
 
-			// Шаг качества задан множителем СТОРОНЫ (TextureStepFactor), а уровни идут степенями
-			// двойки - переводим одно в другое.
+			// The step is a SIDE multiplier (TextureStepFactor) while levels are powers of two -
+			// convert one into the other.
 			int step = Math.Max(1, (int)Math.Round(Math.Log2(stepFactor)));
 
 			for (int index = firstIndex; ; index = Math.Max(0, index - step))
@@ -1108,8 +943,7 @@ namespace DecaEngine.Editor.ECS
 					Math.Max(1, payload.Width >> index),
 					Math.Max(1, payload.Height >> index)));
 
-				// Нулевой уровень - целевое качество; на нём лестница заканчивается всегда, каким бы
-				// шаг ни был.
+				// Level 0 is the target quality; the ladder always ends there regardless of step.
 				if (index == 0)
 				{
 					break;
@@ -1119,9 +953,7 @@ namespace DecaEngine.Editor.ECS
 			return levels;
 		}
 
-		/// <summary>Текстура уже обслуживается - декодируется в пуле ИЛИ её ступени ждут заливки. Второе
-		/// не менее важно: лестница декодируется один раз целиком, и повторный декод той же текстуры,
-		/// пока предыдущий не долит свои ступени, был бы полным разжатием файла впустую.</summary>
+		/// <summary>True if the texture is being decoded OR its levels await upload; re-decoding while a ladder is pending would be a wasted full decompression.</summary>
 		private bool IsUpgradeInFlight(ModelLoader.StreamedTexture stream)
 		{
 			foreach (var job in _textureJobs)
@@ -1146,25 +978,20 @@ namespace DecaEngine.Editor.ECS
 		private static int EffectiveTargetSize(ModelLoader.StreamedTexture stream) =>
 			stream.TargetSize > 0 ? stream.TargetSize : DefaultTextureTargetSize;
 
-		/// <summary>Потолок качества этой текстуры с учётом общего бюджета памяти - см.
-		/// <see cref="ComputeQualityCeiling"/>.</summary>
+		/// <summary>Quality cap for this texture, respecting the global memory budget (see ComputeQualityCeiling).</summary>
 		private int TargetSizeFor(ModelLoader.StreamedTexture stream) =>
 			Math.Max(EffectiveShowSize(stream), Math.Min(EffectiveTargetSize(stream), _qualityCeiling));
 
 		/// <summary>
-		/// Наибольшая сторона, до которой можно поднимать качество, чтобы в <see cref="TextureMemoryBudgetBytes"/>
-		/// поместились ВСЕ текстуры резидентных моделей, а не только те, что успели первыми.
-		///
-		/// Без этого потолка стриминг вырождается в гонку: у ассета из 82 текстур 4K первые 48 доезжают
-		/// до 2048 и выбирают бюджет до байта, а оставшиеся 34 остаются на 1x1-филлерах - модель
-		/// наполовину белая. Ровное качество на всех (пусть и ниже максимума) в этой ситуации - не
-		/// компромисс, а единственный осмысленный исход: 82 текстуры по 1024 занимают 459 МБ и влезают
-		/// целиком, тогда как по 2048 их нужно 1.8 ГБ.
+		/// Largest side such that ALL resident textures fit TextureMemoryBudgetBytes, not just the
+		/// first arrivals. Without it streaming degrades into a race: the first textures take the
+		/// whole budget at max size and the rest stay on 1x1 fillers - a half-white model. Even
+		/// quality for everyone is the only sensible outcome here.
 		/// </summary>
 		private int ComputeQualityCeiling()
 		{
-			// Сжатые и несжатые считаются отдельно: они отличаются вчетверо, и общий счётчик занижал
-			// бы потолок сцене из запечённых текстур ровно во столько же раз.
+			// Compressed and uncompressed are counted separately: they differ 4x, and a shared
+			// counter would under-cap a scene of baked textures by the same factor.
 			var plainStreams = 0;
 			var blockStreams = 0;
 
@@ -1204,21 +1031,15 @@ namespace DecaEngine.Editor.ECS
 			return size;
 		}
 
-		/// <summary>Сторона, начиная с которой текстуру не стыдно показать - см.
-		/// <see cref="ShowTextureSize"/>. Для маленьких исходников это их собственный потолок.</summary>
+		/// <summary>Side at which a texture is presentable (see ShowTextureSize); capped at the source's own target for small sources.</summary>
 		private int EffectiveShowSize(ModelLoader.StreamedTexture stream) =>
 			Math.Min(Math.Max(16, ShowTextureSize), EffectiveTargetSize(stream));
 
 		/// <summary>
-		/// Латчит <see cref="Entry.TexturesReady"/> и шлёт <see cref="ModelTexturesReady"/> - момент, с
-		/// которого модель можно показывать без мигания текстур. Готова = у каждой стрим-текстуры либо
-		/// исчерпан исходник (<see cref="ModelLoader.StreamedTexture.HasSource"/>: дошли до нативного
-		/// разрешения или декод не удался), либо достигнута <see cref="EffectiveShowSize"/> - ПЕРВАЯ
-		/// ступень, а не полное качество: дальше оно догоняет фоном, уже в кадре.
-		///
-		/// Две страховки от вечно невидимой модели: упёршийся бюджет текстурной памяти
-		/// (<see cref="_upgradesStalled"/>) и потолок ожидания (<see cref="TextureWaitTimeoutSeconds"/>) -
-		/// в обоих случаях модель объявляется готовой в том качестве, до которого дошла.
+		/// Latches Entry.TexturesReady and fires ModelTexturesReady - the moment the model can be
+		/// shown without texture popping. Ready = every stream either exhausted its source or
+		/// reached EffectiveShowSize (the FIRST step, not full quality). Two escapes from a
+		/// forever-invisible model: a stalled memory budget and TextureWaitTimeoutSeconds.
 		/// </summary>
 		private void AnnounceTextureReadiness(float deltaTime)
 		{
@@ -1266,9 +1087,8 @@ namespace DecaEngine.Editor.ECS
 				entry.TexturesReady = true;
 				(announced ??= new List<Entry>()).Add(entry);
 
-				// Главное, что должен увидеть пользователь, когда модель вышла белой: это не «стриминг
-				// не догрузил», а нечитаемый формат текстур. Декодер понимает PNG/JPG; DDS/KTX2 (обычная
-				// упаковка ассетов из движковых сэмплов) он не открывает вовсе.
+				// The key fact for a white model: it is not a streaming stall but unreadable
+				// texture formats. The decoder reads PNG/JPG only; DDS/KTX2 are not opened at all.
 				if (entry.TextureDecodeFailures > 0)
 				{
 					EngineLog.Add(LogLevel.Warning,
@@ -1283,8 +1103,8 @@ namespace DecaEngine.Editor.ECS
 				return;
 			}
 
-			// Событие зовётся ВНЕ обхода _entries: подписчик показывает модель, а это может привести к
-			// новым Acquire (например, соседние записи сцены) - мутации словаря под foreach.
+			// Invoked OUTSIDE the _entries loop: a subscriber showing the model may Acquire new
+			// entries, mutating the dictionary under foreach.
 			foreach (var entry in announced)
 			{
 				if (entry.Model != null)
@@ -1295,15 +1115,10 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>
-		/// Оценка VRAM под текстуру со стороной <paramref name="size"/> и полной мип-цепочкой
-		/// (отсюда множитель 4/3).
-		///
-		/// Блочно-сжатые (BC7/BC5 - байт на тексель против четырёх у RGBA8) обязаны считаться
-		/// отдельно: иначе бюджет текстурной памяти видел бы вчетверо больше, чем занято на самом
-		/// деле, и упирался бы в потолок на сцене, которая помещается с запасом, - то есть кеш
-		/// ассетов экономил бы VRAM, а стример продолжал бы вести себя так, будто экономии нет.
-		/// BC1/BC4 занимают ещё вдвое меньше, но в авто-выборе не участвуют, и завышение для них
-		/// безопаснее занижения.
+		/// VRAM estimate for a texture of the given side with a full mip chain (hence the 4/3).
+		/// Block-compressed (BC7/BC5: 1 byte/texel vs 4 for RGBA8) must be counted separately or
+		/// the budget would see 4x the real usage; BC1/BC4 are smaller still but overestimating
+		/// them is safer than underestimating.
 		/// </summary>
 		private static long EstimateTextureBytes(int size, bool blockCompressed)
 		{
@@ -1389,7 +1204,7 @@ namespace DecaEngine.Editor.ECS
 				}
 			}
 
-			// Ошибочные записи без ссылок тоже забываем.
+			// Unreferenced failed entries are forgotten too.
 			foreach (var entry in _entries.Values)
 			{
 				if (entry.RefCount <= 0 && entry.Failed && entry.Model == null && entry.Request == null &&
@@ -1410,8 +1225,8 @@ namespace DecaEngine.Editor.ECS
 
 				if (entry.Model != null)
 				{
-					// Синхронно: подписчики обязаны снять свои регистрации ДО того, как эта модель
-					// уйдёт в отложенный Release - см. class-doc и BeforeModelEvicted.
+					// Synchronous: subscribers must unregister BEFORE the model goes into deferred
+					// Release - see class doc and BeforeModelEvicted.
 					BeforeModelEvicted?.Invoke(entry.Model);
 					_retiredModels.Add((entry.Model, RetireTicks));
 				}
@@ -1423,11 +1238,9 @@ namespace DecaEngine.Editor.ECS
 		}
 
 		/// <summary>
-		/// Полная остановка стола (закрытие редактора и т.п.): отменяет фоновые загрузки и освобождает
-		/// ВСЕ резидентные модели немедленно, барьерясь на GPU один раз в начале - в отличие от
-		/// <see cref="EvictIdle"/>, которая НЕ ждёт GPU (см. class-doc). Вызывающий обязан снять ВСЕ
-		/// регистрации во ВСЕХ своих батч-рендерерах ДО вызова (тот же протокол, что и per-entry
-		/// <see cref="BeforeModelEvicted"/>, но для абсолютно всех записей разом).
+		/// Full shutdown (editor close): cancels background loads and releases ALL resident models
+		/// immediately, barriering on the GPU once - unlike EvictIdle, which never waits. The
+		/// caller must unregister everything from all its batch renderers BEFORE calling.
 		/// </summary>
 		public void Shutdown()
 		{

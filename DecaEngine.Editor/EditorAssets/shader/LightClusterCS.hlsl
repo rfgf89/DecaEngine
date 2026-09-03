@@ -1,15 +1,6 @@
-// Кластеризация punctual-светов (GPU-половина по-типового кулинга, CPU-половина - LightCulling.cs):
-// один тред на фроксел-кластер, перебирает сегмент пула светов текущей камеры (границы - в
-// lightData.ClusterParams) и пишет индексы попавших светов в свой отрезок ClusterIndices
-// фиксированного шага CLUSTER_MAX_LIGHTS. У каждого типа света свой тест против кластера:
-// точечный - сфера против AABB кластера, спот - ограничивающая сфера конуса против AABB кластера
-// И конус против ограничивающей сферы кластера (тест Вронского); направленный в пул не попадает
-// вовсе (идёт каскадным путём).
-//
-// Света идут батчами по CLUSTER_CULL_GROUP через groupshared: перевод свет->view делает ОДИН тред
-// на свет за группу, а не каждый кластер заново (иначе на 3072 кластера это тот же mul() три тысячи
-// раз на один и тот же свет). Отсюда же требование к структуре циклов: они обязаны быть
-// одинаковыми у всех тредов группы - никаких ранних выходов между барьерами.
+// Punctual light clustering: one thread per froxel cluster, CPU half lives in LightCulling.cs.
+// Lights are transformed to view space once per group through groupshared memory, so all loops
+// must stay uniform across the group - no early exits between the barriers.
 
 #include "Instancing.hlsl"
 
@@ -23,22 +14,17 @@ cbuffer Light
     LightData lightData;
 }
 
-// RW, а не SRV, у всех трёх: DiligentComputeMaterial всегда биндит компьюту UAV-вью буфера.
+// RW rather than SRV: DiligentComputeMaterial always binds compute buffers as UAVs.
 RWStructuredBuffer<PunctualLight> PunctualLights;
 RWStructuredBuffer<uint> ClusterCounts;
 RWStructuredBuffer<uint> ClusterIndices;
 
-// View-space представление света для теста против кластера - то, что стоит считать один раз на
-// группу. Ограничивающая сфера (BoundSphere) у точечного совпадает с самим светом, у спота это
-// минимальная сфера вокруг конуса, поэтому дешёвый тест сфера-против-AABB общий для обоих типов.
-groupshared float4 gsPosRange[CLUSTER_CULL_GROUP];   // xyz - позиция во view, w - радиус действия
-groupshared float4 gsDirType[CLUSTER_CULL_GROUP];    // xyz - ось конуса во view, w - тип (0/1)
-groupshared float4 gsBoundSphere[CLUSTER_CULL_GROUP]; // xyz - центр охватывающей сферы, w - радиус
-groupshared float2 gsSpotAngles[CLUSTER_CULL_GROUP]; // x - cos внешнего полуугла, y - sin
+groupshared float4 gsPosRange[CLUSTER_CULL_GROUP];   // xyz view position, w range
+groupshared float4 gsDirType[CLUSTER_CULL_GROUP];    // xyz view cone axis, w type (0/1)
+groupshared float4 gsBoundSphere[CLUSTER_CULL_GROUP]; // xyz center, w radius
+groupshared float2 gsSpotAngles[CLUSTER_CULL_GROUP]; // cos/sin of the outer half angle
 
-// Сфера против AABB кластера - квадрат расстояния от центра до ближайшей точки AABB против квадрата
-// радиуса (Ericson). Для точечного света это точный тест, для спота - консервативный по его
-// охватывающей сфере.
+// Ericson sphere-AABB test; exact for point lights, conservative for a spot's bounding sphere.
 bool SphereIntersectsAabb(float3 center, float radius, float3 aabbMin, float3 aabbMax)
 {
     float3 closest = clamp(center, aabbMin, aabbMax);
@@ -46,10 +32,8 @@ bool SphereIntersectsAabb(float3 center, float radius, float3 aabbMin, float3 aa
     return dot(d, d) <= radius * radius;
 }
 
-// Спот: конус (апекс, ось, высота range, cos/sin внешнего полуугла) против ограничивающей сферы
-// кластера - тест Вронского: расстояние от центра сферы до ближайшей точки поверхности конуса
-// вдоль перпендикуляра к образующей, плюс отсечки по оси спереди/сзади. Сам по себе он слишком
-// щедрый (сфера кластера заметно больше фроксела), поэтому идёт В ПАРЕ с SphereIntersectsAabb.
+// Wronski cone-sphere test. Too permissive alone (the cluster sphere is much larger than the
+// froxel), so it is always paired with SphereIntersectsAabb.
 bool ConeIntersectsSphere(float3 apexView, float3 dirView, float range, float cosOuter,
     float sinOuter, float3 sphereCenter, float sphereRadius)
 {
@@ -64,9 +48,7 @@ bool ConeIntersectsSphere(float3 apexView, float3 dirView, float range, float co
     return !(angleCull || frontCull || backCull);
 }
 
-// Минимальная охватывающая сфера конуса высоты range с полууглом a - зеркалит CPU-версию в
-// LightCulling.IsSpotLightVisible: до 45 градусов (sin <= cos) сфера проходит через апекс и кромку
-// основания, дальше - описана вокруг основания.
+// Minimal cone bounding sphere; must mirror LightCulling.IsSpotLightVisible on the CPU.
 float4 ConeBoundingSphere(float3 apex, float3 dir, float range, float cosOuter, float sinOuter)
 {
     if (sinOuter <= cosOuter)
@@ -82,15 +64,13 @@ float4 ConeBoundingSphere(float3 apex, float3 dir, float range, float cosOuter, 
 void CSMain(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID)
 {
     uint clusterIdx = DTid.x;
-    // Хвостовая группа (если сетка перестанет делиться на CLUSTER_CULL_GROUP) не выходит здесь по
-    // return: её треды обязаны дойти до общих барьеров. Лишний тред просто ничего не пишет.
+    // Tail-group threads must reach the shared barriers, so they mask writes instead of returning.
     bool validCluster = clusterIdx < CLUSTER_COUNT;
 
     uint lightCount = (uint)lightData.ClusterParams.y;
-    // Ранний выход ДО геометрии кластера: при пустом сегменте ClusterParams.zw могут быть нулями,
-    // и математика срезов дала бы NaN. Условие однородно для всего диспатча (значение из кбуфера),
-    // так что барьеры ниже не рассинхронизируются. Counts занулить обязательно - иначе шейдинг
-    // прочтёт кластеры, оставшиеся от предыдущей камеры.
+    // Exit before slice math: an empty segment leaves ClusterParams.zw zero and would yield NaN.
+    // Uniform across the dispatch, so the barriers below stay in sync. Counts must still be
+    // cleared or shading reads clusters left from the previous camera.
     if (lightCount == 0)
     {
         if (validCluster)
@@ -102,21 +82,20 @@ void CSMain(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID)
     uint cy = (clusterIdx / CLUSTER_GRID_X) % CLUSTER_GRID_Y;
     uint cz = (clusterIdx / (CLUSTER_GRID_X * CLUSTER_GRID_Y)) % CLUSTER_GRID_Z;
 
-    // Экспоненциальные срезы глубины zNear..zFar (view-space z, LH-камера смотрит в +Z).
+    // Exponential depth slices in view-space z (left-handed camera looks down +Z).
     float zNear = lightData.ClusterParams.z;
     float zFar = lightData.ClusterParams.w;
     float z0 = zNear * pow(zFar / zNear, cz / (float)CLUSTER_GRID_Z);
     float z1 = zNear * pow(zFar / zNear, (cz + 1) / (float)CLUSTER_GRID_Z);
 
-    // NDC-границы тайла: тайловый y растёт ВНИЗ по экрану, NDC y - вверх, поэтому y-края
-    // перевёрнуты. Обязано зеркалить обратное отображение пиксель->тайл в UnlitInstancedPS.
+    // Tile y grows downward, NDC y upward, hence the flipped y edges. Must mirror the inverse
+    // pixel-to-tile mapping in UnlitInstancedPS.
     float ndcX0 = 2.0 * cx / CLUSTER_GRID_X - 1.0;
     float ndcX1 = 2.0 * (cx + 1) / CLUSTER_GRID_X - 1.0;
     float ndcY0 = 1.0 - 2.0 * (cy + 1) / CLUSTER_GRID_Y;
     float ndcY1 = 1.0 - 2.0 * cy / CLUSTER_GRID_Y;
 
-    // View-space AABB фроксела: clip.x = view.x * P00, w = view.z => view.x = ndc * z / P00.
-    // Углы на обеих глубинах - фроксел расширяется с z, берём охватывающий AABB.
+    // Froxel view-space AABB: clip.x = view.x * P00, w = view.z, so view.x = ndc * z / P00.
     float x00 = ndcX0 * z0 / cullData.P00, x10 = ndcX1 * z0 / cullData.P00;
     float x01 = ndcX0 * z1 / cullData.P00, x11 = ndcX1 * z1 / cullData.P00;
     float y00 = ndcY0 * z0 / cullData.P11, y10 = ndcY1 * z0 / cullData.P11;
@@ -125,18 +104,17 @@ void CSMain(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID)
     float3 aabbMin = float3(min(min(x00, x10), min(x01, x11)), min(min(y00, y10), min(y01, y11)), z0);
     float3 aabbMax = float3(max(max(x00, x10), max(x01, x11)), max(max(y00, y10), max(y01, y11)), z1);
 
-    // Ограничивающая сфера AABB - для конусного теста спотов.
     float3 sphereCenter = (aabbMin + aabbMax) * 0.5;
     float sphereRadius = length(aabbMax - aabbMin) * 0.5;
 
     uint offset = (uint)lightData.ClusterParams.x;
-    uint written = 0; // сколько реально влезло в отрезок кластера
-    uint hits = 0;    // сколько попало ВСЕГО, включая не влезшие - это и уходит в ClusterCounts
+    uint written = 0; // lights that fit in the cluster slot
+    uint hits = 0;    // all intersecting lights, including dropped ones; this goes to ClusterCounts
 
     for (uint base = 0; base < lightCount; base += CLUSTER_CULL_GROUP)
     {
-        // Барьер ПЕРЕД записью батча, а не только после: иначе быстрый тред затрёт свет, который
-        // отстающие ещё читают из предыдущей итерации.
+        // Barrier before the batch write too: a fast thread would otherwise overwrite a light
+        // that lagging threads still read from the previous iteration.
         GroupMemoryBarrierWithGroupSync();
 
         uint loadIdx = base + GTid.x;
@@ -177,9 +155,8 @@ void CSMain(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID)
                 continue;
 
             hits++;
-            // Переполнение отрезка не обрывает перебор: счётчик должен остаться честным, иначе по
-            // ClusterCounts не отличить "ровно 32 света" от "их 200 и 168 потеряно" (диагностика -
-            // канал 14 в UnlitInstancedPS). Шейдинг сам клампит счётчик при чтении.
+            // Overflow does not stop the scan: ClusterCounts must stay honest for the overflow
+            // diagnostic. Shading clamps the count on read.
             if (written < CLUSTER_MAX_LIGHTS)
             {
                 if (validCluster)

@@ -10,22 +10,16 @@ using DecaEngine.Physics;
 using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
-// В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
-// имя разрешается неоднозначно.
+// Friflo ships its own Transform component; the alias disambiguates it from the engine TRS.
 using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Слои поверх базового клипа: overlay, аддитивный клип и look-at. Часть <see cref="AnimationDriver"/> - файл на тему; состояние
-/// персонажа (Character) и кадровый Update живут в основном файле.</summary>
+/// <summary>Layers on top of the base clip: overlay, additive clip and look-at.</summary>
 public sealed partial class AnimationDriver
 {
-	/// <summary>
-	/// Частичный бленд: поддерево от корневой кости играет свой клип поверх базовой позы (ozz
-	/// partial_blend). Идёт ПОСЛЕ базы (клип или локомоушен) и ДО look-at/foot IK: те правят уже
-	/// смешанную позу. Веса - ПОСУСТАВНЫЕ и комплементарные (сумма на каждом суставе единица),
-	/// поэтому вне поддерева база проходит нетронутой побитово, а rest-поза ozz не подмешивается.
-	/// </summary>
+	// Partial blend (ozz partial_blend): runs AFTER the base clip and BEFORE look-at/foot IK.
+	// Per-joint weights are complementary, so outside the subtree the base passes through intact.
 	private void ApplyOverlayClip(Entity entity, Character character, float deltaSeconds)
 	{
 		if (character.Pose == null || !entity.HasComponent<OverlayClipComponent>())
@@ -65,8 +59,7 @@ public sealed partial class AnimationDriver
 			return;
 		}
 
-		// Корень поддерева: авторское имя старше разметки, как везде. Слот по умолчанию - грудь;
-		// у четвероногого она несёт передние лапы, и для «оглядывается» автор ставит шею.
+		// Subtree root: the authored name wins over the avatar mapping, as everywhere.
 		int root = character.Skeleton.FindJoint(
 			JointOf(character, settings.RootJoint, HumanoidBone.Chest));
 		if (root < 0)
@@ -84,8 +77,8 @@ public sealed partial class AnimationDriver
 				: MathF.Min(character.OverlayTime, clip.Duration);
 		}
 
-		// Приёмник бленда намеренно совпадает со слоем базы: ozz пишет выход посуставно после
-		// чтения слоёв того же сустава (см. OzzPose.Blend), и отдельная копия позы не нужна.
+		// The blend output deliberately aliases the base layer: ozz writes each joint only after
+		// reading every layer of that joint, so no separate pose copy is needed.
 		bool ok =
 			character.OverlayPose.Sample(clip, character.OverlayTime) &&
 			character.Pose.Blend([character.Pose, character.OverlayPose], [1f, 1f],
@@ -100,12 +93,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>
-	/// Аддитивный слой: дельта клипа (см. <see cref="AdditiveClip"/>) суммируется поверх текущей
-	/// позы через additive_layers ozz. Идёт ПОСЛЕ overlay (дельта ложится и на его результат) и
-	/// ДО look-at/foot IK. База не участвует в усреднении - слой чистая добавка, и вес просто
-	/// масштабирует её к единичной трансформации.
-	/// </summary>
+	// Additive layer via ozz additive_layers: runs AFTER overlay and BEFORE look-at/foot IK.
 	private void ApplyAdditiveClip(Entity entity, Character character, float deltaSeconds)
 	{
 		if (character.Pose == null || !entity.HasComponent<AdditiveClipComponent>())
@@ -170,8 +158,6 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Перестраивает посуставные веса при смене корня или веса. Принадлежность поддереву -
-	/// подъёмом по родителям: скелет в два-три десятка костей, и кэшировать тут нечего.</summary>
 	private static void EnsureOverlayMasks(Character character, int root, float weight)
 	{
 		if (character.OverlayRoot == root && character.OverlayWeight == weight &&
@@ -223,9 +209,7 @@ public sealed partial class AnimationDriver
 			return;
 		}
 
-		// Цель приходит МИРОВОЙ, а IK работает в пространстве модели. Здесь они совпадают: сущность
-		// префаба ставит модель своим трансформом, а поза считается в её локальном пространстве -
-		// перевод появится вместе с поддержкой смещённых персонажей.
+		// The target arrives in WORLD space and IK works in model space; the two coincide here.
 		if (character.Pose.AimIk(joint, lookAt.Target, lookAt.Forward, lookAt.Up, lookAt.Up, lookAt.Weight) &&
 			character.Pose.LocalToModel() &&
 			character.Pose.ReadModelMatrices(character.Models) &&
@@ -238,7 +222,5 @@ public sealed partial class AnimationDriver
 		character.LookAtTarget = lookAt.Target;
 		character.LookAtJoint = joint;
 	}
-
-	// --- Foot IK -----------------------------------------------------------------------------------
 
 }

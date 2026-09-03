@@ -5,14 +5,7 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>Нативный бэкенд слота апскейлера: AMD FSR через ffx-api и шим DecaFfxShim.dll (см.
-/// native/DecaFfxShim/DecaFfxShim.cpp). D3D12-only. Хэндлы ресурсов идут через
-/// ITexture.GetNativeHandle() (= ID3D12Resource*), командный лист кадра шим достаёт сам из
-/// NativePointer immediate-контекста (Diligent::IDeviceContextD3D12::GetD3D12CommandList).
-///
-/// Владение: конвейер (см. GraphicsPipelineSimple.SetNativeUpscaler). Создавать через
-/// <see cref="TryCreate"/> - вернёт null, если шим/DLL FSR не лежат рядом с экзешником или
-/// бэкенд не D3D12, и конвейер молча останется на встроенном TAAU.</summary>
+/// <summary>AMD FSR upscaler via ffx-api and DecaFfxShim.dll; D3D12 only, TryCreate returns null otherwise.</summary>
 public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 {
 	private const string ShimDll = "DecaFfxShim.dll";
@@ -44,7 +37,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 	private static extern int DecaFsr_QueryVersion(IntPtr anyResource,
 		[MarshalAs(UnmanagedType.LPStr)] System.Text.StringBuilder buf, int bufLen);
 
-	// Зеркало DecaFsrCreateFlags в шиме.
+	// Mirrors DecaFsrCreateFlags in the shim.
 	private const uint FlagHdr = 1u << 0;
 	private const uint FlagDepthInverted = 1u << 1;
 	private const uint FlagDepthInfinite = 1u << 2;
@@ -52,14 +45,10 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 	private const uint FlagDebugChecking = 1u << 4;
 	private const uint FlagDebugVisualization = 1u << 5;
 
-	/// <summary>DECA_FSR_DEBUG_VIEW=1 - отладочная мозаика FSR вместо кадра (векторы, глубина,
-	/// реактивность и т.д. глазами самого FSR) - главный диагност "что он на входе видит".</summary>
+	// DECA_FSR_DEBUG_VIEW=1 renders FSR's debug mosaic (its view of the inputs).
 	private static readonly bool DebugView = Environment.GetEnvironmentVariable("DECA_FSR_DEBUG_VIEW") == "1";
 
-	/// <summary>Диагностические множители знаков: DECA_FSR_JSIGN="x,y" - на джиттер,
-	/// DECA_FSR_MVSIGN="x,y" - на масштаб векторов. Конвенции сверены аналитически, но перепутанный
-	/// знак даёт ровно наблюдаемую кашу (история пересэмплируется мимо каждый кадр) - дешевле
-	/// перебрать четвёрку, чем спорить с документацией.</summary>
+	// DECA_FSR_JSIGN/MVSIGN="x,y": diagnostic sign flips for jitter and MV scale.
 	private static readonly Vector2 JitterSign = ParseSign("DECA_FSR_JSIGN");
 	private static readonly Vector2 MvSign = ParseSign("DECA_FSR_MVSIGN");
 
@@ -86,15 +75,11 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 	private IGpuTexture _depth = null!;
 	private IGpuTexture _motion = null!;
 
-	// НУЛЕВЫЕ маски reactive/transparency рендер-размера. По контракту ffx-api они опциональны, но
-	// официальный сэмпл AMD всегда подаёт обе, и без них ветка 3.1.x сводила кадр в кашу (см.
-	// расследование в fsr-shim-integration): полная нечувствительность к остальным параметрам +
-	// залитая плитка маски в её debug-мозаике. Нулевая маска семантически и есть "маски нет".
+	// Optional per ffx-api, but the 3.1.x provider garbles the frame unless both are bound.
 	private IRenderTarget? _reactiveMask;
 	private IRenderTarget? _transparencyMask;
 
-	/// <summary>Типизированная R32F-копия глубины - см. INativeUpscalerBackend.DepthProxy: сам депт
-	/// Diligent создаёт R32_TYPELESS, и ветка 3.1.x читала бы его нулями.</summary>
+	// Typed R32F depth copy: Diligent's depth is R32_TYPELESS and 3.1.x reads it as zeros.
 	private IRenderTarget? _typedDepth;
 
 	public IGpuTexture? DepthProxy => _typedDepth;
@@ -128,14 +113,11 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 			format = TextureObjectFormat.R8G8B8A8UNorm,
 		});
 
-		// БЕЗ очистки и переходов здесь: create/resize зовутся ПОСРЕДИ кадра редактора (отложка в
-		// Update, ресайз-путь), и внеполосные команды на immediate-контексте вперемешку с кадром и
-		// ImGui роняли процесс AV-ом на ближайшем SetPipelineState. Очистку нулём и переходы делает
-		// сам NativeUpscalePass в заморожённом буфере - каждый кадр, копейки (см. ReactiveMask).
+		// No clears or transitions here: create/resize run mid-frame, and out-of-band commands on
+		// the immediate context crash on the next SetPipelineState. NativeUpscalePass does it.
 	}
 
-	/// <summary>Маски для пасса: он их чистит нулём и переводит в ShaderResource в заморожённом
-	/// буфере перед диспатчем (см. INativeUpscalerBackend).</summary>
+	/// <summary>Zero mask; the upscale pass clears and transitions it before dispatch.</summary>
 	public IGpuTexture? ReactiveMask => _reactiveMask;
 
 	public IGpuTexture? TransparencyMask => _transparencyMask;
@@ -145,22 +127,18 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 	private bool _resetNextFrame = true;
 	private float _sharpness;
 
-	/// <summary>Встроенный шарпен FSR (RCAS): 0 - выключен, 0..1 - сила. Живая ручка - уходит в
-	/// параметры очередного диспатча.</summary>
+	/// <summary>Built-in FSR sharpening (RCAS): 0 disables, 0..1 sets strength.</summary>
 	public void SetSharpness(float sharpness)
 	{
 		_sharpness = Math.Clamp(sharpness, 0f, 1f);
 	}
 
-	/// <summary>Мажор ветки провайдера, под который создан контекст: 0 - автополитика (новейший
-	/// рабочий, см. шим), 2/3 - явный выбор из UI.</summary>
+	// Provider branch the context was created for: 0 is auto (newest working one).
 	private int _providerMajor;
 
 	public int ProviderMajor => _providerMajor;
 
-	/// <summary>Явный выбор ветки провайдера (0 - авто, 2 - FSR 2, 3 - FSR 3.1). Печётся в
-	/// создание контекста - смена пересоздаёт его; вызывающий обязан сперва дождаться GPU (см.
-	/// ModelViewportEnvironment.SetUpscalerTuning). История рвётся, подпись версии обновляется.</summary>
+	/// <summary>Picks the provider branch (0 auto, 2, 3); recreates the context, so idle the GPU first.</summary>
 	public void SetProvider(int providerMajor)
 	{
 		if (providerMajor == _providerMajor)
@@ -172,8 +150,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		Resize(_sceneHdr, _depth, _motion, _renderWidth, _renderHeight, _displayWidth, _displayHeight);
 	}
 
-	/// <summary>"FSR 2.3.4" - версия активного провайдера запрашивается у живого контекста после
-	/// создания (см. DecaFsr_GetVersion), подпись видна в окне Graphics.</summary>
+	/// <summary>Signature of the active provider, e.g. "FSR 2 / 2.3.4".</summary>
 	public string DebugName { get; private set; }
 
 	public IRenderTarget OutputTarget { get; }
@@ -188,7 +165,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		_fovYRad = fovYRad;
 	}
 
-	/// <summary>Последнее сообщение рантайма FSR/шима - для логов пробы.</summary>
+	/// <summary>Last message reported by the FSR runtime or the shim.</summary>
 	public static string LastNativeMessage()
 	{
 		try
@@ -198,7 +175,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		}
 		catch (DllNotFoundException)
 		{
-			return "DecaFfxShim.dll не найден";
+			return "DecaFfxShim.dll not found";
 		}
 	}
 
@@ -212,8 +189,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 			return null;
 		}
 
-		// Выход с UAV: FSR пишет compute-шейдером (см. DiligentResourceFormats - Compute в access
-		// добавляет BindFlags.UnorderedAccess).
+		// UAV output: FSR writes it from a compute shader.
 		var output = graphicsApi.CreateRenderTarget(new TextureInfo
 		{
 			name = colorTargetName + " FSR Output",
@@ -230,15 +206,15 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 			if (!backend.CreateContext(sceneHdr, depth, motion,
 				    renderWidth, renderHeight, displayWidth, displayHeight, out var error))
 			{
-				Console.WriteLine($"[fsr] контекст не создан: {error}; {LastNativeMessage()}");
+				Console.WriteLine($"[fsr] context not created: {error}; {LastNativeMessage()}");
 				output.Release();
 				return null;
 			}
 		}
 		catch (DllNotFoundException)
 		{
-			// Шим не собран/не скопирован - штатный случай, конвейер остаётся на TAAU.
-			Console.WriteLine("[fsr] DecaFfxShim.dll не найден рядом с экзешником - нативный апскейлер недоступен");
+			// Missing shim is a normal case: the pipeline stays on TAAU.
+			Console.WriteLine("[fsr] DecaFfxShim.dll not found next to the executable - native upscaler unavailable");
 			output.Release();
 			return null;
 		}
@@ -246,7 +222,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		var versions = new System.Text.StringBuilder(256);
 		if (DecaFsr_QueryVersion(NativeHandleOf(sceneHdr), versions, versions.Capacity) > 0)
 		{
-			Console.WriteLine($"[fsr] провайдеры: {versions}");
+			Console.WriteLine($"[fsr] providers: {versions}");
 		}
 
 		backend.RefreshVersion();
@@ -264,13 +240,10 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		_displayWidth = displayWidth;
 		_displayHeight = displayHeight;
 
-		// Реверсивный бесконечный Z и линейный HDR-кадр - константы конвейера превью (см.
-		// MakePerspectiveReversedZ и PipelineRenderTargets). Экспозиция - авто: свой 1x1-замер FSR
-		// дешевле, чем прокидывать таргет адаптации.
+		// Reversed infinite Z and linear HDR are pipeline constants; auto exposure saves a target.
 		var flags = FlagHdr | FlagDepthInverted | FlagDepthInfinite | FlagAutoExposure;
 
-		// DECA_FSR_FLAGS=<число> - полное переопределение флагов контекста (диагностика: бит0 hdr,
-		// бит1 inverted, бит2 infinite, бит3 autoExposure, бит4 checking, бит5 debugView).
+		// DECA_FSR_FLAGS=<n> overrides context flags (see the Flag* constants above).
 		if (uint.TryParse(Environment.GetEnvironmentVariable("DECA_FSR_FLAGS"), out var flagsOverride))
 		{
 			flags = flagsOverride;
@@ -290,11 +263,11 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 
 		var rc = DecaFsr_Create(NativeHandleOf(sceneHdr), renderWidth, renderHeight,
 			displayWidth, displayHeight, flags, _providerMajor, out _context);
-		error = rc == 0 ? "" : $"код {rc}";
+		error = rc == 0 ? "" : $"code {rc}";
 		return rc == 0;
 	}
 
-	/// <summary>ID3D12Resource* обёрнутой текстуры - им пользуется и <see cref="DlssUpscalerBackend"/>.</summary>
+	/// <summary>ID3D12Resource* of the wrapped texture.</summary>
 	internal static IntPtr NativeHandleOf(IGpuTexture texture)
 	{
 		var native = texture switch
@@ -307,9 +280,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		return (IntPtr)(long)(ulong)native.GetNativeHandle();
 	}
 
-	/// <summary>Обновляет подпись: промо-имя поколения + технический номер провайдера через " / ".
-	/// Номер провайдера ffx-рантайма - НЕ маркетинговая версия: 2.3.4 - это поддерживаемая ветка
-	/// поколения "FSR 2", 3.1.x - "FSR 3.1", 4.x - "FSR 4".</summary>
+	// The ffx provider number is not the marketing version: 2.3.4 is the "FSR 2" branch.
 	private void RefreshVersion()
 	{
 		if (_context == IntPtr.Zero)
@@ -353,9 +324,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 			return;
 		}
 
-		// Векторы у нас в UV-долях экрана (prevUV = curUV + motion, y вниз); FSR ждёт пиксели того
-		// же направления и того же y-вниз - масштаб равен рендер-размеру. Джиттер - в пикселях, той
-		// же конвенции, что вбита в проекцию (см. ApplyTemporalJitter: ndc = (+2jx/W, -2jy/H)).
+		// Motion is UV, y down (prevUV = curUV + motion); FSR wants pixels, so scale = render size.
 		var rc = DecaFsr_Dispatch(_context,
 			((global::Diligent.IDeviceContext)_api.ImmediateContext).NativePointer,
 			NativeHandleOf(_sceneHdr),
@@ -367,8 +336,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 			_jitterPixels.X * JitterSign.X, _jitterPixels.Y * JitterSign.Y,
 			_renderWidth * MvSign.X, _renderHeight * MvSign.Y,
 			_renderWidth, _renderHeight, _displayWidth, _displayHeight,
-			// far - конечное большое число, не float.MaxValue: при DEPTH_INFINITE поле обещано
-			// игнорируемым, но 3.4e38 в чужой формуле линеаризации - это inf/NaN на ровном месте.
+			// far stays finite: float.MaxValue turns into inf/NaN inside FSR's linearization.
 			_deltaTimeMs, _cameraNear, 10000f, _fovYRad,
 			_resetNextFrame ? 1 : 0, _sharpness > 0f ? 1 : 0, _sharpness, DebugView ? 1 : 0);
 
@@ -379,10 +347,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 			Console.WriteLine($"[fsr] dispatch rc={rc}: {LastNativeMessage()}");
 		}
 
-		// Командный лист трогали мимо Diligent - сперва Flush (сабмит листа с чужими командами,
-		// ровно как советует ворнинг "Invalidating context that has outstanding commands"), потом
-		// InvalidateState по уже чистому контексту. ffx вернул ресурсы в заявленные состояния,
-		// так что дальше графу чинить нечего.
+		// ffx wrote to the command list behind Diligent's back: Flush must precede InvalidateState.
 		_api.ImmediateContext.Flush();
 		_api.ImmediateContext.InvalidateState();
 	}
@@ -390,8 +355,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 	public void Resize(IGpuTexture sceneHdr, IGpuTexture depth, IGpuTexture motion,
 		uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight)
 	{
-		// Нативный контекст пекёт максимальные размеры - пересоздаём. Вызывающий (ресайз-путь
-		// вьюпорта) уже дождался GPU.
+		// The native context bakes in max sizes, so recreate it; the caller has idled the GPU.
 		if (_context != IntPtr.Zero)
 		{
 			DecaFsr_Destroy(_context);
@@ -403,7 +367,7 @@ public sealed class FsrUpscalerBackend : INativeUpscalerBackend
 		if (!CreateContext(sceneHdr, depth, motion, renderWidth, renderHeight,
 			    displayWidth, displayHeight, out var error))
 		{
-			Console.WriteLine($"[fsr] пересоздание контекста после ресайза не удалось: {error}; {LastNativeMessage()}");
+			Console.WriteLine($"[fsr] context recreation after resize failed: {error}; {LastNativeMessage()}");
 		}
 
 		RefreshVersion();

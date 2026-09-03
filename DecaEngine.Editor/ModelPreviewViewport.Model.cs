@@ -15,28 +15,20 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>Загрузка модели: заявка в столе, стриминг, инстансы, RT-сцена теней. Часть <see cref="ModelPreviewViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Model loading: store claim, streaming, instances, RT shadow scene.</summary>
 	public partial class ModelPreviewViewport
 	{
-		/// <summary>
-		/// ????????? .gltf/.glb ?????? ?? ?????????? ???? ? ??????????? EntityStore ????? ??????.
-		/// ?? ?????? ??????, ???? ???? ????????? ? ??? ???????????. ?????? ???????? (????? ????,
-		/// ?? ?????? ? ?.?.) ?? ????????? ?????? - ??. <see cref="LoadError"/>.
-		/// </summary>
+		/// <summary>Loads a model for preview; errors surface through <see cref="LoadError"/>.</summary>
 		public void LoadModel(string modelPath, int subMeshIndex = -1)
 		{
-			// Ключ загрузки - пара (путь, сабмеш): та же модель с другим выбранным сабмешем
-			// должна перезагрузиться (точнее, перенаселить сцену только этим сабмешем).
+			// The load key is (path, sub-mesh): the same file with another sub-mesh must repopulate.
 			if ((string.Equals(_loadedPath, modelPath, StringComparison.OrdinalIgnoreCase) && _loadedSubMesh == subMeshIndex) ||
 			    (string.Equals(_loadingPath, modelPath, StringComparison.OrdinalIgnoreCase) && _loadingSubMesh == subMeshIndex))
 			{
 				return;
 			}
 
-			// Та же модель, что уже резидентна с предыдущего вызова (просто другой сабмеш выбран) -
-			// файл уже распарсен и его меши/материалы уже зарегистрированы в _env.BatchRenderer, так
-			// что достаточно перенаселить сцену, без диска, фоновой задачи и лоадер-хендла.
+			// Already resident: meshes/materials are registered, so just repopulate the scene.
 			if (_residentModel != null && string.Equals(_residentPath, modelPath, StringComparison.OrdinalIgnoreCase))
 			{
 				CancelPendingLoad();
@@ -54,8 +46,7 @@ namespace DecaEngine.Editor
 					_env.DilApi.ImmediateContext.WaitForIdle();
 					_env.Pipeline.InvalidateGraph();
 
-					// AO/GI world-range (см. FrameAll) - только теперь, после барьера выше, той же
-					// причине, что и в PollPendingLoad.
+					// AO/GI world range only after the barrier above, as in PollPendingLoad.
 					_env.SetAoWorldRange(AoWorldRange());
 					_env.SetAoStrength(Math.Clamp(_editorSettings.AoStrength, 0.1f, 4f),
 						Math.Clamp(_editorSettings.AoFloor, 0f, 1f));
@@ -79,8 +70,7 @@ namespace DecaEngine.Editor
 
 			CancelPendingLoad();
 
-			// Возврат из паузы резидента заведомо не имеет (мы сами его отдали при уходе) - это
-			// штатный путь, а не потерянный кеш, о котором предупреждает диагностика ниже.
+			// Resuming from pause has no resident by design, so it is not a lost-cache warning.
 			if (!_restoringAfterResume)
 			{
 				EngineLog.Add(LogLevel.Warning,
@@ -91,36 +81,22 @@ namespace DecaEngine.Editor
 
 			UnloadResidentModel();
 
-			// Сама загрузка стартует из ModelStreamingSystem (в SystemRoot окружения) ближайшим
-			// кадром; готовность опрашивает PollPendingLoad. Ошибки (файл пропал, битый glTF)
-			// приходят через Resident.Failed тем же путём.
+			// The load starts next frame from ModelStreamingSystem; PollPendingLoad polls it.
 			_streamingModel = _streamer.Acquire(modelPath, _orbitTarget);
 			_loadingPath = modelPath;
 			_loadingSubMesh = subMeshIndex;
 			_loadError = null;
 		}
 
-		/// <summary>
-		/// Полностью снимает текущую модель превью с GPU: инстансы, резидентную модель, регистрации в
-		/// батч-рендерере и пробы. «Сначала очистить предыдущее, потом грузить новое»: контент
-		/// прошлого выбора не висит на GPU всё время фоновой загрузки следующего. ClearAll стримера
-		/// выполняет обязательный протокол освобождения (барьер GPU -> сброс регистраций
-		/// батч-рендерера -> Release модели -> пересборка графа - см. комментарии в PopulateFromScene
-		/// про мега-буферы и замороженные команды). Зовётся из <see cref="LoadModel"/> перед новой
-		/// загрузкой и из <see cref="ApplyPendingActiveChange"/>, когда превью уходит в паузу (модель
-		/// в этот момент обязана остаться ровно одна на редактор - см. <see cref="SetActive"/>).
-		/// Вызывать ТОЛЬКО под GPU-локом редактора: внутри есть Flush/WaitForIdle.
-		/// </summary>
+		// Drops the preview model from the GPU entirely. Call ONLY under the editor GPU lock:
+		// contains Flush/WaitForIdle.
 		private void UnloadResidentModel()
 		{
 			ClearInstances();
 
-			// Фоновая сборка BVH под пробы могла ещё читать геометрию старой модели, а ClearAll ниже
-			// её освободит - ждём ДО освобождения (ResetProbeGi зовётся уже после и на этом месте
-			// был бы поздно).
+			// The background probe BVH build may still be reading the old geometry ClearAll frees.
 			WaitProbeBakerTask();
 
-			// Ссылка на резидентную модель прошлого выбора - отпустить до ClearAll.
 			if (_streamingModel != null)
 			{
 				_streamer.Release(_streamingModel);
@@ -135,38 +111,26 @@ namespace DecaEngine.Editor
 			_meshIdMap.Clear();
 			_materialIdMap.Clear();
 			_batchCache.Clear();
-			// Wireframe-материал регистрировался в батч-рендерере - его регистрация умерла со
-			// сбросом в ClearAll; сам объект освобождаем (GPU уже дождались там же) и пересоздадим
-			// лениво в EnsureWireframeMaterial.
+			// The wireframe material's registration died with ClearAll; recreated lazily later.
 			_wireframeMaterial?.Release();
 			_wireframeMaterial = null;
 			_wireframeMaterialId = null;
 			_wireframeBatchCache.Clear();
 
-			// Куб отладочного BVH был зарегистрирован в ТОМ ЖЕ батч-рендерере, чьи регистрации
-			// только что сброшены: его MeshId/BatchId стали недействительны, а сам меш надо
-			// освободить (его GPU-буферы больше никому не принадлежат).
+			// The BVH debug cube's MeshId/BatchId died with the same registration reset.
 			ReleaseBvhDebugResources();
 
 			_loadedPath = null;
 			_loadedSubMesh = -1;
 
-			// Пробы ссылались на материалы/BVH только что освобождённой модели - сброс за барьером,
-			// который ClearAll уже сделал.
 			ResetProbeGi();
 		}
 
-		/// <summary>Опции загрузки для стримера - прежние опции прямого BeginLoadAsync. Фабрика, а не
-		/// снимок: MaxTextureSize/анизотропию пользователь меняет между загрузками. Кламп
-		/// MaxTextureSize - это ПИКОВАЯ память загрузки: все текстуры модели декодируются разом и
-		/// лежат несжатыми до самой заливки (см. EditorSettings.PreviewMaxTextureSize).</summary>
+		// A factory, not a snapshot: MaxTextureSize/anisotropy change between loads.
 		private ModelLoadOptions BuildLoadOptions() =>
 			ViewportSettingsPush.BuildLoadOptions(_editorSettings, RtShadowsEnabled());
 
-		/// <summary>Строит TLAS RT-теней по резидентной модели и привязывает его её материалам.
-		/// No-op вне режима «Ray-traced» и без модели. Прежняя структура освобождается: смена
-		/// модели/сабмеша меняет набор мешей, а BLAS-кэш DiligentRayTracingScene ключуется мешами
-		/// умершей модели. Вызывать только после барьера (Flush + WaitForIdle).</summary>
+		// Call only after a barrier (Flush + WaitForIdle). No-op outside "Ray-traced" mode.
 		private void UpdateRtShadowScene()
 		{
 			_rtShadowScene?.Release();
@@ -207,34 +171,25 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			for (int i = 0; i < _residentModel.materialObjects.Count; i++)
+			// Bind into this environment's own material set: another set's TLAS is another scene.
+			var tlasTargets = OwnMaterials!;
+			for (int i = 0; i < tlasTargets.Count; i++)
 			{
-				if (_residentModel.materialObjects.GetAt(i).Value is DiligentMaterial material)
+				if (tlasTargets.GetAt(i).Value is DiligentMaterial material)
 				{
 					material.SetAccelStructure("_SceneTlas", _rtShadowScene.Tlas);
 				}
 			}
 		}
 
-		/// <summary>Потолок текстуры в том виде, в каком он уходит в загрузчик. Отдельным методом,
-		/// потому что то же значение сравнивает диф перезагрузки: сравнивать сырую настройку с
-		/// заклампленной - значит вечно видеть расхождение на значениях вне [128, 8192].</summary>
+		// Compare against the clamped value: raw settings outside [128, 8192] would always differ.
 		private int ClampedMaxTextureSize() => ViewportSettingsPush.ClampedMaxTextureSize(_editorSettings);
 
-		/// <summary>
-		/// Cancels and releases the in-flight background load, if any - the background Task.Run in
-		/// ModelImporter.PrepareModel checks the token between phases, so this actually stops it from
-		/// continuing to burn CPU decoding textures for a model/sub-mesh selection the user has already
-		/// moved on from, instead of just forgetting the reference and letting it run to completion
-		/// unobserved.
-		/// </summary>
+		// Cancels the in-flight background load; PrepareModel checks the token between phases.
 		private void CancelPendingLoad()
 		{
-			// Отпускаем ссылку ТОЛЬКО если загрузка ещё шла: после готовности _streamingModel - это
-			// ссылка, удерживающая РЕЗИДЕНТНУЮ модель от выселения стримером (переключение сабмеша
-			// зовёт CancelPendingLoad и не должно её терять). Стример сам отменит фоновую задачу
-			// (CancellationToken проверяется между фазами PrepareModel - декод реально остановится)
-			// ближайшим Tick-ом, увидев ноль ссылок; хендл статуса закрывается там же.
+			// Release only while still loading: once ready, _streamingModel is the reference that
+			// keeps the resident model from being evicted, and sub-mesh switching must not lose it.
 			if (_loadingPath != null && _streamingModel != null)
 			{
 				_streamer.Release(_streamingModel);
@@ -245,10 +200,6 @@ namespace DecaEngine.Editor
 			_loadingSubMesh = -1;
 		}
 
-		/// <summary>Опрос стриминга текущего выбора. Саму загрузку (фоновый Prepare, покадровую
-		/// финализацию порциями - дисциплину upload-хипа, регистрацию в батч-рендерере) ведёт
-		/// <see cref="ModelStreamer"/> из ModelStreamingSystem; здесь - только реакция на готовность:
-		/// перенос словарей регистраций, население сцены и пост-обвязка (AO/GI/материалы).</summary>
 		private void PollPendingLoad()
 		{
 			if (_streamingModel == null || _loadingPath == null)
@@ -285,10 +236,7 @@ namespace DecaEngine.Editor
 			{
 				ResetPreviewModeForNewSelection();
 
-				// Модель уже зарегистрирована стримером - переносим его словари регистраций в поля
-				// вьюпорта (ими пользуются PopulateFromScene/wireframe) и объявляем модель резидентной
-				// ДО населения: PopulateFromScene по ReferenceEquals поймёт, что регистрировать заново
-				// нечего.
+				// Mark the model resident BEFORE populating: PopulateFromScene checks by reference.
 				_residentModel = state.Model;
 				_residentPath = modelPath;
 				_meshIdMap.Clear();
@@ -320,9 +268,8 @@ namespace DecaEngine.Editor
 				_env.DilApi.ImmediateContext.WaitForIdle();
 				_env.Pipeline.InvalidateGraph();
 
-				// AO/GI world-range (см. FrameAll) - только теперь, после барьера выше: SetConstant
-				// трогает ImmediateContext и метит AoMaterial dirty (пересборка PSO на следующий
-				// draw), это небезопасно, пока предыдущий кадр ещё может быть в полёте.
+				// AO/GI world range only after the barrier: SetConstant touches ImmediateContext and
+				// marks AoMaterial dirty, unsafe while the previous frame may be in flight.
 				_env.SetAoWorldRange(AoWorldRange());
 				_env.SetAoStrength(Math.Clamp(_editorSettings.AoStrength, 0.1f, 4f),
 					Math.Clamp(_editorSettings.AoFloor, 0f, 1f));
@@ -334,20 +281,16 @@ namespace DecaEngine.Editor
 				_loadError = null;
 				ApplyPreviewSettingsToMaterials();
 
-				// TLAS RT-теней - после барьера выше (сборка BLAS/TLAS трогает ImmediateContext)
-				// и строго ДО первого дроу: вариант с FEATURE_RT_SHADOWS объявляет _SceneTlas, и
-				// коммит ресурсов без привязки упёрся бы в пустой дескриптор.
+				// After the barrier and strictly before the first draw: the FEATURE_RT_SHADOWS
+				// variant declares _SceneTlas, and committing without a binding hits a null SRV.
 				UpdateRtShadowScene();
 
-				// RT-фолбэк SSR мог ждать модель (собственный accel строится от неё) - фичи
-				// перечитываются здесь же; внутри и сборка accel-а, и привязка TLAS.
+				// RT SSR fallback builds its own accel from the model - refresh features here.
 				if (_editorSettings.PreviewSsr && _editorSettings.SsrRayTraced)
 				{
 					ApplyPipelineFeatures();
 				}
 
-				// Probe-GI пересчитывается под новую модель: сброс безопасен - барьер выше уже
-				// дождался GPU, а раунды пойдут из PollProbeBake.
 				ResetProbeGi();
 				RequestProbeSession(delaySeconds: 0f);
 			}
@@ -359,19 +302,10 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>
-		/// subMeshIndex &gt;= 0 - показываем только инстансы этого сабмеша, иначе всю модель. Сабмеш
-		/// без единого инстанса (неиспользуемый меш в glTF) остаётся пустым - HasModel вернёт false
-		/// и Render покажет "No model loaded" вместо синтетического инстанса.
-		/// </summary>
+		// subMeshIndex >= 0 shows only that sub-mesh's instances; a sub-mesh with none stays empty.
 		private void PopulateFromScene(ModelLoader modelLoader, int subMeshIndex = -1)
 		{
-			// Жизненный цикл модели теперь у ModelStreamer: регистрацию ресурсов он делает при
-			// готовности загрузки, освобождение предыдущей модели - в LoadModel через ClearAll
-			// (барьер GPU -> сброс регистраций -> Release -> пересборка графа; прежде этот протокол
-			// жил здесь). Сюда модель приходит уже резидентной: PollPendingLoad переносит словари
-			// регистраций и выставляет _residentModel ДО вызова, сабмеш-путь LoadModel передаёт
-			// _residentModel сам. Чужая модель - нарушение жизненного цикла стриминга.
+			// The model must already be resident: anything else violates the streaming lifecycle.
 			if (!ReferenceEquals(modelLoader, _residentModel))
 			{
 				EngineLog.Add(LogLevel.Error,
@@ -400,18 +334,8 @@ namespace DecaEngine.Editor
 				}
 			}
 
-			// Framing must be based on the actual MESH geometry bounds of ALL sub-meshes/instances
-			// (Scene.ComputeBounds, using Scene.Meshes[i].Center/Radius, computed by
-			// MeshUtility.RecalculateBounds when the model was loaded, see Scene.cs) - a model
-			// almost always consists of multiple sub-meshes/nodes, so a single mesh's bound is not
-			// enough on its own; a mesh whose geometry is offset from its local origin (very common
-			// for glTF nodes) would otherwise make the orbit target sit next to the model instead of
-			// at its actual visual center, so the camera would circle some empty point beside it
-			// rather than fully around it.
-
-			// Для одиночного сабмеша считаем bounds только по ЕГО инстансам (аналог
-			// ModelLoader.ComputeBounds, но с фильтром) - иначе камера кадрировала бы всю модель,
-			// а маленький сабмеш где-нибудь с краю был бы едва различим.
+			// Framing uses the geometry bounds of all shown instances: glTF nodes are commonly
+			// offset from their local origin, so a single mesh bound would orbit an empty point.
 			Vector3 boundsMin, boundsMax;
 			if (subMeshIndex < 0)
 			{
@@ -422,7 +346,6 @@ namespace DecaEngine.Editor
 				(boundsMin, boundsMax) = ModelViewportGeometry.ComputeSubMeshBounds(modelLoader, subMeshIndex);
 			}
 
-			// ??????????? ??? ??????? ??????? ? ???????
 			EngineLog.Add(LogLevel.Info,
 				$"Model preview bounds: min={boundsMin}, max={boundsMax}, instances={_instanceEntities.Count}");
 
@@ -440,17 +363,12 @@ namespace DecaEngine.Editor
 			_instanceEntities.Clear();
 			ClearWireframeOverlay();
 
-			// И боксы отладочного BVH: они такие же инстансы батч-рендерера, и снимать их надо
-			// ЗДЕСЬ - то есть до любого сброса регистраций, пока их BatchId валиден. Иначе после
-			// смены модели они продолжают рисоваться, подхватив геометрию новой модели.
+			// BVH debug boxes are batch-renderer instances too: drop them while BatchIds are valid.
 			ClearBvhDebugOverlay();
 			_bvhDebugState = default;
 		}
 
-		/// <summary>Цвет/интенсивность солнца для бейка проб: тот же keyIntensity, что у
-		/// аналитического мирового света (ProbeGiParams.z в UnlitInstancedPS.hlsl) - иначе баунс не
-		/// сойдётся по яркости с прямым светом: ярче - тень заливается эмбиентом, тусклее - отскок
-		/// проваливается.</summary>
+		// Must match the analytic sun's keyIntensity or the bounce will not match direct light.
 		private Vector3 ProbeSunColor() => ViewportSettingsPush.ProbeSunColor(_editorSettings);
 
 	}

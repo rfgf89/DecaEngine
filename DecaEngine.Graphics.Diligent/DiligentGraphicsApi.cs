@@ -7,7 +7,6 @@ using DecaEngine.Graphics.Diligent.RenderGraph;
 using Diligent;
 using SharpGLTF.Schema2;
 using StbImageSharp;
-// Прямая работа с нативным контекстом - состояния здесь Diligent-овские, не из ICommandBuffer.
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
 using TextureInfo = DecaEngine.Graphics.TextureInfo;
@@ -34,31 +33,19 @@ namespace DecaEngine.Graphics.Diligent
 		public event Action<GraphicsPipelineSetupInfo> OnCreateSetupInfo;
 		public event Action OnSwapChainInfo;
 
-		/// <summary>
-		/// Срабатывает для каждого диагностического сообщения от нативного движка Diligent
-		/// (переданного через IEngineFactory.SetMessageCallback). Позволяет внешнему коду
-		/// (например, редактору) перехватывать эти сообщения со всей структурированной
-		/// информацией вместо парсинга текста из консоли. Если на событие никто не подписан,
-		/// сообщение по умолчанию печатается в Console.
-		/// </summary>
+		/// <summary>Raised for each native Diligent debug message; with no subscribers it goes to Console.</summary>
 		public static event Action<DebugMessageSeverity, string, string, string, int>? DebugMessage;
 
 		public IWindowHandle WindowHandle { get; set; }
 		public DiligentPsoManager PsoManager { get; private set; }
 
-		/// <summary>Дисковый кеш байткода шейдеров (HLSL -> DXIL/DXBC/SPIR-V), null - выключен
-		/// (DECA_SHADER_CACHE=0 или не удалось создать директорию). Дополняет PsoManager: тот
-		/// кеширует только драйверную часть PSO, а секунды на большие варианты UnlitInstancedPS
-		/// съедает именно компилятор - см. DiligentShaderBytecodeCache.</summary>
+		/// <summary>Disk cache of compiled shader bytecode; null when disabled (DECA_SHADER_CACHE=0).</summary>
 		public DiligentShaderBytecodeCache? ShaderBytecodeCache { get; private set; }
 
-		/// <summary>См. <see cref="IGraphicsApi.PresentInterval"/>. Дефолт 1 (vsync) - осознанный, см.
-		/// комментарий в <see cref="Present"/>; переменная окружения DECA_VSYNC перекрывает его при
-		/// старте (0 - без ожидания, 1..4 - интервалы синхронизации).</summary>
+		/// <summary>Default 1 (vsync) is deliberate (see <see cref="Present"/>); DECA_VSYNC overrides at startup (0..4).</summary>
 		public int PresentInterval { get; set; } = ResolvePresentInterval();
 
-		/// <summary>Сколько кадров CPU вправе убежать вперёд GPU (см. фенс в <see cref="Present"/>).
-		/// Меньше - ниже задержка, больше - ровнее загрузка; 2 - прежнее поведение.</summary>
+		/// <summary>How many frames the CPU may run ahead of the GPU (see the fence in <see cref="Present"/>).</summary>
 		public int FramesInFlight { get; set; } = 2;
 
 		private static int ResolvePresentInterval()
@@ -69,9 +56,7 @@ namespace DecaEngine.Graphics.Diligent
 				: 1;
 		}
 
-		/// <summary>Слои валидации GPU: по умолчанию только в Debug-сборке, DECA_GPU_VALIDATION
-		/// ("1"/"0") перекрывает дефолт в обе стороны. В Release валидация стоит заметного CPU-времени
-		/// на каждый вызов API и не нужна.</summary>
+		/// <summary>GPU validation: Debug-only by default; DECA_GPU_VALIDATION=1/0 overrides either way.</summary>
 		private static bool ResolveValidationEnabled()
 		{
 			var env = Environment.GetEnvironmentVariable("DECA_GPU_VALIDATION");
@@ -92,9 +77,7 @@ namespace DecaEngine.Graphics.Diligent
 #endif
 		}
 
-		/// <summary>См. <see cref="IGraphicsApi.RayTracing"/>. Фича запрашивается опционально (см.
-		/// Initialize), поэтому мало проверить флаги адаптера - надо убедиться, что устройство её
-		/// действительно включило.</summary>
+		/// <summary>Reports what the device actually enabled, not just the adapter caps (feature is Optional).</summary>
 		public RayTracingSupport RayTracing
 		{
 			get
@@ -112,9 +95,7 @@ namespace DecaEngine.Graphics.Diligent
 			}
 		}
 
-		/// <summary>Включил ли девайс динамическую индексацию массивов шейдерных ресурсов
-		/// (ShaderResourceRuntimeArrays, запрошена Optional в Initialize) - гейт bindless-режима
-		/// текстур RT-хитов SSR. На D3D12 есть всегда; на Vulkan зависит от драйвера.</summary>
+		/// <summary>True when ShaderResourceRuntimeArrays got enabled; always on D3D12, driver-dependent on Vulkan.</summary>
 		public bool SupportsShaderResourceArrays =>
 			_renderDevice != null &&
 			Device.GetDeviceInfo().Features.ShaderResourceRuntimeArrays == DeviceFeatureState.Enabled;
@@ -181,26 +162,13 @@ namespace DecaEngine.Graphics.Diligent
 		public TextureObjectFormat SwapChainColorFormat => DiligentResourceFormats.ToTextureObjectFormat(SwapChain.GetDesc().ColorBufferFormat);
 		public TextureObjectFormat SwapChainDepthFormat => DiligentResourceFormats.ToTextureObjectFormat(SwapChain.GetDesc().DepthBufferFormat);
 
-		/// <summary>Кэш скомпилированных шейдеров на весь срок жизни api: ключ - файл + точка входа +
-		/// тип + набор кейвордов варианта. Раньше кэш вариантов жил ВНУТРИ одной загрузки модели
-		/// (см. ModelLoader.BuildFromPreparedIncremental), то есть каждая следующая модель - и каждое
-		/// переключение в Asset Browser - компилировала ровно те же варианты UnlitInstancedPS заново,
-		/// синхронно на потоке рендера. Шейдеров десятки, память копеечная, а компиляция большого
-		/// PS-варианта стоит секунды.</summary>
+		/// <summary>Api-lifetime cache keyed by file+entry+type+keywords; a large PS variant costs seconds to compile.</summary>
 		private readonly Dictionary<string, DiligentShader> _shaderCache = new();
 
-		/// <summary>Кэш дёргают и фоновые потоки загрузки (см. ModelLoader.PrecompileShaderVariants),
-		/// и главный - словарь без замка рвался бы гонкой на ресайзе.</summary>
+		/// <summary>Hit by background load threads and the render thread; guard every access.</summary>
 		private readonly object _shaderCacheLock = new();
 
-		/// <summary>
-		/// Шейдер из общего кэша - ТОЛЬКО для потребителей, чьи материалы помечены OwnsShaders=false
-		/// (сейчас это загрузка моделей, см. ModelLoader.BuildFromPreparedIncremental). Обычный
-		/// <see cref="CreateShader(string,string,string,ShaderObjectType)"/> кэш не трогает намеренно:
-		/// материалы пассов движка владеют своими шейдерами и при Release освобождают НАТИВНЫЙ объект
-		/// напрямую - выдай им шарёный экземпляр, и первое же пересоздание окружения убило бы шейдер
-		/// под живыми материалами модели.
-		/// </summary>
+		/// <summary>Cached shader for OwnsShaders=false consumers only; pass-owned materials free the native object on Release and must not share.</summary>
 		public IShaderObject CreateSharedShader(string name, string factoryPath, string filePath,
 			ShaderObjectType type, string entryPoint = "Main", IReadOnlyList<string> keywords = null)
 		{
@@ -220,9 +188,7 @@ namespace DecaEngine.Graphics.Diligent
 					return cached;
 				}
 
-				// Шареный между моделями объект: его Release игнорируется (см. DiligentShader.IsShared) -
-				// иначе освобождение одной модели убило бы нативный шейдер, которым пользуются живые
-				// материалы другой.
+				// Release is a no-op on shared shaders (IsShared); only ReleaseShaderCache frees them.
 				var shader = new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords)
 				{
 					IsShared = true,
@@ -248,7 +214,7 @@ namespace DecaEngine.Graphics.Diligent
 			return new DiligentShader(this, name, factoryPath, filePath, type, entryPoint, keywords);
 		}
 
-		/// <summary>Освобождает кэш шейдеров (их Release игнорирует IsShared - только отсюда).</summary>
+		/// <summary>The only place shared shaders are actually freed (their Release is a no-op).</summary>
 		private void ReleaseShaderCache()
 		{
 			lock (_shaderCacheLock)
@@ -280,7 +246,7 @@ namespace DecaEngine.Graphics.Diligent
 			return filter switch
 			{
 				TextureFilter.Anisotropic => FilterType.Anisotropic,
-				TextureFilter.ComparisonLinear => FilterType.ComparisonLinear, // Added this line
+				TextureFilter.ComparisonLinear => FilterType.ComparisonLinear,
 				_ => FilterType.Linear
 			};
 		}
@@ -297,9 +263,7 @@ namespace DecaEngine.Graphics.Diligent
 				BorderColor = border,
 				ComparisonFunc = (ComparisonFunction)comparisonFunction,
 				MipLODBias = mipLodBias,
-				// НЕ дефолт C#-структуры: new SamplerDesc{} зануляет MaxLOD, а MaxLOD == 0 зажимает
-				// выборку в mip 0 - мипы не работают ВООБЩЕ (и любой mip bias сложится и заклампится
-				// в ноль). Нативный Diligent дефолтит MaxLOD в +FLT_MAX - возвращаем его семантику.
+				// C# zero-init clamps MaxLOD to 0 (mip 0 only); native Diligent defaults it to +FLT_MAX.
 				MinLOD = 0f,
 				MaxLOD = float.MaxValue,
 				MinFilter = ToDiligent(filter),
@@ -308,8 +272,7 @@ namespace DecaEngine.Graphics.Diligent
 				AddressU = ToDiligent(address),
 				AddressV = ToDiligent(address),
 				AddressW = ToDiligent(address),
-				// Без MaxAnisotropy анизотропный фильтр вырождается в обычный линейный - дефолт
-				// дескриптора 0.
+				// MaxAnisotropy 0 (the desc default) degrades anisotropic filtering to plain linear.
 				MaxAnisotropy = filter == TextureFilter.Anisotropic ? 8u : 0u,
 				Name = name,
 			};
@@ -320,8 +283,6 @@ namespace DecaEngine.Graphics.Diligent
 
 		public unsafe IGpuTexture CreateTexture(CpuTextureData data)
 		{
-			// Запечённая BC-текстура из кеша ассетов: мип-цепочка уже готова, ужимать и генерировать
-			// нечего - данные уезжают в VRAM ровно теми байтами, какими лежали на диске.
 			if (data.IsCompressed)
 			{
 				return CreateCompressedTexture(data);
@@ -332,8 +293,7 @@ namespace DecaEngine.Graphics.Diligent
 
 			if (data.DecodedPixels != null)
 			{
-				// Decoding already happened off the GPU thread (see ModelLoader's background load
-				// pipeline) - avoid paying the decode cost again here.
+				// Pixels were decoded off the GPU thread; do not pay the decode cost again here.
 				pixels = data.DecodedPixels;
 				width = data.DecodedWidth;
 				height = data.DecodedHeight;
@@ -347,9 +307,7 @@ namespace DecaEngine.Graphics.Diligent
 				height = imageResult.Height;
 			}
 
-			// Полная мип-цепочка (GenerateMips на GPU): без неё минификация шумит, а анизотропный
-			// сэмплер не работает. Требует Default-usage + RT-bind; 1x1 и запрошенные без мипов
-			// текстуры идут старым immutable-путём.
+			// GenerateMips needs Default usage + RenderTarget bind; 1x1/no-mip textures stay immutable.
 			bool generateMips = data.GenerateMips && width > 1 && height > 1;
 
 			var desc = new TextureDesc
@@ -376,8 +334,7 @@ namespace DecaEngine.Graphics.Diligent
 				if (generateMips)
 				{
 					nativeTexture = Device.CreateTexture(desc);
-					// При нехватке VRAM Diligent возвращает null (лог уже содержит его ошибку), а
-					// UpdateTexture по null-хендлу - это AV, убивающий процесс без managed-исключения.
+					// Diligent returns null on failure; UpdateTexture on a null handle is a native AV.
 					if (nativeTexture == null)
 					{
 						throw new InvalidOperationException(
@@ -400,18 +357,14 @@ namespace DecaEngine.Graphics.Diligent
 				}
 			}
 
-			// DECA_TEX_DIAG=1 - фактическое число мипов КАЖДОЙ созданной текстуры. Диагностика тракта
-			// mip bias: если у текстур один мип, LOD клампится в [0,0] и любые ручки сэмплера
-			// (bias/анизотропия/MaxLOD) физически не могут ничего изменить.
+			// DECA_TEX_DIAG=1 logs actual mip counts: single-mip textures make all sampler knobs no-ops.
 			if (Environment.GetEnvironmentVariable("DECA_TEX_DIAG") == "1")
 			{
 				Console.WriteLine($"[texdiag] {data.Name}: {width}x{height} " +
 					$"mips={nativeTexture.GetDesc().MipLevels} generate={generateMips}");
 			}
 
-			// Add a transition to ShaderResource. Diligent's engine doesn't automatically transition
-			// the underlying native resource to ShaderResource correctly if you skip Context update
-			// transition barriers in materials or if it's used inside indirect draw setups.
+			// Explicit ShaderResource transition: Diligent does not reliably auto-transition here.
 			ImmediateContext.TransitionResourceStates(
 			[
 				new StateTransitionDesc()
@@ -435,12 +388,7 @@ namespace DecaEngine.Graphics.Diligent
 			return new DiligentGpuTexture(data.Name, textureInfo, nativeTexture);
 		}
 
-		/// <summary>
-		/// Texture2DArray из готовых CPU-слоёв ОДНОГО размера (RGBA8, один мип на слой). Нужна
-		/// атласу текстур RT-хитов (см. SsrHitTextures): остальные пути создания сэмплируемых
-		/// текстур прибиты к Tex2d. Формат - UNorm без sRGB, как у всех текстур движка: перевод в
-		/// линейное пространство делает шейдер (pow 2.2), см. DiligentResourceFormats.
-		/// </summary>
+		/// <summary>Texture2DArray from same-size RGBA8 layers (one mip each); UNorm, not sRGB - the shader linearizes.</summary>
 		public unsafe IGpuTexture CreateTextureArray(string name, int width, int height,
 			IReadOnlyList<byte[]> layers)
 		{
@@ -525,14 +473,7 @@ namespace DecaEngine.Graphics.Diligent
 			}
 		}
 
-		/// <summary>
-		/// Создаёт текстуру из готовой блочно-сжатой мип-цепочки (см. DtexFile / ассет-пайплайн).
-		///
-		/// Ни GenerateMips, ни RenderTarget-бинда здесь нет и быть не может: BC-формат не
-		/// фильтруется и не пишется как render target, а цепочка и так забейкана оффлайн. Ресурс
-		/// создаётся Immutable одним вызовом со всеми уровнями сразу - это самый дешёвый путь
-		/// «данные -&gt; VRAM», который вообще даёт API.
-		/// </summary>
+		/// <summary>BC formats cannot be render targets or GenerateMips'd; upload immutable with all mips at once.</summary>
 		private IGpuTexture CreateCompressedTexture(CpuTextureData data)
 		{
 			var format = data.CompressedFormat;
@@ -569,9 +510,7 @@ namespace DecaEngine.Graphics.Diligent
 				{
 					handles[i] = GCHandle.Alloc(mips[i], GCHandleType.Pinned);
 
-					// Stride блочного формата - это длина РЯДА БЛОКОВ, а не строки текселей: один ряд
-					// покрывает 4 строки по высоте, а ширина округляется вверх до кратной 4. Ошибка
-					// здесь не падает, а тихо разъезжает текстуру по диагонали.
+					// Stride is the block-row pitch (4 texel rows, width rounded up to 4); errors skew silently.
 					int mipWidth = Math.Max(1, width >> i);
 					subResources[i] = new TextureSubResData
 					{
@@ -594,8 +533,7 @@ namespace DecaEngine.Graphics.Diligent
 				}
 			}
 
-			// Как и в CreateTexture: при нехватке VRAM Diligent пишет ошибку в лог и возвращает null,
-			// а использование null-хендла дальше - AV без managed-исключения.
+			// Null on failure; using the handle would be a native AV, not a managed exception.
 			if (nativeTexture == null)
 			{
 				throw new InvalidOperationException(
@@ -608,7 +546,7 @@ namespace DecaEngine.Graphics.Diligent
 				Console.WriteLine($"[texdiag] {data.Name}: {width}x{height} {format} mips={mips.Length} (baked)");
 			}
 
-			// Тот же явный переход в ShaderResource, что и в CreateTexture - см. комментарий там.
+			// Same explicit ShaderResource transition as in CreateTexture.
 			ImmediateContext.TransitionResourceStates(
 			[
 				new StateTransitionDesc()
@@ -633,7 +571,7 @@ namespace DecaEngine.Graphics.Diligent
 			return new DiligentGpuTexture(data.Name, textureInfo, nativeTexture);
 		}
 
-		/// <summary>См. <see cref="IGraphicsApi.CreateTexture2DWithMips"/>.</summary>
+		/// <summary>See <see cref="IGraphicsApi.CreateTexture2DWithMips"/>.</summary>
 		public unsafe IGpuTexture CreateTexture2DWithMips(string name, IReadOnlyList<byte[]> mipPixels, int width, int height, bool floatFormat = false)
 		{
 			int bytesPerPixel = floatFormat ? 8 : 4;
@@ -681,7 +619,7 @@ namespace DecaEngine.Graphics.Diligent
 				}
 			}
 
-			// Тот же явный переход в ShaderResource, что и в CreateTexture выше - см. комментарий там.
+			// Same explicit ShaderResource transition as in CreateTexture.
 			ImmediateContext.TransitionResourceStates(
 			[
 				new StateTransitionDesc()
@@ -705,7 +643,7 @@ namespace DecaEngine.Graphics.Diligent
 			return new DiligentGpuTexture(name, textureInfo, nativeTexture);
 		}
 
-		/// <summary>См. <see cref="IGraphicsApi.CreateTexture2DMutable"/>.</summary>
+		/// <summary>See <see cref="IGraphicsApi.CreateTexture2DMutable"/>.</summary>
 		public IGpuTexture CreateTexture2DMutable(string name, int width, int height,
 			bool floatFormat = false, bool unorderedAccess = false)
 		{
@@ -719,8 +657,7 @@ namespace DecaEngine.Graphics.Diligent
 				BindFlags = unorderedAccess
 					? BindFlags.ShaderResource | BindFlags.UnorderedAccess
 					: BindFlags.ShaderResource,
-				// Default (не Dynamic): заливаем целиком командой UpdateTexture, а не через Map -
-				// Dynamic-текстуры в D3D12/Vulkan-бэкендах Diligent не поддерживаются.
+				// Default, not Dynamic: Diligent's D3D12/Vulkan backends do not support Dynamic textures.
 				Usage = Usage.Default,
 				MipLevels = 1,
 			};
@@ -728,16 +665,14 @@ namespace DecaEngine.Graphics.Diligent
 			var nativeTexture = Device.CreateTexture(desc, new TextureData());
 			if (nativeTexture == null)
 			{
-				// Diligent сообщает об отказе в лог и возвращает null. Без этой проверки null уезжал
-				// бы дальше и падал уже на первом использовании - падение процесса вместо внятной
-				// ошибки, которую вызывающий мог бы обработать откатом.
+				// Diligent logs the failure and returns null; fail here with a catchable exception.
 				throw new InvalidOperationException(
 					$"Failed to create texture '{name}' ({width}x{height}, " +
 					$"{(floatFormat ? "RGBA16F" : "RGBA8")}{(unorderedAccess ? ", UAV" : string.Empty)}) - " +
 					"see the graphics log above; the device may have been removed");
 			}
 
-			// Тот же явный переход в ShaderResource, что и в CreateTexture выше - см. комментарий там.
+			// Same explicit ShaderResource transition as in CreateTexture.
 			ImmediateContext.TransitionResourceStates(
 			[
 				new StateTransitionDesc()
@@ -761,7 +696,7 @@ namespace DecaEngine.Graphics.Diligent
 			return new DiligentGpuTexture(name, textureInfo, nativeTexture);
 		}
 
-		/// <summary>См. <see cref="IGraphicsApi.UpdateTexture2D"/>.</summary>
+		/// <summary>See <see cref="IGraphicsApi.UpdateTexture2D"/>.</summary>
 		public unsafe void UpdateTexture2D(IGpuTexture texture, byte[] pixels)
 		{
 			if (texture is not DiligentGpuTexture gpuTexture)
@@ -803,10 +738,7 @@ namespace DecaEngine.Graphics.Diligent
 				handle.Free();
 			}
 
-			// UpdateTexture оставляет текстуру в CopyDest. SRB материалов уже собраны и ждут её в
-			// ShaderResource, а автоматический переход на месте использования их не спасает -
-			// Vulkan-валидация ловит несовпадение layout-а дескриптора (VUID-vkCmdDraw-None-09600).
-			// Возвращаем состояние явно, здесь же.
+			// UpdateTexture leaves CopyDest; built SRBs expect ShaderResource (VUID-vkCmdDraw-None-09600).
 			ImmediateContext.TransitionResourceStates(
 			[
 				new StateTransitionDesc()
@@ -888,14 +820,10 @@ namespace DecaEngine.Graphics.Diligent
 					throw new ArgumentOutOfRangeException(nameof(backend), backend, null);
 			}
 
-			// Имя файла кэша - пер-бэкендное: D3D12 pipeline library и Vulkan pipeline cache
-			// бинарно несовместимы, а редактор (D3D12) и CLI-пробы (Vulkan) стартуют из одной
-			// рабочей директории (см. DiligentPsoManager).
+			// Per-backend cache file: D3D12 pipeline library and Vulkan pipeline cache are incompatible.
 			PsoManager = new DiligentPsoManager(Device,
 				Path.Combine(Environment.CurrentDirectory, $"cache.{backend.ToString().ToLowerInvariant()}.pso"));
-			// Директория тоже пер-бэкендная: DXIL, DXBC и SPIR-V взаимно нечитаемы, а ключ записи
-			// на разных бэкендах совпал бы с точностью до макроса DECA_VULKAN (см. тот же довод у
-			// файла PSO-кеша выше).
+			// Per-backend dir too: DXIL/DXBC/SPIR-V are mutually unreadable and keys would collide.
 			ShaderBytecodeCache = DiligentShaderBytecodeCache.Create(
 				Path.Combine(Environment.CurrentDirectory, $"cache.{backend.ToString().ToLowerInvariant()}.shaders"),
 				backend.ToString());
@@ -991,14 +919,11 @@ namespace DecaEngine.Graphics.Diligent
 				createInfo.Features = new DeviceFeatures()
 				{
 					MultiViewport = DeviceFeatureState.Enabled,
-					// Optional, а не Enabled: на железе/драйвере без трассировки Enabled уронил бы
-					// создание устройства, а так фича просто останется выключенной, и вызывающий
-					// уйдёт на compute-обход своего BVH (см. IGraphicsApi.RayTracing).
+					// Shadow depth-clip-disable needs DepthClamp on Vulkan; Optional so weak GPUs still create.
+					DepthClamp = DeviceFeatureState.Optional,
+					// Optional: Enabled would fail device creation on non-RT hardware.
 					RayTracing = DeviceFeatureState.Optional,
-					// Динамическая индексация массивов шейдерных ресурсов (Texture2D arr[N] с
-					// NonUniformResourceIndex) - «bindless»-текстуры RT-хитов SSR. Тоже Optional:
-					// на D3D12 бесплатно всегда, на Vulkan включает descriptor indexing, если
-					// драйвер умеет; наличие проверяется через SupportsShaderResourceArrays.
+					// Bindless SSR hit textures; free on D3D12, descriptor indexing on Vulkan.
 					ShaderResourceRuntimeArrays = DeviceFeatureState.Optional,
 				};
 
@@ -1064,14 +989,11 @@ namespace DecaEngine.Graphics.Diligent
 				createInfo.Features = new DeviceFeatures()
 				{
 					MultiViewport = DeviceFeatureState.Enabled,
-					// Optional, а не Enabled: на железе/драйвере без трассировки Enabled уронил бы
-					// создание устройства, а так фича просто останется выключенной, и вызывающий
-					// уйдёт на compute-обход своего BVH (см. IGraphicsApi.RayTracing).
+					// Shadow depth-clip-disable needs DepthClamp on Vulkan; Optional so weak GPUs still create.
+					DepthClamp = DeviceFeatureState.Optional,
+					// Optional: Enabled would fail device creation on non-RT hardware.
 					RayTracing = DeviceFeatureState.Optional,
-					// Динамическая индексация массивов шейдерных ресурсов (Texture2D arr[N] с
-					// NonUniformResourceIndex) - «bindless»-текстуры RT-хитов SSR. Тоже Optional:
-					// на D3D12 бесплатно всегда, на Vulkan включает descriptor indexing, если
-					// драйвер умеет; наличие проверяется через SupportsShaderResourceArrays.
+					// Bindless SSR hit textures; free on D3D12, descriptor indexing on Vulkan.
 					ShaderResourceRuntimeArrays = DeviceFeatureState.Optional,
 				};
 
@@ -1102,7 +1024,7 @@ namespace DecaEngine.Graphics.Diligent
 			_frameFence = Device.CreateFence(new FenceDesc { Name = "Frame Fence" });
 		}
 
-		/// <summary>См. <see cref="IGraphicsApi.WaitForGpuIdle"/>.</summary>
+		/// <summary>See <see cref="IGraphicsApi.WaitForGpuIdle"/>.</summary>
 		public void WaitForGpuIdle()
 		{
 			ImmediateContext.Flush();
@@ -1111,10 +1033,7 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void OnWindowHandleResize()
 		{
-			// GPU must be idle before ResizeBuffers-style calls: the OS resize event can land mid-frame,
-			// while commands referencing the current back buffer are still in flight. Resizing out from
-			// under them leaves the device in a broken state, and every texture creation afterwards
-			// starts failing (see the offscreen-target resize sites, which follow the same rule).
+			// GPU must be idle before resize: in-flight back-buffer commands would break the device.
 			ImmediateContext.Flush();
 			ImmediateContext.WaitForIdle();
 
@@ -1163,8 +1082,7 @@ namespace DecaEngine.Graphics.Diligent
 			return suitableAdapter.DeviceId != 0 ? 0 : throw new NullReferenceException("There's no graphics adapter available.");
 		}
 
-		/// <summary>См. <see cref="IGraphicsApi.SavePipelineCache"/>. Ошибки глотаются внутри
-		/// DiligentPsoManager.SaveCache - протухший кэш там же удаляется.</summary>
+		/// <summary>See <see cref="IGraphicsApi.SavePipelineCache"/>; errors are swallowed inside SaveCache.</summary>
 		public void SavePipelineCache()
 		{
 			PsoManager?.SaveCache();
@@ -1172,20 +1090,10 @@ namespace DecaEngine.Graphics.Diligent
 
 		public void Present()
 		{
-			// SyncInterval 1 (vsync/FIFO) по умолчанию, не 0: с MAILBOX на бескапном фреймрейте
-			// презентованные кадры не успевают реаквайриться, и свопчейн Diligent переиспользует их
-			// семафоры (валидация: VUID-vkQueueSubmit-pSignalSemaphores-00067, затем каскад по фенсам
-			// и командным буферам). Ставящий PresentInterval = 0 берёт этот риск на себя - лимит
-			// кадров в полёте ниже держит очередь короткой.
+			// Interval 0 + MAILBOX reuses in-flight semaphores (VUID-vkQueueSubmit-pSignalSemaphores-00067).
 			SwapChain.Present((uint)Math.Max(PresentInterval, 0));
 
-			// Ограничение кадров в полёте (FramesInFlight). Без него (vsync = 0) CPU сабмитит кадры
-			// без ограничений и убегает от GPU на десятки кадров: кольцевой DynamicHeap Diligent
-			// обязан держать данные ВСЕХ кадров в полёте и исчерпывается ("Space in dynamic
-			// heap is almost exhausted. Allocation forced idling the GPU"), пул командных
-			// буферов переиспользует ещё исполняющиеся буферы (валидация Vulkan:
-			// VUID-vkResetCommandBuffer-commandBuffer-00045 и компания), а на D3D12 latency
-			// waitable свопчейна отваливается по таймауту.
+			// Cap CPU run-ahead: unbounded frames exhaust the DynamicHeap and reuse live command buffers.
 			var fenceValue = _nextFrameValue++;
 			ImmediateContext.EnqueueSignal(_frameFence, fenceValue);
 
@@ -1198,7 +1106,7 @@ namespace DecaEngine.Graphics.Diligent
 
 		public void Release()
 		{
-			// Шарёные шейдеры живут до конца api - освобождаются только здесь.
+			// Shared shaders live for the api lifetime; freed only here.
 			ReleaseShaderCache();
 
 			_frameFence?.Dispose();

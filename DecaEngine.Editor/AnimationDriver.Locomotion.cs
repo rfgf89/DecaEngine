@@ -10,23 +10,15 @@ using DecaEngine.Physics;
 using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
-// В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
-// имя разрешается неоднозначно.
+// Friflo has its own Transform component; the alias disambiguates it from the engine TRS.
 using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Локомоция и клипы: походка по скорости, root motion, сэмплирование позы через ozz. Часть <see cref="AnimationDriver"/> - файл на тему; состояние
-/// персонажа (Character) и кадровый Update живут в основном файле.</summary>
+/// <summary>Locomotion and clips: speed-driven gait, root motion, ozz pose sampling.</summary>
 public sealed partial class AnimationDriver
 {
-	/// <summary>
-	/// Локомоушен-бленд (см. <see cref="LocomotionComponent"/>): стойка/шаг/бег по замеренной
-	/// скорости сущности, темп шага масштабируется под неё. Возвращает false, когда позу вести
-	/// нечем (нет компонента, выключен, нет ozz, клипы не нашлись) - тогда позой занимается
-	/// обычный <see cref="Animator"/>. Причины фоллбека снаружи неразличимы намеренно: их
-	/// показывает окно дебага, а вызывающему важно только «кто ведёт позу».
-	/// </summary>
+	// Returns false when nothing can drive the pose, so the plain Animator takes over.
 	private bool ApplyLocomotion(Entity entity, Character character, float deltaSeconds)
 	{
 		character.LocoActive = false;
@@ -42,7 +34,7 @@ public sealed partial class AnimationDriver
 			return false;
 		}
 
-		// Клипы ищутся по именам только при их СМЕНЕ - как AppliedClip у Animator.
+		// Clips are looked up by name only when the names change.
 		string key = $"{settings.IdleClip}\n{settings.WalkClip}\n{settings.RunClip}";
 		if (!string.Equals(key, character.LocoClipsKey, StringComparison.Ordinal))
 		{
@@ -53,9 +45,8 @@ public sealed partial class AnimationDriver
 			character.LocoOffsetsValid = false;
 		}
 
-		// Все три клипа обязательны. Смешивать «что нашлось» нельзя: ozz добирает недостающий вес
-		// rest-позой, и персонаж с опечаткой в имени клипа ходил бы полурастворённым в bind-позу -
-		// это хуже честного фоллбека на Animator, который сразу видно.
+		// All three clips are required: ozz fills missing weight with the rest pose, so a typo in
+		// one clip name would half-dissolve the character into bind pose.
 		if (character.LocoIdle == null || character.LocoWalk == null || character.LocoRun == null)
 		{
 			return false;
@@ -91,9 +82,7 @@ public sealed partial class AnimationDriver
 		float walkSpeed = MathF.Max(settings.WalkSpeed, 1e-3f);
 		float runSpeed = MathF.Max(settings.RunSpeed, walkSpeed + 1e-3f);
 
-		// Скорость меряется по XZ-перемещению сущности: вертикаль - это кочки и падения, темпу шага
-		// она не принадлежит. При нулевом шаге (режим редактирования) не двигается ничего - поза
-		// считается по текущим фазе и скорости, как и весь остальной стек.
+		// Speed is XZ only: vertical motion is bumps and falls, not gait tempo.
 		if (deltaSeconds > 0f)
 		{
 			var worldPos = character.ModelToWorld.Translation;
@@ -104,8 +93,7 @@ public sealed partial class AnimationDriver
 				var delta = worldPos - character.LocoPrevWorld;
 				raw = MathF.Sqrt(delta.X * delta.X + delta.Z * delta.Z) / deltaSeconds;
 
-				// Потолок - от телепортов: перенос сущности при подъёме из рэгдолла - это метры за
-				// кадр, и без потолка каждый подъём начинался бы со вспышки бега.
+				// Cap guards against teleports: a ragdoll get-up moves metres in one frame.
 				raw = MathF.Min(raw, runSpeed * 2f);
 			}
 
@@ -118,21 +106,15 @@ public sealed partial class AnimationDriver
 
 		float speed = character.LocoSpeed;
 
-		// Два активных слоя и общая нормированная фаза. Частота цикла на отрезке стойка-шаг растёт
-		// пропорционально скорости (длина шага авторская, темп подгоняется), на отрезке шаг-бег -
-		// линейно между авторскими темпами: скорость в точке бленда по построению равна
-		// lerp(WalkSpeed, RunSpeed, t), и отдельного множителя «догнать скорость» не нужно.
 		OzzClip layerA, layerB;
 		float timeA, timeB, weightA, weightB, frequency;
 
-		// Время слоя - от общей фазы плюс СДВИГ ДО СОБЫТИЯ АЛЛЮРА клипа (см. LocoWalkPhaseOffset):
-		// сама по себе общая фаза выравнивает только темп, а не то, ЧТО в этот момент делают ноги.
+		// Layer time = shared phase plus the clip's gait-event offset; phase alone aligns
+		// tempo but not what the legs are doing at that instant.
 		float walkTime = (character.LocoPhase + character.LocoWalkPhaseOffset) % 1f * walkClip.Duration;
 		float runTime = (character.LocoPhase + character.LocoRunPhaseOffset) % 1f * runClip.Duration;
 
-		// Аллюр переключается с ГИСТЕРЕЗИСОМ (вверх на 60% отрезка, вниз на 40%), бленд - кроссфейд
-		// по времени ~0.2 с (см. LocoRunGait). Темп внутри аллюра масштабируется под скорость:
-		// застрявший на 2 м/с бегун - это замедленный ЧИСТЫЙ галоп, а не полусмесь аллюров.
+		// Gait switches with hysteresis: up at 60% of the span, down at 40%.
 		float switchUp = walkSpeed + 0.6f * (runSpeed - walkSpeed);
 		float switchDown = walkSpeed + 0.4f * (runSpeed - walkSpeed);
 
@@ -152,9 +134,8 @@ public sealed partial class AnimationDriver
 				(1f - MathF.Exp(-8f * deltaSeconds));
 		}
 
-		// Множитель темпа - от ПРИРОДНОЙ скорости шага клипа (см. LocoWalkStride), в единицах
-		// модели: скорость сущности переводится масштабом. Авторские WalkSpeed/RunSpeed - только
-		// пороги аллюра. Фоллбек на них - когда замер не удался (лапа не размечена).
+		// Rate comes from the clip's natural stride speed in MODEL units; authored
+		// WalkSpeed/RunSpeed are only gait thresholds, used as fallback when measuring failed.
 		float worldScale = MathF.Max(WorldScaleOf(character.ModelToWorld), 1e-6f);
 		float speedModel = speed / worldScale;
 
@@ -195,8 +176,7 @@ public sealed partial class AnimationDriver
 			timeB = runTime;
 			weightB = t;
 
-			// Темп каждого слоя гонится за реальной скоростью в ЕГО аллюре, между ними -
-			// кроссфейдный вес: и разогнанный шаг, и замедленный галоп держат длину шага.
+			// Each layer chases the real speed in its own gait so stride length holds.
 			float walkFrequency = walkRate / walkClip.Duration;
 			float runFrequency = runRate / runClip.Duration;
 			frequency = walkFrequency + (runFrequency - walkFrequency) * t;
@@ -230,12 +210,7 @@ public sealed partial class AnimationDriver
 		return true;
 	}
 
-	/// <summary>
-	/// Фаза СОБЫТИЯ АЛЛЮРА в клипе: нижняя точка задней левой лапы (по humanoid-разметке), 0..1.
-	/// Считается один раз при резолве клипов перебором 32 семплов - выравнивание грубое, но у цикла
-	/// шага событие размазано на десятки миллисекунд, и тридцать второй доли цикла хватает.
-	/// Без разметки (или кость не нашлась) сдвиг нулевой - то есть ровно прежнее поведение.
-	/// </summary>
+	// Gait event phase (0..1): lowest point of the left foot, 32-sample scan, 0 if unmapped.
 	private static float GaitPhaseOffset(Character character, OzzClip clip)
 	{
 		string footName = character.Avatar?[HumanoidBone.LeftFoot] ?? string.Empty;
@@ -271,18 +246,11 @@ public sealed partial class AnimationDriver
 			}
 		}
 
-		// Время слоя считается как (фаза + сдвиг): на общей фазе 0 клип стоит ровно в своём событии,
-		// то есть сдвиг - это ФАЗА СОБЫТИЯ в клипе, как она есть.
 		return bestPhase;
 	}
 
-	/// <summary>
-	/// Природная скорость шага клипа: средняя горизонтальная скорость задней левой лапы в
-	/// пространстве модели за её ТАКТ ОПОРЫ (нижняя четверть размаха высоты), на авторском темпе.
-	/// У in-place клипа опорная лапа едет назад ровно со скоростью, с которой персонаж «должен»
-	/// ехать вперёд, - это и есть скорость, при которой лапы не скользят. Ноль - замер не удался
-	/// (нет разметки, лапа не циклится), вызывающий откатывается на авторские числа.
-	/// </summary>
+	// Natural stride speed in model units: mean horizontal foot speed over its stance beat.
+	// Returns 0 when it cannot be measured, and the caller falls back to authored speeds.
 	private static float MeasureStrideSpeed(Character character, OzzClip clip)
 	{
 		string footName = character.Avatar?[HumanoidBone.LeftFoot] ?? string.Empty;
@@ -341,14 +309,10 @@ public sealed partial class AnimationDriver
 			return;
 		}
 
-		// Компонент правится ПО ССЫЛКЕ. Прежний вариант читал копию и возвращал её через
-		// AddComponent каждый кадр - а это обращение к хранилищу сущностей на каждом кадре на
-		// каждого персонажа, которое в худшем случае двигает сущность между архетипами. Здесь нужно
-		// изменить одно поле, и ref-доступ делает ровно это, ничего не трогая в структуре стора.
+		// By ref: writing the component back each frame can move the entity between archetypes.
 		ref var animator = ref entity.GetComponent<Animator>();
 
-		// Клип ищется по имени только при СМЕНЕ имени: линейный поиск по списку клипов дёшев, но
-		// делать его каждый кадр на каждого персонажа незачем.
+		// Clip is looked up only when the name changes.
 		if (!string.Equals(animator.ClipName ?? string.Empty, character.AppliedClip, StringComparison.Ordinal))
 		{
 			character.AppliedClip = animator.ClipName ?? string.Empty;
@@ -358,8 +322,7 @@ public sealed partial class AnimationDriver
 		character.Player.Loop = animator.Loop;
 		character.Player.Speed = animator.Speed;
 
-		// Время живёт в КОМПОНЕНТЕ (его видно и можно скрабить в инспекторе), но двигает его плеер:
-		// только он знает про зацикливание и про конец незацикленного клипа.
+		// Time lives in the component (scrubbable) but only the player knows looping and clip end.
 		character.Player.Time = animator.Time;
 		float timeBefore = character.Player.Time;
 
@@ -378,15 +341,8 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>
-	/// Root motion по образцу ozz motion_playback: XZ-трансляция КОРНЕВОЙ кости клипа вычитается из
-	/// позы (персонаж остаётся на месте в пространстве модели) и накапливается дельтами в позицию
-	/// сущности - тело движется со скоростью, которую задал автор анимации, включая заворот лупа.
-	/// Вертикаль остаётся в позе: прыжок в клипе - это движение позы, а не сущности.
-	///
-	/// Не сочетается с Character Body (телом владеет его рулевое) и, как остальная процедурка,
-	/// требует нативного ozz - без него стадия молча пропускается.
-	/// </summary>
+	// Root motion after ozz motion_playback: root XZ is subtracted from the pose and accumulated
+	// into the entity position. Y stays in the pose. Skipped for Character Body entities.
 	private static void ApplyRootMotion(Entity entity, Character character, in Animator animator,
 		float timeBefore)
 	{
@@ -412,12 +368,10 @@ public sealed partial class AnimationDriver
 		var track = clip.Tracks[character.MotionJoint];
 		if (track.TranslationTimes.Length < 2)
 		{
-			// Одного ключа (или пустого канала) движению не хватает по построению.
 			return;
 		}
 
-		// Компенсация: корень возвращается к ПЕРВОМУ ключу по XZ - поза шагает на месте, а весь
-		// путь уходит в сущность. Y не трогается: вертикаль клипа - это поза, не путь.
+		// Root snaps back to the first key in XZ: the pose walks in place, travel goes to the entity.
 		var atTime = SampleMotion(track, character.Player.Time);
 		var offset = atTime - track.Translations[0];
 		offset.Y = 0f;
@@ -433,8 +387,7 @@ public sealed partial class AnimationDriver
 
 		character.Models.CopyTo(character.Managed.ModelMatrices, 0);
 
-		// Дельта пути за кадр - с учётом заворота лупа: время после меньше времени до (при прямом
-		// ходе) означает, что плеер завернулся, и к дельте добавляется полный путь цикла.
+		// Frame delta must account for loop wrap: time going backwards means the player wrapped.
 		var delta = atTime - SampleMotion(track, timeBefore);
 
 		if (animator.Loop && clip.Duration > 1e-6f)
@@ -458,8 +411,7 @@ public sealed partial class AnimationDriver
 			return;
 		}
 
-		// Дельта живёт в пространстве МОДЕЛИ, позиция сущности - в пространстве РОДИТЕЛЯ:
-		// модель -> мир -> родитель.
+		// Delta is in model space, entity position is in parent space: model -> world -> parent.
 		var worldDelta = Vector3.TransformNormal(delta, character.ModelToWorld);
 		var parentToWorld = PrefabSceneViewport.ParentToWorldMatrix(entity);
 
@@ -469,8 +421,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Самый верхний предок таза разметки (без разметки - нулевой джойнт): авторское
-	/// движение живёт на корневом узле рига, а не на тазе - таз качается внутри цикла.</summary>
+	// Topmost ancestor of the hips: authored travel lives on the rig root, not on the hips.
 	private static int MotionJointOf(Character character)
 	{
 		int joint = character.Skeleton.FindJoint(character.Avatar?[HumanoidBone.Hips] ?? string.Empty);
@@ -488,8 +439,7 @@ public sealed partial class AnimationDriver
 		return joint;
 	}
 
-	/// <summary>Линейная интерполяция дорожки трансляции корня. Линейный проход осознанно: у
-	/// motion-дорожки единицы-десятки ключей, и звать её приходится дважды за кадр.</summary>
+	// Linear scan on purpose: motion tracks have a handful of keys and are sampled twice a frame.
 	private static Vector3 SampleMotion(JointTrack track, float time)
 	{
 		var times = track.TranslationTimes;
@@ -513,9 +463,7 @@ public sealed partial class AnimationDriver
 		return values[^1];
 	}
 
-	/// <summary>Семплирует клип в позу: нативным ozz, если он есть, иначе C#-семплером. Оба пути
-	/// оставляют результат в одном виде - модельных матрицах <see cref="Character.Models"/> и
-	/// локальных TRS, - поэтому процедурные стадии ниже про этот выбор не знают.</summary>
+	// Samples via native ozz when available, else the C# sampler; both leave the same output.
 	private static void SamplePose(Character character)
 	{
 		var clip = character.Player.Clip;
@@ -545,8 +493,7 @@ public sealed partial class AnimationDriver
 
 		if (!character.Clips.TryGetValue(clip, out var built))
 		{
-			// Неудачная сборка кешируется как null: иначе кадр за кадром повторялась бы одна и та же
-			// провалившаяся перепаковка клипа в сжатый формат ozz.
+			// A failed build is cached as null so the repack is not retried every frame.
 			built = OzzClip.Build(character.Ozz, clip);
 			character.Clips[clip] = built;
 		}

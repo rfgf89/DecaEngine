@@ -32,6 +32,6 @@ public enum ClearDepthStencilFlags
 public enum SetVertexBuffersFlags
 {
 	None = 0,
-	/// <summary>Сбросить слоты, не попавшие в этот вызов, вместо сохранения прежних привязок.</summary>
+	/// <summary>Reset slots not covered by this call instead of keeping prior bindings.</summary>
 	Reset = 1 << 0,
 }

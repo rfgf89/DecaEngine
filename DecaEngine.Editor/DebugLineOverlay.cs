@@ -7,35 +7,26 @@ using DecaEngine.Graphics.Diligent;
 namespace DecaEngine.Editor;
 
 /// <summary>
-/// GPU-сторона дебаг-линий: заливает то, что за кадр накопил <see cref="DebugDraw"/>, и рисует двумя
-/// дроу - с депт-тестом сцены и поверх всего.
+/// GPU side of <see cref="DebugDraw"/>: two draws, depth-tested and on-top.
 ///
-/// Рисуется ИНЛАЙН в конце ForwardPass (см. GraphicsPipelineSimple.InlineOverlay), потому что только
-/// там доступен депт-буфер сцены: без него «кость внутри меша» и «кость снаружи» выглядят
-/// одинаково. Плата за это - HDR-таргет ДО тонемапа: чистый белый после экспозиции и тонемапа
-/// приезжает серым. Поэтому у линий есть множитель яркости (см. <see cref="Intensity"/>) - не
-/// украшение, а способ вытащить дебаг из-под тонемапа сцены, экспозиция которой заранее неизвестна.
+/// Drawn inline at the end of ForwardPass because only there is the scene depth buffer bound.
+/// That target is HDR and pre-tonemap, hence the <see cref="Intensity"/> multiplier.
 ///
-/// ЧИСЛО ВЕРШИН В ДРОУ ЗАШИТО В ЗАМОРОЖЕННУЮ КОМАНДУ ГРАФА, а дебаг-геометрия меняется каждый кадр.
-/// Поэтому дроу всегда идёт на ПОЛНУЮ ёмкость буфера, а лишние вершины гасятся нулевой альфой и
-/// отсекаются в вершиннике (см. DebugLineVS.hlsl). Пересборки графа требует только РОСТ ёмкости -
-/// событие редкое, а не покадровое.
+/// The vertex count is baked into a frozen graph command, so every draw covers the full buffer
+/// capacity and surplus vertices are killed by zero alpha in DebugLineVS.hlsl.
 /// </summary>
 public sealed class DebugLineOverlay : IDisposable
 {
-	/// <summary>Один буфер линий: депт-тестируемые и «поверх всего» отличаются только состоянием
-	/// глубины в PSO, поэтому всё остальное у них общее и живёт здесь.</summary>
+	// Depth-tested and on-top buckets differ only by the PSO depth state.
 	private sealed class Bucket
 	{
 		public IMaterialObject Material = null!;
 		public IBufferHandle? Buffer;
 
-		/// <summary>Ёмкость в вершинах. Она же - число вершин в дроу (см. шапку класса).</summary>
+		// Capacity in vertices, which is also the vertex count of the draw.
 		public int Capacity;
 
-		/// <summary>Сколько вершин буфера залито «живыми» в прошлом кадре: ровно этот хвост нужно
-		/// погасить, если в этом кадре линий стало меньше. Гасить весь буфер незачем - за пределами
-		/// прошлого кадра он уже нулевой.</summary>
+		// Vertices filled last frame: exactly the tail that must be cleared this frame.
 		public int LiveLastFrame;
 
 		public DebugLineVertex[] Scratch = [];
@@ -54,9 +45,7 @@ public sealed class DebugLineOverlay : IDisposable
 
 	private float _appliedIntensity = -1f;
 
-	/// <summary>Множитель яркости линий - см. шапку про HDR. Значение по умолчанию подобрано так,
-	/// чтобы линия читалась на средне-экспонированной сцене; на очень яркой или очень тёмной его
-	/// правит ползунок в окне дебага.</summary>
+	/// <summary>Line brightness multiplier that lifts debug lines out of the scene tonemap.</summary>
 	public float Intensity { get; set; } = 4f;
 
 	public int DepthTestedCapacity => _depthTested.Capacity;
@@ -96,9 +85,8 @@ public sealed class DebugLineOverlay : IDisposable
 			{
 				DepthEnable = depthTest,
 
-				// Reversed-Z, как у всей сцены (ForwardPass чистит глубину нулём). Записи глубины
-				// нет намеренно: дебаг-линия не должна закрывать собой ни сцену, ни другую линию -
-				// пересечение двух каркасов обязано быть видно целиком.
+				// Reverse-Z like the rest of the scene; depth writes stay off so crossing
+				// wireframes never occlude each other.
 				DepthFunc = ComparisonFunctionType.GreaterEqual,
 				DepthWriteEnable = false,
 			},
@@ -125,12 +113,8 @@ public sealed class DebugLineOverlay : IDisposable
 		return material;
 	}
 
-	/// <summary>
-	/// Заливает кадр дебаг-геометрии в GPU. Возвращает true, если замороженные команды графа устарели
-	/// (выросла ёмкость буфера) - вызывающий обязан позвать InvalidateGraph.
-	///
-	/// Звать ДО исполнения графа: заливка идёт немедленным контекстом, как и у контура выделения.
-	/// </summary>
+	/// <summary>Uploads the frame's debug geometry; true means the caller must InvalidateGraph.
+	/// Must be called before the graph runs: the upload uses the immediate context.</summary>
 	public bool Upload(DebugDraw draw)
 	{
 		if (_appliedIntensity != Intensity)
@@ -150,8 +134,7 @@ public sealed class DebugLineOverlay : IDisposable
 
 		if (bucket.Buffer == null || bucket.Capacity < vertices.Length)
 		{
-			// Пересоздание ждёт GPU: старый буфер мог читаться ещё летящим кадром (та же причина,
-			// что в SelectionOutlineOverlay).
+			// Wait for the GPU: an in-flight frame may still be reading the old buffer.
 			_dilApi.ImmediateContext.Flush();
 			_dilApi.ImmediateContext.WaitForIdle();
 
@@ -171,9 +154,7 @@ public sealed class DebugLineOverlay : IDisposable
 				type = BufferHandleType.Vertex,
 			});
 
-			// Свежий буфер содержит мусор, а дроу идёт на всю ёмкость: без начального обнуления в
-			// кадре появились бы линии из неинициализированной памяти - с координатами порядка 1e38,
-			// то есть на весь экран.
+			// A fresh buffer holds garbage and the draw covers all of it, so clear everything once.
 			bucket.LiveLastFrame = capacity;
 			commandsDirty = true;
 		}
@@ -181,8 +162,7 @@ public sealed class DebugLineOverlay : IDisposable
 		var scratch = bucket.Scratch;
 		vertices.CopyTo(scratch);
 
-		// Хвост прошлого кадра гасится нулевой альфой (см. DebugLineVS.hlsl). Чистится ровно он, а не
-		// весь буфер: дальше него уже нули.
+		// Zero alpha kills last frame's tail; beyond it the buffer is already zeroed.
 		int tail = Math.Min(bucket.LiveLastFrame, bucket.Capacity);
 		for (int i = vertices.Length; i < tail; i++)
 		{
@@ -205,7 +185,7 @@ public sealed class DebugLineOverlay : IDisposable
 		return commandsDirty;
 	}
 
-	/// <summary>Тело инлайн-оверлея: рисуется в УЖЕ привязанный render target ForwardPass-а.</summary>
+	/// <summary>Draws into the render target ForwardPass already has bound.</summary>
 	public void Draw(ICommandBuffer cmd)
 	{
 		DrawBucket(cmd, _depthTested);

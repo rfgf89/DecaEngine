@@ -6,8 +6,7 @@ using BepuUtilities.Memory;
 
 namespace DecaEngine.Physics;
 
-/// <summary>Результат райкаста. <see cref="Hit"/> = false означает «луч ничего не задел» - остальные
-/// поля тогда не определены.</summary>
+/// <summary>Raycast result; when <see cref="Hit"/> is false the other fields are undefined.</summary>
 public struct RayHit
 {
 	public bool Hit;
@@ -15,31 +14,23 @@ public struct RayHit
 	public Vector3 Normal;
 	public float Distance;
 
-	/// <summary>Во что попали. Для динамического тела это его handle, для статики - handle статика;
-	/// различать их вызывающий может по <see cref="IsStatic"/>.</summary>
+	/// <summary>Raw handle of the hit collidable; interpret via <see cref="IsStatic"/>.</summary>
 	public int Collidable;
 	public bool IsStatic;
 }
 
 /// <summary>
-/// Мир физики: симуляция Bepu с ФИКСИРОВАННЫМ шагом плюс накопитель времени кадра. Фиксированный
-/// шаг - не вкусовщина: и решатель контактов, и моторы рэгдолла настраиваются под конкретный dt, и
-/// на переменном шаге те же настройки дают разное поведение при разном FPS, вплоть до
-/// расходящегося рэгдолла на просадке.
-///
-/// Помимо симуляции отдаёт райкасты - на них держится вся привязка анимации к геометрии (foot IK
-/// щупает пол под стопой каждый кадр).
+/// Physics world: Bepu simulation with a FIXED time step plus a frame-time accumulator. Fixed step
+/// is required: contact solver and ragdoll motors are tuned for a specific dt.
 /// </summary>
 public sealed class PhysicsWorld : IDisposable
 {
-	/// <summary>Шаг симуляции. 1/120 с, а не 1/60: рэгдолл с моторами и цепочками суставов на 60 Гц
-	/// заметно «резиновый», а вдвое мельче шаг стоит дешевле, чем добавление субшагов решателю.</summary>
+	/// <summary>Sim step. 1/120 s, not 1/60: ragdoll motors are visibly rubbery at 60 Hz and a
+	/// finer step is cheaper than extra solver substeps.</summary>
 	public const float FixedTimeStep = 1f / 120f;
 
-	/// <summary>Потолок шагов за один <see cref="Update"/>. Без него длинный кадр (компиляция
-	/// шейдера, загрузка модели) порождает лавину шагов, каждый из которых снова удлиняет кадр -
-	/// классическая спираль смерти. Лишнее время просто отбрасывается: замедление симуляции честнее
-	/// зависания.</summary>
+	/// <summary>Step cap per <see cref="Update"/>; excess time is dropped to avoid the spiral of
+	/// death after a long frame.</summary>
 	private const int MaxStepsPerUpdate = 8;
 
 	private readonly BufferPool _pool;
@@ -47,27 +38,20 @@ public sealed class PhysicsWorld : IDisposable
 
 	public Simulation Simulation { get; }
 
-	/// <summary>Доля шага, накопленная сверх последнего проинтегрированного: 0..1. Ею интерполируются
-	/// позы для рендера, иначе тела заметно дрожат, когда частота кадров не кратна шагу симуляции.</summary>
+	/// <summary>Fraction of a step accumulated past the last integrated one (0..1), used to
+	/// interpolate render poses.</summary>
 	public float InterpolationAlpha => _accumulator / FixedTimeStep;
 
-	/// <summary>Сборщик точек контакта для дебага. Заведён ВСЕГДА, но по умолчанию выключен: включить
-	/// его на живой сцене - это одна запись в поле, а завести на живой сцене нельзя вовсе (колбэки
-	/// копируются в симуляцию при её создании).</summary>
+	/// <summary>Debug contact recorder. Always created, off by default: callbacks are copied into
+	/// the simulation at creation and cannot be added later.</summary>
 	public PhysicsContactRecorder Contacts { get; } = new();
 
-	/// <summary>Свойства тел, читаемые узкой фазой (см. <see cref="PhysicsBodyProperties"/>). Заведены
-	/// ВСЕГДА по той же причине, что и сборщик контактов: колбэки копируются в симуляцию при её
-	/// создании, и подсунуть их позже нельзя.
-	///
-	/// Штатный <see cref="CollidableProperty{T}"/>, а не свои массивы по значению хендла: он ведётся
-	/// самой симуляцией и потому переживает удаление и переиспользование хендлов - ровно то, на чём
-	/// самописная таблица требовала ручной чистки в каждом Remove.</summary>
+	/// <summary>Per-body properties read by the narrow phase; always created for the same reason
+	/// as <see cref="Contacts"/>. Uses <see cref="CollidableProperty{T}"/> so it survives handle
+	/// removal/reuse without manual cleanup.</summary>
 	public CollidableProperty<PhysicsBodyProperties> Bodies { get; }
 
-	/// <summary>Гравитация, с которой мир создан. Нужна снаружи расчётам «с какой скоростью
-	/// подпрыгнуть, чтобы подняться на h» (step-up персонажа): захардкоженные 9.81 молча врали бы
-	/// в сцене с авторской гравитацией.</summary>
+	/// <summary>Gravity the world was created with, for external jump/step-up math.</summary>
 	public Vector3 Gravity { get; }
 
 	public PhysicsWorld(Vector3 gravity, PhysicsMaterial? material = null)
@@ -84,20 +68,15 @@ public sealed class PhysicsWorld : IDisposable
 				Bodies = Bodies,
 			},
 			new PhysicsPoseCallbacks(gravity),
-			// 8 итераций решателя и 1 субшаг - отправная точка Bepu для «обычной» сцены. Субшаги
-			// понадобятся суставам рэгдолла; поднимать их заранее значит платить за каждый кадр.
+			// 8 solver iterations, 1 substep: Bepu's baseline for an ordinary scene.
 			new SolveDescription(8, 1));
 	}
 
-	/// <summary>
-	/// Двигает симуляцию на прошедшее время кадра ФИКСИРОВАННЫМИ шагами. Возвращает число
-	/// проинтегрированных шагов - ноль означает, что кадр короче шага и позы не менялись (потребитель
-	/// может пропустить перезаливку трансформов).
-	/// </summary>
+	/// <summary>Advances the simulation by fixed steps; returns the number of steps integrated
+	/// (0 = poses unchanged, consumers may skip transform re-upload).</summary>
 	public int Update(float deltaSeconds)
 	{
-		// Отрицательное и нечеловечески большое дельта приходят реально: пауза в отладчике, свёрнутое
-		// окно, перевод часов. Пропустить их дешевле, чем разбираться потом, почему сцена взорвалась.
+		// Negative/huge deltas really happen (debugger pause, minimized window, clock changes).
 		if (!float.IsFinite(deltaSeconds) || deltaSeconds <= 0f)
 		{
 			return 0;
@@ -110,9 +89,8 @@ public sealed class PhysicsWorld : IDisposable
 		int steps = 0;
 		while (_accumulator >= FixedTimeStep && steps < MaxStepsPerUpdate)
 		{
-			// Контакты - снимок ПОСЛЕДНЕГО шага, а не сумма по кадру: за восемь шагов один и тот же
-			// контакт пола попал бы в список восемь раз, и картинка показывала бы не текущее
-			// состояние, а его историю - причём с восьмикратным весом у долгих кадров.
+			// Contacts are a snapshot of the LAST step, not a per-frame sum, or a floor contact
+			// would appear up to eight times.
 			if (recording)
 			{
 				Contacts.Clear();
@@ -131,9 +109,9 @@ public sealed class PhysicsWorld : IDisposable
 		return steps;
 	}
 
-	// --- Тела ------------------------------------------------------------------------------------
+	// --- Bodies ----------------------------------------------------------------------------------
 
-	/// <summary>Динамическое тело: масса конечна, симуляция им управляет полностью.</summary>
+	/// <summary>Dynamic body: finite mass, fully simulation-driven.</summary>
 	public BodyHandle AddDynamic(in RigidPose pose, TypedIndex shape, float mass, float speculativeMargin = 0.1f)
 	{
 		var inertia = ComputeInertia(shape, mass);
@@ -143,17 +121,12 @@ public sealed class PhysicsWorld : IDisposable
 		return Register(Simulation.Bodies.Add(description));
 	}
 
-	/// <summary>
-	/// Заводит телу запись свойств по умолчанию: вне групп, с трением.
-	///
-	/// Обязательно на КАЖДОЕ тело и именно при создании. Хендлы Bepu переиспользуются, и тело,
-	/// заведённое на месте снятого, унаследовало бы его фильтр - «ящик не сталкивается с полом»
-	/// начиная со второй сцены. Перезапись при создании закрывает это без ручной чистки в Remove.
-	/// </summary>
+	/// <summary>Writes default properties for every new body. Mandatory at creation: Bepu reuses
+	/// handles, and a new body would otherwise inherit the removed body's collision filter.</summary>
 	private BodyHandle Register(BodyHandle handle)
 	{
-		// GroupId = 0 у всех «обычных» тел. Одинаковая группа тут безопасна: маски подгрупп полные,
-		// и AllowCollision разрешает столкновение по второму условию (пересечение масок непусто).
+		// GroupId 0 for all ordinary bodies is safe: subgroup masks are full, so AllowCollision
+		// passes on the mask-intersection condition.
 		Bodies.Allocate(handle) = new PhysicsBodyProperties
 		{
 			Filter = new SubgroupCollisionFilter(0),
@@ -163,11 +136,8 @@ public sealed class PhysicsWorld : IDisposable
 		return handle;
 	}
 
-	/// <summary>
-	/// Кинематическое тело: бесконечная масса, движется только тем, что ему задают снаружи. Именно
-	/// им представляются кости персонажа, пока он в АНИМАЦИИ, а не в рэгдолле: они толкают
-	/// окружение, но сами анимацию не сбивают.
-	/// </summary>
+	/// <summary>Kinematic body: infinite mass, externally driven. Used for character bones while
+	/// animation-driven: they push the environment but are not pushed back.</summary>
 	public BodyHandle AddKinematic(in RigidPose pose, TypedIndex shape, float speculativeMargin = 0.1f)
 	{
 		var description = BodyDescription.CreateKinematic(pose,
@@ -179,23 +149,22 @@ public sealed class PhysicsWorld : IDisposable
 	public StaticHandle AddStatic(in RigidPose pose, TypedIndex shape) =>
 		Simulation.Statics.Add(new StaticDescription(pose, shape));
 
-	/// <summary>Тело, горизонтальную скорость которого задаёт код: его контакты становятся
-	/// бестрениевыми (см. <see cref="PhysicsBodyProperties.VelocityDriven"/>). Ставить ПОСЛЕ
-	/// заведения тела.</summary>
+	/// <summary>Marks a body whose horizontal velocity is code-driven: its contacts become
+	/// frictionless (see <see cref="PhysicsBodyProperties.VelocityDriven"/>). Set AFTER creation.</summary>
 	public void SetVelocityDriven(BodyHandle handle, bool value) =>
 		Bodies[handle].VelocityDriven = value;
 
 	private int _nextCollisionGroup;
 
-	/// <summary>Свежий номер группы связанных тел (см. <see cref="SubgroupCollisionFilter"/>). Одна
-	/// группа - один рэгдолл. Ноль занят «обычными» телами и потому не выдаётся.</summary>
+	/// <summary>Fresh group id for linked bodies (one group per ragdoll). Zero is reserved for
+	/// ordinary bodies and never handed out.</summary>
 	public int NewCollisionGroup() => ++_nextCollisionGroup;
 
-	/// <summary>Заводит тело в группу как подгруппу <paramref name="subgroupId"/>.</summary>
+	/// <summary>Puts a body in a group as subgroup <paramref name="subgroupId"/>.</summary>
 	public void SetCollisionGroup(BodyHandle handle, int group, int subgroupId) =>
 		Bodies[handle].Filter = new SubgroupCollisionFilter(group, subgroupId);
 
-	/// <summary>Запрещает столкновение ПАРЫ тел (для рэгдолла - смежных по суставу костей).</summary>
+	/// <summary>Disables collision for a PAIR of bodies (joint-adjacent ragdoll bones).</summary>
 	public void DisableCollision(BodyHandle a, BodyHandle b) =>
 		SubgroupCollisionFilter.DisableCollision(ref Bodies[a].Filter, ref Bodies[b].Filter);
 
@@ -203,18 +172,12 @@ public sealed class PhysicsWorld : IDisposable
 
 	public void Remove(StaticHandle handle) => Simulation.Statics.Remove(handle);
 
-	/// <summary>
-	/// Убирает форму из реестра ВМЕСТЕ с её буферами. Именно RemoveAndDispose, а не Remove: у меша
-	/// (и других составных форм) за <see cref="TypedIndex"/> стоит собственный BVH и массив
-	/// треугольников в пуле, и простое снятие индекса оставило бы их висеть - а статику сцены
-	/// приходится пересобирать на каждое движение объекта, то есть утечка была бы не разовой, а
-	/// пропорциональной времени работы редактора.
-	/// </summary>
+	/// <summary>Removes a shape WITH its buffers (RemoveAndDispose): mesh shapes own a BVH and a
+	/// triangle array in the pool, and plain Remove would leak them on every scene rebuild.</summary>
 	public void RemoveShape(TypedIndex shape) => Simulation.Shapes.RemoveAndDispose(shape, _pool);
 
-	/// <summary>Тензор инерции формы. Отдельным методом, потому что у каждой формы Bepu свой
-	/// ComputeInertia и общего интерфейса под него нет - развилка неизбежна и лучше пусть она будет
-	/// в одном месте.</summary>
+	/// <summary>Inertia for a shape; Bepu has per-shape ComputeInertia with no shared interface,
+	/// so the switch is centralized here.</summary>
 	private BodyInertia ComputeInertia(TypedIndex shape, float mass)
 	{
 		switch (shape.Type)
@@ -230,41 +193,28 @@ public sealed class PhysicsWorld : IDisposable
 			case ConvexHull.Id:
 				return Simulation.Shapes.GetShape<ConvexHull>(shape.Index).ComputeInertia(mass);
 			default:
-				// Меш и составные формы динамическими телами здесь не бывают: у произвольного меша
-				// нет корректного тензора инерции без дополнительных допущений, и молча подставить
-				// шар значило бы получить тело, вращающееся не так, как выглядит.
+				// Meshes/compounds have no well-defined inertia; silently substituting one would
+				// give a body that rotates wrong.
 				throw new NotSupportedException(
 					$"Shape type {shape.Type} cannot be used for a dynamic body - inertia is undefined.");
 		}
 	}
 
-	// --- Формы -----------------------------------------------------------------------------------
+	// --- Shapes ----------------------------------------------------------------------------------
 
 	public TypedIndex AddSphere(float radius) => Simulation.Shapes.Add(new Sphere(radius));
 
 	public TypedIndex AddBox(Vector3 size) => Simulation.Shapes.Add(new Box(size.X, size.Y, size.Z));
 
-	/// <summary>Капсула - основная форма конечности рэгдолла и тела персонажа: у неё нет углов, за
-	/// которые цепляется решатель, и она дёшева в узкой фазе.</summary>
+	/// <summary>Capsule: primary limb/character shape - no corners for the solver to catch, cheap
+	/// in the narrow phase.</summary>
 	public TypedIndex AddCapsule(float radius, float length) => Simulation.Shapes.Add(new Capsule(radius, length));
 
 	/// <summary>
-	/// Статический меш из треугольников движка. Обход РАЗВОРАЧИВАЕТСЯ: лицевая сторона треугольника
-	/// Bepu противоположна лицевой стороне того же треугольника в движке.
-	///
-	/// Меш в Bepu ОДНОСТОРОННИЙ, поэтому цена ошибки здесь не «нормали чуть не те», а полное
-	/// отсутствие столкновений: тело проходит сквозь пол в свободном падении, молча и до конца сцены.
-	///
-	/// РАНЬШЕ ЗДЕСЬ БЫЛО «как есть», и это была ошибка, прожившая долго, потому что проверяли её
-	/// РУКОПИСНЫМ квадратом. Квадрат в пробнике был выложен в уже развёрнутом порядке - он и
-	/// компенсировал разворот, которого не делал этот метод. На настоящей импортированной геометрии
-	/// всё падало сквозь пол. Замерено на демо-площадке (сфера: -17.3 против 0.25 при обратном
-	/// обходе) и, что важнее, на ЧУЖОЙ модели - Sponza из Khronos-семплов, где «как есть» роняет
-	/// сферу сквозь пол на изнанку плиты (-0.68 против 0.23). Вторая модель здесь обязательна:
-	/// по своей собственной геометрии «неверная конвенция» и «наша опечатка в генераторе» неразличимы.
-	///
-	/// Проверка живёт в <c>ScenePhysicsProbe</c> (DECA_PROBE_SCENE=1): она роняет сферу на реальную
-	/// сцену ОБОИМИ обходами и печатает оба числа - одно само по себе ничего не доказывает.
+	/// Static triangle mesh from engine geometry. Winding is REVERSED: Bepu's triangle front face
+	/// is opposite the engine's, and Bepu meshes are one-sided, so wrong winding means no
+	/// collisions at all. Verified against imported geometry (ScenePhysicsProbe, DECA_PROBE_SCENE=1),
+	/// which drops a sphere with both windings and prints both results.
 	/// </summary>
 	public TypedIndex AddTriangleMesh(ReadOnlySpan<Vector3> vertices, ReadOnlySpan<uint> indices, Vector3 scale)
 	{
@@ -273,21 +223,20 @@ public sealed class PhysicsWorld : IDisposable
 
 		for (int i = 0; i < triangleCount; i++)
 		{
-			// Вторая и третья вершины меняются местами - это и есть разворот обхода.
+			// Swapping the 2nd/3rd vertices reverses the winding.
 			triangles[i] = new Triangle(
 				vertices[(int)indices[i * 3 + 0]],
 				vertices[(int)indices[i * 3 + 2]],
 				vertices[(int)indices[i * 3 + 1]]);
 		}
 
-		// Slice ОБЯЗАТЕЛЕН: BufferPool.Take округляет длину вверх до степени двойки, а Mesh берёт
-		// число треугольников из Length буфера. Без среза в меш уезжал бы хвост неинициализированной
-		// памяти - мусорные треугольники с NaN-координатами ломают построение BVH, и меш перестаёт
-		// сталкиваться ВООБЩЕ (тело просто пролетает сквозь него в свободном падении).
+		// Slice is MANDATORY: BufferPool.Take rounds the length up to a power of two, and Mesh
+		// takes the triangle count from the buffer Length; the uninitialized tail would produce
+		// NaN triangles that break BVH construction and kill all collisions.
 		return Simulation.Shapes.Add(new Mesh(triangles.Slice(0, triangleCount), scale, _pool));
 	}
 
-	// --- Райкасты --------------------------------------------------------------------------------
+	// --- Raycasts --------------------------------------------------------------------------------
 
 	private struct ClosestHitHandler : IRayHitHandler
 	{
@@ -300,9 +249,8 @@ public sealed class PhysicsWorld : IDisposable
 		public void OnRayHit(in BepuPhysics.Trees.RayData ray, ref float maximumT, float t, in Vector3 normal,
 			CollidableReference collidable, int childIndex)
 		{
-			// Сужение maximumT - не оптимизация, а условие корректности: без него обработчик
-			// получал бы хиты в произвольном порядке, и «ближайший» пришлось бы искать сравнением,
-			// а Bepu не гарантирует, что дальние хиты вообще будут перечислены.
+			// Shrinking maximumT is a correctness requirement, not an optimization: Bepu reports
+			// hits in arbitrary order and does not guarantee farther hits are enumerated.
 			maximumT = t;
 
 			Result.Hit = true;
@@ -315,9 +263,8 @@ public sealed class PhysicsWorld : IDisposable
 	}
 
 	/// <summary>
-	/// Ближайшее пересечение луча со сценой. Направление НЕ нормализуется здесь: Bepu трактует
-	/// maximumT в единицах длины направления, и нормализация молча меняла бы смысл дальности у
-	/// вызывающего, который передал ненормализованный вектор осознанно (например, «до этой точки»).
+	/// Closest ray hit. The direction is NOT normalized here: Bepu measures maximumT in units of
+	/// the direction length, and normalizing would silently change the caller's range semantics.
 	/// </summary>
 	public RayHit RayCast(Vector3 origin, Vector3 direction, float maximumT)
 	{
@@ -351,10 +298,8 @@ public sealed class PhysicsWorld : IDisposable
 	}
 
 	/// <summary>
-	/// То же, но луч видит ТОЛЬКО СТАТИКУ. Для «пощупать пол» это не оптимизация, а корректность:
-	/// динамические тела в сцене - это капсулы самих персонажей, и луч, пущенный сверху вниз над
-	/// лежащим рэгдоллом, попадает в его же туловище. Замерено циклом подъёма: персонаж «вставал» на
-	/// высоту собственной капсулы (0.288 вместо 0) - на себя самого.
+	/// Same but STATIC-only. For ground probes this is correctness, not optimization: a downward
+	/// ray over a lying ragdoll would hit the character's own capsules.
 	/// </summary>
 	public RayHit RayCastStatic(Vector3 origin, Vector3 direction, float maximumT)
 	{

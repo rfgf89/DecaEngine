@@ -4,17 +4,11 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Tests.Graphics;
 
-/// <summary>
-/// Чистая математика мешей из <see cref="MeshUtility"/>: массивы на входе, массивы на выходе, ни
-/// графического API, ни файлов. Именно её предстоит вынести из ModelLoader.cs (3700 строк) в
-/// отдельный файл, и эти тесты - страховка на время переезда.
-/// </summary>
 public class MeshUtilityTests
 {
 	private const float Tolerance = 1e-5f;
 
-	/// <summary>Единичный квадрат в плоскости XY, нормаль +Z. UV задаёт вызывающий: развёртка -
-	/// единственное, что отличает обычный случай от зеркального.</summary>
+	// Unit quad in the XY plane, normal +Z; only the caller's UVs decide mirrored vs. straight.
 	private static (Vertex[] Vertices, uint[] Indices) Quad(
 		Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3)
 	{
@@ -46,12 +40,7 @@ public class MeshUtilityTests
 		}
 	}
 
-	/// <summary>
-	/// Знак битангента на зеркальной развёртке. Ради него битангент и копится отдельным массивом:
-	/// направление тангента у зеркального квадрата ТО ЖЕ САМОЕ (+X), и по нему одному зеркало не
-	/// отличить. Ошибка здесь не роняет ничего - она переворачивает Y нормал-мапы, то есть
-	/// инвертирует рельеф на симметричных моделях и атласах.
-	/// </summary>
+	// Mirrored UVs keep the same tangent direction; only Tangent.W tells them apart.
 	[Fact]
 	public void GenerateTangents_MirroredUv_FlipsBitangentSign()
 	{
@@ -71,14 +60,10 @@ public class MeshUtilityTests
 		foreach (var vertex in mirrored)
 		{
 			Assert.Equal(-1f, vertex.Tangent.W);
-
-			// Направление осталось прежним - зеркало видно ТОЛЬКО по знаку.
 			Assert.Equal(1f, vertex.Tangent.X, Tolerance);
 		}
 	}
 
-	/// <summary>Меш без UV вовсе: тангент не определён, но остаться нулевым не может - шейдер
-	/// строит по нему базис.</summary>
 	[Fact]
 	public void GenerateTangents_DegenerateUv_FallsBackToVectorPerpendicularToNormal()
 	{
@@ -137,11 +122,6 @@ public class MeshUtilityTests
 		Assert.Equal(skin, roundTrippedSkin);
 	}
 
-	/// <summary>
-	/// Скин-стрим короче геометрии. Так бывает после разваривания вершин под плоские нормали, и
-	/// тихо покорёженный персонаж диагностируется куда хуже, чем краш: недостающие вершины
-	/// прибиваются к корню с полным весом.
-	/// </summary>
 	[Fact]
 	public void PackSkinned_SkinStreamShorterThanGeometry_PinsMissingVerticesToRoot()
 	{
@@ -170,8 +150,7 @@ public class MeshUtilityTests
 		Assert.Equal(0f, radius);
 	}
 
-	/// <summary>Через нативный meshopt: заодно проверяет, что его библиотека вообще доезжает до
-	/// тестового хоста.</summary>
+	// Goes through native meshopt, so it also checks the library reaches the test host.
 	[Fact]
 	public void ComputeBoundsData_UnitCubeCorners_EnclosesEveryVertex()
 	{
@@ -191,6 +170,6 @@ public class MeshUtilityTests
 
 		Assert.All(vertices, v =>
 			Assert.True((v.Position - center).Length() <= radius + Tolerance,
-				$"вершина {v.Position} вне сферы (центр {center}, радиус {radius})"));
+				$"vertex {v.Position} outside the sphere (center {center}, radius {radius})"));
 	}
 }

@@ -19,13 +19,9 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>Содержимое сцены: синк ECS-дерева в инстансы, стриминг моделей, границы, TLAS RT-теней. Часть <see cref="PrefabSceneViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Scene contents: ECS tree sync, model streaming, bounds, RT-shadow TLAS.</summary>
 	public partial class PrefabSceneViewport
 	{
-		/// <summary>Обходит дерево префаба и приводит env-сцену в соответствие: новые ModelRenderer-ы
-		/// начинают загрузку, готовые модели инстанцируются, сдвинутые сущности переставляют свои
-		/// инстансы, удалённые - убирают их.</summary>
 		private void SyncScene(Entity root)
 		{
 			_visitedThisSync.Clear();
@@ -35,9 +31,7 @@ namespace DecaEngine.Editor
 
 			SyncEntity(root, ref structuralChange, ref boundsDirty);
 
-			// Света, пропавшие из дерева (удалены/лишились компонента/сменили тип на направленный), -
-			// убираем зеркала. Пересборки графа не требуется: пул светов и ClusterParams полностью
-			// живые, замороженные команды перечитывают их каждый кадр.
+			// Dropping light mirrors needs no graph rebuild: frozen commands re-read the light pool.
 			_removeScratch.Clear();
 			foreach (var kvp in _lightMirrors)
 			{
@@ -55,7 +49,6 @@ namespace DecaEngine.Editor
 				_lightMirrors.Remove(id);
 			}
 
-			// Сущности, пропавшие из дерева (удалены/лишились компонента), - убираем их инстансы.
 			_removeScratch.Clear();
 			foreach (var kvp in _rendered)
 			{
@@ -73,60 +66,36 @@ namespace DecaEngine.Editor
 
 			if (structuralChange)
 			{
-				// Команды графа заморожены после первого Compile - новые/удалённые батчи он не
-				// увидит без пересборки, а освобождение/создание GPU-ресурсов требует барьера
-				// (см. ModelPreviewViewport.PollPendingLoad - тот же порядок).
+				// Graph commands are frozen after the first Compile; releasing/creating GPU
+				// resources needs a barrier first.
 				_env.DilApi.ImmediateContext.Flush();
 				_env.DilApi.ImmediateContext.WaitForIdle();
 
-				// Ёмкости под новые батчи/инстансы наращиваются ЗДЕСЬ, пока GPU уже остановлен, а
-				// граф всё равно будет пересобран. Иначе рост обнаруживается позже - в ветке
-				// _transformsDirty, которая идёт ПОСЛЕ записи команд и барьера не делает; она
-				// построена на допущении «движение ёмкости не меняет», и это допущение кто-то должен
-				// обеспечивать. Лишним вызовом это не является: внутри стоит проверка, и при
-				// достаточных ёмкостях он ничего не делает.
+				// Grow capacity here, while the GPU is stopped: the _transformsDirty branch below
+				// runs after command recording and assumes capacity never changes.
 				_env.BatchRenderer.CheckAndReallocateBuffers();
 
-				// Заливку СОДЕРЖИМОГО инстансов здесь делать нельзя, и это главное про это место:
-				// мировые матрицы инстансов производит GpuInstanceBufferSystem внутри
-				// _env.Root.Update, а он идёт ПОЗЖЕ по кадру. На кадре появления модели её матрицы
-				// ещё не посчитаны, и любая заливка отсюда отправила бы на GPU нули - объект
-				// схлопнут в точку и невидим. Дальше его никто не перезаливал, потому что грязных
-				// флагов не осталось, и он оживал только от первого сдвига.
-				//
-				// Поэтому поднимается _transformsDirty: ветка движения идёт ПОСЛЕ Root.Update и
-				// перезальёт инстансы уже с настоящими матрицами - тем же путём, которым это и так
-				// работает при перетаскивании.
+				// Instance world matrices are produced later in the frame by GpuInstanceBufferSystem,
+				// so uploading them here would push zeros; defer to the movement branch instead.
 				_transformsDirty = true;
 
-				// Первый шаг анимации СРАЗУ после инстанцирования, до пересборки графа. Персонаж
-				// появляется в драйвере именно здесь, а кадровый UpdateAnimation идёт РАНЬШЕ по
-				// коду - то есть на кадре появления модели скиннинг не диспетчеризовался ни разу,
-				// и приёмник скиннед-инстанса оставался в GPU-буфере незаполненным: модель была
-				// невидима (схлопнута), хотя обводка выделения рисовалась. Появлялась она только
-				// после первого сдвига, который поднимал _transformsDirty и попутно всё дозаливал.
-				// Нулевой шаг времени: позу посчитать нужно, а двигать её - нет.
+				// Zero-step pose evaluation: the character enters the driver here, after the frame's
+				// UpdateAnimation already ran, so skinning would miss its first dispatch.
 				UpdateAnimation(0f);
 
 				_env.Pipeline.InvalidateGraph();
 
-				// Ручки AO/SSGI - только после барьера (SetConstant трогает ImmediateContext).
+				// AO/SSGI knobs only after the barrier (SetConstant touches ImmediateContext).
 				PushPostProcessRanges();
 				ApplyMaterialSettings();
 
-				// TLAS RT-теней - тоже после барьера: свежезагруженные модели принесли новые меши
-				// (BLAS) и материалы (привязка _SceneTlas обязана случиться до их первого дроу).
+				// Also after the barrier: _SceneTlas must be bound before the new meshes' first draw.
 				UpdateRtShadowScene();
 				boundsDirty = true;
 
-				// Контур выделения строится по env-инстансам - структурное изменение (модель
-				// догрузилась/сущность удалена) обязано его перепечь (см. SyncSelectionHighlight).
 				_structuralDirtySelection = true;
-
-				// По той же причине устарела и статика физики (см. RebuildPhysicsStatics).
 				_physicsStaticsDirty = true;
 
-				// Геометрия сцены сменилась - пробы пересобираются (мировой BVH бейкера статичен).
 				RequestProbeSession(0.3f);
 			}
 
@@ -139,17 +108,10 @@ namespace DecaEngine.Editor
 				}
 			}
 
-			// Движение сущностей: при живом GPU-пути позы уезжают в TLAS без пересоздания сессии -
-			// и без прежнего лага (ребейк BVH на главном потоке + потеря поля). CPU-путь остаётся
-			// статическим - там по-старому, ребейк за дебаунсом.
 			if (_transformsDirty)
 			{
-				// Условие требует И СТРУКТУР УСКОРЕНИЯ, а не только живого GPU-пути: позы
-				// уезжают именно в TLAS, а его нет на программной трассировке (_sceneAccel == null,
-				// там шейдер ходит по BVH бейкера, а тот собран под СТАРЫЕ позы). Без этой
-				// проверки ветка выбиралась по «жив ли GPU-путь», PollSceneProbePoses тут же выходил
-				// по _sceneAccel == null, а ребейк никто не заказывал - движение терялось МОЛЧА, и GI
-				// оставался от старой сцены до следующего ребейка по другой причине.
+				// Requires acceleration structures too, not just a live GPU path: without a TLAS the
+				// shader walks the baker BVH, which still holds the old poses - so rebake instead.
 				if (_sceneGpu != null && _sceneAccel != null && !_sceneGpuDisabled)
 				{
 					_sceneTlasDirty = true;
@@ -159,17 +121,12 @@ namespace DecaEngine.Editor
 					RequestProbeSession(0.4f);
 				}
 
-				// TLAS RT-теней живёт отдельно от проб и следует за позами сам: пересборка верхнего
-				// уровня дешёвая (BLAS-ы кешируются по мешам), гизмо-драг тянет её каждый кадр.
+				// RT-shadow TLAS follows poses on its own; top-level rebuild is cheap (BLAS cached).
 				UpdateRtShadowScene();
 			}
 		}
 
-		/// <summary>Пересобирает TLAS RT-теней по актуальным позам сцены и привязывает его
-		/// материалам всех резидентных моделей (см. ModelPreviewViewport.UpdateRtShadowScene -
-		/// та же роль; здесь мировая поза инстанса = локальный TRS × мировая матрица записи).
-		/// No-op вне режима «Ray-traced». Вызывается из ветки структурного изменения (после
-		/// барьера) и из ветки движения сущностей.</summary>
+		// Instance world pose = local TRS x record world matrix. No-op outside "Ray-traced" mode.
 		private void UpdateRtShadowScene()
 		{
 			if (!RtShadowsEnabled())
@@ -216,8 +173,7 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Привязка идемпотентна (дескриптор указывает на сам объект TLAS) - после структурного
-			// изменения она докрывает материалы свежезагруженных моделей.
+			// Idempotent: the descriptor points at the TLAS object itself.
 			foreach (var kvp in ((DiligentBatchRenderer)_env.BatchRenderer).GetMaterials())
 			{
 				kvp.Value.SetAccelStructure("_SceneTlas", _rtShadowScene.Tlas);
@@ -250,8 +206,7 @@ namespace DecaEngine.Editor
 					if (record.ResolvedPath == null)
 					{
 						EngineLog.Add(LogLevel.Warning, $"Prefab scene: asset not found: '{assetPath}'");
-						// Путь не зарезолвился - помечаем запись "пустой" моделью, чтобы не искать
-						// файл заново каждый кадр; смена Path в компоненте пересоздаст запись.
+						// Empty marks "resolved to nothing" so the file is not searched every frame.
 						record.ResolvedPath = "";
 					}
 				}
@@ -261,10 +216,7 @@ namespace DecaEngine.Editor
 					var world = ComputeWorldMatrix(entity);
 					var anchor = world.Translation;
 
-					// Решение стриминга по камере: в радиусе - держим ссылку (загрузка стартует из
-					// ModelStreamingSystem по приоритету расстояния), вышли за радиус (с гистерезисом) -
-					// снимаем инстансы и отпускаем; стример выселит модель с GPU после паузы
-					// (UnloadAfterSeconds - буфер против дребезга на границе радиуса).
+					// Camera-radius streaming decision; hysteresis lives in ShouldBeResident.
 					if (record.Resident == null)
 					{
 						if (_streamer.ShouldBeResident(anchor, currentlyResident: false))
@@ -302,27 +254,16 @@ namespace DecaEngine.Editor
 							boundsDirty = true;
 							_transformsDirty = true;
 
-							// Объект поехал - его треугольники в статике физики устарели. Стопа
-							// персонажа обязана встать на пол там, где он ТЕПЕРЬ, а не там, где он
-							// был при последней пересборке.
-							//
-							// НО ТОЛЬКО ЕСЛИ ОН В СТАТИКЕ ВООБЩЕ ЕСТЬ. Скиннед-модели в неё не идут
-							// (см. RebuildPhysicsStatics: персонаж не должен быть полом сам себе), и
-							// пересборка на их движение - это работа впустую, которая ЛОМАЕТ сцену:
-							// идущий персонаж двигается каждый кадр, статика пересобирается каждый
-							// кадр, а пересборка снимает и заводит заново меш пола. Тело, стоящее на
-							// нём, каждый кадр теряет накопленные импульсы контакта, не успевает
-							// опереться и проваливается в свободном падении - вместе с рэгдоллами, а
-							// лучи foot IK при этом бьют то в пол, то в пустоту.
+							// Skinned models are not in the static set, and rebuilding it every frame
+							// resets the floor mesh, so standing bodies lose contact impulses and fall.
 							_physicsStaticsDirty |= state.Model?.Skeleton == null;
 						}
 					}
 				}
 			}
 
-			// Punctual-света (point/spot) - зеркалом в рендер-стор окружения с МИРОВЫМ трансформом
-			// (Position сущности префаба локален родителю). Направленные и солнце сюда не идут:
-			// направленный свет Scene View - это солнце окружения (см. SyncSunEntity).
+			// Punctual lights are mirrored into the env store with a WORLD transform (prefab
+			// Position is parent-local). Directional lights go through SyncSunEntity instead.
 			if (entity.HasComponent<LightComponent>() && !entity.HasComponent<SunComponent>())
 			{
 				var light = entity.GetComponent<LightComponent>();
@@ -357,9 +298,8 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Резолвит путь AssetRef (относительный к "Assets" проекта, forward-slash) в
-		/// абсолютный. Фолбэк - папка "Assets" вверх по пути от текущего .prefab.json: префаб можно
-		/// открыть и без загруженного проекта.</summary>
+		// AssetRef paths are forward-slash and relative to the project "Assets" folder; falls back
+		// to the nearest "Assets" ancestor of the .prefab.json when no project is loaded.
 		private string? ResolveAssetPath(string assetPath)
 		{
 			if (Path.IsPathRooted(assetPath))
@@ -396,34 +336,23 @@ namespace DecaEngine.Editor
 			return null;
 		}
 
-		/// <summary>Опции загрузки для стримера - те же, что были у прямого BeginLoadAsync.
-		/// Фабрика (а не снимок): анизотропию пользователь меняет на лету, а смена, требующая
-		/// перечитывания, обрабатывается в RecreateEnvironment (dropModels).</summary>
+		// A factory, not a snapshot: anisotropy can change at any time.
 		private ModelLoadOptions BuildLoadOptions() =>
 			ViewportSettingsPush.BuildLoadOptions(_editorSettings, RtShadowsEnabled());
 
-		/// <summary>Потолок текстуры в том виде, в каком он уходит в загрузчик - тем же методом, что
-		/// и в превью: сравнивать сырую настройку с заклампленной значило бы вечно видеть расхождение
-		/// на значениях вне [128, 8192] и перечитывать сцену каждым нажатием OK.</summary>
+		// Compare against the clamped value: raw settings outside [128, 8192] would always differ.
 		private int ClampedMaxTextureSize() => ViewportSettingsPush.ClampedMaxTextureSize(_editorSettings);
 
-		/// <summary>Модель догрузилась и зарегистрирована стримером: атласы проб уже живут -
-		/// новорождённой модели вместо плейсхолдеров сразу привязываются настоящие (кбуфер с сеткой
-		/// она получит из ApplyMaterialSettings после структурной пересборки в SyncScene).</summary>
+		// Bind the real probe atlases immediately so the new model never renders with placeholders.
 		private void OnStreamedModelReady(ModelStreamer.Resident resident)
 		{
 			_probeTextures?.Bind(resident.Model!);
 		}
 
-		/// <summary>Стример сейчас снимет регистрации батч-рендерера ОДНОЙ конкретной модели
-		/// (партиционное выселение - см. ModelStreamer.ResidencyResetting): снимаем инстанс-сущности
-		/// только тех записей, что ссылаются на ИМЕННО этого резидента, пока его BatchId-ы ещё валидны.
-		/// Записи других моделей не трогаются - в отличие от прежней версии (полный сброс всей сцены
-		/// на любое частичное выселение), см. задачу про сужение этого события.</summary>
+		// Runs while the evicted resident's BatchIds are still valid; other residents are untouched.
 		private void OnStreamerResidencyResetting(ModelStreamer.Resident resident)
 		{
-			// Стример сейчас освободит эту модель - фоновая сборка BVH (читает геометрию ВСЕЙ сцены)
-			// обязана перестать её читать ДО этого.
+			// The background BVH build reads the whole scene's geometry - stop it before the free.
 			WaitProbeBakerTask();
 
 			foreach (var record in _rendered.Values)
@@ -434,8 +363,6 @@ namespace DecaEngine.Editor
 				}
 			}
 
-			// Контур выделения ссылался на снятые сущности; пробы - на материалы/BVH выселяемой
-			// модели. Сброс проб безопасен: барьер GPU стример делает сразу после этого события.
 			_highlightedId = -1;
 			_env.Pipeline.PostOverlay = null;
 			_structuralDirtySelection = true;
@@ -448,8 +375,7 @@ namespace DecaEngine.Editor
 			_framePending |= _rendered.Count == 0;
 		}
 
-		/// <summary>Создаёт env-сущности под все инстансы модели: комбинированный трансформ =
-		/// локальный трансформ glTF-инстанса * мировая матрица сущности префаба.</summary>
+		// Combined transform = local glTF instance transform * prefab entity world matrix.
 		private void InstantiateRecord(RenderedModel record, ModelStreamer.Resident state, Matrix4x4 world)
 		{
 			var model = state.Model!;
@@ -461,8 +387,7 @@ namespace DecaEngine.Editor
 					_env.BatchRenderer, state.MeshIds, state.MaterialIds, state.BatchCache,
 					instance.meshId, instance.materialId, combined,
 					model, state.SkinBases,
-					// Все скиннед-инстансы модели принадлежат ОДНОЙ сущности префаба: это один
-					// персонаж из нескольких мешей, и поза у них общая.
+					// All skinned instances share one prefab entity: one character, one pose.
 					palette => EnsureAnimation().AddInstance(record.EntityId, model, palette));
 				if (entity != null)
 				{
@@ -475,9 +400,7 @@ namespace DecaEngine.Editor
 			record.Instantiated = true;
 		}
 
-		/// <summary>Переставляет env-сущности записи под новую мировую матрицу сущности префаба.
-		/// GpuUpdateTag снимается системой после применения (см. GpuInstanceBufferSystem) - каждое
-		/// движение обязано перевесить его заново.</summary>
+		// GpuInstanceBufferSystem clears GpuUpdateTag after applying it - re-add it on every move.
 		private void UpdateRecordTransforms(RenderedModel record, ModelStreamer.Resident state, Matrix4x4 world)
 		{
 			var model = state.Model!;
@@ -504,11 +427,8 @@ namespace DecaEngine.Editor
 
 			if (!Matrix4x4.Decompose(combined, out var scale, out var rotation, out var translation))
 			{
-				// Скошенный трансформ (неравномерный скейл под поворотом) - восстанавливаем TRS из
-				// базиса матрицы. Прежний фолбэк "позиция + Identity" молча ВЫБРАСЫВАЛ поворот:
-				// объект рисовался неповёрнутым, а его punctual-тень вдобавок кулилась не там.
-				// Ортонормированный базис под скосом приближение, но приближение В ТОМ ЖЕ месте
-				// мира, а не другая поза.
+				// Sheared transform (non-uniform scale under rotation): recover TRS from the basis.
+				// The orthonormalised basis is an approximation, but keeps the object in place.
 				translation = combined.Translation;
 				var bx = new Vector3(combined.M11, combined.M12, combined.M13);
 				var by = new Vector3(combined.M21, combined.M22, combined.M23);
@@ -535,10 +455,7 @@ namespace DecaEngine.Editor
 			};
 		}
 
-		/// <summary>Снимает env-сущности записи. <paramref name="releaseResident"/> - отпустить ли и
-		/// ссылку стримера на модель (запись умирает совсем); false - при сбросе регистраций
-		/// стримера (модель остаётся нужна, запись переинстанцируется) и при стрим-ауте по радиусу
-		/// (ссылка отпускается вызывающим отдельно).</summary>
+		// releaseResident: false when the caller keeps or releases the streamer reference itself.
 		private void RemoveRecord(RenderedModel record, bool releaseResident = true)
 		{
 			foreach (var entity in record.EnvEntities)
@@ -550,14 +467,81 @@ namespace DecaEngine.Editor
 			record.InstanceIndices.Clear();
 			record.Instantiated = false;
 
-			// Поза персонажа держит нативные объекты ozz и участки палитры, привязанные к уже
-			// снятым инстансам: пережить их она не должна.
+			// The pose owns native ozz objects and palette slices tied to the removed instances.
 			_animation?.Remove(record.EntityId);
 
 			if (releaseResident && record.Resident != null)
 			{
 				_streamer.Release(record.Resident);
 				record.Resident = null;
+			}
+		}
+
+		/// <summary>DECA_LOOP_INSPECTOR diagnostic: mean luma/chroma of the Scene View frame.</summary>
+		public void DumpFrameStats(string tag)
+		{
+			try
+			{
+				_env.DilApi.ImmediateContext.Flush();
+				_env.DilApi.ImmediateContext.WaitForIdle();
+				var pixels = DiligentTextureReadback.ReadRgba8(_env.DilApi,
+					(DiligentRenderTarget)_env.ColorTarget, out var width, out var height);
+
+				long lumaSum = 0;
+				long chromaSum = 0;
+				int count = pixels.Length / 4;
+				for (int i = 0; i < pixels.Length; i += 4)
+				{
+					int r = pixels[i];
+					int g = pixels[i + 1];
+					int b = pixels[i + 2];
+					lumaSum += (r + g + b) / 3;
+					chromaSum += Math.Max(r, Math.Max(g, b)) - Math.Min(r, Math.Min(g, b));
+				}
+
+				Console.WriteLine($"[insploop] {tag}: {width}x{height} " +
+					$"luma={(count > 0 ? (double)lumaSum / count : 0):F1} " +
+					$"chroma={(count > 0 ? (double)chromaSum / count : 0):F1} " +
+					$"rendered={_rendered.Count} probes={(_probeTextures != null ? "on" : "OFF")} " +
+					$"probesEnabled={ProbesEnabled} sessionDelay={_probeSessionDelay:F2} " +
+					$"baker={(_probeBaker != null)} session={(_probeSession != null)} " +
+					$"gpuDisabled={_sceneGpuDisabled}");
+
+				var dumpDir = System.Environment.GetEnvironmentVariable("DECA_LOOP_INSPECTOR_DIR");
+				if (!string.IsNullOrEmpty(dumpDir))
+				{
+					Directory.CreateDirectory(dumpDir);
+					WriteBmp(Path.Combine(dumpDir, $"insploop_{tag.Replace(' ', '_')}.bmp"), pixels, width, height);
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"[insploop] {tag}: readback failed: {ex.Message}");
+			}
+		}
+
+		// Uncompressed 24-bit BMP: the editor has no PNG writer (that lives in DecaEngine.Probes).
+		private static void WriteBmp(string path, byte[] rgba, int width, int height)
+		{
+			int rowSize = (width * 3 + 3) & ~3;
+			int dataSize = rowSize * height;
+			using var writer = new BinaryWriter(File.Create(path));
+			writer.Write((byte)'B'); writer.Write((byte)'M');
+			writer.Write(54 + dataSize); writer.Write(0); writer.Write(54);
+			writer.Write(40); writer.Write(width); writer.Write(height);
+			writer.Write((short)1); writer.Write((short)24);
+			writer.Write(0); writer.Write(dataSize); writer.Write(0); writer.Write(0); writer.Write(0); writer.Write(0);
+			var row = new byte[rowSize];
+			for (int y = height - 1; y >= 0; y--)
+			{
+				int src = y * width * 4;
+				for (int x = 0; x < width; x++)
+				{
+					row[x * 3] = rgba[src + x * 4 + 2];
+					row[x * 3 + 1] = rgba[src + x * 4 + 1];
+					row[x * 3 + 2] = rgba[src + x * 4];
+				}
+				writer.Write(row);
 			}
 		}
 
@@ -568,10 +552,7 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Физика сцены умирает вместе со сценой: её статика - это геометрия исчезающих моделей,
-			// а рэгдоллы держат хендлы тел этого мира. Рэгдоллы сносятся ПЕРВЫМИ - иначе они
-			// остались бы хендлами в уничтоженной симуляции. Самих персонажей снимают ниже
-			// RemoveRecord-ы, по одному вместе с их записями.
+			// Ragdolls first: they hold body handles into the simulation destroyed on the next line.
 			_animation?.DetachPhysics();
 			_physics?.Dispose();
 			_physics = null;
@@ -583,8 +564,7 @@ namespace DecaEngine.Editor
 			}
 			_rendered.Clear();
 
-			// Зеркала светов живут в рендер-сторе окружения - оно переживает смену префаба,
-			// сущности надо снять руками (в отличие от RecreateEnvironment, где стор умирает целиком).
+			// Light mirrors live in the env store, which outlives a prefab switch - delete by hand.
 			foreach (var mirror in _lightMirrors.Values)
 			{
 				if (!mirror.IsNull)
@@ -594,36 +574,24 @@ namespace DecaEngine.Editor
 			}
 			_lightMirrors.Clear();
 
-			// «Сначала очистить предыдущее, потом грузить новое»: смена/закрытие префаба освобождает
-			// резидентные модели прошлой сцены с GPU (барьер + сброс регистраций + Release +
-			// пересборка графа внутри ClearAll) и отменяет её фоновые загрузки - модели нового
-			// префаба стартуют в пустом батч-рендерере. Прежний кеш жил вечно и копил geometry
-			// footprint всех когда-либо открытых префабов.
+			// Clear before loading: the new prefab's models must start in an empty batch renderer.
 			WaitProbeBakerTask();
 			_streamer.ClearAll();
 
-			// Выделение ссылалось на сущности умершего стора - контур снимается вместе со сценой
-			// (пересборка графа ниже подхватит и снятый PostOverlay-хук).
 			_highlightedId = -1;
 			_env.Pipeline.PostOverlay = null;
 
-			// Замороженные команды графа продолжали бы рисовать снятые инстансы (см. комментарий в
-			// ModelPreviewViewport.ClearWireframeOverlay) - барьер + пересборка обязательны.
+			// Frozen graph commands would keep drawing the removed instances: barrier then rebuild.
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
 
-			// Пробы пересчитаются под новую сцену; сброс за барьером выше.
 			ResetProbeGi();
 
 			_env.Pipeline.InvalidateGraph();
 		}
 
-		// --- Выделение: контур отдельным пассом и пикинг --------------------------------------------
+		// --- Selection: outline pass and picking ----------------------------------------------------
 
-		/// <summary>Держит контур выделения (см. <see cref="SelectionOutlineOverlay"/>) в согласии со
-		/// сценой: перепекает мировую геометрию силуэта при смене выделения, движении сущностей или
-		/// структурных изменениях (модель догрузилась/удалена). Пустое выделение снимает
-		/// PostOverlay-хук с конвейера.</summary>
 		private void SyncSelectionHighlight(Entity? selected)
 		{
 			int id = selected.HasValue && !selected.Value.IsNull ? selected.Value.Id : -1;
@@ -657,9 +625,7 @@ namespace DecaEngine.Editor
 			_selectionOverlay ??= new SelectionOutlineOverlay(_env.DilApi, _graphicsApi, _env.BatchRenderer,
 				(IRenderTarget)_env.ColorTarget);
 
-			// Пересборка команд пасса нужна только когда изменилось ЧИСЛО индексов/пересозданы
-			// буферы либо хук ещё не висел; обновление содержимого буферов на месте (гизмо-драг)
-			// замороженные команды переживают.
+			// Frozen commands survive in-place buffer updates; only a resize needs a rebuild.
 			bool commandsDirty = _selectionOverlay.UpdateGeometry(_selectionPositions, _selectionIndices);
 			if (_env.Pipeline.PostOverlay == null)
 			{
@@ -673,8 +639,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Собирает мировую геометрию силуэта выделенной сущности И её потомков (выделение
-		/// родителя подсвечивает всё поддерево, как в обычных редакторах).</summary>
+		// Selecting a parent highlights its whole subtree.
 		private void CollectSelectionGeometry(Entity entity)
 		{
 			if (_rendered.TryGetValue(entity.Id, out var record) && record.Instantiated &&
@@ -690,23 +655,14 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Запекает вершины инстансов записи в мировое пространство (CPU-копии вершин живут
-		/// в IMeshObject, пока жива модель - тот же источник, что у probe-GI BVH, см. ProbeGiBaker).
-		///
-		/// Приёмник приходит параметром: та же самая мировая геометрия нужна и обводке выделения, и
-		/// статике физики (см. RebuildPhysicsStatics), и переписывать её вторым таким же методом
-		/// значило бы завести второе место, где можно ошибиться с фильтром топологии или с
-		/// трансформом инстанса.</summary>
+		// Bakes instance vertices into world space; CPU vertex copies live in IMeshObject.
 		private void AppendRecordGeometry(RenderedModel record, ModelLoader model,
 			List<Vector3> targetPositions, List<uint> targetIndices)
 			=> AppendModelGeometry(model,
 				System.Runtime.InteropServices.CollectionsMarshal.AsSpan(record.InstanceIndices),
 				record.LastWorld, targetPositions, targetIndices);
 
-		/// <summary>Та же запечка, но по ЯВНОМУ списку инстансов и явной мировой матрице - вход для
-		/// headless-прогона сцены (см. <see cref="ScenePhysicsProbe"/>). Вынесено, чтобы у пробника не
-		/// завелась вторая копия фильтра топологии и склейки трансформа инстанса: разойдясь с этой,
-		/// она проверяла бы не ту статику, которую строит редактор.</summary>
+		/// <summary>Bakes the given model instances into world-space triangles.</summary>
 		public static unsafe void AppendModelGeometry(ModelLoader model, ReadOnlySpan<int> instanceIndices,
 			Matrix4x4 world, List<Vector3> targetPositions, List<uint> targetIndices)
 		{
@@ -718,8 +674,7 @@ namespace DecaEngine.Editor
 					continue;
 				}
 
-				// Только треугольные меши: PSO маски - TriangleList, индексы линий/точек дали бы
-				// мусорные треугольники в силуэте (тот же фильтр, что у ProbeGiBaker).
+				// Triangles only: the mask PSO is TriangleList, line/point indices would be garbage.
 				if (model.MaterialPbr.TryGetValue(instance.materialId, out var pbr) &&
 					pbr.Topology != ModelLoader.MeshTopologyTriangles)
 				{
@@ -738,7 +693,7 @@ namespace DecaEngine.Editor
 				int vertexCount = UnsafeArray.GetLength(mesh.VertexData);
 				var vertices = new ReadOnlySpan<Vertex>(UnsafeArray.GetPtr<Vertex>(mesh.VertexData, 0), vertexCount);
 
-				// ModelLoader всегда строит 32-битные индексы (см. PreparedMesh.Indices: uint[]).
+				// ModelLoader always builds 32-bit indices.
 				var indices = new ReadOnlySpan<uint>(UnsafeArray.GetPtr<uint>(mesh.IndexData, 0), mesh.IndexCount);
 
 				int baseVertex = targetPositions.Count;
@@ -753,8 +708,6 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>AABB всей env-сцены по сферам мешей инстансов - питает кадрирование камеры и
-		/// ортокамеру мирового света.</summary>
 		private bool TryComputeSceneBounds(out Vector3 min, out Vector3 max)
 		{
 			min = new Vector3(float.PositiveInfinity);
@@ -769,11 +722,7 @@ namespace DecaEngine.Editor
 			return FinalizeBounds(any, ref min, ref max);
 		}
 
-		/// <summary>AABB одной сущности префаба И её поддерева - фокус по F на выделении (см.
-		/// SceneCamera.Frame / FrameSelection). Сущности без своей записи в _rendered (света, группы,
-		/// пустышки) в баунды геометрии не попадают - если во всём поддереве не нашлось НИ ОДНОЙ
-		/// модели, фолбэком идёт мировая позиция сущности с условным радиусом (иначе F на пустышке
-		/// был бы неотличим от щелчка мимо и просто ничего не делал бы).</summary>
+		// Entities with no geometry in the subtree (lights, groups) fall back to a nominal radius.
 		private bool TryComputeEntityBounds(Entity entity, out Vector3 min, out Vector3 max)
 		{
 			min = new Vector3(float.PositiveInfinity);
@@ -805,8 +754,6 @@ namespace DecaEngine.Editor
 			return any;
 		}
 
-		/// <summary>Общий накопитель AABB одной записи _rendered - сферы мешей её инстансов в мировом
-		/// пространстве; общий код TryComputeSceneBounds и TryComputeEntityBounds.</summary>
 		private bool AccumulateRecordBounds(RenderedModel record, ref Vector3 min, ref Vector3 max)
 		{
 			if (!record.Instantiated || string.IsNullOrEmpty(record.ResolvedPath) ||
@@ -839,8 +786,7 @@ namespace DecaEngine.Editor
 			return any;
 		}
 
-		/// <summary>NaN/Infinity в трансформах не должны ронять кадрирование - общий хвост
-		/// TryComputeSceneBounds/TryComputeEntityBounds.</summary>
+		// NaN/Infinity in transforms must not break camera framing.
 		private static bool FinalizeBounds(bool any, ref Vector3 min, ref Vector3 max)
 		{
 			if (!any)
@@ -858,8 +804,6 @@ namespace DecaEngine.Editor
 			return true;
 		}
 
-		/// <summary>Баунды каскада теней мирового света - пересчитываются при любом изменении сцены
-		/// (см. SimpleCullingAndRenderSystem.BuildLightData).</summary>
 		private void UpdateShadowBounds()
 		{
 			if (_env.ShadowSettings == null || !TryComputeSceneBounds(out var min, out var max))

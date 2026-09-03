@@ -10,23 +10,16 @@ public interface ICommandBuffer
 	void TransitionResource(IBufferHandle buffer, ResourceState newState);
 	void TransitionResource(IGpuTexture texture, ResourceState newState);
 
-	/// <summary>Полная копия текстуры (все мипы/слои, форматы должны совпадать) - например, снятие
-	/// сэмплируемой копии color-таргета между opaque- и transmissive-дроу для рефракции (см.
-	/// <see cref="ForwardPass"/>). Переходы состояний src→CopySource / dst→CopyDest берёт на себя.</summary>
+	/// <summary>Full texture copy (all mips/layers, formats must match); handles state transitions itself.</summary>
 	void CopyTexture(IGpuTexture src, IGpuTexture dst);
 
-	/// <summary>Резолв MSAA-таргета в одиночный (усреднение сэмплов) - завершение MSAA-кадра
-	/// превью (см. <see cref="ForwardPass"/>). Форматы должны совпадать; переходы состояний
-	/// берёт на себя.</summary>
+	/// <summary>Resolves an MSAA target into a single-sample one; formats must match, transitions handled.</summary>
 	void ResolveTexture(IGpuTexture src, IGpuTexture dst);
 
 	void SetBackBufferTarget(IGraphicsApi api);
 	void SetRenderTarget(IGpuTexture rtv, IGpuTexture dsv, uint rtvSlice = 0, uint dsvSlice = 0);
 
-	/// <summary>MRT-вариант <see cref="SetRenderTarget"/>: несколько цветовых таргетов разом (нулевые
-	/// мипы/слои) - тонкий G-buffer отражений в <see cref="ForwardPass"/> (нормаль/шероховатость +
-	/// множитель env-спекуляра для SSR, см. SsrPass). PSO дроу обязан быть создан с тем же списком
-	/// форматов - на Vulkan несовпадение числа аттачментов с пайплайном ломает рендер-пасс.</summary>
+	/// <summary>MRT variant; on Vulkan an attachment-count mismatch breaks the render pass.</summary>
 	void SetRenderTargets(IGpuTexture[] rtvs, IGpuTexture dsv);
 	void ClearRenderTarget(IGpuTexture rtv, Vector4 color, uint slice = 0);
 	void ClearDepthStencil(IGpuTexture dsv, ClearDepthStencilFlags flags, float depth, byte stencil, uint slice = 0);
@@ -54,22 +47,10 @@ public interface ICommandBuffer
 	void UpdateBuffer<T>(IBufferHandle buffer, NativeArray<T> data) where T : unmanaged;
 	unsafe void UpdateBuffer<T>(IBufferHandle buffer, UnsafeArray* data) where T : unmanaged;
 
-	/// <summary>Управляемый колбэк ВНУТРИ реплея заморожённого буфера - точка врезки нативных
-	/// библиотек (FSR/DLSS), которые пишут в командный лист кадра мимо Diligent (см.
-	/// NativeUpscalePass). Исполняется на КАЖДОМ реплее, в позиции записи. Колбэк, трогающий
-	/// командный лист напрямую, обязан после себя вернуть контекст в согласованное состояние
-	/// (InvalidateState) - это забота самого колбэка.</summary>
+	/// <summary>Replayed in position every replay; must restore any context state it touches.</summary>
 	void Callback(Action callback);
 
-	/// <summary>Условно реплеит чужой ЗАМОРОЖЕННЫЙ буфер <paramref name="nested"/> - ТОЛЬКО если
-	/// <c>schedule.ShouldRender(cascadeIndex)</c> на момент реплея ЭТОГО буфера (см.
-	/// <see cref="ShadowPass"/>/<see cref="ShadowCascadeSchedule"/>). Это ЯВНАЯ команда, а не
-	/// колбэк-замыкание над внешним массивом: <paramref name="nested"/>, <paramref name="schedule"/>
-	/// и <paramref name="cascadeIndex"/> хранятся как данные внутри записи команды, поэтому
-	/// переживают ровно столько же, сколько любая другая команда этого буфера - не дольше. Если
-	/// вызывающий пасс не перезапишет эту команду при следующей <c>WriteCommands</c>, она не может
-	/// остаться в буфере как-то иначе, чем вместе со всем остальным его содержимым (тот же выбор
-	/// заморозить/перезаписать, что у <see cref="SetPipelineState(IMaterialObject)"/> и прочих).</summary>
+	/// <summary>Replays a frozen nested buffer only if the schedule allows that cascade.</summary>
 	void ExecuteNested(ICommandBuffer nested, ShadowCascadeSchedule schedule, int cascadeIndex);
 
 	void BeginRecording();

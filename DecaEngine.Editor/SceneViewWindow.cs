@@ -5,16 +5,10 @@ using Hexa.NET.ImGuizmo;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// Докируемое окно "Scene View": GPU-рендер сцены редактируемого в <see cref="InspectorWindow"/>
-	/// префаба через <see cref="PrefabSceneViewport"/> (объекты грузятся по AssetRef из компонентов
-	/// ModelRenderer), с гизмо перемещения/поворота/масштаба выделенной сущности, переключателями
-	/// шейдинга и вращением направленного света - те же ручки, что у превью модели.
-	/// </summary>
+	/// <summary>Dockable "Scene View" window rendering the prefab edited in the Inspector.</summary>
 	public class SceneViewWindow : ImGuiDockingWindow
 	{
-		// Порядок ОБЯЗАН совпадать с PrefabSceneViewport.ShadingMode - Combo отдаёт индекс, который
-		// приводится к перечислению напрямую.
+		// Order must match PrefabSceneViewport.ShadingMode: the combo index is cast to it directly.
 		private static readonly string[] ShadingLabels =
 		{
 			"Lighting", "Textured", "Normal", "UV", "Tangent", "Punctual Shadow Debug",
@@ -57,19 +51,13 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Вьюпорт рендерит лит-небо окружения ДАЖЕ без открытого префаба (см.
-			// PrefabSceneViewport.Update: hasRoot) - кадр показываем всегда, а "No prefab loaded"
-			// кладём поверх подсказкой, а не вместо картинки. root телом Render не используется
-			// (см. его сигнатуру) - default передаётся, когда префаб не открыт.
+			// The viewport renders the environment sky even with no prefab open, so always show it.
 			var cursor = ImGui.GetCursorScreenPos();
 			if (_sceneViewport.Render(_imGuiRender, root ?? default, _inspectorWindow.Selected, canvasSize, out var pick))
 			{
 				_inspectorWindow.NotifyTransformChangedExternally();
 			}
 
-			// Сцена на паузе (Inspector показывает превью модели) снята с GPU целиком - модель
-			// редактора грузится ровно в одном месте, см. PrefabSceneViewport.SetActive. Кадр при
-			// этом пишется, но пустой, поэтому объясняем пустоту подсказкой, как и закрытый префаб.
 			var hint = !_sceneViewport.IsActive
 				? "Scene paused - Inspector is showing a model preview"
 				: root is null ? "No prefab loaded" : null;
@@ -81,8 +69,6 @@ namespace DecaEngine.Editor
 					ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.6f)), hint);
 			}
 
-			// Клик по вьюпорту: объект - выделяем его в Inspector-е (и гизмо переезжает на него),
-			// пустота - снимаем выделение, как в обычных редакторах.
 			if (pick.Clicked)
 			{
 				if (pick.Entity.HasValue)
@@ -126,7 +112,6 @@ namespace DecaEngine.Editor
 				_sceneViewport.FrameAll();
 			}
 
-			// Режим шейдинга - тот же набор, что у превью модели (Lighting/Textured/каналы отладки).
 			ImGui.SameLine();
 			int shadingIndex = (int)_sceneViewport.Shading;
 			ImGui.SetNextItemWidth(110f * _scale);
@@ -134,18 +119,13 @@ namespace DecaEngine.Editor
 			{
 				_sceneViewport.SetShading((PrefabSceneViewport.ShadingMode)shadingIndex);
 			}
-			// Легенда ВЫБРАННОГО отладочного режима - у каждого своя (см.
-			// PrefabSceneViewport.ClusterLegend): у кластерных видов ценность целиком в том, что
-			// ожидаемая картинка известна заранее, и держать её надо перед глазами, а не в статье.
 			var hoveredShading = (PrefabSceneViewport.ShadingMode)shadingIndex;
 			if (ImGui.IsItemHovered() && hoveredShading >= PrefabSceneViewport.ShadingMode.PunctualShadowDebug)
 			{
 				ImGui.SetTooltip(PrefabSceneViewport.ClusterLegend(hoveredShading));
 			}
 
-			// HDR+GI: одна галочка включает и авто-экспозицию (HDR-конвейер), и probe-GI сцены.
-			// Применяется пересозданием окружения без перезагрузки моделей (см.
-			// PrefabSceneViewport.SetHdrEnabled).
+			// One checkbox drives both auto-exposure and probe GI; applied by rebuilding the env.
 			ImGui.SameLine();
 			bool hdr = _sceneViewport.HdrEnabled;
 			if (ImGui.Checkbox("HDR+GI", ref hdr))
@@ -153,8 +133,6 @@ namespace DecaEngine.Editor
 				_sceneViewport.SetHdrEnabled(hdr);
 			}
 
-			// Поворот мирового направленного света - live, вместе с небом/IBL (см.
-			// PrefabSceneViewport.SetLightRotation; та же семантика, что в превью модели).
 			float lightYaw = _sceneViewport.LightYawDegrees;
 			float lightElevation = _sceneViewport.LightElevationDegrees;
 			bool lightChanged = false;

@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
 using DecaEngine.Core;
@@ -15,13 +15,10 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>Режимы просмотра: каналы/сабмеши/вайрфрейм и BVH-оверлей бейкера. Часть <see cref="ModelPreviewViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Preview modes: channels/sub-meshes/wireframe and the baker's BVH overlay; state and per-frame Update/Render live in the main file.</summary>
 	public partial class ModelPreviewViewport
 	{
-		/// <summary>Switches the sub-mesh view mode (see <see cref="InspectorWindow"/>'s View Mode combo).
-		/// No-op outside sub-mesh view. Independent of <see cref="WireframeEnabled"/> - the wireframe
-		/// overlay, if on, stays on across a mode switch.</summary>
+		/// <summary>Switches the sub-mesh view mode; no-op outside sub-mesh view. Independent of the wireframe overlay.</summary>
 		public void SetSubMeshViewMode(SubMeshPreviewMode mode)
 		{
 			if (_viewMode == mode || !IsSubMeshView)
@@ -33,9 +30,7 @@ namespace DecaEngine.Editor
 			ApplyPreviewSettingsToMaterials();
 		}
 
-		/// <summary>Toggles the wireframe overlay (see <see cref="InspectorWindow"/>'s Wireframe checkbox) -
-		/// orthogonal to <see cref="SetSubMeshViewMode"/>, so it can be combined with either Highlight or
-		/// Channel. No-op outside sub-mesh view.</summary>
+		/// <summary>Toggles the wireframe overlay; orthogonal to the view mode. No-op outside sub-mesh view.</summary>
 		public void SetWireframeEnabled(bool enabled)
 		{
 			if (_wireframeEnabled == enabled || !IsSubMeshView)
@@ -55,8 +50,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Switches the Channel-mode debug channel (see <see cref="InspectorWindow"/>'s Channel
-		/// combo). Only has a visible effect while <see cref="ViewMode"/> is <see cref="SubMeshPreviewMode.Channel"/>.</summary>
+		/// <summary>Switches the Channel-mode debug channel; only visible while ViewMode is Channel.</summary>
 		public void SetPreviewChannel(PreviewChannel channel)
 		{
 			if (_previewChannel == channel)
@@ -69,16 +63,12 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>
-		/// Pushes the current view mode/channel to every material of the resident model via
-		/// <see cref="IMaterialObject.SetConstant{T}"/> (see UnlitInstancedPS.hlsl's PreviewSettings
-		/// cbuffer). The whole-model view (<see cref="IsSubMeshView"/> false) always maps to Lighting
-		/// (Mode 3) regardless of <see cref="ViewMode"/> - that combo is only shown/meaningful for
-		/// sub-mesh view (see <see cref="InspectorWindow.RenderModelPreview"/>).
+		/// Pushes the current view mode/channel to every material of the resident model (see the
+		/// PreviewSettings cbuffer in UnlitInstancedPS.hlsl). The whole-model view always maps to
+		/// Lighting (Mode 3); the View Mode combo only exists for sub-mesh view.
 		/// </summary>
 		private void ApplyPreviewSettingsToMaterials()
 		{
-			// The whole-model view always renders in Lighting (PBR) mode; the View Mode combo only
-			// exists for an isolated sub-mesh (see InspectorWindow.RenderModelPreview).
 			int mode = !IsSubMeshView ? 3 : _viewMode switch
 			{
 				SubMeshPreviewMode.Channel => 2,
@@ -86,10 +76,9 @@ namespace DecaEngine.Editor
 				_ => 1,
 			};
 
-			// Отладочные виды (каналы/подсветка сабмеша, AO debug, probe debug) пишут в кадр УЖЕ
-			// отображаемые значения - HDR-конвейер обязан прокинуть их мимо экспозиции и кривой, иначе
-			// художник смотрел бы не на то, что шейдер посчитал (см. TonemapPassResources.SetPassthrough).
-			// Пушится ДО выхода по отсутствию модели: пустое превью тоже рисует кадр.
+			// Debug views write already-display-ready values; the HDR pipeline must bypass
+			// exposure and the tone curve for them (see TonemapPassResources.SetPassthrough).
+			// Pushed BEFORE the null-model early-out: an empty preview still renders a frame.
 			_env.SetTonemapPassthrough(mode != 3 || _editorSettings.AoDebugView
 				|| (_editorSettings.ProbeGiDebugView && !IsSubMeshView));
 
@@ -100,7 +89,7 @@ namespace DecaEngine.Editor
 
 			var data = new PreviewSettingsData
 			{
-				// Кривая действует только в LDR - в HDR её применяет TonemapPass (см. Tonemap.hlsl).
+				// The curve applies only in LDR; in HDR the TonemapPass applies it (Tonemap.hlsl).
 				ToneCurve = _editorSettings.ToneCurve,
 				Mode = mode,
 				Channel = (int)_previewChannel,
@@ -108,48 +97,46 @@ namespace DecaEngine.Editor
 				ShadowMode = _editorSettings.ShadowFilterMode,
 			};
 
-			// Параметры сетки проб (нули = probe-GI выключен, Origin.w - тумблер в шейдере): атласы
-			// уже привязаны к материалам в PollProbeBake, здесь только кбуфер. Выключение тумблера
-			// в окне Graphics просто перестаёт слать сетку - атласы остаются привязанными, но
-			// мёртвая ветка шейдера их не читает.
+			// Probe grid params (zeros = probe-GI off, Origin.w is the shader toggle): atlases are
+			// bound in PollProbeBake; turning the toggle off just stops sending the grid.
 			if (_probeTextures != null && _editorSettings.PreviewProbeGi)
 			{
 				ProbeGiViewportShared.PushGrid(ref data, _probeTextures,
 					_editorSettings.ProbeGiNormalBias, _editorSettings.ProbeGiViewBias);
 			}
 
-			// Live-ручки probe-GI/солнца (см. кбуфер ProbeGiParams в UnlitInstancedPS.hlsl).
+			// Live probe-GI/sun knobs (ProbeGiParams cbuffer in UnlitInstancedPS.hlsl).
 			data.ProbeGiParams = new Vector4(
 				Math.Clamp(_editorSettings.ProbeGiShadowFloor, 0f, 1f),
 				Math.Clamp(_editorSettings.ProbeGiSpecularFloor, 0f, 1f),
 				Math.Clamp(_editorSettings.ProbeGiSunIntensity, 0.1f, 16f),
 				Math.Clamp(_editorSettings.ProbeGiAmbientBoost, 0.1f, 128f));
-			// y - сторона окто-карты видимости: шейдер раскладывает по ней тайл пробы в атласе, и
-			// значение обязано быть тем же, под которое собрана сессия (см. ProbeGiBakeResult.VisRes).
+			// y = visibility octahedral map side: must match what the session was baked with
+			// (see ProbeGiBakeResult.VisRes) - the shader uses it to locate probe tiles.
 			data.ProbeGiParams2 = new Vector4(
 				Math.Clamp(_editorSettings.ProbeGiSkyShadowFloor, 0.01f, 1f),
 				ProbeGiBakeResult.VisRes, 0f, 0f);
 
-			// Отладочный вид probe-GI (см. канал 9 в шейдере) - только для целого вида модели:
-			// в сабмеш-режиме каналом управляет Inspector-ов Channel-комбо.
+			// Probe-GI debug view (shader channel 9) - whole-model view only; in sub-mesh mode
+			// the Inspector's Channel combo owns the channel.
 			if (_editorSettings.ProbeGiDebugView && !IsSubMeshView)
 			{
 				data.Channel = 9;
 			}
 
-			// Расстановка проб (канал 10) старше вида поля: если попросили оба, показываем более
-			// частный - где стоят пробы.
+			// Probe placement (channel 10) outranks the field view when both are requested.
 			if (_editorSettings.ProbeGiDebugProbes && !IsSubMeshView)
 			{
 				data.Channel = 10;
 			}
 
-			// Unlike Mode/Channel, the PBR factors are per material (glTF metallic/roughness/baseColor,
-			// see ModelLoader.MaterialPbr), so the constant push has to walk key-value pairs rather than
-			// blast one shared struct at every material.
-			for (int i = 0; i < _residentModel.materialObjects.Count; i++)
+			// PBR factors are per material (glTF metallic/roughness/baseColor), so the push walks
+			// key-value pairs. Use the preview's OWN material set, not the primary one: pushing
+			// into a shared model's primary set would clobber the prefab scene's Lighting settings.
+			var materials = OwnMaterials!;
+			for (int i = 0; i < materials.Count; i++)
 			{
-				var kvp = _residentModel.materialObjects.GetAt(i);
+				var kvp = materials.GetAt(i);
 
 				if (!_residentModel.MaterialPbr.TryGetValue(kvp.Key, out var pbr))
 				{
@@ -187,28 +174,26 @@ namespace DecaEngine.Editor
 				data.OcclusionUvSet = pbr.OcclusionUvSet;
 				data.SheenColorRoughness = pbr.SheenColorRoughness;
 				data.SpecularColorFactor = pbr.SpecularColorFactor;
+				data.Emissive = pbr.EmissiveFactor;
+				data.AlphaBlend = pbr.IsSoftBlend ? 1 : 0;
 
 				kvp.Value.SetConstant("PreviewSettings", ref data, HandleAccess.Pixel);
 			}
 		}
 
-		// --- Отладочный вид BVH проб ----------------------------------------------------------------
+		// --- Probe BVH debug view -------------------------------------------------------------------
 
-		/// <summary>Сущности каркасных боксов узлов BVH (см. <see cref="PopulateBvhDebugOverlay"/>).</summary>
+		/// <summary>Wireframe box entities for BVH nodes (see <see cref="PopulateBvhDebugOverlay"/>).</summary>
 		private readonly List<Entity> _bvhDebugEntities = new();
 
-		/// <summary>Единичный куб для отладочных боксов: рисуется тем же wireframe-материалом, что и
-		/// оверлей сабмеша, поэтому каркас получается из обычной треугольной геометрии. Один меш на
-		/// весь оверлей - боксы различаются только Position/Scale3 инстанса.</summary>
+		/// <summary>Unit cube for debug boxes, drawn with the sub-mesh wireframe material; one mesh for the whole overlay, boxes differ only by instance Position/Scale3.</summary>
 		private MeshId? _bvhDebugMeshId;
 		private BatchId? _bvhDebugBatchId;
 
-		/// <summary>Снимок настроек, под которым построен текущий оверлей: боксы перестраиваются
-		/// только при реальном изменении (спуск по дереву - не бесплатная операция).</summary>
+		/// <summary>Settings snapshot the current overlay was built for; boxes rebuild only on a real change (tree walk is not free).</summary>
 		private (bool On, int Depth, bool Leaves, object? Baker) _bvhDebugState;
 
-		/// <summary>Держит отладочный оверлей BVH в согласии с настройками и текущим деревом.
-		/// Зовётся каждый кадр из Update - вся работа только на изменение.</summary>
+		/// <summary>Keeps the BVH debug overlay in sync with settings and the current tree; called every frame from Update, all work happens on change only.</summary>
 		private void PollBvhDebugOverlay()
 		{
 			var wanted = (_editorSettings.ProbeGiBvhDebug && _probeBaker != null,
@@ -231,9 +216,9 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>
-		/// Создаёт по каркасному боксу на узел BVH (см. <see cref="ProbeGiBaker.CollectDebugBoxes"/>).
-		/// Инстансы обычные - те же Position/Rotation/Scale3 + регистрация в RenderResourceManager,
-		/// что и у геометрии модели, так что культинг и инстансинг работают как есть.
+		/// Creates one wireframe box per BVH node (see <see cref="ProbeGiBaker.CollectDebugBoxes"/>).
+		/// Instances are ordinary Position/Rotation/Scale3 + RenderResourceManager registrations,
+		/// so culling and instancing work as-is.
 		/// </summary>
 		private void PopulateBvhDebugOverlay(int maxDepth, bool leavesOnly)
 		{
@@ -249,8 +234,8 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Верхний предел - защита от «показать все листья Sponza» (сотни тысяч боксов кладут и
-			// инстанс-буферы, и глаз): режем и честно говорим об этом в консоль.
+			// Cap guards against "show all Sponza leaves" (hundreds of thousands of boxes kill
+			// both the instance buffers and the eye); truncation is reported to the console.
 			const int MaxBoxes = 20000;
 			int drawn = Math.Min(boxes.Count, MaxBoxes);
 
@@ -282,8 +267,8 @@ namespace DecaEngine.Editor
 					_bvhDebugEntities.Add(entity);
 				}
 
-				// Тот же барьер + пересборка графа, что у остальных оверлеев: команды ForwardPass
-				// заморожены, а мы только что добавили батч/инстансы (см. ClearWireframeOverlay).
+				// Same barrier + graph rebuild as the other overlays: ForwardPass commands are
+				// frozen and we just added a batch/instances (see ClearWireframeOverlay).
 				_env.DilApi.ImmediateContext.Flush();
 				_env.DilApi.ImmediateContext.WaitForIdle();
 				_env.Pipeline.InvalidateGraph();
@@ -302,7 +287,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Единичный куб (центр в нуле, сторона 1) - геометрия отладочного бокса.</summary>
+		/// <summary>Unit cube (centered at origin, side 1) - the debug box geometry.</summary>
 		private void EnsureBvhDebugMesh()
 		{
 			if (_bvhDebugMeshId != null)
@@ -331,7 +316,7 @@ namespace DecaEngine.Editor
 				};
 			}
 
-			// Треугольники куба: в wireframe-состоянии PSO (см. GetWireframeState) они и дают каркас.
+			// Cube triangles; the wireframe PSO state (see GetWireframeState) renders them as lines.
 			var indices = new uint[]
 			{
 				0, 2, 1, 1, 2, 3, // -Z
@@ -353,22 +338,18 @@ namespace DecaEngine.Editor
 
 		private IMeshObject? _bvhDebugMesh;
 
-		/// <summary>Выбрасывает GPU-сторону отладочного оверлея: зовётся там, где сбрасываются
-		/// регистрации батч-рендерера (смена модели, пересоздание окружения) - MeshId/BatchId после
-		/// сброса выдаются заново с нуля, и старые указывали бы в чужую геометрию. Вызывающий уже
-		/// дождался GPU.
-		///
-		/// ВНИМАНИЕ: сущности оверлея обязан снять вызывающий - ДО сброса регистраций, пока их
-		/// BatchId ещё валиден (см. ClearBvhDebugOverlay). Просто забыть список здесь нельзя: живые
-		/// сущности остаются в сторе, их BatchRenderInfo указывает на батч с уже переиспользованным
-		/// индексом, и вместо боксов дерева сцена получает копии геометрии НОВОЙ модели, расставленные
-		/// по позициям старых боксов.</summary>
+		/// <summary>Drops the GPU side of the debug overlay; call where batch-renderer registrations
+		/// are reset (model change, environment recreation) - MeshId/BatchId are reissued from zero
+		/// after a reset and stale ones would point into foreign geometry. Caller has already waited
+		/// for the GPU. Overlay entities must be removed by the caller BEFORE the reset, while their
+		/// BatchId is still valid (see ClearBvhDebugOverlay): live entities left in the store would
+		/// render the NEW model's geometry at the old box positions.</summary>
 		private void ReleaseBvhDebugResources()
 		{
 			if (_bvhDebugEntities.Count > 0)
 			{
-				// Страховка на случай нового пути, забывшего снять сущности: без Unregister слоты
-				// инстансов утекут, но мусорной геометрии в кадре не будет.
+				// Safety net for a new code path that forgot to remove entities: without
+				// Unregister the instance slots leak, but no garbage geometry is drawn.
 				foreach (var entity in _bvhDebugEntities)
 				{
 					if (!entity.IsNull)
@@ -403,17 +384,14 @@ namespace DecaEngine.Editor
 
 			_bvhDebugEntities.Clear();
 
-			// Без пересборки графа снятые инстансы продолжали бы рисоваться (та же причина, что в
+			// Without a graph rebuild the removed instances would keep drawing (same reason as
 			// ClearWireframeOverlay).
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
 			_env.Pipeline.InvalidateGraph();
 		}
 
-		/// <summary>Lazily creates the shared wireframe-overlay material/PSO (see
-		/// <see cref="DiligentBatchRenderer.GetWireframeState"/>) - one instance shared by every mesh this
-		/// viewport ever draws in wireframe, since it needs no per-material texture/state beyond a flat
-		/// color (see WireframeOverlayPS.hlsl).</summary>
+		/// <summary>Lazily creates the shared wireframe-overlay material/PSO - one instance for every mesh this viewport draws in wireframe (flat color, no per-material state).</summary>
 		private void EnsureWireframeMaterial()
 		{
 			if (_wireframeMaterialId != null)
@@ -432,10 +410,9 @@ namespace DecaEngine.Editor
 		}
 
 		/// <summary>
-		/// Adds one wireframe instance per instance of the currently isolated sub-mesh, reusing (and
-		/// lazily creating) one wireframe batch per mesh - mirrors <see cref="ModelViewportGeometry.CreateInstanceEntity"/>
-		/// but against <see cref="_wireframeMaterialId"/> instead of the sub-mesh's real material, since
-		/// the wireframe overlay is the same flat color regardless of which glTF material the geometry uses.
+		/// Adds one wireframe instance per instance of the isolated sub-mesh, reusing one wireframe
+		/// batch per mesh - mirrors ModelViewportGeometry.CreateInstanceEntity but against the
+		/// shared wireframe material, since the overlay is the same flat color for any glTF material.
 		/// </summary>
 		private void PopulateWireframeOverlay()
 		{
@@ -475,19 +452,14 @@ namespace DecaEngine.Editor
 				_wireframeEntities.Add(entity);
 			}
 
-			// See the matching Flush/WaitForIdle/InvalidateGraph comments in LoadModel/PollPendingLoad -
-			// a new wireframe batch/material may have just been registered, which the render graph's
-			// frozen ForwardPass commands need to be recompiled to pick up.
+			// A new wireframe batch/material may have just been registered; the render graph's
+			// frozen ForwardPass commands must be recompiled to pick it up.
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
 			_env.Pipeline.InvalidateGraph();
 		}
 
-		/// <summary>Resets the sub-mesh view mode/channel/wireframe toggle to their defaults (Highlight/
-		/// Normal/off) whenever a genuinely new model or sub-mesh selection is about to be populated - a
-		/// "Channel: Tangent" or wireframe choice made for one sub-mesh shouldn't silently carry over to
-		/// an unrelated one (e.g. with different/no UV data). Wireframe overlay entities themselves are
-		/// cleared by <see cref="ClearInstances"/>, called by both call sites right before this.</summary>
+		/// <summary>Resets sub-mesh view mode/channel/wireframe to defaults when a genuinely new model or sub-mesh is populated - choices made for one sub-mesh must not carry over to an unrelated one.</summary>
 		private void ResetPreviewModeForNewSelection()
 		{
 			_viewMode = SubMeshPreviewMode.Highlight;
@@ -509,15 +481,10 @@ namespace DecaEngine.Editor
 			}
 			_wireframeEntities.Clear();
 
-			// Without this, the wireframe overlay never actually disappears: ForwardPass's commands are
-			// only (re-)recorded when the render graph recompiles (see DiligentRenderGraph.Compile/
-			// Execute), and DiligentBatchRenderer.CheckAndReallocateBuffers - which re-uploads the CPU-side
-			// instance array picking up the now-freed slots as holes for the culling compute shader to
-			// skip - only runs from inside that recording (ForwardPass.WriteCommands). The compute dispatch
-			// itself IS replayed every frame, but against whatever GPU instance buffer content existed at
-			// the last compile, so it would keep "seeing" and drawing the unregistered wireframe instances
-			// until something forces a recompile. Same Flush/WaitForIdle/InvalidateGraph triple as
-			// LoadModel/PollPendingLoad/PopulateWireframeOverlay above, for consistency.
+			// Without this the overlay never disappears: ForwardPass commands are only re-recorded
+			// on render-graph recompile, and CheckAndReallocateBuffers (which re-uploads the
+			// instance array so culling skips freed slots) only runs inside that recording. The
+			// compute dispatch replays every frame against the stale GPU instance buffer otherwise.
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
 			_env.Pipeline.InvalidateGraph();

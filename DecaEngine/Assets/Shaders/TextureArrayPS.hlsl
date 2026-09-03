@@ -1,5 +1,5 @@
 Texture2DArray  g_texture;
-SamplerState    g_texture_sampler; // By convention, texture samplers must use the '_sampler' suffix
+SamplerState    g_texture_sampler; // Diligent convention: sampler name = texture name + '_sampler'
 
 struct PSInput
 {
@@ -13,9 +13,7 @@ struct PSOutput
     float4 color    : SV_TARGET;
 };
 
-// Note that if separate shader objects are not supported (this is only the case for old GLES3.0 devices), vertex
-// shader output variable name must match exactly the name of the pixel shader input variable.
-// If the variable has structure type (like in this example), the structure declarations must also be identical.
+// Without separate shader objects (old GLES3.0), VS output names/structs must match PS inputs exactly.
 PSOutput main(in PSInput input)
 {
     PSOutput output;

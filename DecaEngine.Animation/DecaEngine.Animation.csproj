@@ -1,17 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<!--
-		Рантайм анимации: скелет и клипы как данные, поза и сэмплирование через нативный ozz,
-		аддитивные клипы, IK стоп, пружинные кости, гуманоидный аватар и его референс-поза.
+		Animation runtime: skeleton and clips as data, posing and sampling through native ozz,
+		additive clips, foot IK, spring bones, the humanoid avatar and its reference pose.
 
-		Лежал в DecaEngine.Graphics.Core, хотя графики в нём нет: во всех девяти файлах нет ни
-		одного using на DecaEngine - только System.*. Единственной внешней зависимостью был
-		Transform, объявленный посреди ModelLoader.cs; он уехал в Core.
+		This used to live in DecaEngine.Graphics.Core, even though there is no graphics in it: none
+		of the nine files has a single using on DecaEngine - only System.*. Its one external
+		dependency was Transform, declared in the middle of ModelLoader.cs; that moved to Core.
 
-		Импортная сторона (SkinningImport - разбор скина из glTF) осталась в Graphics.Core рядом с
-		ModelLoader: она принадлежит загрузке моделей, а не проигрыванию анимации. Направление
-		получилось Graphics.Core -> Animation: загрузчик ПРОИЗВОДИТ PreparedSkeleton/
-		PreparedAnimation, рантайм их ПОТРЕБЛЯЕТ. Обратной стрелки нет.
+		The import side (SkinningImport - parsing the skin out of glTF) stayed in Graphics.Core next
+		to ModelLoader: it belongs to model loading, not to animation playback. The direction came
+		out as Graphics.Core -> Animation: the loader PRODUCES PreparedSkeleton/PreparedAnimation,
+		the runtime CONSUMES them. There is no arrow back.
 	-->
 	<ItemGroup>
 		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />

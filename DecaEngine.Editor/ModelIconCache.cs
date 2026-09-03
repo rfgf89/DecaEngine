@@ -9,36 +9,14 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Дисковый + рантайм кеш превью-иконок моделей для <see cref="AssetBrowserWindow"/>.
-/// На диске живёт в папке открытого проекта: "&lt;project&gt;/EditorCache/AssetPreviews" -
-/// PNG-иконка целой модели, PNG на каждый SubMesh и JSON-манифест (имена сабмешей + время
-/// изменения исходника, чтобы понимать, когда кеш протух). Рантайм-часть лениво поднимает
-/// PNG в GPU-текстуры и биндит их к ImGui-текстурам (см. <see cref="TryGetIcon"/>), чтобы
-/// сетка ассетов могла рисовать их через ImDrawList.AddImage.
-///
-/// Сам бейк иконок делает <see cref="ModelIconBaker"/> - он вызывает
-/// <see cref="SaveIcon"/>/<see cref="SaveManifest"/> и затем <see cref="Invalidate"/>, чтобы
-/// уже показанные фолбэк-состояния перечитались с диска.
-/// </summary>
+/// <summary>Disk plus runtime cache of model preview icons for <see cref="AssetBrowserWindow"/>.</summary>
 public class ModelIconCache
 {
-	/// <summary>Индекс "иконка целой модели" (в отличие от 0..N-1 - иконок сабмешей).</summary>
+	/// <summary>Icon of the whole model, as opposed to a 0..N-1 sub-mesh icon.</summary>
 	public const int WholeModelIndex = -1;
 
-	/// <summary>
-	/// Бампается при изменении логики бейка/имён сабмешей (см. ModelImporter.PrepareModel,
-	/// ModelIconBaker) - манифест на диске, записанный старой версией, иначе остаётся "валидным"
-	/// сколько угодно (единственная проверка протухания - время изменения ИСХОДНОГО файла модели,
-	/// см. GetManifest), так что баг вроде "у всех сабмешей одно и то же имя" пережил бы фикс кода
-	/// и требовал бы вручную стирать EditorCache. Проверка версии заставляет такие манифесты
-	/// перебейкаться автоматически при следующем обращении.
-	/// </summary>
-	/// v2: до фикса RenderResourceManager.DrawInstanceCount бейк сабмешей, шедший после бейка целой
-	/// модели, обходил пустой префикс массива инстансов и писал на диск ПУСТЫЕ (цвета фона) PNG -
-	/// они валидны по времени изменения исходника и без бампа версии остались бы навсегда.
-	/// v3: ModelLoader начал конвертировать RH->LH (зеркалирование Z) - все ранее забейканные
-	/// иконки отражены и должны перебейкаться.
+	// Bump whenever bake logic or sub-mesh naming changes; otherwise stale manifests stay "valid",
+	// since the only other staleness check is the source model's write time.
 	private const int BakeVersion = 3;
 
 	public sealed class Manifest
@@ -70,13 +48,8 @@ public class ModelIconCache
 	public static string GetCacheDirectory(string projectDirectory) =>
 		Path.Combine(projectDirectory, "EditorCache", "AssetPreviews");
 
-	/// <summary>
-	/// Манифест иконок для модели, если он существует на диске и не протух (время изменения
-	/// исходного файла совпадает с записанным при бейке). Иначе null - вызывающий может
-	/// поставить модель в очередь на бейк (см. <see cref="ModelIconBaker.Enqueue"/>).
-	/// Результат (в т.ч. отрицательный) кешируется в памяти до <see cref="Invalidate"/> -
-	/// чтобы не делать файловые stat/чтения каждый кадр из кода отрисовки.
-	/// </summary>
+	/// <summary>Icon manifest if present on disk and not stale; null otherwise. The result, including
+	/// the negative one, is memoized until <see cref="Invalidate"/> to keep drawing code off the disk.</summary>
 	public Manifest? GetManifest(string projectDirectory, string modelPath)
 	{
 		var entry = GetOrCreateEntry(modelPath);
@@ -104,14 +77,12 @@ public class ModelIconCache
 
 			if (manifest.BakeVersion != BakeVersion)
 			{
-				// Записан старой версией бейкера/именования сабмешей - протух независимо от того,
-				// менялся ли сам исходник модели на диске.
+				// Written by an older baker: stale regardless of the source file's write time.
 				return null;
 			}
 
 			if (File.GetLastWriteTimeUtc(modelPath).Ticks != manifest.SourceWriteTimeUtcTicks)
 			{
-				// Исходник изменился после бейка - иконки устарели.
 				return null;
 			}
 
@@ -119,17 +90,13 @@ public class ModelIconCache
 		}
 		catch
 		{
-			// Битый JSON, гонка с записью и т.п. - ведём себя как "кеша нет".
+			// Corrupt JSON or a race with the writer: behave as if there were no cache.
 		}
 
 		return entry.Manifest;
 	}
 
-	/// <summary>
-	/// ImGui-текстура закешированной иконки (лениво загружается с диска при первом запросе).
-	/// <paramref name="subMeshIndex"/>: <see cref="WholeModelIndex"/> - иконка целой модели,
-	/// иначе индекс сабмеша. false - если иконки на диске нет (или не смогли прочитать).
-	/// </summary>
+	/// <summary>ImGui texture of a cached icon, loaded from disk on first request.</summary>
 	public bool TryGetIcon(string projectDirectory, string modelPath, int subMeshIndex, out ImTextureRef textureRef)
 	{
 		textureRef = default;
@@ -145,7 +112,7 @@ public class ModelIconCache
 			return false;
 		}
 
-		// Иконки грузим только если манифест валиден - иначе на диске могут лежать протухшие PNG.
+		// Only load icons behind a valid manifest: stale PNGs may still sit on disk.
 		if (GetManifest(projectDirectory, modelPath) is null)
 		{
 			return false;
@@ -185,17 +152,8 @@ public class ModelIconCache
 		}
 	}
 
-	/// <summary>
-	/// Сбрасывает рантайм-состояние ОДНОЙ иконки (см. <paramref name="subMeshIndex"/>), освобождая
-	/// её GPU-текстуру и ImGui-биндинг. Диск не трогает. Вызывается после перебейка этой иконки -
-	/// остальные уже загруженные иконки той же модели (другие сабмеши) не трогаются, иначе каждый
-	/// ленивый добейк одного сабмеша (см. ModelIconBaker.EnqueueSubMeshIcon) заставлял бы AssetBrowser
-	/// заново поднимать с диска и перебиндить ВСЕ уже показанные иконки этой модели.
-	///
-	/// Для <see cref="WholeModelIndex"/> дополнительно сбрасывает закешированный манифест - он
-	/// перезаписывается на диске тем же бейком (см. ModelIconBaker.BakeNextStage), так что рантайм-копию
-	/// нужно перечитать, иначе <see cref="GetManifest"/> продолжит отдавать старые данные до перезапуска.
-	/// </summary>
+	/// <summary>Drops the runtime state of one icon, leaving the other icons of the model alone;
+	/// for <see cref="WholeModelIndex"/> the cached manifest is dropped too.</summary>
 	public void Invalidate(string modelPath, int subMeshIndex)
 	{
 		if (!_entries.TryGetValue(modelPath, out var entry))
@@ -263,15 +221,8 @@ public class ModelIconCache
 	private static string GetManifestPath(string projectDirectory, string modelPath) =>
 		Path.Combine(GetCacheDirectory(projectDirectory), GetCacheKey(projectDirectory, modelPath) + ".json");
 
-	/// <summary>
-	/// Имя файлов кеша: читаемое имя модели + короткий хеш её пути относительно проекта + версия
-	/// бейкера. BakeVersion - часть самого ИМЕНИ файла (а не только поля внутри Manifest), чтобы
-	/// протухшие PNG отдельных сабмешей автоматически переставали находиться на диске при бампе
-	/// версии - GetManifest уже отбраковывает старый Manifest.json по полю BakeVersion, но
-	/// TryGetIcon грузит PNG по пути by-index НАПРЯМУЮ, не читая Manifest повторно, так что без
-	/// версии в самом пути старые PNG (запечённые багнутым бейкером) продолжали бы находиться и
-	/// показываться даже после того, как манифест уже перебейкался с фиксом.
-	/// </summary>
+	// BakeVersion is part of the file NAME, not just the manifest: TryGetIcon loads sub-mesh PNGs
+	// by path without re-reading the manifest, so stale ones must stop resolving on a bump.
 	private static string GetCacheKey(string projectDirectory, string modelPath)
 	{
 		string relative;

@@ -57,13 +57,10 @@ public abstract class ImGuiDockingWindow : ImGuiWindow
 		}
 	}
 
-	/// <summary>Позволяет наследникам запросить дополнительные флаги для ImGui.Begin (например, ImGuiWindowFlags.MenuBar для окон со своей шапкой-тулбаром).</summary>
 	protected virtual ImGuiWindowFlags AdditionalWindowFlags => ImGuiWindowFlags.None;
 
-	/// <summary>Было ли окно (вместе с дочерними) в фокусе на ПОСЛЕДНЕЙ отрисовке. Нужно системам,
-	/// которые читают ввод в обход ImGui и обязаны молчать, пока активно чужое окно: io.WantCaptureKeyboard
-	/// для этого не годится - с NavEnableKeyboard он true при фокусе ЛЮБОГО окна, включая то самое,
-	/// которому ввод и предназначен (см. FlyCameraSystem).</summary>
+	/// <summary>Whether this window (or a child) was focused on the LAST draw. Systems that read
+	/// input outside ImGui must use this: io.WantCaptureKeyboard is true for any focused window.</summary>
 	public bool IsFocused { get; private set; }
 
 	public override void Render(uint dockId)
@@ -98,17 +95,12 @@ public abstract class ImGuiDockingWindow : ImGuiWindow
 		var max = min + ImGui.GetWindowSize();
 		var style = ImGui.GetStyle();
 
-		// GetColorU32 возвращает "упакованный" ARGB uint - лерп таких значений напрямую через
-		// float.Lerp смешивает не каналы цвета, а сырые числа целиком, что даёт визуальный мусор
-		// (каналы интерферируют друг с другом). Поэтому распаковываем оба цвета в Vector4 (RGBA
-		// по 0..1) и лерпим покомпонентно - так каналы смешиваются независимо и корректно.
+		// GetColorU32 returns packed ARGB; lerping the packed ints would blend channels into
+		// each other, so unpack to Vector4 first.
 		var overline = ImGui.ColorConvertU32ToFloat4(ImGui.GetColorU32(ImGuiCol.TabSelectedOverline));
 		var windowBg = ImGui.ColorConvertU32ToFloat4(ImGui.GetColorU32(ImGuiCol.WindowBg));
 
-		// "Слегка" - подмешиваем цвет выделения совсем небольшой долей (18%) поверх фона окна,
-		// сохраняя альфу самого WindowBg (а не альфу overline-цвета, который обычно непрозрачен) -
-		// иначе заливка могла бы стать более непрозрачной, чем исходный фон, и выглядеть как
-		// сплошная перекраска, а не лёгкая подсветка.
+		// Keep WindowBg's alpha: the overline color is usually opaque and would repaint the window.
 		var blended = Vector4.Lerp(windowBg, overline, 0.05f);
 		blended.W = windowBg.W;
 		var color = ImGui.GetColorU32(blended);

@@ -1,10 +1,6 @@
 #include "Instancing.hlsl"
 
-// Environment background for the model preview: samples the same prefiltered equirect panorama
-// the PBR materials reflect (see PreviewEnvironmentMap / UnlitInstancedPS.hlsl), so what shows
-// up in a chrome sphere is exactly what the backdrop shows behind it. Drawn as the first pass
-// of the frame (depth test off, see ModelViewportEnvironment's sky PSO) and then overdrawn by
-// geometry.
+// Same prefiltered equirect panorama the PBR materials reflect; drawn first, depth test off.
 Texture2D    _EnvMap;
 SamplerState _EnvMap_sampler;
 
@@ -13,16 +9,12 @@ cbuffer View
     ViewData viewData;
 }
 
-// Пользовательский поворот энвайронмента вокруг Y (ползунок света в превью, см.
-// SkyPassResources.SetEnvironmentYaw) - тот же сдвиг equirect-U, что в UnlitInstancedPS.hlsl
-// (PbrEnvYaw), чтобы фон и отражения вращались одинаково. 0 (zero-init) = без поворота.
 cbuffer SkySettings
 {
+    // Equirect-U shift in radians; must match PbrEnvYaw so reflections rotate with the backdrop.
     float SkyEnvYaw;
 
-    // >0.5 - HDR-конвейер превью: кадр остаётся ЛИНЕЙНЫМ до TonemapPS.hlsl, и небо обязано писать
-    // линейную яркость - иначе авто-экспозиция мерила бы уже свёрнутый гаммой фон (см.
-    // SkyPassResources.SetHdrOutput).
+    // >0.5: HDR pipeline, frame stays linear until TonemapPS, so write linear luminance here.
     float SkyHdrOutput;
 
     float SkyPad1, SkyPad2;
@@ -48,9 +40,6 @@ PSOutput Main(in VSOutput input)
 {
     PSOutput output;
 
-    // Восстанавливаем мировое направление луча камеры: NDC -> view-простр. направление через
-    // известный FOV/aspect, затем поворот view->world транспонированной (обратной для чистого
-    // поворота) частью view-матрицы.
     float aspect = viewData.viewport.z / max(viewData.viewport.w, 1.0);
     float3 dirView = normalize(float3(input.ndc.x * TanHalfFov * aspect, input.ndc.y * TanHalfFov, 1.0));
     float3 dirWorld = mul(dirView, transpose((float3x3)viewData.view));
@@ -58,12 +47,10 @@ PSOutput Main(in VSOutput input)
     float2 uv = float2(atan2(dirWorld.z, dirWorld.x) / (2.0 * PI) + 0.5 + SkyEnvYaw / (2.0 * PI),
                        acos(clamp(dirWorld.y, -1.0, 1.0)) / PI);
 
-    // Слегка размытый мип - фон в превью-вьюверах традиционно мягче зеркальных отражений, чтобы
-    // не спорить с моделью за внимание.
+    // Blurred mip: the backdrop stays softer than the mirror reflections on the model.
     float3 sky = _EnvMap.SampleLevel(_EnvMap_sampler, uv, 1.5).rgb;
 
-    // Тот же ручной display-энкод, что в Lighting-режиме (таргет не *_SRGB); в HDR-режиме энкод
-    // делает TonemapPS в самом конце.
+    // Manual display encode: the LDR target is not *_SRGB. In HDR mode TonemapPS encodes instead.
     output.color = float4(SkyHdrOutput > 0.5 ? sky : pow(sky, 1.0 / 2.2), 1.0);
     return output;
 }

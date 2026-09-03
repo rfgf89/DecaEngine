@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Numerics;
 using System.Threading;
@@ -19,17 +19,13 @@ public partial class ModelLoader
 {
 	public List<InstanceData> instances = new();
 
-	/// <summary>Разбивка времени загрузки и объём декодированных текстур - диагностика.
-	/// Фазы стоят очень по-разному на разных ассетах, и «очевидный» виновник обычно не тот:
-	/// без этих чисел оптимизация загрузки - гадание.</summary>
+	/// <summary>Per-phase load timing and decoded-texture volume, for load diagnostics.</summary>
 	public readonly record struct LoadTimings(long ParseMs, long DecodeMs, long MaterialsMs, long MeshesMs,
 		long FinalizeMs, int DecodedImages, long DecodedBytes, int ShaderVariants, long ShaderMs,
 		int TextureUploads, long TextureMs, int MeshUploads, long MeshMs, int Samplers, long SamplerMs, int MaterialsBuilt, long MaterialBuildMs, long MatCreateMs, long MatShaderMs);
 
 	public LoadTimings Timings { get; internal set; }
 
-	// Компиляция вариантов пиксельного шейдера внутри финализации - накапливается там же
-	// (см. BuildFromPreparedIncremental.GetPixelShaderVariant).
 	internal long _shaderMs;
 	internal int _shaderVariants;
 	internal long _textureMs;
@@ -43,27 +39,10 @@ public partial class ModelLoader
 	internal long _matCreateMs;
 	internal long _matShaderMs;
 
-	/// <summary>Освобождает GPU-ресурсы модели: меши (вершинные/индексные буферы плюс их CPU-копии
-	/// в неуправляемой памяти) и материалы (PSO, SRB, кбуферы, шейдеры, текстуры).
-	///
-	/// Раньше этого не было вовсе - <see cref="ModelLoader"/> не был освобождаемым, и каждая
-	/// открытая модель оставляла на GPU весь свой footprint навсегда.
-	///
-	/// Про шейдеры отдельно, потому что рядом в коде есть предупреждение о двойном освобождении:
-	/// один вершинный шейдер и горстка вариантов пиксельного ШАРЯТСЯ между материалами модели, и
-	/// <see cref="IMaterialObject.Release"/> освобождает их у каждого. Здесь это безопасно по двум
-	/// причинам: DiligentShader.Release нуллит нативный объект и повторный вызов на нём - no-op, а
-	/// кэш вариантов локален для ОДНОЙ загрузки (см. BuildFromPreparedIncremental), так что чужой
-	/// модели эти шейдеры не принадлежат. Опасен был другой сценарий - освобождение шейдера, пока им
-	/// пользуется ЖИВОЙ материал; здесь же умирает весь набор разом.
-	///
-	/// Вызывающий обязан сперва снять все инстансы со сцены и дождаться GPU: на буферы модели
-	/// ссылаются записанные команды рендер-графа (см. ModelPreviewViewport.PopulateFromScene).</summary>
-	/// <summary>Шейдеры, созданные загрузкой этой модели: один вершинный, варианты пиксельного и
-	/// (при не-треугольных топологиях) точечный вершинный. ШАРЯТСЯ между материалами модели, поэтому
-	/// материалы их не освобождают (OwnsShaders=false) - освобождает их отсюда, по одному разу.</summary>
+	// Shaders are shared by this model's materials (OwnsShaders=false); released once here.
 	internal readonly List<IShaderObject> _ownedShaders = new();
 
+	/// <summary>Releases GPU resources; caller must detach all instances and wait for the GPU first.</summary>
 	public void Release()
 	{
 		foreach (var mesh in Meshes)
@@ -74,10 +53,8 @@ public partial class ModelLoader
 		Meshes.Clear();
 		MeshHasUv.Clear();
 
-		// По РАЗЛИЧНЫМ объектам, а не по значениям словаря: дефолтный материал раздаётся ВСЕМ
-		// null-материалам модели, то есть лежит в materialObjects под несколькими ключами. Простой
-		// проход по Values освободил бы его столько же раз, а повторный Dispose нативного SRB/PSO -
-		// это обращение к освобождённой памяти, ровно как с шарёными шейдерами.
+		// Distinct instances only: the default material sits under several keys; a second
+		// native Release would touch freed memory.
 		var releasedMaterials = new HashSet<IMaterialObject>(ReferenceEqualityComparer.Instance
 			as IEqualityComparer<IMaterialObject>);
 		foreach (var material in materialObjects.Values)
@@ -90,8 +67,7 @@ public partial class ModelLoader
 
 		materialObjects.Clear();
 
-		// Текстуры - ПОСЛЕ материалов: их SRB держали вьюхи текстур; сами материалы текстур не
-		// освобождают (см. DiligentMaterial.Release), владение здесь.
+		// Textures after materials: their SRBs held the texture views; ownership is here.
 		foreach (var texture in _ownedTextures)
 		{
 			texture?.Release();
@@ -109,8 +85,7 @@ public partial class ModelLoader
 
 		StreamedTextures.Clear();
 
-		// ПОСЛЕ материалов: они держат нативные шейдеры, и освобождать шейдер, пока жив
-		// использующий его материал, - та же ошибка, только с другой стороны.
+		// Shaders after materials: live materials still hold the native shaders.
 		foreach (var shader in _ownedShaders)
 		{
 			shader?.Release();
@@ -122,82 +97,51 @@ public partial class ModelLoader
 
 	public List<IMeshObject> Meshes = new();
 
-	/// <summary>
-	/// Parallel to <see cref="Meshes"/>: whether the glTF primitive that became Meshes[i] had a real
-	/// TEXCOORD_0 accessor, as opposed to synthesized all-zero UVs (see PrepareModel). Used to gate the
-	/// Tangent channel option in <see cref="DecaEngine.Editor.ModelPreviewViewport"/>'s Channel debug
-	/// view - a derivative-based tangent computed from degenerate (0,0) UVs is meaningless.
-	/// </summary>
+	/// <summary>Parallel to <see cref="Meshes"/>: had a real TEXCOORD_0, not synthesized zero UVs.</summary>
 	public List<bool> MeshHasUv = new();
 
-	/// <summary>Скелет модели, null у статической (см. <see cref="PreparedSkeleton"/>). Общий на всю
-	/// модель, живёт на CPU: скиннинг-палитра считается по нему покадрово, а процедурный слой (IK,
-	/// рэгдолл, spring bones) правит позу до того, как она уедет в GPU.</summary>
+	/// <summary>Model skeleton, null for static models; kept CPU-side for procedural pose edits.</summary>
 	public PreparedSkeleton Skeleton;
 
-	/// <summary>Клипы модели, разложенные по джойнтам <see cref="Skeleton"/>.</summary>
+	/// <summary>Animation clips mapped onto <see cref="Skeleton"/> joints.</summary>
 	public List<PreparedAnimation> Animations = new();
 
-	/// <summary>Параллельно <see cref="Meshes"/>: скин-стрим меша (null у статических). Держится на
-	/// CPU до сборки GPU-буфера скиннинга - см. <see cref="SkinVertex"/>.</summary>
+	/// <summary>Parallel to <see cref="Meshes"/>: per-mesh skin stream, null for static meshes.</summary>
 	public List<SkinVertex[]> MeshSkin = new();
 
-	/// <summary>Линейное альбедо каждого треугольника меша (ключ - meshId), из base color текстур -
-	/// см. <see cref="ComputeTriangleAlbedoFromTextures"/>. Пусто у мешей без текстуры/UV/пикселей.</summary>
+	/// <summary>Linear per-triangle albedo by meshId; empty for meshes without texture/UV/CPU pixels.</summary>
 	public Dictionary<int, Vector3[]> TriangleAlbedo { get; } = new();
 
-	/// <summary>Металличность каждого треугольника меша (ключ - meshId): B-канал metallic-roughness
-	/// текстуры в центроиде UV x MetallicFactor. Потребитель - «зеркало в зеркале» RT-отражений
-	/// (детект металла у TLAS-хита, см. SceneTrace.hlsl): по одному лишь альбедо светлый хром
-	/// (серебро/золото) неотличим от белой штукатурки. Строится тем же проходом, что
-	/// <see cref="TriangleAlbedo"/>, только при живых CPU-пикселях MR-текстуры; без неё потребитель
-	/// падает на MetallicFactor материала.</summary>
+	/// <summary>Per-triangle metalness by meshId: MR texture B channel times MetallicFactor.</summary>
 	public Dictionary<int, float[]> TriangleMetalness { get; } = new();
 
-	/// <summary>Шероховатость каждого треугольника меша (ключ - meshId): G-канал
-	/// metallic-roughness текстуры в центроиде UV x RoughnessFactor. Потребитель тот же, что у
-	/// <see cref="TriangleMetalness"/>: RT-отражения (насколько резко металлический хит отражает
-	/// дальше - без неё зеркальный хром и матовое железо шейдились одинаково размыто). Без
-	/// CPU-пикселей MR-текстуры словарь пуст - фолбэк на RoughnessFactor материала.</summary>
+	/// <summary>Per-triangle roughness by meshId: MR texture G channel times RoughnessFactor.</summary>
 	public Dictionary<int, float[]> TriangleRoughness { get; } = new();
 
-	/// <summary>Сторона плитки <see cref="MaterialAlbedoTile"/>.</summary>
+	/// <summary>Side of a <see cref="MaterialAlbedoTile"/> tile.</summary>
 	public const int AlbedoTileSize = 128;
 
-	/// <summary>Даунсемпленная до <see cref="AlbedoTileSize"/>² плитка base color текстуры
-	/// материала (ключ - materialId): RGBA8 в sRGB, усреднение в ЛИНЕЙНОМ пространстве (среднее по
-	/// sRGB темнит контрастные текстуры), БЕЗ BaseColorFactor - его умножает потребитель. Источник
-	/// слоёв атласа текстур RT-хитов (дешёвый режим, см. SsrHitTextures в редакторе). Как и
-	/// <see cref="TriangleAlbedo"/>, строится только пока живы CPU-пиксели: у стриминга и
-	/// cooked-моделей словарь пуст, потребитель падает на плитку среднего цвета материала.</summary>
+	/// <summary>Per-material base color tile: sRGB RGBA8 downsampled in LINEAR space, no BaseColorFactor.</summary>
 	public Dictionary<int, byte[]> MaterialAlbedoTile { get; } = new();
 
 	public OrderedDictionary<int, IMaterialObject> materialObjects = new();
 
-	/// <summary>Одна стримимая текстура модели (см. <see cref="ModelLoadOptions.StreamTextures"/>):
-	/// текущая GPU-текстура (первая ступень - низкое качество), сжатый исходник для ре-декода и все
-	/// слоты материалов, куда она привязана (один image часто шарится каналами/материалами - ORM).
-	/// Апгрейды делает DecaEngine.Editor.ECS.ModelStreamer: фоновый декод следующей ступени ->
-	/// CreateTexture -> SetTexture по всем привязкам (SRB живого материала обновляется на месте, см.
-	/// DiligentMaterial.SetTexture - тот же приём, что у ProbeGiTextures.Bind) -> отложенный Release
-	/// старой. По достижении целевого/нативного размера <see cref="EncodedPixels"/> обнуляется -
-	/// CPU-данные освобождаются.</summary>
+	/// <summary>One streamable model texture and every material slot bound to it.</summary>
 	public sealed class StreamedTexture
 	{
-		/// <summary>Путь к внешнему файлу картинки (ре-декод читает его с диска в фоне) - null для
-		/// встроенных, у них исходник лежит в <see cref="EncodedPixels"/>.</summary>
+		/// <summary>External image path for background re-decode; null for embedded images.</summary>
 		public string FilePath;
 
-		/// <summary>Сжатый исходник встроенной картинки (.glb / data-URI).</summary>
+		/// <summary>Encoded source of an embedded image (.glb / data URI).</summary>
 		public byte[] EncodedPixels;
 
-		/// <summary>Есть ли ещё откуда брать ступени (иначе стриминг этой текстуры окончен).</summary>
+		/// <summary>Whether another quality step can still be produced.</summary>
 		public bool HasSource => !Completed && (FilePath != null || EncodedPixels != null || DtexPath != null);
 
-		/// <summary>Читает сжатый исходник. Дисковый I/O - звать только из фонового потока.</summary>
+		/// <summary>Reads the encoded source; disk I/O — background thread only.</summary>
 		public byte[] ReadEncoded() => EncodedPixels ?? (FilePath != null ? File.ReadAllBytes(FilePath) : null);
 
-		/// <summary>Освобождает CPU-данные исходника (стриминг завершён).</summary>
+		/// <summary>Releases CPU-side source data once streaming is complete.</summary>
 		public void ReleaseCpuData()
 		{
 			Completed = true;
@@ -206,65 +150,47 @@ public partial class ModelLoader
 			DtexPath = null;
 		}
 
-		/// <summary>Бо́льшая сторона текущего GPU-декода (0 = ещё 1x1-филлер).</summary>
+		/// <summary>Larger side of the current GPU decode; 0 = still the 1x1 filler.</summary>
 		public int CurrentSize;
 
-		/// <summary>Целевая сторона (<see cref="ModelLoadOptions.MaxTextureSize"/>; 0 = нативное
-		/// разрешение файла).</summary>
+		/// <summary>Target side; 0 = native file resolution.</summary>
 		public int TargetSize;
 
 		public bool Completed;
 
-		/// <summary>Авторские настройки сэмплера glTF - апгрейд создаёт текстуру, сэмплер уже
-		/// привязан к слоту как immutable и не меняется.</summary>
+		/// <summary>Authored glTF sampler settings; bound once as an immutable sampler.</summary>
 		public TextureAddress AddressMode;
 		public TextureFilter FilterMode;
 
-		/// <summary>Текущая GPU-текстура (шарится всеми привязками); null = слот ещё на 1x1-филлере.
-		/// Финальную освобождает <see cref="ModelLoader.Release"/>, промежуточные - стример
-		/// отложенной очередью.</summary>
+		/// <summary>Current GPU texture shared by all bindings; null = slot still on the 1x1 filler.</summary>
 		public IGpuTexture Texture;
 
 		public readonly List<(IMaterialObject Material, string Slot)> Bindings = new();
 
-		/// <summary>Запечённая .dtex этой текстуры (см. DecaEngine.Graphics.Assets.DtexFile) - источник
-		/// ступеней, когда модель пришла из кеша ассетов. Ступень здесь не декодируется вовсе: она
-		/// ЧИТАЕТСЯ хвостом мип-цепочки прямо с диска и уезжает в VRAM теми же байтами.</summary>
+		/// <summary>Baked .dtex source from the asset cache; the mip tail is read from disk as-is.</summary>
 		public string DtexPath;
 
-		/// <summary>Размеры нулевого уровня <see cref="DtexPath"/> - из cooked-модели, чтобы перевести
-		/// запрошенную сторону в номер мип-уровня без открытия файла.</summary>
+		/// <summary>Level-0 size of <see cref="DtexPath"/>, to pick a mip without opening the file.</summary>
 		public int DtexWidth;
 		public int DtexHeight;
 
-		/// <summary>Ступени этой текстуры блочно-сжатые - она занимает вчетверо меньше VRAM, чем
-		/// RGBA8 той же стороны. Отдельным полем от <see cref="DtexPath"/> именно потому, что путь
-		/// обнуляется по завершении стриминга (<see cref="ReleaseCpuData"/>), а учёт занятой памяти
-		/// живёт дальше - см. ModelStore.EstimateTextureBytes.</summary>
+		/// <summary>Levels are block-compressed; outlives <see cref="DtexPath"/> for memory accounting.</summary>
 		public bool IsBlockCompressed;
 	}
 
-	/// <summary>
-	/// Одна ступень качества стримимой текстуры - то, что фоновая задача подготовила, а заливка
-	/// отдаёт графическому API.
-	///
-	/// Два источника с общим интерфейсом: несжатые RGBA8-пиксели (декод PNG/JPG - путь без кеша
-	/// ассетов) и готовый хвост BC-цепочки из .dtex (путь с кешем). Различие не размазано по
-	/// стримеру: он оперирует ступенями, а чем ступень является внутри - знает только она сама.
-	/// </summary>
+	/// <summary>One quality step of a streamed texture, prepared in the background and handed to the graphics API.</summary>
 	public sealed class StreamedTextureLevel
 	{
-		/// <summary>Данные уровней: ровно один элемент для RGBA8 (мипы достроит GPU), хвост цепочки
-		/// от этой ступени и ниже - для блочно-сжатых (их GPU достроить не может).</summary>
+		/// <summary>One RGBA8 element (GPU builds mips) or the whole BC mip chain (GPU cannot).</summary>
 		public required byte[][] Mips { get; init; }
 
-		/// <summary>Формат блочно-сжатых данных; <see cref="TextureObjectFormat.Unknown"/> - RGBA8.</summary>
+		/// <summary>Block-compressed format; <see cref="TextureObjectFormat.Unknown"/> = RGBA8.</summary>
 		public required TextureObjectFormat Format { get; init; }
 
 		public required int Width { get; init; }
 		public required int Height { get; init; }
 
-		/// <summary>Бо́льшая сторона - ею стример меряет качество ступени.</summary>
+		/// <summary>Larger side — the streamer's quality metric.</summary>
 		public int Size => Math.Max(Width, Height);
 
 		public long ByteLength
@@ -317,86 +243,46 @@ public partial class ModelLoader
 			};
 	}
 
-	/// <summary>Что привязано в слот _MainTex материала - текстура, её (immutable) сэмплер и запись
-	/// стриминга, если текстура приезжает ступенями.
-	///
-	/// Существует ради ТЕНЕВОГО материала с альфа-тестом (см. ShadowRenderer.RegisterAlphaTestedMaterial):
-	/// теневой пасс - отдельный PSO со своим SRB, и чтобы вырезать листву по альфе, ему нужна ровно
-	/// та же текстура и тот же сэмплер, что и экранному материалу. Пересоздавать их для тени
-	/// значило бы удвоить память на каждую крону.</summary>
+	/// <summary>_MainTex binding shared with the alpha-tested shadow material.</summary>
 	public sealed class BaseColorBinding
 	{
 		public IGpuTexture Texture;
 		public ISamplerObject Sampler;
 
-		/// <summary>Запись стриминга (null - текстура загружена целиком): подписавшись на неё,
-		/// теневой материал получает те же ступени качества, что и экранный.</summary>
+		/// <summary>Streaming record; null when the texture loaded whole.</summary>
 		public StreamedTexture Stream;
 	}
 
-	/// <summary>Привязки _MainTex по ключу материала (тому же, что у <see cref="materialObjects"/> и
-	/// <see cref="MaterialPbr"/>). Материалы без базовой текстуры сюда не попадают.</summary>
+	/// <summary>_MainTex bindings keyed like <see cref="materialObjects"/>; untextured ones are absent.</summary>
 	public readonly Dictionary<int, BaseColorBinding> MaterialBaseColor = new();
 
-	/// <summary>Обобщение <see cref="MaterialBaseColor"/> на ВСЕ слоты (не только _MainTex): по ключу
-	/// материала (как у <see cref="materialObjects"/>/<see cref="MaterialPbr"/>) - словарь "имя слота
-	/// -&gt; привязка" для каждого слота, куда был привязан РЕАЛЬНЫЙ (не филлер) ресурс. Слоты, ушедшие
-	/// на филлер (нет текстуры в glTF), сюда не попадают - их состояние детерминированно выводится из
-	/// <see cref="MaterialPbr"/> (Has*Texture/TransmissionFactor).
-	///
-	/// Существует ради <see cref="BuildAdditionalMaterialSet"/>: второй (третий, ...) набор материалов
-	/// для ДРУГОГО окружения строится из уже загруженных GPU-текстур этой модели без повторной
-	/// декодировки/заливки - см. класс-комментарий у <see cref="DecaEngine.Editor.ECS.ModelStore"/> о
-	/// том, почему материалы (в отличие от текстур/мешей) НЕ шарятся между окружениями напрямую.</summary>
+	/// <summary>All real (non-filler) texture bindings per material slot, for reuse.</summary>
 	public readonly Dictionary<int, Dictionary<string, BaseColorBinding>> MaterialTextureBindings = new();
 
-	/// <summary>Общие 1x1-филлеры модели (белый и плоская нормаль) плюс их сэмплер - см. локальные
-	/// EnsureFallbackTextures/BindFallbackTexture/BindFlatNormalFallback в
-	/// <see cref="BuildFromPreparedIncremental"/>, которые их лениво создают и заполняют эти поля.
-	/// Освобождаются как обычные <see cref="_ownedTextures"/> в <see cref="Release"/>; хранятся здесь
-	/// отдельно только чтобы <see cref="BuildAdditionalMaterialSet"/> могло переиспользовать те же
-	/// объекты вместо создания собственных копий на каждое окружение.</summary>
+	// Shared 1x1 fillers, reused by BuildAdditionalMaterialSet; released via _ownedTextures.
 	internal IGpuTexture FallbackWhiteTexture;
 	internal ISamplerObject FallbackSampler;
 	internal IGpuTexture FallbackFlatNormalTexture;
 
-	/// <summary>Стримимые текстуры модели; пусто без <see cref="ModelLoadOptions.StreamTextures"/>.</summary>
+	/// <summary>Streamed textures; empty unless <see cref="ModelLoadOptions.StreamTextures"/>.</summary>
 	public readonly List<StreamedTexture> StreamedTextures = new();
 
-	/// <summary>Не-стримимые GPU-текстуры загрузки (полноразмерные + 1x1-филлеры): материалы текстур
-	/// не освобождают (см. DiligentMaterial.Release), владение и Release - здесь. Раньше они не
-	/// хранились нигде и утекали навсегда.</summary>
+	// Materials do not release textures (see DiligentMaterial.Release); ownership is here.
 	internal readonly List<IGpuTexture> _ownedTextures = new();
 
-	// Коды топологии меша (MaterialPbrFactors.Topology / PreparedMesh.Topology): точечные и
-	// линейные glTF-примитивы рисуются клоном материала с PSO соответствующей топологии.
+	// Mesh topology codes: point/line glTF primitives draw via a material clone with a matching PSO.
 	public const int MeshTopologyTriangles = 0;
 	public const int MeshTopologyLineList = 1;
 	public const int MeshTopologyLineStrip = 2;
 	public const int MeshTopologyPoints = 3;
 
-	/// <summary>Синтетический ключ материала-клона для не-треугольной топологии - не пересекается с
-	/// логическими индексами glTF-материалов (-1..N).</summary>
+	/// <summary>Material key for a topology clone; never collides with glTF indices (-1..N).</summary>
 	public static int MakeTopologyMaterialKey(int topology, int materialIndex) => 10000 * topology + materialIndex + 1;
 
-	/// <summary>
-	/// PBR metallic-roughness factors per material, keyed like <see cref="materialObjects"/> (glTF
-	/// logical material index, plus -1 for the built-in default material). Consumed by the editor's
-	/// Model Preview Lighting mode (see DecaEngine.Editor.ModelPreviewViewport / UnlitInstancedPS.hlsl
-	/// PreviewMode == 3) - the engine has no PBR scene shading yet, so nothing else reads these.
-	/// </summary>
+	/// <summary>PBR factors per material, keyed like <see cref="materialObjects"/>; -1 is the default.</summary>
 	public Dictionary<int, MaterialPbrFactors> MaterialPbr = new();
 
-	/// <summary>
-	/// ????????? ????? (world-space) AABB ???? ?????, ????????? bounding-????? (<see
-	/// cref="IMeshObject.Center"/>/<see cref="IMeshObject.Radius"/>, ??. <see
-	/// cref="MeshUtility.RecalculateBounds"/>) ??????? <see cref="InstanceData"/>, ??????????????????
-	/// ??? <see cref="Transform"/>. ?????? ????? ?????? ??????? ?? ?????????? ???????? (??????????
-	/// glTF-????/?????) - ??????? ???????????? bound ??????? ???? ?????????? ????????????, ?????
-	/// ?????????? bounds ???? ?????????/???????? ?????, ????? ????? ?????? ????? ???????? ??????
-	/// ?????? ??? ???????? ?????? ??????. ?????????? (Vector3.Zero, Vector3.Zero), ???? ? ????? ???
-	/// ?? ?????? ????????? ????????.
-	/// </summary>
+	/// <summary>Approximate world AABB from mesh bounding spheres; (Zero, Zero) when empty.</summary>
 	public (Vector3 min, Vector3 max) ComputeBounds()
 	{
 		var min = new Vector3(float.MaxValue);
@@ -413,19 +299,16 @@ public partial class ModelLoader
 			var mesh = Meshes[instance.meshId];
 			var t = instance.transform;
 
-			// ??????? ?????? ????????????????? ???????: Scale -> Rotate -> Translate
 			var matrix = Matrix4x4.CreateScale(t.scale.X, t.scale.Y, t.scale.Z) *
 						 Matrix4x4.CreateFromQuaternion(t.rotation) *
 						 Matrix4x4.CreateTranslation(t.position);
 
-			// ?????????????? ????????? ????? ? world-space
 			var worldCenter = Vector3.Transform(mesh.Center, matrix);
 
-			// ??? ??????? ?????????? ???????????? ????????? scale (?????????????? ??????)
+			// Conservative: scale the sphere radius by the largest axis scale.
 			var worldRadius = mesh.Radius * MathF.Max(MathF.Abs(t.scale.X),
 				MathF.Max(MathF.Abs(t.scale.Y), MathF.Abs(t.scale.Z)));
 
-			// ????????? - ?????????? ???????? ? NaN ??? Infinity ? bounds
 			if (float.IsNaN(worldCenter.X) || float.IsNaN(worldCenter.Y) || float.IsNaN(worldCenter.Z) ||
 			    float.IsNaN(worldRadius) || float.IsInfinity(worldCenter.X) || float.IsInfinity(worldCenter.Y) ||
 			    float.IsInfinity(worldCenter.Z) || float.IsInfinity(worldRadius) || worldRadius <= 0)
@@ -484,30 +367,14 @@ public partial class ModelLoader
 		}
 	}
 
-	/// <summary>
-	/// Path to a lightweight placeholder model bundled at EditorAssets/models/result.gltf, used when
-	/// no other model has been selected (the full Sponza.gltf scene this once stood in for isn't
-	/// shipped in this repo - large external asset).
-	/// </summary>
+	/// <summary>Lightweight placeholder model bundled with the editor, used when no model is selected.</summary>
 	public const string DefaultModelPath = "EditorAssets/models/result.gltf";
 
 	internal ModelLoader()
 	{
 	}
 
-	/// <summary>
-	/// Kicks off loading a .gltf/.glb file from <paramref name="modelPath"/> (absolute or relative to
-	/// <see cref="Environment.CurrentDirectory"/>) in the background: file I/O, glTF parsing, texture
-	/// decoding and mesh optimization/LOD generation (all pure-CPU work) run on a thread-pool thread via
-	/// <see cref="Task.Run(Action)"/>. GPU resource creation (shaders/materials/textures/meshes) cannot
-	/// safely happen off the main thread (Diligent's immediate device context isn't thread-safe - see
-	/// DiligentGraphicsApi.CreateTexture), so it's deferred to <see cref="ModelLoadRequest.FinalizeOnMainThread"/>,
-	/// which the caller must invoke from the same thread that owns <paramref name="graphicsApi"/> once
-	/// the request is ready. <paramref name="progress"/>, if given, receives 0..1 completion updates from
-	/// the background thread. Used both by the main editor scene (<see
-	/// cref="DecaEngine.Editor.EditorManager"/>) and <see cref="DecaEngine.Editor.ModelPreviewViewport"/>'s
-	/// lightweight Asset Browser preview.
-	/// </summary>
+	/// <summary>Starts the CPU-side load in the background; finalize on the graphics API's own thread.</summary>
 	public static ModelLoadRequest BeginLoadAsync(IGraphicsApi graphicsApi, string modelPath, ModelLoadOptions options,
 		IProgress<float> progress = null, CancellationToken cancellationToken = default)
 	{
@@ -526,12 +393,7 @@ public partial class ModelLoader
 		return new ModelLoadRequest(graphicsApi, modelPath, options, progress, cancellationToken);
 	}
 
-	/// <summary>
-	/// Synchronously loads and finalizes a model - equivalent to <see cref="BeginLoadAsync"/> followed by
-	/// blocking until ready and calling <see cref="ModelLoadRequest.FinalizeOnMainThread"/>. Blocks the
-	/// calling thread for the entire load; prefer <see cref="BeginLoadAsync"/> in the editor so the UI
-	/// stays responsive and a progress indicator can be shown.
-	/// </summary>
+	/// <summary>Synchronously loads and finalizes a model; blocks the calling thread for the whole load.</summary>
 	public static ModelLoader Load(IGraphicsApi graphicsApi, string modelPath, ModelLoadOptions options)
 	{
 		var request = BeginLoadAsync(graphicsApi, modelPath, options);
@@ -539,12 +401,7 @@ public partial class ModelLoader
 		return request.FinalizeOnMainThread();
 	}
 
-	/// <summary>
-	/// Handle to an in-flight background <see cref="ModelLoader"/> load (see <see cref="BeginLoadAsync"/>).
-	/// Poll <see cref="PrepareTask"/>/<see cref="Progress"/> from the render loop and, once the task
-	/// completes successfully, call <see cref="FinalizeOnMainThread"/> on the graphics thread to create
-	/// the actual GPU resources and obtain the ready <see cref="ModelLoader"/>.
-	/// </summary>
+	/// <summary>In-flight load: await <see cref="PrepareTask"/>, then finalize on the graphics thread.</summary>
 	public sealed class ModelLoadRequest
 	{
 		private readonly IGraphicsApi _graphicsApi;
@@ -557,8 +414,7 @@ public partial class ModelLoader
 
 		private PreparedModel _prepared;
 
-		// Состояние пошаговой финализации (см. FinalizeChunk): наполовину построенный ModelLoader и
-		// текущая позиция итератора BuildFromPreparedIncremental. Живёт между кадрами.
+		// Incremental finalization state (see FinalizeChunk); persists across frames.
 		private ModelLoader _finalizing;
 		private long _finalizeMs;
 		private IEnumerator<long> _finalizeSteps;
@@ -579,39 +435,19 @@ public partial class ModelLoader
 			PrepareTask = Task.Run(() =>
 			{
 				_prepared = ModelImporter.PrepareModel(modelPath, options, combinedProgress, cancellationToken);
-				// Прогрев шейдер-вариантов ЗДЕСЬ, в фоне - иначе они компилируются лениво из
-				// SetShader во время финализации, синхронно на GPU-потоке (см. PrecompileShaderVariants).
+				// Warm shader variants here in the background, not lazily on the GPU thread.
 				PrecompileShaderVariants(graphicsApi, options, _prepared, cancellationToken);
 			}, cancellationToken);
 		}
 
-		/// <summary>Дефолтный байтовый бюджет одного вызова <see cref="FinalizeChunk"/>. Подобран под
-		/// дефолтный dynamicHeapSize Diligent-а: страницы upload-хипа возвращаются в пул только на
-		/// FinishFrame (Present), поэтому бюджет кадра и определяет пиковый расход host-visible
-		/// памяти при загрузке (у Sponza одним махом выходило 2.5+ GB и «Space in dynamic heap is
-		/// almost exhausted» с принудительным idle GPU).</summary>
+		/// <summary>Upload-heap pages recycle only at Present, so this bounds host-visible memory.</summary>
 		public const long DefaultFinalizeBudgetBytes = 96L << 20;
 
-		/// <summary>
-		/// Creates the GPU resources (shaders/materials/textures/meshes) for a completed background load
-		/// and returns the ready <see cref="ModelLoader"/>. Must be called on the thread that owns the
-		/// <see cref="IGraphicsApi"/> passed to <see cref="BeginLoadAsync"/> (i.e. the main/render
-		/// thread), only after <see cref="PrepareTask"/> has completed successfully. Заливает ВСЮ
-		/// модель одним вызовом - в интерактивном рендер-лупе предпочитайте покадровый
-		/// <see cref="FinalizeChunk"/>, иначе upload-хип раздувается на весь размер модели.
-		/// </summary>
+		/// <summary>Finalizes the whole model in one blocking call on the graphics thread.</summary>
 		public ModelLoader FinalizeOnMainThread() => FinalizeChunk(long.MaxValue, long.MaxValue);
 
-		/// <summary>
-		/// Покадровая версия <see cref="FinalizeOnMainThread"/>: создаёт GPU-ресурсы, пока суммарная
-		/// оценка залитых байт не превысит <paramref name="budgetBytes"/>, и возвращает null - «зайди
-		/// на следующем кадре» (между вызовами обязан пройти Present, освобождающий страницы
-		/// upload-хипа). Когда всё создано - возвращает готовый <see cref="ModelLoader"/>. Те же
-		/// требования, что у FinalizeOnMainThread: главный поток, PrepareTask завершился успешно.
-		/// Внимание: бросить запрос между вызовами (не дойдя до результата) - значит утечь уже
-		/// созданными GPU-ресурсами: у ModelLoader нет Release, недостроенный экземпляр никому не
-		/// возвращается.
-		/// </summary>
+		/// <summary>Incremental finalize on the graphics thread, returning null until done; a Present
+		/// must pass between calls, and abandoning mid-way leaks the GPU resources made so far.</summary>
 		public ModelLoader FinalizeChunk(long budgetBytes = DefaultFinalizeBudgetBytes,
 			long budgetMs = FinalizeBudgetMs)
 		{
@@ -632,8 +468,6 @@ public partial class ModelLoader
 				_finalizeSteps = BuildFromPreparedIncremental(_graphicsApi, _options, _prepared, _finalizing);
 			}
 
-			// Финализация размазана по кадрам, поэтому её время копится по кусочкам - иначе цифра
-			// показывала бы длину последнего чанка, а не стоимость фазы.
 			var swFinalize = System.Diagnostics.Stopwatch.StartNew();
 
 			long uploadedBytes = 0;
@@ -654,20 +488,14 @@ public partial class ModelLoader
 					_finalizing = null;
 					_prepared = null;
 
-					// Кэш PSO - на диск ровно здесь: загрузка только что создала все конвейеры модели,
-					// а следующий запуск иначе скомпилирует их заново (см. IGraphicsApi.SavePipelineCache).
+					// Persist the PSO cache now that every pipeline of the model exists.
 					_graphicsApi.SavePipelineCache();
 					return ready;
 				}
 
 				uploadedBytes += _finalizeSteps.Current;
 
-				// Бюджет ВРЕМЕНИ, а не только байт. Байтовый бюджет считает ЗАЛИВКУ, а самое дорогое
-				// в финализации байт не заливает вовсе: компиляция вариантов пиксельного шейдера
-				// (секунда на вариант) и создание материалов. В режиме стриминга текстур оценка
-				// материала - жалкие 4 КБ, так что все 50+ материалов Sponza со всеми компиляциями
-				// проходили за ОДИН вызов, то есть за один кадр: окно редактора висело "Not
-				// Responding" на всё время загрузки.
+				// Time budget too: shader compilation uploads no bytes yet can cost ~1s per variant.
 				if (swFinalize.ElapsedMilliseconds >= budgetMs)
 				{
 					break;
@@ -679,10 +507,7 @@ public partial class ModelLoader
 			return null;
 		}
 
-		/// <summary>Сколько миллисекунд одному вызову <see cref="FinalizeChunk"/> позволено занимать
-		/// поток рендера. Один шаг итератора прервать нельзя (компиляция шейдера идёт целиком), так
-		/// что реальный кадр может выйти длиннее - но следующий шаг уже уедет в следующий кадр, и UI
-		/// остаётся живым.</summary>
+		/// <summary>Per-call render-thread time budget; one iterator step is uninterruptible, so a frame may overrun.</summary>
 		public const long FinalizeBudgetMs = 8;
 
 		private sealed class ProgressTracker

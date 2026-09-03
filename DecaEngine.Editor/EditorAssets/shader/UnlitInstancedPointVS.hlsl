@@ -1,8 +1,6 @@
-// Копия UnlitInstancedVS.hlsl для материалов с ТОЧЕЧНОЙ топологией (glTF mode POINTS, см.
-// ModelLoader.MeshTopologyPoints): Vulkan требует, чтобы VS пайплайна с POINT_LIST писал
-// builtin PointSize (VUID-VkGraphicsPipelineCreateInfo-topology-08773) - обычный VS его не
-// пишет, и такой PSO отбраковывается валидацией. Держать PSIZE в общем VS нельзя по той же
-// причине наоборот: у не-точечных топологий он запрещён/бессмыслен.
+// Copy of UnlitInstancedVS.hlsl for POINT-topology materials (glTF mode POINTS): Vulkan
+// requires a POINT_LIST pipeline's VS to write builtin PointSize (VUID-08773), and PSIZE
+// cannot live in the shared VS because non-point topologies forbid it.
 #include "Instancing.hlsl"
 
 StructuredBuffer<GPURenderInstance> GPURenderInstances;
@@ -18,7 +16,7 @@ struct VSInput
     float2 uv           : ATTRIB1;
     float3 normal       : ATTRIB2;
     int instanceId      : ATTRIB3;
-    // xyz = тангент, w = знак битангента (см. ModelLoader.Vertex.Tangent).
+    // xyz = tangent, w = bitangent sign (see ModelLoader.Vertex.Tangent).
     float4 tangent      : ATTRIB4;
     float4 color        : ATTRIB5;
     float2 uv1          : ATTRIB6;
@@ -33,8 +31,8 @@ struct PSInput
     float4 tangent     : TEXCOORD2;
     float4 vertexColor : COLOR0;
     float2 uv1         : TEXCOORD3;
-    // Атрибут обязателен на Vulkan (builtin PointSize, VUID-08773), но FXC на D3D не знает
-    // синтаксиса [[...]] (error X3000) - там PSIZE просто игнорируется (точки всегда 1px).
+    // Required on Vulkan (builtin PointSize, VUID-08773); FXC rejects [[...]] syntax
+    // (error X3000), so on D3D PSIZE is simply ignored (points are always 1px).
 #if DECA_VULKAN
     [[vk::builtin("PointSize")]]
 #endif
@@ -57,8 +55,7 @@ PSInput Main(in VSInput input)
     result.vertexColor = input.color;
     result.uv1 = input.uv1;
 
-    // Достаточно крупные точки, чтобы «крапчатые» сферы точечных примитивов читались в превью
-    // (1px на 512+ таргете почти невидим).
+    // Points large enough to read in previews (1px is nearly invisible on 512+ targets).
     result.pointSize = 3.0;
 
     return result;

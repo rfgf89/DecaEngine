@@ -19,23 +19,12 @@ public class RenderResourceManager
 
 	private BatchSubset _renderSubset;
 
-	// Верхняя граница ЗАНЯТЫХ слотов (максимальный выданный индекс + 1), а не их количество.
-	// Слоты выдаются из стека свободных, поэтому занятые индексы РАЗРЕЖЕНЫ: после освобождения
-	// пачки слотов стек отдаёт их в обратном порядке, и следующая, более мелкая пачка инстансов
-	// садится в ХВОСТ диапазона (например слоты 8..9 при 10 освобождённых). Culling-шейдер
-	// (BatchingInstancingCS) обходит Instances[0..drawCount) и пропускает дырки по batchId/objectId
-	// < 0, так что drawCount - это граница ИНДЕКСА. Если подставить туда количество занятых слотов
-	// (totalInstances - totalFreeSlot), шейдер обойдёт только начало массива, где после churn-а
-	// лежат одни дырки, и не нарисует ничего - именно так пропадали превью сабмешей в
-	// AssetBrowser/Inspector после бейка целой модели (см. ModelIconBaker.CreateStageEntities).
+	// Highest occupied slot INDEX + 1, not the occupied count: slots are sparse after churn,
+	// and the culling shader (BatchingInstancingCS) walks Instances[0..drawCount) skipping
+	// holes by batchId/objectId < 0, so drawCount must be an index bound.
 	private int _slotHighWaterMark;
 
-	/// <summary>
-	/// Сколько первых слотов массива инстансов должен обойти culling-шейдер - см.
-	/// <see cref="_slotHighWaterMark"/>. Подставляется в CullData.drawCount
-	/// (<see cref="CullingAndRenderSystem"/> и упрощённый SimpleCullingAndRenderSystem,
-	/// оставшийся на стороне редактора вместе с настройками теней превью).
-	/// </summary>
+	/// <summary>Instance-array bound the culling shader must walk; goes into CullData.drawCount.</summary>
 	public int DrawInstanceCount => _slotHighWaterMark;
 
 	public RenderResourceManager(int totalInstances, int totalBatch, EntityStore store,
@@ -69,15 +58,9 @@ public class RenderResourceManager
 			_freeSlots.Push(totalInstances - 1 - i);
 		}
 
-		// Подстраховка от утечки GPU-слотов: если сущность с BatchRenderInfo удаляют напрямую
-		// (Entity.DeleteEntity), минуя UnregisterRenderable (например InspectorWindow при удалении
-		// объекта из иерархии), её слот раньше никогда не возвращался в _freeSlots - разрежение
-		// росло безвозвратно, а верхняя граница диспатча (_slotHighWaterMark) не опускалась.
-		// OnEntityDelete стреляет ДО фактического удаления (сущность ещё жива и с компонентами -
-		// см. документацию Friflo), так что можно прочитать GpuSlotIndex и освободить слот тем же
-		// путём, что и UnregisterRenderable. Для сущностей, уже отцепленных через
-		// UnregisterRenderable (обычный протокол вьюпортов/стримера), TryGetComponent тут вернёт
-		// false - двойного освобождения нет.
+		// Reclaims GPU slots when an entity with BatchRenderInfo is deleted directly, bypassing
+		// UnregisterRenderable. OnEntityDelete fires BEFORE deletion (components still readable,
+		// per Friflo docs); already-unregistered entities fail TryGetComponent, so no double free.
 		_store.OnEntityDelete += OnEntityDeleting;
 	}
 
@@ -89,10 +72,7 @@ public class RenderResourceManager
 		}
 	}
 
-	/// <summary>Поджимает верхнюю границу диспатча (<see cref="_slotHighWaterMark"/>) под фактически
-	/// занятые слоты, схлопывая освободившийся хвост. Вызывается сама из <see cref="FreeSlot"/> при
-	/// каждом освобождении слота, так что отдельный вызов обычно не нужен - метод публичный и
-	/// идемпотентный на случай, если слоты когда-нибудь освободятся в обход FreeSlot.</summary>
+	/// <summary>Shrinks the dispatch bound over the freed tail; idempotent, called from FreeSlot.</summary>
 	public void RecycleDeadHandles()
 	{
 		while (_slotHighWaterMark > 0 && _renderSubset.instances[_slotHighWaterMark - 1].batchId.batchId < 0)
@@ -101,12 +81,8 @@ public class RenderResourceManager
 		}
 	}
 
-	/// <summary>Общий путь освобождения одного GPU-слота инстанса: возвращает индекс в
-	/// <see cref="_freeSlots"/>, гасит запись в <see cref="_renderSubset"/> (иначе куллинг-шейдер
-	/// продолжил бы читать чужой/устаревший инстанс по этому индексу), откатывает
-	/// префикс-суммы <see cref="_batchCounts"/>/countData и поджимает хвост диспатча. Используется
-	/// и из <see cref="UnregisterRenderable"/> (явное снятие), и из <see cref="OnEntityDeleting"/>
-	/// (сущность удалена напрямую, в обход UnregisterRenderable).</summary>
+	// Single release path for one GPU instance slot; the instance record must be reset here,
+	// otherwise the culling shader keeps reading a stale instance at that index.
 	private unsafe void FreeSlot(int slotIndex, BatchId batchId)
 	{
 		_freeSlots.Push(slotIndex);
@@ -203,13 +179,9 @@ public class RenderResourceManager
 				_renderSubset.countData.Dispose();
 			}
 
-			// countData - префикс-сумма (стартовый слот инстансов батча i = число инстансов у
-			// батчей с id < i). НОВЫЕ хвостовые записи обязаны стартовать с текущей суммарной
-			// заселённости, а не с нуля: нулевой хвост означал бы, что батчи с id >= старой
-			// ёмкости получают офсеты, НАЛОЖЕННЫЕ на диапазоны первых батчей - куллинг-шейдер
-			// писал бы их инстансы поверх чужих, а индирект-дроу читал бы чужие слоты (виден был
-			// бы случайный поднабор сцены; вылезло на PrimitiveModeNormalsTest - 25 батчей при
-			// стартовой ёмкости 16, см. ModelViewportEnvironment).
+			// countData is a prefix sum (start slot of batch i = instance count of batches < i).
+			// New tail entries must start at the current total, not zero, or new batches would
+			// get offsets overlapping the first batches' ranges.
 			int registeredTotal = 0;
 			for (int i = 0; i < oldBatchCountsLength; i++)
 			{

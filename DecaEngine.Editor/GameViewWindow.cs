@@ -12,10 +12,7 @@ namespace DecaEngine.Editor
 		private static readonly Vector2 ToolbarButtonSizeBase = new(48f, 22f);
 		private const float ToolbarSpacingBase = 6f;
 
-		// Единая палитра стиля подсказок (DrawStateOverlay), которой также следуют кнопки тулбара GameView.
-		// Фон оверлея/тулбара выводится из EditorPalette.Background (а не захардкожен), чтобы тема из
-		// Preferences → Appearance применялась и здесь. Play/Pause/Stop - семантические цвета состояния
-		// (зелёный/жёлтый/красный), намеренно не привязаны к теме - как и цвета уровней лога в ConsoleWindow.
+		// Play/Pause/Stop stay semantic colors on purpose: they do not follow the editor theme.
 		private static Vector4 OverlayBackground => EditorPalette.WithAlpha(EditorPalette.Darken(EditorPalette.Background, 0.02f), 0.78f);
 		private static readonly Vector4 PlayAccent = new(0.35f, 0.85f, 0.45f, 1f);
 		private static readonly Vector4 PauseAccent = new(1f, 0.75f, 0.2f, 1f);
@@ -43,13 +40,9 @@ namespace DecaEngine.Editor
 			Play
 		}
 
-		// Кадр ImGui, на котором ЛЮБАЯ из Game View последний раз была в фокусе (окон может быть
-		// несколько). Пишется при отрисовке, читается системой полётной камеры - см. IsAnyFocused.
 		private static int _lastFocusedImGuiFrame = int.MinValue;
 
-		/// <summary>Активна ли сейчас какая-нибудь Game View. Ввод у полётной камеры читается в обход
-		/// ImGui и ДО его отрисовки (см. EditorManager.OnUpdate: Root.Update идёт раньше RenderWindows),
-		/// поэтому засчитываем и предыдущий кадр - иначе камера дёргалась бы через кадр.</summary>
+		/// <summary>Any Game View focused; last frame counts, fly camera reads input before ImGui draws.</summary>
 		public static bool IsAnyFocused => ImGui.GetFrameCount() - _lastFocusedImGuiFrame <= 1;
 
 		protected override void OnRender(uint dockId)

@@ -7,19 +7,11 @@ using DecaEngine.Graphics.Diligent;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Контур выделенного объекта Scene View ОТДЕЛЬНЫМ пассом в конце кадра (см.
-/// <see cref="GraphicsPipelineSimple.PostOverlay"/>): силуэт выделения рисуется в собственный
-/// mask-таргет (SelectionMaskVS/PS), затем фуллскрин-композит (SelectionOutlinePS) обводит край
-/// маски оранжевым поверх готового ColorTarget. Блендинга в PSO движка нет, поэтому композит
-/// читает копию кадра (CopyTexture в scratch) и переписывает таргет целиком.
-///
-/// Геометрия выделения приходит УЖЕ в мировом пространстве - вершинный буфер перезапекается CPU
-/// при смене выделения/трансформа (см. PrefabSceneViewport.SyncSelectionHighlight): ни матриц
-/// инстансов, ни инстансинга, один DrawIndexed на весь силуэт. Команды пасса заморожены вместе с
-/// графом - изменение ЧИСЛА индексов или пересоздание буферов требует InvalidateGraph (см.
-/// <see cref="UpdateGeometry"/>), обновление содержимого на месте - нет.
-/// </summary>
+/// <summary>Scene View selection outline, drawn as a separate pass at end of frame.</summary>
+// Engine PSOs have no blending, so the composite reads a copy of the frame and rewrites
+// the target whole. Geometry arrives in WORLD space, rebaked on CPU when the selection
+// changes. Pass commands are frozen with the graph: changing the index COUNT or
+// recreating buffers requires InvalidateGraph, updating contents in place does not.
 public sealed class SelectionOutlineOverlay : IDisposable
 {
 	private readonly DiligentGraphicsApi _dilApi;
@@ -53,8 +45,7 @@ public sealed class SelectionOutlineOverlay : IDisposable
 			format = TextureObjectFormat.R8G8B8A8UNorm,
 		});
 
-		// Копия готового кадра под композит: формат обязан совпадать с ColorTarget (CopyTexture
-		// не конвертирует) - ColorTarget всегда отображаемый RGBA8 (см. PipelineRenderTargets).
+		// Format must match ColorTarget exactly: CopyTexture does not convert.
 		_sceneScratch = api.CreateRenderTarget(new TextureInfo
 		{
 			name = "Prefab Selection Scene Copy",
@@ -74,8 +65,7 @@ public sealed class SelectionOutlineOverlay : IDisposable
 			RenderTargetFormats = [TextureObjectFormat.R8G8B8A8UNorm],
 			DepthStencilFormat = TextureObjectFormat.Unknown,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
-			// Силуэту нужна вся геометрия независимо от обхода; депта нет - контур виден и сквозь
-			// прочие объекты (как в большинстве редакторов).
+			// No culling and no depth: the silhouette must show through other objects.
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
 			DepthStencilState = new DepthStencilStateInfo { DepthEnable = false },
 			InputLayout =
@@ -112,12 +102,7 @@ public sealed class SelectionOutlineOverlay : IDisposable
 
 	public bool HasGeometry => _indexCount > 0;
 
-	/// <summary>
-	/// Заливает мировую геометрию выделения в GPU-буферы. Возвращает true, если замороженные
-	/// команды пасса устарели (пересозданы буферы или изменилось число индексов) - вызывающий
-	/// обязан позвать InvalidateGraph. Пересоздание буферов само ждёт GPU (Flush + WaitForIdle):
-	/// старые могли читаться ещё находящимся в полёте кадром.
-	/// </summary>
+	/// <summary>Uploads world-space selection geometry; true means call InvalidateGraph.</summary>
 	public bool UpdateGeometry(List<Vector3> positions, List<uint> indices)
 	{
 		bool commandsDirty = false;
@@ -156,21 +141,17 @@ public sealed class SelectionOutlineOverlay : IDisposable
 
 		if (positions.Count > 0)
 		{
-			// Страховка перед заливкой. Буферы выше растут под размер данных, поэтому выход за
-			// границы означает не «не хватило места», а рассогласование состояния - например
-			// провалившееся создание буфера, оставившее обёртку с пустым нативным объектом.
-			// Заливка мимо буфера даёт не искажённую обводку, а 0xC0000005 внутри UpdateBuffer,
-			// причём на D3D12 сразу, а на Vulkan - когда повезёт; отлаживать это по стеку падения
-			// бесполезно, потому что виновник в нём не виден.
+			// Guard the upload: an overrun here means inconsistent state, not a small buffer,
+			// and writing past a buffer is an access violation inside UpdateBuffer.
 			var vertexBuffer = ((DiligentBufferHandle)_vertexBuffer!).Buffer;
 			var indexBuffer = ((DiligentBufferHandle)_indexBuffer!).Buffer;
 
 			if (vertexBuffer == null || indexBuffer == null ||
 				positions.Count > _vertexCapacity || indices.Count > _indexCapacity)
 			{
-				Console.WriteLine($"[selection] обводка НЕ залита: вершин {positions.Count}/{_vertexCapacity}, " +
-					$"индексов {indices.Count}/{_indexCapacity}, " +
-					$"буферы {(vertexBuffer == null ? "VB=null " : "")}{(indexBuffer == null ? "IB=null" : "")}");
+				Console.WriteLine($"[selection] outline NOT uploaded: vertices {positions.Count}/{_vertexCapacity}, " +
+					$"indices {indices.Count}/{_indexCapacity}, " +
+					$"buffers {(vertexBuffer == null ? "VB=null " : "")}{(indexBuffer == null ? "IB=null" : "")}");
 
 				_indexCount = 0;
 				return true;
@@ -187,8 +168,7 @@ public sealed class SelectionOutlineOverlay : IDisposable
 		return commandsDirty;
 	}
 
-	/// <summary>Тело пасса - хук <see cref="GraphicsPipelineSimple.PostOverlay"/>: маска силуэта,
-	/// копия кадра, композит контура в ColorTarget.</summary>
+	/// <summary>Pass body: silhouette mask, frame copy, outline composite into ColorTarget.</summary>
 	public void Draw(ICommandBuffer cmd)
 	{
 		if (_indexCount == 0 || _vertexBuffer == null || _indexBuffer == null)
@@ -218,9 +198,8 @@ public sealed class SelectionOutlineOverlay : IDisposable
 		cmd.Draw(3);
 	}
 
-	/// <summary>Ресайз таргетов оверлея вместе с остальными таргетами вьюпорта - звать из
-	/// PrefabSceneViewport.ResizeTargets, ПОСЛЕ его GPU-барьера. Resize пересоздаёт нативные
-	/// текстуры - SRB композита обязан перепривязаться (см. ModelPreviewViewport.ResizeTargets).</summary>
+	/// <summary>Resizes the overlay targets; call after the viewport's GPU barrier, since Resize
+	/// recreates the native textures and the composite SRB must be rebound.</summary>
 	public void Resize(Vector2 newSize)
 	{
 		_maskTarget.Resize(newSize);

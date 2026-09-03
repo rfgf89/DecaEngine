@@ -3,13 +3,7 @@ using System.IO.Compression;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Минимальный PNG-энкодер (8-bit RGBA, без интерлейса) для сохранения превью-иконок ассетов
-/// (см. <see cref="ModelIconBaker"/>). Свой, а не библиотечный, потому что StbImageSharp
-/// (уже в зависимостях) умеет только декодировать - а тянуть отдельный пакет ради записи
-/// маленьких 128x128 иконок не хочется. Сжатие - стандартный zlib через
-/// <see cref="ZLibStream"/> (PNG IDAT - это ровно zlib-поток отфильтрованных строк).
-/// </summary>
+/// <summary>Minimal PNG encoder (8-bit RGBA, no interlace); hand-rolled because StbImageSharp only decodes.</summary>
 public static class PngWriter
 {
 	private static readonly uint[] CrcTable = BuildCrcTable();
@@ -32,7 +26,7 @@ public static class PngWriter
 		ihdr[12] = 0;
 		WriteChunk(stream, "IHDR", ihdr.ToArray());
 
-		// IDAT: zlib-поток строк, каждая строка предваряется байтом фильтра 0 (None).
+		// IDAT: zlib stream of rows, each prefixed with filter byte 0 (None).
 		var rowBytes = width * 4;
 		using (var idatBuffer = new MemoryStream())
 		{

@@ -1,28 +1,13 @@
-// Главный пасс GTAO (Ground Truth Ambient Occlusion, Jimenez et al. 2016) в редакции XeGTAO
-// (Intel, Strugar/Mccalla). Вместо счёта заслоняющих тапов, как в SsaoCommon.hlsl, по каждому из
-// нескольких экранных срезов (slice) ищутся углы горизонта и аналитически интегрируется
-// косинус-взвешенная видимость полусферы - отсюда более «физичное» затемнение без характерного
-// для SSAO серого налёта на плоских поверхностях. Альтернатива SsaoCommon.hlsl, выбирается
-// настройкой AO technique (см. AmbientOcclusionMode / SsaoPassResources).
-//
-// Пасс - ВТОРОЕ звено конвейера из трёх, и сам по себе не рисуется:
-//   1. GtaoDepthPrefilterCommon.hlsl + GtaoDepthMipPS.hlsl - линейная глубина и её мип-цепочка;
-//   2. этот пасс - оценка видимости плюс «рёбра» для денойзера, обе величины в один RGBA8-таргет;
-//   3. GtaoDenoisePS.hlsl - краесохраняющая фильтрация результата.
-// Глубину пасс читает ТОЛЬКО из цепочки (_AoDepth0.._AoDepth4), а не из депт-буфера: выбор мипа
-// по дальности сэмпла - штатная часть алгоритма, а не оптимизация, см. GtaoDepthMipPS.hlsl. Как
-// следствие MSAA этого пасса вообще не касается - мультисемпловый депт видит только префильтр.
-//
-// Реконструкция позиции и масштаб-инвариантность - те же, что в SsaoCommon.hlsl: infinite
-// reversed-Z, фиксированный FOV 45 (см. ModelViewportEnvironment).
+// GTAO main pass, XeGTAO variant; alternative to SsaoCommon.hlsl (see AmbientOcclusionMode).
+// Stage 2 of 3: GtaoDepthPrefilter/GtaoDepthMipPS -> this pass -> GtaoDenoisePS.
+// Depth is read only from the prefiltered chain, so MSAA never reaches this pass.
+// Infinite reversed-Z, fixed 45 degree FOV (see ModelViewportEnvironment).
 #include "Instancing.hlsl"
 #include "GtaoShared.hlsl"
 
-// Цепочка линейных вью-спейсных глубин: [0] - полное разрешение, дальше каждый вдвое меньше.
-// Отдельными текстурами, а не мипами одной: IRenderTarget движка не умеет рисовать в конкретный
-// мип-уровень (см. IGraphicsApi.CreateRenderTarget), поэтому уровень выбирается ветвлением, а не
-// параметром SampleLevel. Сэмплеры ТОЧЕЧНЫЕ: билинейная фильтрация смешала бы соседние глубины
-// внутри уровня и наврала бы по наклону поверхности.
+// Linear view-space depth chain, [0] full res; separate textures, not mips, because
+// IRenderTarget cannot render into a specific mip level (see IGraphicsApi.CreateRenderTarget).
+// Point samplers: bilinear would blend neighbouring depths and skew the surface slope.
 Texture2D _AoDepth0;
 SamplerState _AoDepth0_sampler;
 Texture2D _AoDepth1;
@@ -39,14 +24,9 @@ cbuffer View
     ViewData viewData;
 }
 
-// Мировой радиус влияния AO: доля габаритного радиуса модели, пушится после её кадрирования
-// (см. ModelPreviewViewport.FrameAll -> SsaoPassResources.SetWorldRange). С ним контактная тень
-// не схлопывается при приближении камеры; 0 = легаси (радиус в долях экрана, см.
-// GtaoEffectRadius). Плюс живые ручки окна Graphics: контраст видимости и её нижний предел.
-//
-// Паддинг тремя скалярами, НЕ float3: float3 по смещению 4 нарушает 16-байтное выравнивание
-// std140/SPIR-V - легализация шейдера на Vulkan падала ("Failed to legalize SPIR-V shader"),
-// и AO-пасс работал как undefined behavior. Зеркалит AoConstantsData (SsaoPass.cs).
+// aoWorldRange in world units, 0 = legacy screen-fraction radius (see GtaoEffectRadius).
+// Padded with scalars, not float3: float3 at offset 4 breaks std140/SPIR-V alignment and
+// Vulkan fails to legalize the shader. Mirrors AoConstantsData (SsaoPass.cs).
 cbuffer AoConstants
 {
     float aoWorldRange;
@@ -55,9 +35,7 @@ cbuffer AoConstants
     float aoConstantsPad2;
 }
 
-// Качество: срезов больше канонических трёх (XeGTAO High), потому что здесь нет TAA - временного
-// накопления, за счёт которого XeGTAO обходится тремя. Шагов на срез - три, как в High: их число
-// влияет в первую очередь на дальние окклюдеры, которые всё равно читаются из грубых мипов.
+// More slices than XeGTAO High (3): there is no TAA here to accumulate them over time.
 static const int SliceCount = 5;
 static const int StepsPerSlice = 3;
 
@@ -72,14 +50,11 @@ struct PSOutput
     float4 color : SV_TARGET;
 };
 
-/// Индекс пикселя на кривой Гильберта 64x64. Основа пространственного шума: R2-последовательность,
-// прогнанная вдоль кривой Гильберта, раскладывает направления срезов так, что СОСЕДНИЕ пиксели
-// получают максимально непохожие ориентации, но любая небольшая окрестность покрывает весь набор
-// равномерно. Именно на это рассчитан краесохраняющий денойзер (GtaoDenoisePS.hlsl): он усредняет
-// 3x3, и белый хеш-шум, в отличие от этого, оставляет в такой окрестности случайные сгустки.
+// Pixel index on a 64x64 Hilbert curve: makes every 3x3 neighbourhood cover the whole
+// slice-direction set evenly, which is what the 3x3 denoiser assumes (white noise clumps).
 uint GtaoHilbertIndex(uint2 pos)
 {
-    // Кривая периодична с шагом 64, а разворот ниже (63 - pos) верен только внутри одного периода.
+    // The curve has period 64; the (63 - pos) flip below is valid only within one period.
     pos &= 63;
 
     uint index = 0;
@@ -106,13 +81,12 @@ uint GtaoHilbertIndex(uint2 pos)
     return index;
 }
 
-/// Пара шумов на пиксель: x крутит ориентацию срезов, y - положение шагов вдоль среза.
+// Per-pixel noise pair: x rotates the slice orientation, y jitters steps along the slice.
 float2 GtaoSpatialNoise(uint2 pixel)
 {
     uint index = GtaoHilbertIndex(pixel);
 
-    // R2 - двумерная низкодискрепансная последовательность (Roberts): сдвиги по золотым сечениям
-    // высшего порядка. Она и раскладывает индекс кривой в две «равномерно перемешанные» доли.
+    // R2 low-discrepancy sequence (Roberts): higher-order golden-ratio shifts.
     return frac(0.5 + index * float2(0.75487766624669276005, 0.5698402909980532659114));
 }
 
@@ -122,8 +96,7 @@ float LoadViewDepth(int2 pixel, float2 viewportSize)
     return _AoDepth0.Load(int3(pixel, 0)).r;
 }
 
-/// Глубина на выбранном уровне цепочки. Уровень - целый: SampleLevel по одной мип-цепочке здесь
-// недоступен (уровни живут в разных текстурах), а точечный сэмплер и так отбросил бы дробную часть.
+// Integer chain level only: the levels live in separate textures, so SampleLevel cannot pick.
 float SampleDepthMip(float2 uv, int mip)
 {
     if (mip <= 0)
@@ -171,10 +144,7 @@ PSOutput Main(in VSOutput input)
     int2 pixel = int2(input.pos.xy);
     float2 centerUV = (pixel + 0.5) * invViewportSize;
 
-    // Рёбра считаются ВСЕГДА, включая фон: денойзер читает их безусловно, и «дыра» на фоне
-    // означала бы нулевые веса у его соседей на силуэте. На фоне глубина упирается в потолок,
-    // разницы с соседями относительно неё ничтожны, и все четыре ребра выходят единицами - то
-    // есть фон свободно смешивается сам с собой и никуда не течёт.
+    // Edges are computed for background pixels too: the denoiser reads them unconditionally.
     float viewspaceZ = LoadViewDepth(pixel, viewportSize);
     float leftZ = LoadViewDepth(pixel + int2(-1, 0), viewportSize);
     float rightZ = LoadViewDepth(pixel + int2(1, 0), viewportSize);
@@ -184,18 +154,15 @@ PSOutput Main(in VSOutput input)
     float4 edgesLRTB = GtaoCalculateEdges(viewspaceZ, leftZ, rightZ, topZ, bottomZ);
     float packedEdges = GtaoPackEdges(edgesLRTB);
 
-    // Фон не затеняется. Видимость пакуется поделённой на GtaoOcclusionTermScale - ровно как всё
-    // остальное, что пишет этот пасс, иначе денойзер домножил бы фон до 1.5.
+    // Background is unoccluded, but still packed divided by GtaoOcclusionTermScale.
     if (viewspaceZ >= GtaoMaxViewDepth * 0.99)
     {
         output.color = float4(1.0 / GtaoOcclusionTermScale, packedEdges, 0.0, 1.0);
         return output;
     }
 
-    // Нормаль по схеме XeGTAO (XeGTAO_CalculateNormal): четыре крест-произведения соседей,
-    // взвешенные теми же рёбрами. Вариант с одной парой производных по минимальной z-разнице на
-    // скользящих поверхностях (уходящий вдаль пол) заметно врал по наклону: горизонт считался
-    // относительно неверной касательной плоскости, и пол затенял сам себя.
+    // Normal from four edge-weighted neighbour cross products (XeGTAO_CalculateNormal):
+    // a single derivative pair skews the slope on grazing surfaces and self-shadows them.
     float3 center = ViewPosFromUV(centerUV, viewspaceZ, aspect);
     float3 posL = ViewPosAt(pixel + int2(-1, 0), viewportSize, aspect);
     float3 posR = ViewPosAt(pixel + int2(1, 0), viewportSize, aspect);
@@ -222,22 +189,18 @@ PSOutput Main(in VSOutput input)
         viewspaceNormal = -viewspaceNormal;
     }
 
-    // Центральная точка чуть придвигается к камере (XeGTAO: "Move center pixel slightly towards
-    // camera to avoid imprecision artifacts due to depth buffer imprecision"). Без этого соседние
-    // тапы ТОЙ ЖЕ плоскости из-за квантования глубины оказываются на волосок ВЫШЕ центра,
-    // поднимают горизонт над касательной плоскостью - и ровная поверхность затеняет сама себя.
-    // Множитель - под half-цепочку глубин (XE_GTAO_FP32_DEPTHS выключен).
+    // Nudge the center toward the camera: depth quantization otherwise lifts same-plane taps
+    // above the tangent plane and flat surfaces shadow themselves.
+    // Factor is tuned for the half-precision depth chain (XE_GTAO_FP32_DEPTHS off).
     viewspaceZ *= 0.99920;
 
     float3 pixCenterPos = ViewPosFromUV(centerUV, viewspaceZ, aspect);
 
-    // Вектор к камере: камера в начале координат вью-спейса, +z вглубь экрана.
+    // Camera sits at the view-space origin, +z points into the screen.
     float3 viewVec = normalize(-pixCenterPos);
 
-    // Заваливаем нормали, смотрящие ОТ камеры, обратно в видимую полусферу. В XeGTAO эта строка
-    // есть, но закомментирована - там нормаль приходит из G-буфера и такого не бывает по
-    // построению. У нас она реконструируется из глубины, и на скользящих ракурсах крест-произведения
-    // соседей дают вектор, глядящий за поверхность.
+    // Normals reconstructed from depth can face away at grazing angles (XeGTAO takes them
+    // from the G-buffer and has this disabled); pull them back into the visible hemisphere.
     viewspaceNormal = normalize(viewspaceNormal + max(0.0, -dot(viewspaceNormal, viewVec)) * viewVec);
 
     float NdotV = saturate(dot(viewspaceNormal, viewVec));
@@ -247,21 +210,16 @@ PSOutput Main(in VSOutput input)
     float falloffRange = max(GtaoFalloffRange * effectRadius, 1e-6);
     float falloffFrom = effectRadius * (1.0 - GtaoFalloffRange);
 
-    // Предвычисленный falloff: вес = 1 до falloffFrom и линейно к нулю на самом радиусе. Схема
-    // XeGTAO; прежнее saturate(1 - dist/range) начинало гасить сэмплы сразу от точки, то есть
-    // занижало вклад ближних окклюдеров - тех самых, что дают контактное затемнение.
+    // XeGTAO falloff: weight is 1 up to falloffFrom, then linear to 0 at the radius.
     float falloffMul = -1.0 / falloffRange;
     float falloffAdd = falloffFrom / falloffRange + 1.0;
 
     float screenspaceRadius = max(effectRadius / pixelWorldSize, 1e-3);
 
-    // Затухание эффекта на крошечных экранных радиусах (дальний план, сильное отдаление): там
-    // сэмплы всё равно попадают в те же один-два текселя, и «оценка» вырождается в шум - лучше
-    // честно отдать половину видимости, чем мерцающий мусор.
+    // Fade out at tiny screen radii: all samples land in the same texel and yield only noise.
     float visibility = saturate((10.0 - screenspaceRadius) / 100.0) * 0.5;
 
-    // Минимальный отступ шага: тап вплотную к центру не несёт полезной информации, зато исправно
-    // ловит квантование глубины и поднимает горизонт на ровной поверхности.
+    // Minimum step offset: taps next to the center carry only depth quantization noise.
     float minS = GtaoPixelTooCloseThreshold / screenspaceRadius;
 
     float2 noise = GtaoSpatialNoise(uint2(pixel));
@@ -269,8 +227,7 @@ PSOutput Main(in VSOutput input)
     [loop]
     for (int slice = 0; slice < SliceCount; slice++)
     {
-        // Срез: плоскость, натянутая на viewVec и экранное направление omega. Пиксельный y растёт
-        // вниз, вью-спейсный - вверх, отсюда минус у sinPhi в экранном направлении.
+        // Pixel y grows down, view-space y grows up: hence the minus on the screen-space sinPhi.
         float sliceK = (slice + noise.x) / SliceCount;
         float phi = sliceK * GtaoPI;
         float cosPhi = cos(phi);
@@ -280,7 +237,7 @@ PSOutput Main(in VSOutput input)
         float3 directionVec = float3(cosPhi, sinPhi, 0.0);
         float3 orthoDirectionVec = directionVec - dot(directionVec, viewVec) * viewVec;
 
-        // Ось среза ортогональна и направлению, и взгляду - на неё проецируется нормаль.
+        // Slice axis is orthogonal to both the direction and the view; the normal projects onto it.
         float3 axisVec = normalize(cross(orthoDirectionVec, viewVec));
         float3 projectedNormalVec = viewspaceNormal - axisVec * dot(viewspaceNormal, axisVec);
 
@@ -288,14 +245,11 @@ PSOutput Main(in VSOutput input)
         float projectedNormalVecLength = length(projectedNormalVec);
         float cosNorm = saturate(dot(projectedNormalVec, viewVec) / max(projectedNormalVecLength, 1e-6));
 
-        // Угол проекции нормали относительно взгляда - центр дуги, которую могут закрыть горизонты.
+        // Projected normal angle vs view: the center of the arc horizons can cover.
         float n = signNorm * GtaoFastACos(cosNorm);
 
-        // Нижняя граница горизонта - НЕ -1, как в исходной статье, а горизонт на уровне
-        // касательной плоскости точки: под горизонтом «вес» значит уже другое, раз он отсчитывается
-        // от нормали. Это и есть штатная защита от самозатенения плоскости - сэмплы, лежащие в
-        // касательной плоскости (а на скользящем ракурсе таких большинство: экранная сетка тапов
-        // ложится вдоль поверхности), горизонт над ней не поднимают.
+        // Horizon floor is the tangent plane, not -1 as in the paper: keeps samples lying in
+        // that plane (most of them at grazing angles) from self-shadowing the surface.
         float lowHorizonCos0 = cos(n + GtaoHalfPI);
         float lowHorizonCos1 = cos(n - GtaoHalfPI);
 
@@ -305,8 +259,7 @@ PSOutput Main(in VSOutput input)
         [unroll]
         for (int step = 0; step < StepsPerSlice; step++)
         {
-            // R1-последовательность по (срез, шаг): сдвиг золотым сечением даёт разным шагам
-            // разного среза непересекающиеся позиции вместо решётки, кратной одному шагу.
+            // R1 golden-ratio shift over (slice, step) so steps do not land on one lattice.
             float stepBaseNoise = float(slice + step * StepsPerSlice) * 0.6180339887498948482;
             float stepNoise = frac(noise.y + stepBaseNoise);
 
@@ -317,13 +270,11 @@ PSOutput Main(in VSOutput input)
             float2 sampleOffset = s * omega;
             float sampleOffsetLength = length(sampleOffset);
 
-            // Уровень цепочки по длине шага: чем дальше сэмпл, тем грубее (и тем шире усреднённая
-            // им область) - см. GtaoDepthMipPS.hlsl.
+            // Coarser chain level for longer steps - see GtaoDepthMipPS.hlsl.
             int mipLevel = (int)clamp(round(log2(sampleOffsetLength) - GtaoDepthMipSamplingOffset),
                                       0, GTAO_DEPTH_MIP_LEVELS - 1);
 
-            // Привязка к центру текселя: без неё позиция сэмпла не совпадает с центром той тексели,
-            // из которой прочитана глубина, и реконструированная точка «съезжает» по наклону.
+            // Snap to texel centers, else the reconstructed point drifts along the slope.
             sampleOffset = round(sampleOffset) * invViewportSize;
 
             float2 sampleUV0 = centerUV + sampleOffset;
@@ -343,11 +294,8 @@ PSOutput Main(in VSOutput input)
             float3 sampleHorizonVec0 = sampleDelta0 / sampleDist0;
             float3 sampleHorizonVec1 = sampleDelta1 / sampleDist1;
 
-            // Компенсация тонких окклюдеров: экранный горизонт как бегущий максимум неявно считает,
-            // что окклюдер тянется вглубь бесконечно (штора толщиной в сантиметр затеняла бы стену
-            // за собой как монолит). Растягивая z в мере расстояния, мы заставляем сэмплы, ушедшие
-            // ЗА точку, выпадать из радиуса раньше боковых. При нулевой компенсации (дефолт XeGTAO)
-            // выражение тождественно обычному расстоянию.
+            // Thin-occluder compensation: stretching z in the distance metric drops samples
+            // behind the point sooner, so occluders are not treated as infinitely deep.
             float falloffBase0 = length(float3(sampleDelta0.x, sampleDelta0.y,
                                                sampleDelta0.z * (1.0 + GtaoThinOccluderCompensation)));
             float falloffBase1 = length(float3(sampleDelta1.x, sampleDelta1.y,
@@ -358,8 +306,7 @@ PSOutput Main(in VSOutput input)
             float shc0 = dot(sampleHorizonVec0, viewVec);
             float shc1 = dot(sampleHorizonVec1, viewVec);
 
-            // Сэмпл вне радиуса не отбрасывается, а плавно возвращается к нижней границе горизонта -
-            // иначе окклюдер, выезжающий из радиуса при движении камеры, гас бы скачком.
+            // Out-of-radius samples ease back to the horizon floor instead of popping.
             shc0 = lerp(lowHorizonCos0, shc0, weight0);
             shc1 = lerp(lowHorizonCos1, shc1, weight1);
 
@@ -367,11 +314,10 @@ PSOutput Main(in VSOutput input)
             horizonCos1 = max(horizonCos1, shc1);
         }
 
-        // Фадж XeGTAO против передержки на крутых склонах (там же помечен как эмпирический:
-        // "I can't figure out the slight overdarkening on high slopes").
+        // XeGTAO empirical fudge against overdarkening on high slopes.
         projectedNormalVecLength = lerp(projectedNormalVecLength, 1.0, 0.05);
 
-        // Аналитический интеграл дуги видимости: a(h) = (cos(n) + 2h*sin(n) - cos(2h - n)) / 4.
+        // Analytic visibility arc integral: a(h) = (cos(n) + 2h*sin(n) - cos(2h - n)) / 4.
         float h0 = -GtaoFastACos(horizonCos1);
         float h1 = GtaoFastACos(horizonCos0);
 
@@ -383,34 +329,17 @@ PSOutput Main(in VSOutput input)
 
     visibility /= SliceCount;
 
-    // Гашение на почти профильных поверхностях (NdotV -> 0). НЕ художественная правка и не
-    // перестраховка: там реконструкция нормали из глубины вырождается принципиально - поверхность
-    // занимает по экрану считанные пиксели, и одного шага квантования глубины хватает, чтобы
-    // нормаль развернуло на десятки градусов. Дальше по срезу такая нормаль уводит центр дуги
-    // видимости под горизонт, интеграл схлопывается в ноль, и на экране это сплошные ЧЁРНЫЕ пятна
-    // с резкой границей плюс «полосы» вдоль силуэтов - складки штор, кромки карнизов, стена,
-    // уходящая от камеры почти в профиль. Замерено (probe, Sponza, вид вдоль нефа): в этих
-    // областях NdotV < 0.03, то есть окно смузстепа ровно их и накрывает.
-    //
-    // Здесь нельзя обойтись заваливанием нормали к камере (строка выше): оно спасает только от
-    // нормали, глядящей ЗА поверхность (dot < 0), а вырождение начинается раньше, при dot,
-    // чуть большем нуля. Единственное, что можно честно сказать про такой пиксель, - что данных
-    // о его нормали нет, поэтому AO для него не оценивается вовсе (видимость = 1).
-    //
-    // XeGTAO этой проблемы не знает, потому что берёт нормаль из G-буфера; появится он в движке -
-    // гашение снимается вместе с реконструкцией.
+    // Normal reconstruction degenerates on near-edge-on surfaces (measured NdotV < 0.03),
+    // collapsing the integral into black blotches; skip AO there. Drops with a G-buffer normal.
     visibility = lerp(1.0, visibility, smoothstep(0.005, 0.03, NdotV));
 
     visibility = pow(saturate(visibility), aoPower > 0.01 ? aoPower : GtaoFinalValuePower);
 
-    // Полное затемнение запрещено ещё до денойза: пиксель заведомо виден (мы его и рисуем), а
-    // нулевая видимость к тому же портит усреднение в фильтре.
+    // Never fully dark: the pixel is visibly shaded, and zero also skews the denoiser average.
     visibility = max(0.03, visibility);
 
-    // Сырая (недофильтрованная) видимость может перескочить единицу и после усреднения вернуться
-    // обратно, поэтому в UNORM8 она пакуется поделённой - денойзер домножает. Рёбра едут во втором
-    // канале того же таргета: отдельный таргет под них не заводим, четырёх градаций на ребро
-    // достаточно (см. GtaoPackEdges).
+    // Raw visibility can exceed 1 before filtering, so UNORM8 stores it divided; the denoiser
+    // scales it back. Edges ride the second channel of the same target (see GtaoPackEdges).
     output.color = float4(saturate(visibility / GtaoOcclusionTermScale), packedEdges, 0.0, 1.0);
     return output;
 }

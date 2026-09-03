@@ -1,8 +1,11 @@
-// Финал блума: готовый ореол подмешивается в кадр. См. BloomCommon.hlsl.
-//
-// _SourceTex - КОПИЯ кадра (читать и писать один таргет нельзя, см. BloomPass), _LowerTex -
-// верхний уровень цепочки апсэмпла.
+// Bloom composite: mixes the finished halo into the frame. _SourceTex is a COPY of the frame
+// (a target cannot be read and written at once, see BloomPass); _LowerTex is the top of the
+// upsample chain.
 #include "BloomCommon.hlsl"
+
+// Declared only by the passes that read it (see BloomCommon.hlsl).
+Texture2D    _LowerTex;
+SamplerState _LowerTex_sampler;
 
 PSOutput Main(in VSOutput input)
 {
@@ -13,15 +16,12 @@ PSOutput Main(in VSOutput input)
     float4 scene = _SourceTex.Sample(_SourceTex_sampler, uv);
     float3 bloom = _LowerTex.Sample(_LowerTex_sampler, uv).rgb;
 
-    // АДДИТИВНО и в ЛИНЕЙНОМ пространстве, до тонемапа: рассеяние в оптике добавляет свет, а не
-    // подменяет его. Смешивание через lerp гасило бы сам источник, ради которого ореол и рисуется.
-    //
-    // Нормировка на число уровней здесь же (bloomSource.x), иначе интенсивность значила бы разное
-    // при разной длине цепочки, а длина зависит от разрешения вьюпорта.
+    // Additive, in LINEAR space before tonemap: scattering adds light; lerp would dim the source.
+    // Normalized by chain length (bloomSource.x) so intensity doesn't depend on viewport size.
     float3 result = scene.rgb + bloom * (bloomParams.w / max(bloomSource.x, 1.0));
 
-    // Альфа - ОТ СЦЕНЫ: композит рисует поверх кадра, и своя альфа выбила бы прозрачный фон
-    // бейкера иконок (та же причина, что в SsgiCompositeCommon.hlsl и FogCommon.hlsl).
+    // Alpha from the scene: own alpha would knock out the icon baker's transparent background
+    // (same reason as SsgiCompositeCommon.hlsl and FogCommon.hlsl).
     output.color = float4(max(result, 0.0), scene.a);
     return output;
 }

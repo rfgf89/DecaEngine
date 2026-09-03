@@ -1,6 +1,8 @@
-// Звено ВВЕРХ по цепочке блума: тентовый апсэмпл нижнего (более размытого) уровня плюс уровень
-// этого разрешения. См. BloomCommon.hlsl.
+// Bloom up-chain link: tent upsample of the lower level added onto this resolution.
 #include "BloomCommon.hlsl"
+
+Texture2D    _LowerTex;
+SamplerState _LowerTex_sampler;
 
 PSOutput Main(in VSOutput input)
 {
@@ -8,14 +10,10 @@ PSOutput Main(in VSOutput input)
 
     float2 uv = input.pos.xy * bloomTarget.zw;
 
-    // Радиус в текселях ТАРГЕТА, а не источника: тент обязан быть одинаковой ширины в экранных
-    // пикселях на всех уровнях, иначе крупные уровни размывались бы вдвое слабее мелких и ореол
-    // получал бы видимые кольца на границах уровней.
+    // Radius in TARGET texels: the tent must be equally wide in screen pixels on every level.
     float2 o = bloomTarget.zw * max(bloomParams.z, 0.0);
 
-    // 3x3 тент (веса 1-2-1 по обеим осям, сумма 16). Билинейная выборка нижнего уровня и так
-    // сглаживает, но её одной мало: между уровнями вдвое разное разрешение, и без тента переход
-    // виден как ступенька яркости вокруг источника.
+    // 3x3 tent, weights 1-2-1 per axis, sum 16.
     float3 s = _LowerTex.Sample(_LowerTex_sampler, uv + float2(-o.x,  o.y)).rgb;
     s += _LowerTex.Sample(_LowerTex_sampler, uv + float2( 0.0,   o.y)).rgb * 2.0;
     s += _LowerTex.Sample(_LowerTex_sampler, uv + float2( o.x,   o.y)).rgb;
@@ -30,9 +28,7 @@ PSOutput Main(in VSOutput input)
 
     s *= 1.0 / 16.0;
 
-    // Накопление СЛОЖЕНИЕМ, а не lerp: каждый уровень - это своя полоса частот ореола, и они
-    // складываются, а не заменяют друг друга. Нормировку на число уровней делает композит одной
-    // общей интенсивностью.
+    // Additive, not lerp: each level is its own frequency band; the composite normalizes.
     float3 current = _SourceTex.Sample(_SourceTex_sampler, uv).rgb;
 
     output.color = float4(max(current + s, 0.0), 1.0);

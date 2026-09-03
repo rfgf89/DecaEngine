@@ -1,6 +1,8 @@
 using System.Numerics;
 using DecaEngine;
 using DecaEngine.Core;
+using DecaEngine.Graphics;
+using DecaEngine.Graphics.Diligent;
 using DecaEngine.Sdl;
 using Friflo.Engine.ECS;
 using AnimationSample;

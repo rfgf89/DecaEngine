@@ -4,53 +4,34 @@ using DecaEngine.Core;
 namespace DecaEngine.Graphics;
 
 /// <summary>Owns the off-screen color/depth/scene-copy targets a <see cref="GraphicsPipelineSimple"/>
-/// renders into - the off-screen equivalent of a swap chain's back buffer, created once by the
-/// pipeline (see <see cref="SsaoPassResources"/>, <see cref="SkyPassResources"/> for the same pattern
-/// applied to individual passes).
-///
-/// MSAA выпилен из конвейера целиком (вместе с мультисемпловой парой таргетов, резолвами и
-/// *Msaa*-вариантами шейдеров пост-обработки): сглаживание - забота темпоральных техник
-/// (TAAU/FSR/DLSS, см. TemporalUpscalePass), которые с мультисемплом были взаимоисключающи, а
-/// каждый экранный пасс таскал под него второй вариант шейдера.</summary>
+/// renders into - the off-screen equivalent of a swap chain's back buffer.</summary>
+// No MSAA path: antialiasing is left to the temporal upscalers (TemporalUpscalePass).
 public sealed class PipelineRenderTargets : IReleaseObject
 {
 	public IRenderTarget ColorTarget { get; }
 	public IRenderTarget DepthTarget { get; }
 
-	/// <summary>Non-null только в HDR-режиме (<c>hdr: true</c>): линейный RGBA16F-таргет, в который
-	/// рисуется вся геометрия и пост-обработка, тогда как <see cref="ColorTarget"/> остаётся
-	/// отображаемым RGBA8 и получает кадр уже после тонемапа (см. <see cref="TonemapPassResources"/>).
-	/// Отдельный таргет, а не смена формата <see cref="ColorTarget"/>, потому что его сэмплируют
-	/// ImGui и readback превью-пробы - они ждут display-space RGBA8.</summary>
+	/// <summary>Linear RGBA16F scene target, non-null only in HDR mode; ColorTarget stays
+	/// display-space RGBA8 because ImGui and preview readback sample it.</summary>
 	public IRenderTarget? HdrColorTarget { get; }
 
-	/// <summary>Формат таргета, в который реально рисует геометрия (и с которым обязаны совпадать
-	/// PSO пост-пассов): RGBA16F в HDR-режиме, иначе RGBA8.</summary>
+	/// <summary>Format geometry actually renders into; post-pass PSOs must match it.</summary>
 	public TextureObjectFormat RenderColorFormat { get; }
 
-	/// <summary>Таргет геометрии: HDR-таргет, если конвейер HDR, иначе отображаемый цветовой.
-	/// Именно его отдают <see cref="ForwardPass"/>/<see cref="SsgiPass"/>.</summary>
+	/// <summary>Target geometry renders into: the HDR target when HDR, else the display color.</summary>
 	public IRenderTarget RenderColorTarget => HdrColorTarget ?? ColorTarget;
 
-	/// <summary>Сэмплируемая копия <see cref="ColorTarget"/> после opaque-дроу - источник рефракции
-	/// для transmissive-материалов (см. ForwardPass / UnlitInstancedPS.hlsl).</summary>
+	/// <summary>Sampleable copy of the scene after opaque draws, used as the refraction source.</summary>
 	public IRenderTarget SceneCopyTarget { get; }
 
-	/// <summary>Тонкий G-buffer отражений (SSR, см. SsrPass), non-null в HDR-режиме. Пишется вторым и
-	/// третьим MRT-слотами opaque-дроу (см. ForwardPass / FEATURE_REFLECTION_GBUFFER в
-	/// UnlitInstancedPS.hlsl): нормаль шейдинга (мир, xyz) + perceptual roughness (w).</summary>
+	/// <summary>Reflection G-buffer, non-null in HDR mode: world shading normal (xyz) plus
+	/// perceptual roughness (w), written from the second MRT slot of opaque draws.</summary>
 	public IRenderTarget? NormalRoughnessTarget { get; }
 
-	/// <summary>Вторая половина G-buffer-а отражений: полный множитель, на который в env-спекуляре
-	/// умножается префильтрованное окружение (Fr * specularWeight * occlusion * envOcclusion, rgb) -
-	/// им SSR энергетически корректно ЗАМЕНЯЕТ окружение своим результатом, а не складывается поверх.
-	/// w = 1 у пикселей, прошедших lit-путь (маска для композита).</summary>
+	/// <summary>Third MRT slot: the full env-specular multiplier (rgb) so SSR can replace the
+	/// prefiltered environment instead of adding on top; w = 1 marks lit-path pixels.</summary>
 	public IRenderTarget? EnvFactorTarget { get; }
 
-	/// <param name="hdr">Включает HDR-конвейер: добавляется линейный <see cref="HdrColorTarget"/>, а
-	/// scene-copy создаётся в том же RGBA16F (копия формат не конвертирует, а рефракция обязана
-	/// читать линейную сцену). Нужен для авто-экспозиции - см.
-	/// <see cref="EyeAdaptationPassResources"/>.</param>
 	public PipelineRenderTargets(IGraphicsApi api, string colorTargetName, string depthTargetName,
 		uint width, uint height, bool hdr = false)
 	{
@@ -72,9 +53,7 @@ public sealed class PipelineRenderTargets : IReleaseObject
 			format = TextureObjectFormat.D32Float,
 		});
 
-		// Снимок opaque-сцены для refraction-пасса (см. ForwardPass): transmissive-материалы
-		// сэмплируют его как "_SceneColor" - то, что реально находится за стеклом. Формат и
-		// размер обязаны совпадать с ColorTarget (CopyTexture не конвертирует).
+		// Format and size must match the source: CopyTexture does not convert.
 		SceneCopyTarget = api.CreateRenderTarget(new TextureInfo
 		{
 			name = colorTargetName + " Scene Copy",
@@ -83,8 +62,6 @@ public sealed class PipelineRenderTargets : IReleaseObject
 			format = RenderColorFormat,
 		});
 
-		// Линейный кадр HDR-конвейера: вся геометрия, небо, AO/GI-композиты и refraction-снимок
-		// живут здесь, а ColorTarget получает результат TonemapPass-а (экспозиция + кривая + sRGB).
 		if (hdr)
 		{
 			HdrColorTarget = api.CreateRenderTarget(new TextureInfo
@@ -96,10 +73,8 @@ public sealed class PipelineRenderTargets : IReleaseObject
 			});
 		}
 
-		// G-buffer отражений - в HDR-режиме безусловно (вместе с MSAA ушла и его условность):
-		// форматы MRT пекутся в PSO всей геометрии (см. DiligentBatchRenderer.GetBaseState), и
-		// условность здесь означала бы пересоздание окружения на тумблер отражений - ровно то,
-		// от чего ушёл безусловный hdr (см. комментарий GraphicsPipelineSimple).
+		// Unconditional in HDR mode: MRT formats are baked into every geometry PSO, so gating this
+		// on the reflections toggle would force a full environment rebuild.
 		if (hdr)
 		{
 			NormalRoughnessTarget = api.CreateRenderTarget(new TextureInfo

@@ -1,12 +1,10 @@
-// Композит контура выделения Scene View (см. SelectionOutlineOverlay): край маски силуэта
-// (SelectionMaskVS/PS) рисуется оранжевой обводкой поверх готового кадра. Блендинга в PSO движка
-// нет - вместо него пасс читает копию кадра (_SceneTex, снятую CopyTexture перед композитом) и
-// пишет результат целиком. Фуллскрин-треугольник - SkyBackgroundVS.hlsl.
+// Selection outline composite. There is no blend state in the engine PSO, so the pass reads a copy
+// of the frame and writes the whole result instead. Fullscreen triangle comes from SkyBackgroundVS.
 
-// Маска силуэта выделения (1 = объект).
+// Selection silhouette mask (1 = object).
 Texture2D _MaskTex;
 
-// Копия готового кадра (ColorTarget до этого пасса).
+// Copy of the finished frame, taken before this pass.
 Texture2D _SceneTex;
 
 struct VSOutput
@@ -17,7 +15,7 @@ struct VSOutput
 
 float LoadMask(int2 p)
 {
-    // Load за краем таргета возвращает 0 - контур на границе экрана корректно обрезается.
+    // Load outside the target returns 0, so the outline clips cleanly at screen edges.
     return _MaskTex.Load(int3(p, 0)).r;
 }
 
@@ -27,7 +25,7 @@ float4 Main(in VSOutput input) : SV_TARGET
     float3 scene = _SceneTex.Load(int3(p, 0)).rgb;
     float center = LoadMask(p);
 
-    // Дилатация маски кольцом тапов радиуса 1-2: контур ~2px, как в обычных редакторах.
+    // Dilate the mask with a radius 1-2 ring of taps: a ~2px outline.
     float ring = 0.0;
     ring = max(ring, LoadMask(p + int2( 1,  0)));
     ring = max(ring, LoadMask(p + int2(-1,  0)));
@@ -42,7 +40,7 @@ float4 Main(in VSOutput input) : SV_TARGET
     ring = max(ring, LoadMask(p + int2( 0,  2)));
     ring = max(ring, LoadMask(p + int2( 0, -2)));
 
-    // Край = расширенная маска минус сама маска: обводка снаружи силуэта, объект не перекрывается.
+    // Dilated mask minus the mask: the outline sits outside the silhouette.
     float edge = saturate(ring - center);
 
     const float3 outlineColor = float3(1.0, 0.55, 0.1);

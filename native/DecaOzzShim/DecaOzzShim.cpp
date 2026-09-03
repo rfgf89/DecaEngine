@@ -1,20 +1,12 @@
-// DecaOzzShim - мост DecaEngine <-> ozz-animation.
+// DecaOzzShim - DecaEngine <-> ozz-animation bridge.
 //
-// Зачем шим вообще. ozz - это C++ с SoA-раскладкой поз (ozz::math::SoaTransform: четыре джойнта в
-// одном SIMD-регистре), шаблонными job-ами и собственным аллокатором. Тащить это в C# через
-// пословный маршалинг бессмысленно: выигрыш ozz именно в том, что вся поза обсчитывается пачками по
-// четыре кости, а поштучный переход границы managed/native съел бы его целиком. Поэтому граница
-// проведена по КРУПНЫМ операциям: «просемплируй клип в позу», «сблендь позы», «переведи в модельные
-// матрицы». Всё, что между ними, живёт нативно и managed-код не видит вовсе.
+// The boundary is coarse (sample / blend / local-to-model): SoA poses never cross it.
 //
-// Раскладка матриц. ozz::math::Float4x4 - четыре SimdFloat4-столбца, где i-й столбец есть образ i-й
-// оси. System.Numerics.Matrix4x4 в строчной конвенции (v * M) хранит ровно то же самое строками.
-// Поэтому матрицы копируются ПОБАЙТОВО, без транспонирования - см. DecaOzz_ReadModelMatrices.
+// Matrix layout: ozz::math::Float4x4 columns hold the same bytes as a row-major
+// System.Numerics.Matrix4x4, so matrices are memcpy'd, never transposed.
 //
-// Порядок джойнтов. ozz ПЕРЕУПОРЯДОЧИВАЕТ кости при сборке скелета (breadth-first), и его порядок не
-// совпадает с нашим. Чтобы связь не была основана на догадках о внутреннем обходе, каждая кость
-// уходит в ozz с именем "<исходный индекс>|<имя>", а после сборки префикс читается обратно - так
-// шим отдаёт ТОЧНЫЙ remap, не воспроизводя логику ozz у себя (см. DecaOzz_BuildSkeleton).
+// ozz reorders joints breadth-first when building a skeleton. Each joint is passed in
+// named "<source index>|<name>" so the exact remap is read back, never guessed.
 
 #include <cstdint>
 #include <cstdio>
@@ -35,8 +27,7 @@
 #include "ozz/animation/runtime/sampling_job.h"
 #include "ozz/animation/runtime/skeleton.h"
 #include "ozz/base/maths/simd_math.h"
-// SimdQuaternion объявлен вперёд в заголовках IK-job-ов, но определён только здесь - без этого
-// include компилятор видит неполный тип ровно в тех местах, где нужны коррекции IK.
+// The IK job headers only forward-declare SimdQuaternion; corrections need the definition.
 #include "ozz/base/maths/simd_quaternion.h"
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/memory/unique_ptr.h"
@@ -46,8 +37,7 @@
 
 namespace {
 
-// Зеркало DecaEngine.Graphics.Transform: TRS одного джойнта в AoS-виде. Граница managed/native
-// работает только в AoS - SoA остаётся деталью нативной стороны.
+// Mirrors DecaEngine.Graphics.Transform. The managed boundary is AoS only.
 struct DecaOzzTransform {
 	float translation[3];
 	float rotation[4]; // xyzw
@@ -56,12 +46,11 @@ struct DecaOzzTransform {
 
 struct DecaOzzJointDesc {
 	const char* name;
-	int32_t parent; // -1 у корня; массив ОБЯЗАН быть топологически упорядочен
+	int32_t parent; // -1 for a root; the array must be topologically ordered
 	DecaOzzTransform bind;
 };
 
-// Один ключ дорожки. Каналы приходят раздельными массивами, поэтому ключ несёт только время и
-// значение нужной размерности; трансляция и масштаб читают xyz, поворот - xyzw.
+// One track key: translation and scale read xyz, rotation reads xyzw.
 struct DecaOzzKey {
 	float time;
 	float value[4];
@@ -70,8 +59,7 @@ struct DecaOzzKey {
 struct Skeleton {
 	ozz::unique_ptr<ozz::animation::Skeleton> skeleton;
 
-	// ozz-индекс -> исходный индекс и обратно. Держим оба: первый нужен на выгрузке результата,
-	// второй - на загрузке входных данных (палитра, обратные bind-матрицы, IK-цели).
+	// ozz index -> source index and back; readback uses the first, uploads the second.
 	std::vector<int32_t> to_source;
 	std::vector<int32_t> from_source;
 };
@@ -80,9 +68,7 @@ struct Animation {
 	ozz::unique_ptr<ozz::animation::Animation> animation;
 };
 
-// Поза одного персонажа: локальные TRS в SoA + модельные матрицы + контекст семплирования.
-// Контекст живёт ЗДЕСЬ, а не создаётся на вызов: в нём лежат курсоры распакованных ключей, ради
-// которых ozz и быстр на последовательном воспроизведении - пересоздание убивало бы весь смысл.
+// The sampling context is per-pose, not per-call: it holds ozz's decompressed key cursors.
 struct Pose {
 	const Skeleton* owner = nullptr;
 	ozz::vector<ozz::math::SoaTransform> locals;
@@ -99,13 +85,11 @@ ozz::math::Transform ToOzz(const DecaOzzTransform& source) {
 	return result;
 }
 
-// Рекурсивно материализует поддерево сырого скелета. Рекурсия, а не итерация: RawSkeleton::Joint
-// хранит детей вектором ПО ЗНАЧЕНИЮ, и любой push_back в него инвалидирует указатели на уже
-// заполненных потомков - итеративная сборка по указателям здесь просто не работает.
+// Recursive by necessity: RawSkeleton::Joint holds children by value, so growing that
+// vector invalidates pointers to already-filled children.
 void FillRawJoint(ozz::animation::offline::RawSkeleton::Joint& destination, int32_t index,
 				  const std::vector<std::vector<int32_t>>& children, const DecaOzzJointDesc* joints) {
-	// Префикс с исходным индексом - способ получить точный remap после переупорядочивания ozz
-	// (см. шапку файла). Имя остаётся читаемым, что важно при отладке ozz-дампов.
+	// Source-index prefix carries the exact remap across ozz's reorder (see file header).
 	char prefix[16];
 	std::snprintf(prefix, sizeof(prefix), "%d|", index);
 	destination.name = ozz::string(prefix) + ozz::string(joints[index].name ? joints[index].name : "");
@@ -118,10 +102,8 @@ void FillRawJoint(ozz::animation::offline::RawSkeleton::Joint& destination, int3
 	}
 }
 
-// Домножает локальный поворот одной кости на довороты IK. Возни с транспонированием не избежать:
-// поза лежит в SoA (по четыре кости в регистре), а коррекция приходит одиночным кватернионом, и
-// добраться до его дорожки можно только развернув блок в AoS и свернув обратно. Это ровно тот же
-// приём, что в семплах ozz (MultiplySoATransformQuaternion).
+// A single-lane correction can only reach an SoA block by transposing it to AoS and back
+// (same trick as ozz's MultiplySoATransformQuaternion sample).
 void MultiplySoaRotation(ozz::math::SoaTransform& block, int lane, const ozz::math::SimdQuaternion& correction) {
 	ozz::math::SimdQuaternion aos[4];
 	ozz::math::Transpose4x4(&block.rotation.x, &aos->xyzw);
@@ -131,8 +113,7 @@ void MultiplySoaRotation(ozz::math::SoaTransform& block, int lane, const ozz::ma
 	ozz::math::Transpose4x4(&aos->xyzw, &block.rotation.x);
 }
 
-// Достаёт rest-позу одного джойнта (ozz-индекс) в AoS-виде. Нужна при сборке клипа: см.
-// SeedEmptyChannels.
+// Rest pose of one joint (ozz index) in AoS form.
 ozz::math::Transform RestPoseOf(const ozz::animation::Skeleton& skeleton, int joint) {
 	const auto rest = skeleton.joint_rest_poses();
 	const ozz::math::SoaTransform& block = rest[joint / 4];
@@ -158,16 +139,11 @@ ozz::math::Transform RestPoseOf(const ozz::animation::Skeleton& skeleton, int jo
 	return result;
 }
 
-// Досевает пустые каналы дорожек ОДНИМ ключом из bind-позы.
+// Seeds empty channels with one bind-pose key.
 //
-// Это не мелочь, а обязательный шаг: у ozz канал без ключей означает ЕДИНИЧНОЕ значение, а в glTF
-// (и у нашего C#-семплера) неанимированный канал означает «значение из позы узла». Разница ровно в
-// том, что кость с одним лишь анимированным поворотом - самый частый случай в персонажных ригах -
-// получала бы нулевую трансляцию и уезжала в начало координат родителя. На Fox это давало
-// расхождение с C#-семплером в сотню единиц при габаритах модели ~160.
-//
-// Касается и джойнтов, которых клип не трогает вовсе: без досева они тоже схлопнулись бы в
-// единичную трансформацию вместо bind-позы.
+// Required: ozz reads a keyless channel as IDENTITY, while glTF (and our C# sampler) read it
+// as "value from the node's pose". Without this a rotation-only bone loses its translation
+// and collapses onto its parent's origin.
 void SeedEmptyChannels(ozz::animation::offline::RawAnimation& raw, const ozz::animation::Skeleton& skeleton) {
 	for (size_t i = 0; i < raw.tracks.size(); ++i) {
 		auto& track = raw.tracks[i];
@@ -204,11 +180,10 @@ int32_t ParseSourceIndex(const char* name) {
 
 } // namespace
 
-// --- Скелет -------------------------------------------------------------------------------------
+// --- Skeleton -----------------------------------------------------------------------------------
 
-/// Собирает рантайм-скелет ozz. joints ОБЯЗАН быть топологически упорядочен (родитель раньше
-/// ребёнка) - это же требование у PreparedSkeleton на стороне C#.
-/// Возвращает handle или nullptr.
+/// Builds the runtime skeleton. joints must be topologically ordered (parent before child),
+/// matching the requirement on C#-side PreparedSkeleton. Returns a handle or nullptr.
 DECA_API void* DecaOzz_BuildSkeleton(const DecaOzzJointDesc* joints, int32_t jointCount) {
 	if (joints == nullptr || jointCount <= 0) {
 		return nullptr;
@@ -224,8 +199,7 @@ DECA_API void* DecaOzz_BuildSkeleton(const DecaOzzJointDesc* joints, int32_t joi
 		} else if (parent < i) {
 			children[static_cast<size_t>(parent)].push_back(i);
 		} else {
-			// Родитель позже ребёнка - вход не топологичен. Собирать из такого скелет нельзя:
-			// получилась бы тихо оборванная иерархия, а не ошибка.
+			// Parent after child: not topological, would silently break the hierarchy.
 			return nullptr;
 		}
 	}
@@ -275,8 +249,8 @@ DECA_API int32_t DecaOzz_SkeletonJointCount(void* handle) {
 	return skeleton != nullptr ? skeleton->skeleton->num_joints() : 0;
 }
 
-/// Таблица «ozz-индекс -> исходный индекс», по которой C#-сторона переупорядочивает обратные
-/// bind-матрицы и индексы костей в скин-стриме. Без неё палитра уехала бы костями (см. шапку).
+/// "ozz index -> source index" table: C# reorders inverse bind matrices and skin bone
+/// indices by it, otherwise the palette is shifted by bone (see file header).
 DECA_API int32_t DecaOzz_SkeletonRemap(void* handle, int32_t* out, int32_t capacity) {
 	auto* skeleton = static_cast<Skeleton*>(handle);
 	if (skeleton == nullptr || out == nullptr) {
@@ -292,12 +266,10 @@ DECA_API int32_t DecaOzz_SkeletonRemap(void* handle, int32_t* out, int32_t capac
 	return count;
 }
 
-// --- Клип ---------------------------------------------------------------------------------------
+// --- Clip ---------------------------------------------------------------------------------------
 
-/// Собирает рантайм-клип. Дорожки приходят В ИСХОДНОМ порядке джойнтов; шим сам раскладывает их по
-/// ozz-порядку через remap скелета - так вызывающему не нужно знать о переупорядочивании вовсе.
-/// Каждый канал задан парой (указатель на ключи, число ключей); нулевое число = канал не анимирован,
-/// джойнт остаётся в bind-позе.
+/// Builds the runtime clip. Tracks come in SOURCE joint order; the shim remaps them.
+/// Each channel is a (keys, count) pair; count 0 means unanimated - joint stays in bind pose.
 DECA_API void* DecaOzz_BuildAnimation(void* skeletonHandle, const char* name, float duration,
 									  int32_t trackCount, const DecaOzzKey* const* translationKeys,
 									  const int32_t* translationCounts, const DecaOzzKey* const* rotationKeys,
@@ -372,7 +344,7 @@ DECA_API float DecaOzz_AnimationDuration(void* handle) {
 	return animation != nullptr ? animation->animation->duration() : 0.0f;
 }
 
-// --- Поза ---------------------------------------------------------------------------------------
+// --- Pose ---------------------------------------------------------------------------------------
 
 DECA_API void* DecaOzz_CreatePose(void* skeletonHandle) {
 	auto* skeleton = static_cast<Skeleton*>(skeletonHandle);
@@ -386,8 +358,7 @@ DECA_API void* DecaOzz_CreatePose(void* skeletonHandle) {
 	pose->models.resize(static_cast<size_t>(skeleton->skeleton->num_joints()));
 	pose->context.Resize(skeleton->skeleton->num_joints());
 
-	// Стартовая поза - bind: до первого семплирования потребитель имеет право читать позу, и
-	// нулевые (то есть вырожденные) трансформации дали бы схлопнутого в точку персонажа.
+	// Start in bind pose: the pose may legally be read before the first sample.
 	const auto rest = skeleton->skeleton->joint_rest_poses();
 	std::memcpy(pose->locals.data(), rest.data(), rest.size_bytes());
 
@@ -396,8 +367,8 @@ DECA_API void* DecaOzz_CreatePose(void* skeletonHandle) {
 
 DECA_API void DecaOzz_ReleasePose(void* handle) { delete static_cast<Pose*>(handle); }
 
-/// Семплирует клип в локальные TRS позы. ratio - НОРМАЛИЗОВАННОЕ время [0..1] (соглашение ozz), а
-/// не секунды: вызывающий делит на длительность сам, потому что он же владеет зацикливанием.
+/// Samples a clip into the pose's local TRS. ratio is normalized time [0..1] (ozz
+/// convention), not seconds: the caller owns looping and divides by duration itself.
 DECA_API int32_t DecaOzz_SamplePose(void* poseHandle, void* animationHandle, float ratio) {
 	auto* pose = static_cast<Pose*>(poseHandle);
 	auto* animation = static_cast<Animation*>(animationHandle);
@@ -414,9 +385,8 @@ DECA_API int32_t DecaOzz_SamplePose(void* poseHandle, void* animationHandle, flo
 	return job.Run() ? 1 : 0;
 }
 
-/// Смешивает позы-слои в приёмник. Веса не нормализуются здесь намеренно: ozz сам добирает разницу
-/// до единицы rest-позой через threshold, и «нормализация» на нашей стороне ломала бы аддитивные
-/// сценарии, где сумма весов заведомо не единица.
+/// Blends layer poses into the destination. Weights are deliberately not normalized: ozz
+/// makes up the difference from the rest pose, and normalizing breaks additive layers.
 DECA_API int32_t DecaOzz_BlendPoses(void* destinationHandle, void* const* layerHandles, const float* weights,
 									int32_t layerCount) {
 	auto* destination = static_cast<Pose*>(destinationHandle);
@@ -428,7 +398,7 @@ DECA_API int32_t DecaOzz_BlendPoses(void* destinationHandle, void* const* layerH
 	for (int32_t i = 0; i < layerCount; ++i) {
 		auto* layer = static_cast<Pose*>(layerHandles[i]);
 		if (layer == nullptr || layer->owner != destination->owner) {
-			// Слой от другого скелета - не «немного не то», а чтение чужой памяти по чужим индексам.
+			// A layer from another skeleton would read foreign memory by foreign indices.
 			return 0;
 		}
 
@@ -444,14 +414,11 @@ DECA_API int32_t DecaOzz_BlendPoses(void* destinationHandle, void* const* layerH
 	return job.Run() ? 1 : 0;
 }
 
-/// Тот же бленд, но с ПОСУСТАВНЫМИ весами слоёв (частичный бленд ozz: верх тела играет свой клип,
-/// ноги - базовый) и АДДИТИВНЫМИ слоями (additiveFlags: ненулевой флаг кладёт слой в
-/// additive_layers - его трансформы суммируются ПОВЕРХ результата, а не участвуют в усреднении;
-/// слой обязан содержать ДЕЛЬТУ, см. AdditiveAnimationBuilder). additiveFlags может быть nullptr -
-/// все слои обычные. jointWeights - на слой либо nullptr (вес всюду 1), либо массив по числу костей
-/// В ИСХОДНОМ порядке: переупорядочивание в SoA-четвёрки ozz - деталь шима, как и везде.
-/// Приёмник МОЖЕТ совпадать с одним из слоёв: BlendingJob пишет выход посуставно после чтения всех
-/// слоёв того же сустава, межсуставных зависимостей у него нет.
+/// Same blend, with per-joint layer weights and additive layers. A non-zero additiveFlags
+/// entry routes the layer to additive_layers, where it is applied ON TOP of the result and
+/// must therefore hold a DELTA (see AdditiveAnimationBuilder); nullptr means all normal.
+/// jointWeights per layer is either nullptr (weight 1 everywhere) or an array in SOURCE
+/// joint order. The destination may alias a layer: BlendingJob has no cross-joint deps.
 DECA_API int32_t DecaOzz_BlendPosesLayered(void* destinationHandle, void* const* layerHandles,
 										   const float* weights, const float* const* jointWeights,
 										   const int32_t* additiveFlags, int32_t layerCount) {
@@ -567,7 +534,6 @@ DECA_API int32_t DecaOzz_BlendPosesMasked(void* destinationHandle, void* const* 
 	return job.Run() ? 1 : 0;
 }
 
-/// Локальные TRS -> модельные матрицы.
 DECA_API int32_t DecaOzz_LocalToModel(void* poseHandle) {
 	auto* pose = static_cast<Pose*>(poseHandle);
 	if (pose == nullptr) {
@@ -582,8 +548,8 @@ DECA_API int32_t DecaOzz_LocalToModel(void* poseHandle) {
 	return job.Run() ? 1 : 0;
 }
 
-/// Выгружает модельные матрицы В ИСХОДНОМ порядке джойнтов - вызывающий про ozz-порядок не знает.
-/// Копирование побайтовое: раскладка Float4x4 и System.Numerics.Matrix4x4 совпадает (см. шапку).
+/// Reads model matrices back in SOURCE joint order. The copy is byte-wise: Float4x4 and
+/// System.Numerics.Matrix4x4 share a layout (see file header).
 DECA_API int32_t DecaOzz_ReadModelMatrices(void* poseHandle, float* out, int32_t jointCapacity) {
 	auto* pose = static_cast<Pose*>(poseHandle);
 	if (pose == nullptr || out == nullptr) {
@@ -604,8 +570,8 @@ DECA_API int32_t DecaOzz_ReadModelMatrices(void* poseHandle, float* out, int32_t
 	return count;
 }
 
-/// Локальные TRS в AoS-виде и в исходном порядке - вход процедурного слоя (spring bones, ручная
-/// правка костей). Распаковка из SoA здесь, а не на стороне C#: раскладка SoA - внутреннее дело ozz.
+/// Local TRS in AoS form and SOURCE order - input of the procedural layer. Unpacking stays
+/// native: the SoA layout is ozz's own business.
 DECA_API int32_t DecaOzz_ReadLocalTransforms(void* poseHandle, DecaOzzTransform* out, int32_t jointCapacity) {
 	auto* pose = static_cast<Pose*>(poseHandle);
 	if (pose == nullptr || out == nullptr) {
@@ -650,7 +616,7 @@ DECA_API int32_t DecaOzz_ReadLocalTransforms(void* poseHandle, DecaOzzTransform*
 	return count;
 }
 
-/// Обратная операция: правленые процедурным слоем локальные TRS обратно в SoA-позу.
+/// Writes procedurally edited local TRS back into the SoA pose.
 DECA_API int32_t DecaOzz_WriteLocalTransforms(void* poseHandle, const DecaOzzTransform* in, int32_t jointCount) {
 	auto* pose = static_cast<Pose*>(poseHandle);
 	if (pose == nullptr || in == nullptr) {
@@ -663,9 +629,8 @@ DECA_API int32_t DecaOzz_WriteLocalTransforms(void* poseHandle, const DecaOzzTra
 		return 0;
 	}
 
-	// Хвостовые дорожки последнего SoA-блока (число костей редко кратно четырём) заполняются
-	// единичной трансформацией: мусор в них не влияет на результат по костям, но легко даёт NaN, а
-	// NaN в SIMD-регистре портит и три соседние ЖИВЫЕ кости вместе с собой.
+	// Tail lanes of the last SoA block get identity: a NaN there corrupts the three live
+	// bones sharing the SIMD register.
 	const size_t soaCount = pose->locals.size();
 	for (size_t block = 0; block < soaCount; ++block) {
 		float translation[3][4] = {}, rotation[4][4] = {}, scale[3][4] = {};
@@ -708,12 +673,9 @@ DECA_API int32_t DecaOzz_WriteLocalTransforms(void* poseHandle, const DecaOzzTra
 
 // --- IK -----------------------------------------------------------------------------------------
 
-/// Two-bone IK (нога, рука): доворачивает start и mid так, чтобы end попал в target. Индексы
-/// джойнтов - ИСХОДНЫЕ, шим переводит их в ozz-порядок сам. Результат применяется к локальной позе,
-/// поэтому вызывающий обязан после этого заново позвать DecaOzz_LocalToModel.
-///
-/// Требует АКТУАЛЬНЫХ модельных матриц: job читает мировые положения костей. Порядок вызова -
-/// Sample -> LocalToModel -> TwoBoneIk -> LocalToModel.
+/// Two-bone IK (leg, arm): rotates start and mid so that end reaches target. Joint indices
+/// are SOURCE indices. Needs up-to-date model matrices and writes the local pose, so the
+/// call order is Sample -> LocalToModel -> TwoBoneIk -> LocalToModel.
 DECA_API int32_t DecaOzz_TwoBoneIk(void* poseHandle, int32_t startJoint, int32_t midJoint, int32_t endJoint,
 								   const float* target, const float* poleVector, const float* midAxis,
 								   float weight, float soften, float twistAngle) {
@@ -754,15 +716,14 @@ DECA_API int32_t DecaOzz_TwoBoneIk(void* poseHandle, int32_t startJoint, int32_t
 		return 0;
 	}
 
-	// Коррекции - ДОвороты в модельном пространстве, применяются к локальным поворотам костей.
-	// Именно локальная поза, а не модельные матрицы, есть источник истины для дальнейших стадий
-	// (блендинг, spring bones), поэтому правится она.
+	// Corrections are model-space deltas applied to local rotations: the local pose, not the
+	// model matrices, is the source of truth for later stages.
 	MultiplySoaRotation(pose->locals[static_cast<size_t>(start / 4)], start & 3, startCorrection);
 	MultiplySoaRotation(pose->locals[static_cast<size_t>(mid / 4)], mid & 3, midCorrection);
 	return 1;
 }
 
-/// Aim IK: доворачивает одну кость (голова, торс, ствол оружия) так, чтобы её forward смотрел в цель.
+/// Aim IK: rotates one joint so that its forward axis points at the target.
 DECA_API int32_t DecaOzz_AimIk(void* poseHandle, int32_t joint, const float* target, const float* forward,
 							   const float* up, const float* poleVector, float weight) {
 	auto* pose = static_cast<Pose*>(poseHandle);

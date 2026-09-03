@@ -25,12 +25,9 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
     private RenderCamerasData _renderCamerasData;
     private DirectionalLightCascadeData _shadowData;
 
-    // Кадровая раскладка теневых слайсов punctual-светов: id сущности света -> первый слайс
-    // (см. PunctualShadowScheduler). Пересобирается каждый кадр, читается при сборке пула светов.
+    // Light entity id -> first shadow slice, rebuilt every frame.
     private readonly System.Collections.Generic.Dictionary<int, int> _punctualShadowSlices = new();
 
-    /// <param name="shadowSettings">Мировой свет превью (null = теней нет, свет остаётся камерным):
-    /// система строит из него один каскад для ShadowPass и LightData для форвард-шейдера.</param>
     public SimpleCullingAndRenderSystem(RenderResourceManager resourceManager, IGraphicsPipeline pipeline,
         PreviewShadowSettings shadowSettings = null)
     {
@@ -43,17 +40,11 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
     {
         var cameras = Query.Store.Query<CameraComponent>();
 
-        // Punctual-света (point/spot) Scene View/превью: всё с LightComponent, кроме солнца.
-        // Та же схема, что в CullingAndRenderSystem: по-типовый кулинг против фрустума каждой
-        // камеры (LightCulling), выжившие - в общий пул кадра, сегмент камеры - в её
-        // LightData.ClusterParams.
+        // Punctual lights are everything with a LightComponent except the sun.
         var punctualLightsQuery = Query.Store.Query<LightComponent>()
             .WithoutAllComponents(ComponentTypes.Get<SunComponent>());
 
         int cameraCount = cameras.Count;
-        // ВРЕМЕННЫЙ отладочный принт (расследование "punctual shadow слайс не совпадает") -
-        // сколько камер реально видит этот QuerySystem: подозрение, что оффскрин-баунсы
-        // (probe-GI/иконки) оставляют лишние CameraComponent-сущности в общем сторе.
         if (Environment.GetEnvironmentVariable("DECA_DEBUG_CAMERACOUNT") == "1")
         {
             int lightCount = Query.Store.Query<LightComponent>()
@@ -65,9 +56,7 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             return;
         }
 
-        // Граница ИНДЕКСА занятых слотов, а не их количество - слоты выдаются из стека свободных и
-        // разрежены, см. RenderResourceManager.DrawInstanceCount. Именно из-за подстановки сюда
-        // количества превью сабмеши уезжали в пустоту после бейка/показа целой модели.
+        // Slot index bound, not a count: draw slots come from a free stack and stay sparse.
         int drawCount = _resourceManager.DrawInstanceCount;
 
         if (!_renderCamerasData.IsCreated || _renderCamerasData.Capacity != cameraCount)
@@ -77,9 +66,6 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
                 _renderCamerasData.Dispose();
             }
 
-            // Каскады мирового света (число - опция окружения, см. PreviewShadowSettings.CascadeCount);
-            // без _shadowSettings список остаётся пустым (Count 0), и ShadowPass - если он вообще
-            // добавлен в граф - корректно no-op-ится.
             if (!_shadowData.IsCreated)
             {
                 _shadowData = new DirectionalLightCascadeData(CascadeCount());
@@ -92,9 +78,7 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
         _renderCamerasData.Clear();
         _shadowData.Clear();
 
-        // Опорная камера каскадов: срезы её фрустума задают объёмы каскадов (классический CSM;
-        // тот же приём, что referenceCamera в CullingAndRenderSystem). Берётся первая - у
-        // офскрин-окружений камера одна.
+        // Cascade reference camera; off-screen environments only ever have one.
         bool hasCamera = false;
         Vector3 cameraPos = default;
         Quaternion cameraRot = Quaternion.Identity;
@@ -114,8 +98,7 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
 
         var lightData = BuildLightData(drawCount, hasCamera, cameraPos, cameraRot, cameraFov, cameraAspect);
 
-        // Теневые слайсы punctual-светов - ДО сборки пер-камерных пулов: TryBuildPunctualLight
-        // читает раскладку, собирая ShadowParams.
+        // Must run before the per-camera pools: TryBuildPunctualLight reads this layout.
         PunctualShadowScheduler.BuildShadowSlices(punctualLightsQuery, cameraPos, drawCount,
             ref _renderCamerasData, _punctualShadowSlices);
 
@@ -128,12 +111,9 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             var cullData = camera.CreateCullData();
             cullData.drawCount = drawCount;
 
-            // Пер-камерный кулинг punctual-светов: сегмент камеры в общем пуле кадра начинается с
-            // текущего конца - пул один на все камеры, границы уходят в ClusterParams.
+            // One light pool shared by all cameras; this camera's segment starts at the current end.
             int segmentOffset = punctualLightTotal;
             var cullDataCopy = cullData;
-            // Границы влияния светов сегмента по view-глубине - из них строится диапазон срезов
-            // кластерной сетки (см. LightCulling.ClusterDepthRange).
             float minLightZ = float.MaxValue;
             float maxLightZ = float.MinValue;
             punctualLightsQuery.ForEachEntity((ref LightComponent light, Entity lightEntity) =>
@@ -174,16 +154,9 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
     private int CascadeCount() =>
         Math.Clamp(_shadowSettings?.CascadeCount ?? 1, 1, ShadowRenderer.MaxCascades);
 
-    /// <summary>Строит LightData мирового света и (при валидных баундах) каскады для ShadowPass -
-    /// той же схемой, что UpdateCascades основного пайплайна: каждый каскад - сфера, описанная
-    /// вокруг СРЕЗА ФРУСТУМА опорной камеры, со снапом центра к текселю shadow map и оттяжкой
-    /// глаза света под кастеры над объёмом. Отличие одно: дистанции срезов не абсолютные метры из
-    /// конфига, а прогрессия по диапазону [дистанция до сцены - габарит .. дистанция + габарит] -
-    /// орбитальная камера редактора может стоять и вплотную, и очень далеко от геометрии. Шейдер
-    /// берёт первый каскад, чей объём содержит точку (см. SampleWorldLightShadow в
-    /// UnlitInstancedPS.hlsl); точка глубже far-плоскости каскада проваливается в следующий.
-    /// Depth-конвенция shadow map - ОБЫЧНЫЙ Z (ShadowRenderer: clear 1.0 + DepthFunc Less):
-    /// орто-матрица мапит near->0, far->1, сравнение в шейдере - LessEqual.</summary>
+    // Mirrors the main pipeline's UpdateCascades, except splits are a progression over
+    // [distance - extent .. distance + extent] since the orbit camera can sit at any distance.
+    // Shadow maps use standard Z here (clear 1.0, DepthFunc Less), not reversed Z.
     private LightData BuildLightData(int drawCount, bool hasCamera, Vector3 cameraPos,
         Quaternion cameraRot, float cameraFov, float cameraAspect)
     {
@@ -201,12 +174,8 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
         var right = Vector3.Normalize(Vector3.Cross(up, lightDir));
         var upAxis = Vector3.Cross(lightDir, right);
 
-        // Дальности срезов - по диапазону, где РЕАЛЬНО лежит геометрия: [дистанция до сцены -
-        // габарит .. дистанция + габарит]. Орбитальная камера редактора обычно стоит далеко от
-        // объекта, и срезы «от нуля» ложились бы в пустой воздух перед ней - все камерные каскады
-        // выходили почти одинаковыми и без пользы. Внутри сцены (rangeStart -> 0) схема
-        // вырождается в классическую «от камеры». Прогрессия ~2.6x (0.38^k): ближний к геометрии
-        // срез самый плотный. Камера LH - forward это +Z её поворота.
+        // Splits span only where geometry actually is; from-zero splits land in empty air when the
+        // orbit camera is far away. Left-handed camera: forward is +Z of its rotation.
         float distanceToScene = hasCamera ? Vector3.Distance(cameraPos, sceneCenter) : 0f;
         float rangeStart = MathF.Max(distanceToScene - sceneRadius, 0f);
         float rangeSpan = MathF.Max(distanceToScene + sceneRadius - rangeStart, sceneRadius * 0.1f);
@@ -224,8 +193,7 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
         var lightData = new LightData
         {
             LightPos = new Vector4(sceneCenter - lightDir * sceneRadius * 2f, 0f),
-            // Конвенция основного пайплайна: LightDirection указывает НА солнце (шейдер берёт
-            // keyDir без инверсии, см. UnlitInstancedPS).
+            // Convention: LightDirection points toward the sun; the shader does not invert it.
             LightDirection = new Vector4(-lightDir, 0f),
             LightColor = new Vector4(1f, 0.97f, 0.9f, 1f),
             CascadeSplits = new Vector4(float.MaxValue, float.MaxValue, float.MaxValue, float.MaxValue),
@@ -243,8 +211,6 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
 
             if (hasCamera)
             {
-                // Точно как UpdateCascades основного пайплайна: сфера, описанная вокруг восьми
-                // углов среза фрустума камеры [sliceNear .. sliceFar].
                 float sliceNear = i == 0 ? rangeStart : splitEnds[i - 1];
                 (center, radius) = FitFrustumSlice(cameraPos, cameraForward, cameraRight, cameraUp,
                     tanHalfFov, cameraAspect, sliceNear, splitEnds[i]);
@@ -252,36 +218,31 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             }
             else
             {
-                // Фолбэк без камеры (headless-пробы) - сцена целиком.
+                // Headless fallback: cover the whole scene.
                 center = sceneCenter;
                 radius = sceneRadius;
             }
 
-            // Кайма ВОКРУГ сферы каскада - см. ShadowRenderer.CascadeMarginTexels: шейдер не берёт
-            // каскад, пока точка не ушла от края карты внутрь, и без каймы этот отступ съедал край
-            // самого объёма.
+            // Grow past CascadeMarginTexels: the shader rejects points near the map edge, which
+            // would otherwise eat the rim of the cascade volume itself.
             radius /= 1f - 2f * ShadowRenderer.CascadeMarginTexels / ShadowRenderer.ShadowMapSize;
 
-            // Снап центра к сетке текселей shadow map в осях света (Floor, как в UpdateCascades) -
-            // без него тень мерцает при движении камеры: центр каскада двигается субтексельными
-            // шагами.
+            // Snap the center to the shadow texel grid in light axes, or shadows shimmer as the
+            // camera moves.
             float texelWorld = 2f * radius / ShadowRenderer.ShadowMapSize;
             float rSnap = MathF.Floor(Vector3.Dot(center, right) / texelWorld) * texelWorld - Vector3.Dot(center, right);
             float uSnap = MathF.Floor(Vector3.Dot(center, upAxis) / texelWorld) * texelWorld - Vector3.Dot(center, upAxis);
             center += right * rSnap + upAxis * uSnap;
 
-            // Глаз и глубина - как в UpdateCascades (после фикса near-клиппинга): глаз оттянут от
-            // сферы каскада к свету на её диаметр, чтобы кастеры между солнцем и объёмом (высокая
-            // геометрия над срезом) не резались near-плоскостью.
+            // Pull the light eye back by a diameter so casters above the volume survive near clip.
             float casterExtension = radius * 2f;
             var eye = center - lightDir * (radius + casterExtension);
             var view = Matrix4x4.CreateLookAtLeftHanded(eye, center, up);
 
             float near = 0.01f;
 
-            // Запас ЗА сферой каскада - см. подробный разбор в UpdateCascades: без него приёмники на
-            // задней полусфере получают ndc.z >= 1 (normal-offset + снап центра + float) и
-            // UnlitInstancedPS отбрасывает каскад, оставляя просветы.
+            // Slack behind the sphere: receivers on the far hemisphere otherwise reach ndc.z >= 1
+            // and the shader drops the cascade, leaving gaps.
             float receiverExtension = radius * 0.5f;
             float far = radius * 2f + casterExtension + receiverExtension;
 
@@ -304,9 +265,7 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
             }
         }
 
-        // x..w = мировые ширины ортокаскадов (0 = каскада нет - шейдер по этому и отличает
-        // валидные). Шейдер делит на разрешение shadow map и получает мировой размер текселя
-        // для normal-offset bias.
+        // World widths per cascade; 0 marks an absent cascade for the shader.
         lightData.CascadeSizes = sizes;
 
         for (int i = 0; i < cascadeCount; i++)
@@ -325,10 +284,8 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
                 drawCount = drawCount,
             });
 
-            // ВАЖНО: ShadowVS.hlsl трансформирует КАЖДЫЙ слайс по lightData.CascadeMatrix[0] своего
-            // пасса - в запись каскада обязана уйти ЕГО матрица, а не общий набор (одна матрица на
-            // все четыре слайса рисовала бы их одинаково, а форвард-шейдер сэмплировал бы четырьмя
-            // разными - ложные силуэтные тени по всей сцене).
+            // ShadowVS.hlsl always transforms by CascadeMatrix0, so each slice record must carry
+            // its own matrix rather than the shared set.
             var cascadeLight = lightData;
             cascadeLight.CascadeMatrix0 = viewProjs[i];
             _shadowData.lightData.Add(cascadeLight);
@@ -337,8 +294,6 @@ public sealed class SimpleCullingAndRenderSystem : QuerySystem, IDisposable
         return lightData;
     }
 
-    /// <summary>Сфера, описанная вокруг восьми углов среза камерного фрустума [near .. far] -
-    /// объём каскада (тот же приём, что UpdateCascades основного пайплайна).</summary>
     private static (Vector3 Center, float Radius) FitFrustumSlice(Vector3 cameraPos, Vector3 forward,
         Vector3 right, Vector3 up, float tanHalfFov, float aspect, float near, float far)
     {

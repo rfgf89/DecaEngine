@@ -4,9 +4,7 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Animation;
 
-/// <summary>Насколько поза похожа на T: по каждой конечности - отклонение её направления от
-/// ожидаемого, в градусах. Числа, а не «да/нет»: поза почти никогда не идеальна, и решать, годится
-/// ли она, должен человек, глядя на величину промаха.</summary>
+/// <summary>Per-limb deviation from the expected T-pose direction, in degrees.</summary>
 public readonly record struct HumanoidPoseReport(
 	float LeftArmDegrees,
 	float RightArmDegrees,
@@ -18,24 +16,17 @@ public readonly record struct HumanoidPoseReport(
 		MathF.Max(LeftArmDegrees, RightArmDegrees),
 		MathF.Max(LeftLegDegrees, RightLegDegrees));
 
-	/// <summary>Порог «это T-поза». 25 градусов - не строгость ради строгости: A-поза отличается от
-	/// T примерно на 45, и порог обязан их различать, оставляя запас на риги, у которых руки чуть
-	/// опущены по замыслу.</summary>
+	/// <summary>25 degrees: an A-pose differs from T by about 45, so the threshold separates
+	/// them while allowing rigs with slightly lowered arms.</summary>
 	public bool LooksLikeTPose => Complete && Worst <= 25f;
 }
 
-/// <summary>
-/// Снятие и проверка референсной позы аватара (см. <see cref="HumanoidAvatar.ReferenceLocals"/>).
-///
-/// Референсная поза - это НЕ bind-поза модели. Совпадать они могут, но требовать этого нельзя:
-/// экспортируют модели в чём угодно, включая A-позу и позу с согнутыми руками, и bind-поза в таком
-/// риге - произвольное состояние, а не общая точка отсчёта. Поэтому её СНИМАЮТ явно: автор ставит
-/// персонажа в T и нажимает кнопку.
-/// </summary>
+/// <summary>Captures and validates an avatar's reference pose, which is NOT the model's bind
+/// pose: rigs ship in arbitrary poses, so the author sets a T-pose and captures it explicitly.</summary>
 public static class HumanoidReferencePose
 {
-	/// <summary>Снимает референсную позу из текущих локальных TRS. Ключ - ИМЯ кости: индексы
-	/// разъезжаются при переэкспорте, а разметка обязана переживать его.</summary>
+	/// <summary>Captures the reference pose from the current local TRS, keyed by bone NAME:
+	/// joint indices shift on re-export and the mapping has to survive it.</summary>
 	public static void Capture(HumanoidAvatar avatar, PreparedSkeleton skeleton, Transform[] locals)
 	{
 		if (avatar == null || skeleton == null || locals == null)
@@ -52,19 +43,12 @@ public static class HumanoidReferencePose
 		}
 	}
 
-	/// <summary>Снимает референсную позу из BIND-позы скелета - разумная отправная точка, когда
-	/// модель уже экспортирована в T.</summary>
+	/// <summary>Captures the reference pose from the skeleton's BIND pose.</summary>
 	public static void CaptureFromBind(HumanoidAvatar avatar, PreparedSkeleton skeleton) =>
 		Capture(avatar, skeleton, skeleton?.BindLocals ?? []);
 
-	/// <summary>
-	/// Оценивает референсную позу: насколько руки лежат вдоль X, а ноги вдоль -Y.
-	///
-	/// Проверяется НАПРАВЛЕНИЕ КОНЕЧНОСТИ (от плеча к кисти, от бедра к стопе), а не повороты
-	/// отдельных костей: именно оно определяет позу, и именно оно не зависит от того, как автор рига
-	/// сориентировал локальные оси. Проверка по осям костей ловила бы не позу, а соглашение
-	/// экспортёра.
-	/// </summary>
+	/// <summary>Scores the reference pose: arms along X, legs along -Y. Measures LIMB DIRECTION,
+	/// not per-bone rotations, which only reflect the exporter's local axis convention.</summary>
 	public static HumanoidPoseReport Evaluate(HumanoidAvatar avatar, PreparedSkeleton skeleton)
 	{
 		if (avatar == null || skeleton == null || !avatar.HasReferencePose)
@@ -78,8 +62,7 @@ public static class HumanoidReferencePose
 			return new HumanoidPoseReport(0f, 0f, 0f, 0f, Complete: false);
 		}
 
-		// Левая сторона - вдоль +X, правая - вдоль -X (соглашение движка, см.
-		// HumanoidAutoMap.AssignSides), ноги - вниз.
+		// Engine convention: left along +X, right along -X (see HumanoidAutoMap.AssignSides).
 		bool complete =
 			TryDirection(avatar, skeleton, models, HumanoidBone.LeftUpperArm, HumanoidBone.LeftHand, out var leftArm) &
 			TryDirection(avatar, skeleton, models, HumanoidBone.RightUpperArm, HumanoidBone.RightHand, out var rightArm) &
@@ -94,9 +77,8 @@ public static class HumanoidReferencePose
 			complete);
 	}
 
-	/// <summary>Модельные матрицы референсной позы. Кость, которой в позе нет, берётся из bind-позы:
-	/// референс мог быть снят с рига до переэкспорта, и обрывать из-за одной новой кости всю оценку
-	/// незачем.</summary>
+	/// <summary>Model matrices of the reference pose; bones missing from it fall back to the
+	/// bind pose, since the reference may predate a re-export that added them.</summary>
 	public static Matrix4x4[]? BuildModelMatrices(HumanoidAvatar avatar, PreparedSkeleton skeleton)
 	{
 		if (avatar == null || skeleton == null || skeleton.JointCount == 0)

@@ -10,19 +10,16 @@ using DecaEngine.Physics;
 using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
-// В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
-// имя разрешается неоднозначно.
+// Friflo ships its own Transform component; the alias disambiguates it from the engine TRS.
 using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Отладочная отрисовка и интроспекция: скелет, цепочки, IK, суставы рэгдолла. Часть <see cref="AnimationDriver"/> - файл на тему; состояние
-/// персонажа (Character) и кадровый Update живут в основном файле.</summary>
+/// <summary>Debug drawing and introspection: skeleton, chains, IK, ragdoll joints.</summary>
 public sealed partial class AnimationDriver
 {
-	/// <summary>Сводка по персонажу для окна дебага. Плоская структура, а не ссылка на
-	/// <see cref="Character"/>: окно не должно уметь трогать состояние драйвера, а список персонажей
-	/// оно перечитывает каждый кадр.</summary>
+	/// <summary>Flat per-character summary for the debug window, deliberately not a reference
+	/// to <see cref="Character"/>.</summary>
 	public readonly record struct CharacterInfo(
 		int EntityId,
 		string Clip,
@@ -79,12 +76,8 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>
-	/// Связи рэгдолла: отрезок между центрами связанных тел и точка крепления сустава. Живёт здесь, а
-	/// не в <see cref="PhysicsDebugDraw"/>, потому что по симуляции связь рэгдолла неотличима от
-	/// любой другой: решатель Bepu хранит их плоским списком без понятия «это рэгдолл вот этого
-	/// персонажа». Знание о структуре есть только у того, кто её строил.
-	/// </summary>
+	/// <summary>Draws ragdoll constraints. Lives here, not in PhysicsDebugDraw: the Bepu solver
+	/// keeps constraints in a flat list with no notion of which ragdoll they belong to.</summary>
 	public void DrawRagdollJoints(DebugDraw draw, bool onTop)
 	{
 		if (draw is not { Enabled: true })
@@ -105,8 +98,6 @@ public sealed partial class AnimationDriver
 				var pose = ragdoll.PoseOf(bone);
 				int parent = ragdoll.ParentOf(bone);
 
-				// Центр тела - крестом: расхождение центра капсулы с суставом скелета и есть тот
-				// самый перевод «джойнт -> тело», в котором чаще всего ошибаются.
 				draw.Cross(pose.Position, character.Scale * 0.1f, DebugColor.White, onTop);
 
 				if (parent >= 0)
@@ -117,8 +108,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Средняя длина кости скелета - характерный размер модели. По ней масштабируется весь
-	/// дебаг и дальность лучей IK; см. <see cref="Character.Scale"/>.</summary>
+	// Mean bone length as the model's characteristic size: scales debug draw and IK ray length.
 	private static float MeasureScale(PreparedSkeleton skeleton)
 	{
 		var pose = new SkeletonPose(skeleton);
@@ -194,9 +184,6 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Подсветка кости, выбранной в окне Humanoid: крест, оси и подпись. Оси - не
-	/// украшение: при разметке рига важно не только «эта ли кость», но и «куда она смотрит», потому
-	/// что от этого зависит вся дальнейшая работа с ней.</summary>
 	private void DrawHighlight(DebugDraw draw, Character character)
 	{
 		if (string.IsNullOrEmpty(HighlightJoint))
@@ -233,9 +220,7 @@ public sealed partial class AnimationDriver
 				if (parent >= 0)
 				{
 					var from = Vector3.Transform(character.Models[parent].Translation, toWorld);
-					// Цвет кодирует источник позы: кость, которой управляет физика, - оранжевая, как
-					// динамическое тело в дебаге физики. Так на одном экране видно, где кончается
-					// анимация и начинается рэгдолл.
+					// Colour encodes the pose source: orange for physics-driven, cyan for animated.
 					var color = character.RagdollOwned.Length > i && character.RagdollOwned[i]
 						? DebugColor.Orange
 						: DebugColor.Cyan;
@@ -260,9 +245,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Bind-поза приглушённым серым. Считается на месте, а не хранится: рисуется она под
-	/// вопрос «применилась ли поза вообще», то есть редко, а массив матриц на каждого персонажа
-	/// жил бы всегда.</summary>
+	// Recomputed on demand rather than cached: this is drawn rarely, the matrices would live always.
 	private static void DrawBindPose(DebugDraw draw, Character character, bool onTop)
 	{
 		var pose = new SkeletonPose(character.Skeleton);
@@ -303,8 +286,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Стопы: сустав и то, чем он стал после IK. Сами ЛУЧИ рисует дебаг физики - они
-	/// принадлежат миру, а не скелету, и записываются там же, где пускаются (см. ScenePhysics).</summary>
+	// The IK rays themselves are drawn by the physics debug, where they are cast.
 	private static void DrawFootIk(DebugDraw draw, Character character, bool onTop)
 	{
 		var toWorld = character.ModelToWorld;
@@ -320,7 +302,7 @@ public sealed partial class AnimationDriver
 			draw.Line(lower, foot, color, onTop);
 			draw.Cross(foot, character.Scale * 0.2f, color, onTop);
 
-			// Точка опоры: у дигитиграда это носок, и плюсна дорисовывается к цепочке.
+			// Contact point: for a digitigrade rig this is the toe, so the metatarsal is drawn too.
 			var contact = foot;
 			if (leg.ToeJoint >= 0)
 			{
@@ -328,8 +310,7 @@ public sealed partial class AnimationDriver
 				draw.Line(foot, contact, color, onTop);
 			}
 
-			// Подошва: сустав опоры минус его высота. Именно её IK сажает на поверхность, и именно
-			// её расхождение с точкой попадания луча объясняет утопленную или висящую стопу.
+			// Sole: the contact joint minus its height. This is what IK plants on the surface.
 			var sole = contact - Vector3.TransformNormal(Vector3.UnitY * leg.AnkleHeight, toWorld);
 			draw.Line(contact, sole, DebugColor.Dim(color), onTop);
 		}

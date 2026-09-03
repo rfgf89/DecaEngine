@@ -105,6 +105,5 @@ public class KeyboardImGuiKeys
 		{ KeyboardKeys.Keys.RightCtrl, ImGuiKey.RightCtrl },
 		{ KeyboardKeys.Keys.RightShift, ImGuiKey.RightShift },
 		{ KeyboardKeys.Keys.RightAlt, ImGuiKey.RightAlt }
-		// и т.д. для остальных, если есть
 	};
 }

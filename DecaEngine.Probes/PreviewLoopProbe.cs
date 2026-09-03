@@ -8,14 +8,8 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// ВРЕМЕННЫЙ отладочный CLI-режим: `DecaEngine.Editor.exe --preview-loop &lt;model.gltf&gt;
-/// [frames] [backend]`. В отличие от <see cref="PreviewProbe"/> (который вручную собирает
-/// оффскрин-сцену и рендерит один кадр), гоняет РЕАЛЬНЫЙ <see cref="ModelPreviewViewport"/> -
-/// тот же путь, что и настоящий редактор (LoadModel -> PollPendingLoad -> Update() каждый кадр
-/// в цикле) - чтобы поймать баг, который не воспроизводится в PreviewProbe (см. NRE в
-/// DiligentCommandBuffer.Execute при работе полного редактора).
-/// </summary>
+/// <summary>CLI probe: `DecaEngine.Editor.exe --preview-loop &lt;model.gltf&gt; [frames] [backend]`.
+/// Drives the real <see cref="ModelPreviewViewport"/> frame loop, unlike the single-frame PreviewProbe.</summary>
 public static class PreviewLoopProbe
 {
 	public static void Run(string[] args)
@@ -53,11 +47,8 @@ public static class PreviewLoopProbe
 		const float dt = 1f / 60f;
 		for (int i = 0; i < frames; i++)
 		{
-			// LoadModel грузит в фоновом Task.Run - реальные кадры редактора идут с реальным
-			// интервалом (в отличие от тайтового цикла), так что тут нужна настоящая задержка,
-			// иначе PollPendingLoad ни разу не увидит PrepareTask завершённым. Загрузка/финализация
-			// теперь в ModelStore (см. EditorManager.OnUpdate) - без ручного Tick здесь модель никогда
-			// бы не догрузилась, viewport.Update больше сам её не шагает.
+			// Real delay required: LoadModel runs in a background Task, and ModelStore.Tick must
+			// pump it or the model never finishes loading.
 			Thread.Sleep(16);
 			modelStore.Tick(dt);
 			viewport.Update(dt, time);
@@ -67,8 +58,7 @@ public static class PreviewLoopProbe
 			{
 				Console.WriteLine($"[loop] frame {i}: HasModel={viewport.HasModel}, LoadError={viewport.LoadError}");
 
-				// На половине прогона переключаем технику AO живьём - тот же путь, что и OK в
-				// окне настроек (RecreateEnvironment), см. ModelPreviewViewport.OnGraphicsSettingsChanged.
+				// Mid-run live AO toggle exercises the same path as OK in the settings window.
 				if (Environment.GetEnvironmentVariable("DECA_LOOP_TOGGLE") == "1")
 				{
 					settings.PreviewAoMode = settings.PreviewAoMode == AmbientOcclusionMode.Gtao

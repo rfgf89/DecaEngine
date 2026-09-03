@@ -9,9 +9,7 @@ public enum LogLevel
 	Error
 }
 
-/// <summary>Кто написал строку: сам движок/редактор, сборка пользовательского проекта или
-/// нативный слой (Diligent, шимы). Разделение нужно окну консоли для фильтра - искать ошибку
-/// своего скрипта среди тысяч строк драйвера иначе невозможно.</summary>
+/// <summary>Who wrote the line: the engine/editor, the user project build, or the native layer.</summary>
 public enum LogSource
 {
 	Editor,
@@ -35,18 +33,7 @@ public readonly struct LogEntry
 	}
 }
 
-/// <summary>
-/// Сток логов движка: кольцевой буфер записей плюс перехват stdout/stderr.
-///
-/// Лежит в Core, а не в редакторе, хотя читает его именно окно консоли. Причина в
-/// <see cref="Install"/>: он подменяет Console.Out и Console.Error, то есть перехватывает вывод
-/// ВСЕГО процесса - загрузчика моделей, бейкера probe GI, физики, пользовательской сборки. Пиши
-/// он из редактора, каждый модуль движка, которому есть что сказать, был бы обязан знать про
-/// редактор - а это ровно та зависимость, которой быть не должно.
-///
-/// Окно консоли (ConsoleWindow) остаётся в редакторе и работает поверх <see cref="Snapshot"/> и
-/// <see cref="EntryAdded"/>.
-/// </summary>
+/// <summary>Engine log sink: a ring buffer of entries plus process-wide stdout/stderr capture.</summary>
 public static class EngineLog
 {
 	private const int MaxEntries = 5000;
@@ -74,8 +61,7 @@ public static class EngineLog
 			Add(LogLevel.Error, e.ExceptionObject?.ToString() ?? "Unhandled exception");
 	}
 
-	/// <summary>Поток, на котором крутится сборка пользовательского проекта: всё, что напишет он,
-	/// помечается как <see cref="LogSource.Project"/>.</summary>
+	/// <summary>Marks a thread so everything it writes is tagged <see cref="LogSource.Project"/>.</summary>
 	public static void SetProjectThreadId(int? threadId)
 	{
 		_projectThreadId = threadId;

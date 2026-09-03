@@ -5,13 +5,9 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Owns the GPU resources for the final colour grading + vignette pass (см.
-/// ColorGradePS.hlsl): one fullscreen material plus its own display-space copy of the frame.
-///
-/// СВОЯ копия, а не общий <see cref="PipelineRenderTargets.SceneCopyTarget"/>: тот в HDR-режиме
-/// RGBA16F (его читает рефракция), а грейдинг работает по ОТОБРАЖАЕМОМУ RGBA8-кадру, и CopyTexture
-/// между разными форматами не годится. Зато благодаря этому пасс совершенно одинаков в обоих
-/// конвейерах - ColorTarget всегда RGBA8 display-space.</summary>
+/// <summary>Owns the GPU resources for the final colour grading + vignette pass: one fullscreen
+/// material plus its own RGBA8 display-space copy of the frame, since CopyTexture cannot cross
+/// formats and the shared scene copy is RGBA16F in HDR mode.</summary>
 public sealed unsafe class ColorGradePassResources : IReleaseObject
 {
 	internal IMaterialObject Material { get; }
@@ -20,13 +16,12 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 	private readonly IBufferHandle _constantBuffer;
 	private readonly ColorGradeConstantsData* _constants;
 
-	/// <summary>Копия кадра, из которой читает пасс - её наполняет <see cref="ColorGradePass"/>.</summary>
 	internal IRenderTarget Copy => _copy;
 
 	public ColorGradePassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer,
 		string colorTargetName, uint width, uint height)
 	{
-		// Формат жёстко RGBA8: грейдинг всегда идёт по отображаемому кадру (см. док класса).
+		// Hardcoded RGBA8: grading always runs on the displayable frame.
 		_copy = graphicsApi.CreateRenderTarget(new TextureInfo
 		{
 			name = colorTargetName + " Grade Copy",
@@ -35,8 +30,7 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 			format = TextureObjectFormat.R8G8B8A8UNorm,
 		});
 
-		// Свой экземпляр VS - см. комментарий в SsaoPassResources (шареный шейдер освобождался бы
-		// дважды при пересоздании окружения).
+		// Own VS instance: a shared shader would be released twice when the environment is rebuilt.
 		var vs = graphicsApi.CreateShader("Color Grade VS", "EditorAssets/shader", "SkyBackgroundVS.hlsl",
 			ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Color Grade PS", "EditorAssets/shader", "ColorGradePS.hlsl",
@@ -67,8 +61,7 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 		Material.SetTexture("_SceneTex", _copy);
 		Material.SetImmutableSampler("_SceneTex", sampler);
 
-		// dynamic = false: динамические буферы Diligent обновляет через Map, а нам нужен именно
-		// UpdateBuffer из командного буфера (USAGE_DEFAULT) - см. EyeAdaptationPassResources.
+		// dynamic = false: Diligent updates dynamic buffers via Map; we need UpdateBuffer.
 		_constantBuffer = graphicsApi.CreateBuffer(new BufferInfo
 		{
 			name = "GradeConstants",
@@ -82,7 +75,7 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 		_constants = (ColorGradeConstantsData*)NativeMemory.AllocZeroed(
 			1, (nuint)sizeof(ColorGradeConstantsData));
 
-		// Дефолты - до первого пуша из окна Graphics (та же причина, что в SsaoPassResources).
+		// Defaults, used until the Graphics window pushes its first values.
 		SetGrade(DefaultSaturation, DefaultContrast, DefaultGamma, DefaultTemperature, DefaultTint);
 		SetTints(Vector3.Zero, Vector3.One);
 		SetVignette(DefaultVignetteIntensity, DefaultVignetteRadius, DefaultVignetteSmoothness,
@@ -90,9 +83,7 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 		Resize(width, height);
 	}
 
-	/// <summary>Нейтральные дефолты: с ними пасс не меняет кадр ВООБЩЕ. Это сознательно - грейдинг
-	/// включается галкой, и включение не должно само по себе перекрашивать сцену; художник добавляет
-	/// коррекцию сам, начиная с нуля.</summary>
+	/// <summary>Neutral defaults: enabling the pass must not change the frame by itself.</summary>
 	public const float DefaultSaturation = 1f;
 	public const float DefaultContrast = 1f;
 	public const float DefaultGamma = 1f;
@@ -103,26 +94,26 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 	public const float DefaultVignetteSmoothness = 0.45f;
 	public const float DefaultVignetteRoundness = 1f;
 
-	/// <summary>Layout кбуфера "GradeConstants" в ColorGradePS.hlsl - пять float4 (80 байт).</summary>
+	// Mirrors cbuffer "GradeConstants" in ColorGradePS.hlsl: five float4, 80 bytes.
 	private struct ColorGradeConstantsData
 	{
-		/// <summary>x - насыщенность, y - контраст, z - гамма, w - температура.</summary>
+		// x saturation, y contrast, z gamma, w temperature.
 		public Vector4 Params;
 
-		/// <summary>x - оттенок, y - сила виньетки, z - радиус, w - мягкость края.</summary>
+		// x tint, y vignette intensity, z radius, w edge smoothness.
 		public Vector4 Params2;
 
-		/// <summary>xyz - тонировка теней (аддитивная), w - вытянутость виньетки к формату.</summary>
+		// xyz additive shadow tint, w vignette aspect roundness.
 		public Vector4 ShadowTint;
 
-		/// <summary>xyz - тонировка светов (мультипликативная), w - резерв.</summary>
+		// xyz multiplicative highlight tint, w reserved.
 		public Vector4 HighlightTint;
 
-		/// <summary>xy - размер таргета, zw - 1/xy.</summary>
+		// xy target size, zw 1/xy.
 		public Vector4 Target;
 	}
 
-	/// <summary>Основные ручки коррекции. Все живые - пасс перечитывает кбуфер каждым реплеем.</summary>
+	/// <summary>Main grading knobs; live, the cbuffer is re-read on every replay.</summary>
 	public void SetGrade(float saturation, float contrast, float gamma, float temperature, float tint)
 	{
 		_constants->Params = new Vector4(MathF.Max(saturation, 0f), MathF.Max(contrast, 0f),
@@ -130,17 +121,14 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 		_constants->Params2.X = Math.Clamp(tint, -1f, 1f);
 	}
 
-	/// <summary>Тонировка теней (аддитивная, нейтраль - чёрный) и светов (мультипликативная,
-	/// нейтраль - белый). Это lift/gain, разнесённые по способу применения: аддитив поднимает
-	/// именно чёрное, множитель - белое.</summary>
+	/// <summary>Lift/gain: shadows are additive (neutral black), highlights multiplicative (neutral white).</summary>
 	public void SetTints(Vector3 shadows, Vector3 highlights)
 	{
 		_constants->ShadowTint = new Vector4(shadows, _constants->ShadowTint.W);
 		_constants->HighlightTint = new Vector4(highlights, 0f);
 	}
 
-	/// <summary>Виньетка: сила, радиус чистой зоны, мягкость края и «круглость» (1 - круг с учётом
-	/// формата кадра, 0 - овал по всему кадру).</summary>
+	/// <summary>Vignette; roundness 1 = aspect-corrected circle, 0 = oval spanning the frame.</summary>
 	public void SetVignette(float intensity, float radius, float smoothness, float roundness)
 	{
 		_constants->Params2.Y = Math.Clamp(intensity, 0f, 1f);
@@ -149,16 +137,14 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 		_constants->ShadowTint.W = Math.Clamp(roundness, 0f, 1f);
 	}
 
-	/// <summary>Ресайзит копию кадра и обновляет размеры в кбуфере - зовётся при ресайзе вьюпорта
-	/// (см. ModelPreviewViewport.ResizeTargets).</summary>
+	/// <summary>Resizes the frame copy and updates the size in the cbuffer.</summary>
 	public void Resize(uint width, uint height)
 	{
 		_copy.Resize(new Vector2(width, height));
 		_constants->Target = new Vector4(width, height, 1f / MathF.Max(width, 1f), 1f / MathF.Max(height, 1f));
 	}
 
-	/// <summary>Перепривязывает копию после её Resize - Resize пересоздаёт нативную текстуру, и SRB
-	/// иначе держал бы уничтоженную.</summary>
+	/// <summary>Rebind after Resize: it recreates the native texture the SRB points at.</summary>
 	public void RebindTargets(uint width, uint height)
 	{
 		Resize(width, height);
@@ -176,14 +162,8 @@ public sealed unsafe class ColorGradePassResources : IReleaseObject
 	}
 }
 
-/// <summary>
-/// Render-graph pass that applies colour grading and a vignette to the finished displayable frame.
-///
-/// Последний ХУДОЖЕСТВЕННЫЙ пасс кадра: после тонемапа (грейдинг определён в отображаемом
-/// пространстве, см. ColorGradePS.hlsl), но ДО <see cref="PostOverlayPass"/> - контур выделения,
-/// гизмо и прочий интерфейс коррекция трогать не должна, иначе выделение меняло бы цвет вместе с
-/// настроением сцены.
-/// </summary>
+/// <summary>Render-graph pass applying colour grading and a vignette to the displayable frame;
+/// must run after tonemapping and before <see cref="PostOverlayPass"/>, which grading must not touch.</summary>
 public sealed class ColorGradePass : RenderGraphPass<ColorGradePass.PassData>
 {
 	public override string Name => "Color Grade Pass";
@@ -203,7 +183,6 @@ public sealed class ColorGradePass : RenderGraphPass<ColorGradePass.PassData>
 		_viewPortRef = viewPortRef;
 	}
 
-	/// <summary>Объявляет графу таргеты пасса - см. <see cref="ForwardPass.Setup"/>.</summary>
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		var color = builder.ImportTexture(_colorTarget);
@@ -223,7 +202,7 @@ public sealed class ColorGradePass : RenderGraphPass<ColorGradePass.PassData>
 
 		_resources.WriteConstants(cmd);
 
-		// Читать и писать один таргет нельзя - берём копию, как это делают туман и блум.
+		// Cannot read and write one target: go through a copy, as fog and bloom do.
 		cmd.SetRenderTarget(null, null);
 		cmd.CopyTexture(_colorTarget, _resources.Copy);
 		cmd.TransitionResource(_resources.Copy, ResourceState.ShaderResource);

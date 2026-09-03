@@ -8,21 +8,10 @@ using DecaEngine.Scene;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Переводит состояние мира физики в дебаг-линии: каркасы коллайдеров, точки контакта, лучи,
-/// скорости.
-///
-/// Рисуется по РЕАЛЬНЫМ формам из реестра симуляции, а не по тому, что заказывал вызывающий. Это
-/// принципиально: половина ошибок физики - это расхождение между «я создал капсулу такой» и «в
-/// симуляции лежит вот такая» (капсула Bepu измеряется цилиндрической частью, у меша не тот
-/// масштаб, тело осталось от прошлой сборки). Дебаг, рисующий заказ, такие ошибки скрывает.
-///
-/// Статический класс без состояния: всё, что нужно, - симуляция и приёмник линий.
-/// </summary>
+/// <summary>Draws the physics world as debug lines, using the simulation's actual shapes.</summary>
 public static class PhysicsDebugDraw
 {
-	/// <summary>Цвет тела по его состоянию. Кодировка одна на весь движок (см. легенду в окне
-	/// дебага): оранжевое - динамика, голубое - кинематика, серое - спит.</summary>
+	// Engine-wide legend: orange dynamic, cyan kinematic, grey asleep.
 	private static Vector4 BodyColor(bool kinematic, bool awake)
 	{
 		if (!awake)
@@ -67,9 +56,7 @@ public static class PhysicsDebugDraw
 	{
 		var bodies = simulation.Bodies;
 
-		// Обход по НАБОРАМ, а не по активному: спящие тела лежат в отдельных наборах, и рисовать
-		// только активные значит показывать пустую сцену через секунду после того, как всё легло, -
-		// ровно тогда, когда и появляется вопрос «а где мои тела».
+		// Iterate all sets, not just the active one: sleeping bodies live in separate sets.
 		for (int setIndex = 0; setIndex < bodies.Sets.Length; setIndex++)
 		{
 			ref var set = ref bodies.Sets[setIndex];
@@ -89,8 +76,7 @@ public static class PhysicsDebugDraw
 
 				if (options.Colliders)
 				{
-					// Коллайдеры - по СВОЕМУ флагу: капсула персонажа целиком внутри его меша, и с
-					// депт-тестом её не видно вовсе (см. PhysicsDebugOptions.CollidersDepthTested).
+					// Own depth flag: a character capsule sits inside its mesh and is hidden otherwise.
 					DrawShape(draw, simulation, body.Collidable.Shape, pose, color,
 						!options.CollidersDepthTested);
 				}
@@ -103,9 +89,7 @@ public static class PhysicsDebugDraw
 		}
 	}
 
-	/// <summary>Скорость стрелкой из центра тела. Длина - сама скорость в единицах мира за секунду:
-	/// не нормализованная и не масштабированная, потому что вопрос к ней обычно количественный -
-	/// «почему оно летит так быстро», - а нормализованная стрелка на него не отвечает.</summary>
+	// Arrow length is the raw velocity in world units per second, not normalized.
 	private static void DrawVelocity(DebugDraw draw, Vector3 position, in BodyVelocity velocity, bool onTop)
 	{
 		if (velocity.Linear.LengthSquared() > 1e-6f)
@@ -130,12 +114,7 @@ public static class PhysicsDebugDraw
 		}
 	}
 
-	/// <summary>
-	/// Каркас формы по её ФАКТИЧЕСКИМ данным из реестра. Меш рисуется габаритной коробкой, а не
-	/// треугольниками: статика сцены - это вся её геометрия, и каркас по треугольникам не только
-	/// стоит миллионы линий, но и закрашивает экран так, что не видно ничего, ради чего дебаг
-	/// включали. Треугольники и так видны - это сама сцена.
-	/// </summary>
+	// Meshes draw as a bounding box: per-triangle wireframe costs millions of lines.
 	private static void DrawShape(DebugDraw draw, Simulation simulation, TypedIndex shape, in RigidPose pose,
 		Vector4 color, bool onTop)
 	{
@@ -157,8 +136,7 @@ public static class PhysicsDebugDraw
 			{
 				var capsule = simulation.Shapes.GetShape<Capsule>(shape.Index);
 
-				// HalfLength, а не Length: Bepu хранит именно половину ЦИЛИНДРИЧЕСКОЙ части, а
-				// рисователь принимает полную её длину - см. DebugDraw.WireCapsule.
+				// Bepu HalfLength covers only the cylindrical part; WireCapsule wants its full length.
 				draw.WireCapsule(pose.Position, pose.Orientation, capsule.Radius, capsule.HalfLength * 2f,
 					color, 14, onTop);
 				break;
@@ -191,18 +169,14 @@ public static class PhysicsDebugDraw
 
 			default:
 			{
-				// Форма, которую здесь ещё не научились рисовать (составная, выпуклая оболочка), -
-				// крест в её положении. Молчание было бы хуже: тело есть, а на экране пусто, и это
-				// читается как «тела нет», то есть как совсем другой диагноз.
+				// Unsupported shape (compound, hull): mark it, so it never reads as "no body".
 				draw.Cross(pose.Position, 0.1f, DebugColor.Magenta, onTop);
 				break;
 			}
 		}
 	}
 
-	/// <summary>Точки контакта: крест в точке, стрелка по нормали, длина стрелки - глубина
-	/// проникновения. Именно глубина отвечает на вопрос «почему тело дрожит»: контакт с растущей
-	/// глубиной - это решатель, который не справляется, а не «плохая геометрия».</summary>
+	// Normal arrow length is the penetration depth.
 	private static void DrawContacts(DebugDraw draw, ScenePhysics physics, bool onTop)
 	{
 		var contacts = physics.World.Contacts.Contacts;
@@ -218,9 +192,7 @@ public static class PhysicsDebugDraw
 		}
 	}
 
-	/// <summary>Лучи кадра: сам луч серым, попавшая часть - зелёным до точки попадания, плюс нормаль
-	/// поверхности. Промах остаётся полностью серым - так «луч не долетел» отличимо от «под стопой
-	/// действительно пусто».</summary>
+	// A miss stays fully grey, so "ray too short" is distinguishable from "nothing there".
 	private static void DrawRays(DebugDraw draw, ScenePhysics physics, bool onTop)
 	{
 		foreach (var ray in physics.Rays)

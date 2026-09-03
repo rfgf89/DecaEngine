@@ -16,14 +16,10 @@ public struct MaterialPbrFactors
 	public float MetallicFactor;
 	public float RoughnessFactor;
 
-	/// <summary>Среднее ЛИНЕЙНОЕ альбедо материала (среднее по base color текстуре × фактор; без
-	/// текстуры - просто фактор). Цвет отскока для CPU-бейка probe-GI (см. DecaEngine.Editor.ProbeGiBaker):
-	/// трассировщику нужен один цвет на материал, а не сэмплинг текстур.</summary>
+	/// <summary>Mean linear albedo (base color texture average x factor); bounce color for the probe-GI bake.</summary>
 	public Vector3 AverageBaseColor;
 
-	/// <summary>Средняя альфа base color текстуры × фактор (1 без текстуры). Probe-GI бейкер по
-	/// ней отличает «дырявые» материалы (листва: альфа мала - не блокируют лучи) от сплошных,
-	/// даже если экспортер пометил их MASK/BLEND (камень: альфа ~1).</summary>
+	/// <summary>Mean base color alpha x factor; probe-GI uses it to tell see-through foliage from solid geometry.</summary>
 	public float AverageAlpha;
 
 	/// <summary>Whether the material has a base-color texture bound as _MainTex - lets a shader
@@ -48,25 +44,20 @@ public struct MaterialPbrFactors
 	/// with per-channel refraction of the backdrop - see UnlitInstancedPS.hlsl.</summary>
 	public float Dispersion;
 
-	/// <summary>KHR_materials_volume, precomputed for the shader: rgb = attenuationColor, w =
-	/// thicknessFactor / attenuationDistance (Beer-Lambert exponent; 0 = no volume attenuation).
-	/// Учитывает масштаб узла - см. ScaleVolumeAttenuation.</summary>
+	/// <summary>KHR_materials_volume packed for the shader: rgb = attenuationColor, w = Beer-Lambert
+	/// exponent thicknessFactor / attenuationDistance, node scale applied (0 = no attenuation).</summary>
 	public Vector4 VolumeAttenuation;
 
-	/// <summary>Толщина стекла в МИРОВЫХ единицах (thicknessFactor × масштаб узла) - геометрическая
-	/// длина преломлённого луча внутри объёма для расчёта смещения рефракции в шейдере.</summary>
+	/// <summary>Glass thickness in world units (thicknessFactor x node scale).</summary>
 	public float ThicknessWorld;
 
-	/// <summary>Код топологии примитивов этого материала (MeshTopology*-константы ModelLoader) -
-	/// не-треугольным нужен PSO с соответствующей PrimitiveTopology, см. RegisterModelResources.</summary>
+	/// <summary>Primitive topology code (ModelLoader MeshTopology* constants); non-triangles need their own PSO.</summary>
 	public int Topology;
 
-	/// <summary>glTF normalScale (множитель xy-каналов нормал-мапы; 1 = как есть). Материалы без
-	/// нормал-мапы получают "плоский" филлер (0,0,1), так что отдельный has-флаг не нужен.</summary>
+	/// <summary>glTF normalScale; materials without a normal map get a flat (0,0,1) filler, so no has-flag.</summary>
 	public float NormalScale;
 
-	/// <summary>glTF occlusionStrength (вес запечённого AO из _OcclusionTex; 1 = как в текстуре).
-	/// Материалы без AO-текстуры получают белый филлер (R=1 = не заслонено).</summary>
+	/// <summary>glTF occlusionStrength; materials without an AO texture get a white (unoccluded) filler.</summary>
 	public float OcclusionStrength;
 
 	/// <summary>Alpha-clip threshold for the shader: pixels whose base-color alpha falls below it
@@ -76,50 +67,46 @@ public struct MaterialPbrFactors
 	/// would otherwise cover the walls as fully opaque grime), OPAQUE to 0.</summary>
 	public float AlphaCutoff;
 
-	/// <summary>Режим прозрачности glTF, сохранённый ОТДЕЛЬНО от <see cref="AlphaCutoff"/>. Раньше он
-	/// в него схлопывался (MASK -> авторский порог, BLEND -> 0.5, OPAQUE -> 0), и после загрузки MASK
-	/// от BLEND было не отличить ничем.
-	///
-	/// Различие не косметическое: BLEND-накладка (декали грязи и потёков Intel Sponza) обязана не
-	/// отбрасывать тень ВООБЩЕ - она лежит в миллиметрах от стены, которую украшает, и её тень
-	/// дублирует её же рисунок на этой самой стене крупными тёмными кляксами. У MASK (листва,
-	/// решётки) тень наоборот нужна, просто вырезанная по альфе.</summary>
+	/// <summary>glTF alpha mode, kept separate from <see cref="AlphaCutoff"/>: BLEND decals must cast
+	/// no shadow at all, while MASK foliage still casts an alpha-clipped one.</summary>
 	public MaterialAlphaMode AlphaMode;
 
-	/// <summary>Доля текселей base color с промежуточной альфой - насколько альфа-канал бинарен
-	/// (см. ModelLoader.ComputeSoftAlphaFraction). Разделяет вырезку (листва: почти 0) и мягкую
-	/// накладку (декаль грязи: заметно больше нуля), которые glTF помечает одним и тем же BLEND.
-	/// -1 = неизвестно (пикселей не было и в кеше значения нет).</summary>
+	/// <summary>Fraction of base-color texels with intermediate alpha; separates cutout from soft
+	/// overlays, which glTF both tags BLEND. -1 = unknown.</summary>
 	public float SoftAlphaFraction;
 
-	/// <summary>KHR_texture_transform, предвычисленная в 2x2-матрицу UV (row-major: u' = X*u + Y*v,
-	/// v' = Z*u + W*v, затем + <see cref="UvOffset"/>). Одна на материал - берётся с baseColor-канала
-	/// (фоллбек normal/MR, каналы одного материала практически всегда делят одну трансформацию).
-	/// Валидна только при <see cref="HasUvTransform"/>.</summary>
+	/// <summary>KHR_texture_transform as a row-major 2x2 UV matrix (u' = X*u + Y*v, v' = Z*u + W*v,
+	/// then + <see cref="UvOffset"/>), taken from the baseColor channel. Valid only when <see cref="HasUvTransform"/>.</summary>
 	public Vector4 UvTransform;
 
-	/// <summary>KHR_texture_transform offset - слагаемое после матрицы <see cref="UvTransform"/>.</summary>
+	/// <summary>KHR_texture_transform offset, added after <see cref="UvTransform"/>.</summary>
 	public Vector2 UvOffset;
 
-	/// <summary>Есть ли у материала KHR_texture_transform. Шейдер применяет матрицу только по этому
-	/// флагу, так что зануленный по умолчанию cbuffer (сцены вне превью его не заполняют) остаётся
-	/// тождественным преобразованием.</summary>
+	/// <summary>Whether KHR_texture_transform is present; a zeroed cbuffer must stay an identity transform.</summary>
 	public bool HasUvTransform;
 
-	/// <summary>Индекс UV-канала occlusionTexture (glTF texCoord; поддержаны 0 и 1, см.
-	/// <see cref="Vertex.TexCoord1"/>) - AO часто запечён под уникальную развёртку второго канала.</summary>
+	/// <summary>occlusionTexture UV channel index (glTF texCoord; only 0 and 1 are supported).</summary>
 	public int OcclusionUvSet;
 
-	/// <summary>KHR_materials_sheen, упакованный для шейдера: rgb = sheenColorFactor (линейный;
-	/// ноль = расширение не авторское, велюровый лоб выключен), w = sheenRoughnessFactor.
-	/// Даёт ткани "световой ворс" - ретрорефлективный ободок Charlie-лоба (велюр/бархат).</summary>
+	/// <summary>KHR_materials_sheen packed for the shader: rgb = linear sheenColorFactor (zero = off),
+	/// w = sheenRoughnessFactor.</summary>
 	public Vector4 SheenColorRoughness;
 
-	/// <summary>KHR_materials_specular, упакованный для шейдера: rgb = specularColorFactor
-	/// (может быть &gt;1 - по спеке умножается на F0 от IOR и клампится к 1), w = specularFactor
-	/// (вес всего диэлектрического спекуляра). (1,1,1,1) = расширение не авторское, тождественно;
-	/// это struct - каждая точка конструирования обязана заполнить его, иначе нулевой w глушит
-	/// спекуляр в чёрный (та же ловушка, что у <see cref="Ior"/>).</summary>
+	/// <summary>KHR_materials_specular packed for the shader: rgb = specularColorFactor (may exceed 1),
+	/// w = specularFactor. Every construction site must set (1,1,1,1) or a zero w kills the specular.</summary>
 	public Vector4 SpecularColorFactor;
+
+	/// <summary>Linear emission: glTF emissiveFactor x KHR_materials_emissive_strength, collapsed at import.</summary>
+	public Vector3 EmissiveFactor;
+
+	/// <summary>Whether an emissive texture is bound as _EmissiveTex (sRGB, multiplies <see cref="EmissiveFactor"/>);
+	/// source of the HAS_EMISSIVE_TEXTURE keyword.</summary>
+	public bool HasEmissiveTexture;
+
+	/// <summary>A BLEND material needing real alpha blending rather than a 0.5 cutout. Must stay a
+	/// single property: divergent copies give a blending PSO with alpha 1, i.e. an opaque overlay.
+	/// The threshold is softer than the shadow-caster one (0.1 vs 0.25) on purpose.</summary>
+	public bool IsSoftBlend =>
+		AlphaMode == MaterialAlphaMode.Blend && SoftAlphaFraction > 0.1f && TransmissionFactor <= 0f;
 }
 

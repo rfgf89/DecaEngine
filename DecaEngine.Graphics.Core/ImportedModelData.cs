@@ -15,24 +15,16 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-//
-// Модель данных CPU-фазы импорта: то, что PrepareModel достаёт из glTF и что потребляют и
-// GPU-финализация загрузчика, и кулинария ассетов (CookedModelFile/ModelAssetBaker).
-//
-// Раньше эти типы были ВЛОЖЕНЫ в ModelLoader: любой, кому нужен был разобранный меш - включая
-// пекарню ассетов, - обязан был писать PreparedModel и тем самым зависеть от всего
-// загрузчика. Данные импорта - общий словарь конвейера, а не потроха одного класса.
-//
+// Data model of the CPU import phase: what PrepareModel pulls out of glTF, consumed by both the
+// loader's GPU finalization and the asset bakery (CookedModelFile/ModelAssetBaker).
 
-/// <summary>Сжатый исходник одной glTF-картинки для стриминга качества - один на image, шарится
-/// всеми PreparedTexture его каналов/материалов; в финализации по нему группируются привязки в
-/// один <see cref="StreamedTexture"/>.</summary>
+// Compressed source of one glTF image, shared by every PreparedTexture that references it.
 internal sealed class TextureStreamSource
 {
-	/// <summary>Внешний файл картинки (предпочтительно - ничего не держим в памяти).</summary>
+	// External image file; preferred, since nothing is held in memory.
 	public string FilePath;
 
-	/// <summary>Встроенные байты (.glb / data-URI), когда файла на диске нет.</summary>
+	// Embedded bytes (.glb / data URI) when there is no file on disk.
 	public byte[] EncodedBytes;
 }
 
@@ -44,18 +36,13 @@ internal sealed class PreparedTexture
 	public TextureAddress AddressMode;
 	public TextureFilter FilterMode;
 
-	/// <summary>null = стриминг выключен (обычный полноразмерный декод).</summary>
+	// null = streaming off (plain full-size decode).
 	public TextureStreamSource StreamSource;
 
-	/// <summary>Ключ запечённой BC-текстуры в кеше ассетов (см. DecaEngine.Graphics.Assets.AssetCache).
-	/// Когда не null, пиксели брать неоткуда и не нужно: слот заливается прямо из .dtex готовой
-	/// мип-цепочкой. Это и есть штатный путь при попадании в кеш - именно он убирает из загрузки
-	/// и декод PNG, и RGBA8-буферы, и генерацию мипов на GPU.</summary>
+	// Baked BC texture key; when set, Pixels is absent and the slot uploads straight from .dtex.
 	public string CacheKey;
 
-	/// <summary>Картинка glTF, из которой декодирован слот. Нужна только фазе бейка - по её
-	/// СЖАТЫМ байтам считается ключ кеша (см. AssetCache.TextureKey). В .dmdl не попадает и при
-	/// загрузке из кеша всегда null: там glTF не открывается вовсе.</summary>
+	// Bake phase only: the cache key is hashed from this image's compressed bytes. Never in .dmdl.
 	public SharpGLTF.Schema2.Image SourceImage;
 }
 
@@ -71,11 +58,17 @@ internal sealed class PreparedMaterial
 	public PreparedTexture OcclusionTexture;
 	public float OcclusionStrength = 1f;
 
-	/// <summary>glTF texCoord occlusion-канала (0/1, см. MaterialPbrFactors.OcclusionUvSet).</summary>
+	// glTF texCoord set of the occlusion channel (0/1).
 	public int OcclusionUvSet;
 	public PreparedTexture ThicknessTexture;
 
-	// KHR_texture_transform (см. MaterialPbrFactors.UvTransform/UvOffset/HasUvTransform).
+	// sRGB like base color; decoded only when EmissiveFactor is non-zero, since it multiplies.
+	public PreparedTexture EmissiveTexture;
+
+	// Linear emission: glTF emissiveFactor x KHR_materials_emissive_strength, folded on import.
+	public Vector3 EmissiveFactor;
+
+	// KHR_texture_transform.
 	public Vector4 UvTransform;
 	public Vector2 UvOffset;
 	public bool HasUvTransform;
@@ -87,8 +80,7 @@ internal sealed class PreparedMaterial
 	public float AlphaCutoff;
 	public MaterialAlphaMode AlphaMode;
 
-	/// <summary>См. <see cref="ComputeSoftAlphaFraction"/>. Считается по ПИКСЕЛЯМ, поэтому обязана
-	/// попадать в .dmdl - в cooked-модели пикселей нет. -1 = не считалось.</summary>
+	// Computed from pixels, so it must be stored in .dmdl. -1 = not computed yet.
 	public float SoftAlphaFraction = -1f;
 	public float TransmissionFactor;
 	public float Ior = 1.5f;
@@ -96,28 +88,21 @@ internal sealed class PreparedMaterial
 	public Vector4 VolumeAttenuation = new(1f, 1f, 1f, 0f);
 	public float ThicknessFactor;
 
-	// KHR_materials_sheen (нулевой цвет = выключено; roughness-дефолт спеки 0).
+	// KHR_materials_sheen (zero color = off; spec default roughness is 0).
 	public Vector3 SheenColorFactor;
 	public float SheenRoughnessFactor;
 
-	// KHR_materials_specular (дефолты спеки: белый цвет, вес 1 = тождественно).
+	// KHR_materials_specular (spec defaults: white color, weight 1 = identity).
 	public Vector3 SpecularColorFactor = Vector3.One;
 	public float SpecularFactor = 1f;
 
-	/// <summary>Среднее base color: rgb - линейное альбедо, w - средняя альфа (см.
-	/// <see cref="EnsureAverageBaseColor"/>). Считается ПО ПИКСЕЛЯМ текстуры, поэтому обязано
-	/// попадать в .dmdl: в cooked-модели пикселей нет вовсе (CookedModelFile.WriteTexture), и
-	/// пересчитать это при загрузке из кеша не из чего. Пока поле не сохранялось, у всей
-	/// cooked-сцены альфа выходила равной фактору (=1), а по ней отбираются «дырявые» материалы -
-	/// листва теряла и альфа-тест в тенях (ModelViewportEnvironment), и исключение из BVH
-	/// probe-GI (ProbeGi), то есть кроны отбрасывали тень сплошными квадратами.
-	/// null = ещё не считалось.</summary>
+	// rgb = linear albedo, w = mean alpha. From pixels, so it must be stored in .dmdl.
+	// null = not computed yet.
 	public Vector4? AverageBaseColorRgba;
 }
 
-/// <summary>Сырьё одного glTF-примитива, собранное последовательной фазой PrepareModel (чтение
-/// SharpGLTF не потокобезопасно) для параллельной CPU-обработки (winding/нормали/тангенты/
-/// meshopt/LOD). Индекс в списке work-item-ов = будущий meshId.</summary>
+// One glTF primitive, gathered serially (SharpGLTF reads are not thread-safe) for parallel CPU
+// processing. Index in the work-item list is the future meshId.
 internal sealed class MeshWorkItem
 {
 	public string Name;
@@ -128,7 +113,7 @@ internal sealed class MeshWorkItem
 	public bool HasNormals;
 	public bool HasTangents;
 
-	/// <summary>Скин-стрим примитива, null у статической геометрии (см. <see cref="SkinVertex"/>).</summary>
+	// null for static geometry.
 	public SkinVertex[] SourceSkin;
 }
 
@@ -139,14 +124,13 @@ internal sealed class PreparedMesh
 	public uint[] Indices;
 	public LodLevel[] LodLevels;
 
-	/// <summary>Скиннинг-атрибуты, параллельные <see cref="Vertices"/>; null - меш статический и
-	/// рисуется прежним путём без compute-скиннинга.</summary>
+	// Parallel to Vertices; null means a static mesh drawn without compute skinning.
 	public SkinVertex[] SkinVertices;
 	public Vector3 BoundsCenter;
 	public float BoundsRadius;
 	public bool HasUv;
 
-	/// <summary>Код топологии (MeshTopology*-константы).</summary>
+	// MeshTopology* constant.
 	public int Topology;
 }
 
@@ -156,34 +140,23 @@ internal sealed class PreparedModel
 	public List<PreparedMesh> Meshes = new();
 	public List<InstanceData> Instances = new();
 
-	/// <summary>Скелет модели, null у статической. Один на модель, даже если скинов несколько
-	/// (см. <see cref="SkinningImport.BuildSkeleton"/>).</summary>
+	// null for a static model. One per model even when it has several skins.
 	public PreparedSkeleton Skeleton;
 
-	/// <summary>Клипы, разложенные по джойнтам <see cref="Skeleton"/>. Пусто, если скелета нет
-	/// или ни один клип его не задевает.</summary>
+	// Clips resolved against Skeleton's joints; empty when no clip touches the skeleton.
 	public List<PreparedAnimation> Animations = new();
 
-	/// <summary>Реестр материалов-клонов для не-треугольных топологий: синтетический ключ ->
-	/// (исходный glTF-материал, код топологии). Заполняется в PrepareModel, материализуется в
-	/// BuildFromPrepared.</summary>
+	// Clone materials for non-triangle topologies: synthetic key -> (glTF material, topology).
 	public Dictionary<int, (int SourceMaterial, int Topology)> TopologyMaterialClones = new();
 
-	/// <summary>Тайминги фоновых фаз, мс - для диагностики (см. ModelLoader.Timings). Без них
-	/// оптимизация загрузки превращается в гадание: фазы стоят очень по-разному на разных
-	/// ассетах, и «очевидный» виновник обычно не тот.</summary>
+	// Background phase timings, ms.
 	public long MsParse, MsDecode, MsMaterials, MsMeshes;
 
-	/// <summary>Сколько уникальных картинок декодировано и сколько мегабайт они заняли
-	/// несжатыми - главный вкладчик в пиковую память загрузки.</summary>
+	// Unique images decoded and their uncompressed size: the peak load memory contributor.
 	public int DecodedImages;
 	public long DecodedBytes;
 
-	/// <summary>Потриугольные атрибуты материала (ключ - meshId), по 5 байт на треугольник:
-	/// альбедо RGB в sRGB-кодировке + металличность + шероховатость. Считаются ПО ПИКСЕЛЯМ
-	/// текстур, поэтому обязаны попадать в .dmdl: в cooked-модели пикселей нет вовсе, и
-	/// пересчитать это на загрузке не из чего - без них у RT-отражений оставались плоский
-	/// средний цвет и «неизвестный» материал (цепочка отскоков не запускалась никогда).
-	/// Пусто = ещё не считалось (см. <see cref="EnsureTriangleAttributes"/>).</summary>
+	// meshId -> 5 bytes per triangle: sRGB albedo + metallic + roughness. From pixels, so it must
+	// be stored in .dmdl. Empty = not computed yet.
 	public Dictionary<int, byte[]> TriangleAttributes = new();
 }

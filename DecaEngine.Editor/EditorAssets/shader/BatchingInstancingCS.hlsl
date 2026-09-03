@@ -84,10 +84,7 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
 	int objectID = Instances[instanceIdx].objectId;
 	int batchId = Instances[instanceIdx].batchId;
 
-	// Свободные/очищенные слоты помечаются objectId = -1 / batchId = -1 (см. RenderResourceManager) -
-	// именно ИХ надо пропускать. Прежняя проверка "objectID == 0" делала ровно обратное: валидный
-	// слот 0 (первый же зарегистрированный инстанс) никогда не рисовался, а мёртвые слоты проходили
-	// дальше и читали MeshBatchData[-1] (out-of-bounds), инкрементя чужие draw-команды.
+	// Free slots are marked -1 by RenderResourceManager; slot 0 is valid.
 	if (objectID < 0 || batchId < 0)
 	{
 		return;
@@ -96,11 +93,8 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
 	DrawData drawData = InstancesDrawData[objectID];
 	PerMeshData meshData = MeshBatchData[batchId];
 
-	// Центр - ПОКОМПОНЕНТНЫМ масштабом: максимум (positionScale.w) на неравномерном масштабе уносил
-	// центр от геометрии на |bounds.center|*(max-фактический), и повёрнутый инстанс со смещённым
-	// пивотом выпадал из фрустума теневого слайса punctual-света (единственного потребителя этого
-	// кулинга) - объект рисовался, а тень сквозь него не ложилась. Радиус остаётся по максимуму -
-	// для сферы это консервативно при любом повороте.
+	// Centre uses the per-component scale; the radius keeps the max scale, which stays
+	// conservative for a sphere under any rotation.
 	float3 centerWorld = rotateQuat(meshData.bounds.xyz * drawData.scale3.xyz, drawData.orientation) + drawData.positionScale.xyz;
 	float3 center = mul(float4(centerWorld, 1), cullData.view).xyz;
 	float radius = meshData.bounds.w * drawData.positionScale.w;

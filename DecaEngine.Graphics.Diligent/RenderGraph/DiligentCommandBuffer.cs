@@ -102,9 +102,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _stateTracker.Clear();
         }
 
-        /// <summary>
-        /// Re-points this command buffer at a different device context.
-        /// </summary>
+        /// <summary>Re-points this command buffer at a different device context.</summary>
         public void Retarget(IDeviceContext context)
         {
             _context = context;
@@ -168,7 +166,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             cmd.Obj1 = res; cmd.U1 = (uint)nativeState;
         }
 
-        /// <summary>См. <see cref="ICommandBuffer.Callback"/>.</summary>
         public void Callback(Action callback)
         {
             if (!_isRecording) return;
@@ -176,9 +173,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             cmd.Obj1 = callback;
         }
 
-        /// <summary>См. <see cref="ICommandBuffer.ExecuteNested"/>. Данные, не замыкание: тот же
-        /// choke point (BeginRecording/Reset), что у любой другой команды - живёт ровно один
-        /// цикл записи этого буфера.</summary>
+        // Recorded as data, not a closure, so it dies with this buffer's recording cycle.
         public void ExecuteNested(ICommandBuffer nested, ShadowCascadeSchedule schedule, int cascadeIndex)
         {
             if (!_isRecording) return;
@@ -193,8 +188,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             ITexture srcTex = GetNativeTexture(src);
             ITexture dstTex = GetNativeTexture(dst);
 
-            // Не-explicit транзишены: при записи они лягут в буфер ПЕРЕД командой копии и при
-            // реплее пройдут через state tracker, как у SetRenderTarget.
+            // Non-explicit transitions: recorded before the copy and replayed via the state tracker.
             AddTransitionInternal(srcTex, global::Diligent.ResourceState.CopySource);
             AddTransitionInternal(dstTex, global::Diligent.ResourceState.CopyDest);
 
@@ -259,9 +253,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             cmd.Obj1 = rtvView; cmd.Obj2 = dsvView;
         }
 
-        /// <summary>См. <see cref="ICommandBuffer.SetRenderTargets"/>. Массив вьюх аллоцируется при
-        /// ЗАПИСИ (запись у графа происходит один раз на компиляцию, реплей массив только читает) -
-        /// хелпер-массив на 1 слот здесь не годится, команд с разными наборами в буфере несколько.</summary>
+        // View array is allocated at record time; replay only reads it.
         public void SetRenderTargets(IGpuTexture[] rtvs, IGpuTexture dsv)
         {
             var views = new ITextureView[rtvs.Length];
@@ -458,9 +450,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         {
             if (_commandCount == 0) return;
 
-            // A frozen buffer may share resources with other passes that changed their
-            // states since the previous frame. Start from Unknown and let Diligent use
-            // the resource's tracked native state for every replay.
+            // A frozen buffer shares resources with passes that moved them since the last frame.
             _stateTracker.Clear();
 
             var cmdArray = _commandsArray;
@@ -507,7 +497,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                         }
                         break;
                     case CommandType.TransitionResource:
-                        // Transitions from explicit TransitionResource commands in the buffer
                         _stateTracker.AddTransition((IDeviceObject)cmd.Obj1, (global::Diligent.ResourceState)cmd.U1);
                         _stateTracker.Flush(_context);
                         break;
@@ -535,9 +524,8 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                         });
                         break;
                     case CommandType.Callback:
-                        // Нативная врезка (FSR и т.п.) трогает командный лист мимо Diligent - его
-                        // кэш стейтов после неё недостоверен. Сам колбэк обязан позвать
-                        // InvalidateState; наш трекер сбрасываем здесь же.
+                        // Native callbacks touch the command list behind Diligent's back: they must
+                        // call InvalidateState, and our tracker is reset here.
                         ((Action)cmd.Obj1).Invoke();
                         _stateTracker.Clear();
                         break;
@@ -546,10 +534,8 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                             var schedule = (ShadowCascadeSchedule)cmd.Obj2;
                             if (schedule.ShouldRender((int)cmd.U1))
                             {
-                                // Ретаргет на КАЖДЫЙ реплей - на всякий случай, той же дисциплиной,
-                                // что DiligentRenderGraphContext.Execute у буфера графа: суб-буфер
-                                // заведён под ImmediateContext один раз при создании, но привязку
-                                // лучше не предполагать неизменной.
+                                // Retarget on every replay: the sub-buffer's context binding is not
+                                // assumed to stay valid.
                                 if (cmd.Obj1 is DiligentCommandBuffer nested)
                                 {
                                     nested.Retarget(_context);
@@ -560,9 +546,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                                     ((ICommandBuffer)cmd.Obj1).Execute();
                                 }
 
-                                // Суб-буфер сам расставил свои переходы состояний через СВОЙ трекер
-                                // и мог тронуть ресурсы, общие с этим буфером (shadow map слайсы) -
-                                // наш кэш состояний после этого недостоверен, как и после Callback.
+                                // The sub-buffer transitioned shared resources via its own tracker.
                                 _stateTracker.Clear();
                             }
                         }
@@ -666,13 +650,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         }
 
 #if DEBUG
-        /// <summary>
-        /// Debug-only summary of the recorded (and typically frozen/reused) command list: draw call
-        /// count, compute dispatch count, resource transition count and an approximate triangle
-        /// count. Cheap: scans the already-recorded command array once, no GPU readback involved.
-        /// Indirect draw triangle counts cannot be known on the CPU (the count lives in a GPU buffer),
-        /// so they are not included.
-        /// </summary>
+        /// <summary>Debug summary of the recorded command list; indirect draws add no triangles.</summary>
         public (int drawCalls, int dispatchCalls, int transitionCount, long triangles) GetDebugStats()
         {
             int draws = 0, dispatches = 0, transitions = 0;

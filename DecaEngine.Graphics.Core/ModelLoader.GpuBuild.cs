@@ -15,38 +15,25 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>GPU-фаза: инкрементальная финализация PreparedModel в буферы, текстуры и материалы по чанкам между кадрами. Часть <see cref="ModelLoader"/> - файл на фазу; состояние,
-/// точки входа загрузки и Release живут в основном файле.</summary>
+/// <summary>GPU phase: incremental finalization of a PreparedModel into buffers, textures, materials.</summary>
 public partial class ModelLoader
 {
-	/// <summary>Пошаговое создание GPU-ресурсов готовой <see cref="PreparedModel"/>: итератор
-	/// возвращает ОЦЕНКУ байт, залитых в GPU на очередном шаге (текстуры материала / вершины+индексы
-	/// меша). Diligent освобождает страницы upload-хипа только на FinishFrame (Present), поэтому
-	/// финализация всей модели одним кадром раздувала host-visible память до гигабайт («Space in
-	/// dynamic heap is almost exhausted», peak 2.5+ GB). Вызывающий (<see
-	/// cref="ModelLoadRequest.FinalizeChunk"/>) двигает итератор, пока не выберет байтовый бюджет
-	/// кадра, и продолжает на следующем кадре - <paramref name="result"/> наполняется по мере
-	/// движения и валиден только после того, как MoveNext вернул false.</summary>
+	// Yields an estimate of bytes uploaded per step; Diligent frees upload-heap pages only on
+	// Present, so finalizing a whole model in one frame blows host-visible memory past 2.5 GB.
+	// result is only valid once MoveNext returned false.
 	private static IEnumerator<long> BuildFromPreparedIncremental(IGraphicsApi graphicsApi, ModelLoadOptions options,
 		PreparedModel prepared, ModelLoader result)
 	{
 		var (vsFactoryPath, vsFileName) = options.VertexShader.ToShaderFactoryParts();
 		var (psFactoryPath, psFileName) = options.PixelShader.ToShaderFactoryParts();
-		// Шейдеры модели берутся из ОБЩЕГО кэша бэкенда: варианты у разных моделей практически
-		// всегда одни и те же, а компиляция идёт синхронно на потоке рендера (см. CreateSharedShader).
-		// Материалы модели помечены OwnsShaders=false, так что шарёный экземпляр никто не убьёт.
-		// FEATURE_RT_SHADOWS и на ВЕРШИННИКЕ: сам вершинник кейворд не читает, но он переключает
-		// компилятор на DXC/SM6.5 (см. DiligentShader) - D3D12 запрещает смешивать DXBC и DXIL в
-		// одном PSO, и FXC-вершинник с DXC-пикселем ломал создание пайплайна.
+		// FEATURE_RT_SHADOWS on the VS too: it switches the compiler to DXC/SM6.5, and D3D12
+		// forbids mixing DXBC and DXIL in one PSO.
 		var vsKeywords = options.RtShadows ? new[] { "FEATURE_RT_SHADOWS" } : null;
 		var modelShaderVs = graphicsApi.CreateSharedShader("Model Vertex Shader", vsFactoryPath, vsFileName,
 			ShaderObjectType.Vertex, keywords: vsKeywords);
 		result._ownedShaders.Add(modelShaderVs);
 
-		// Пиксельные ВАРИАНТЫ по shader keywords (см. шапку UnlitInstancedPS.hlsl): эффекты,
-		// статически известные по материалу (текстуры, transmission, dispersion, alpha clip),
-		// вырезаются из кода компиляцией вместо рантайм-веток по cbuffer-флагам. Кэш - материалы
-		// с одинаковым набором ключей делят один скомпилированный шейдер.
+		// Pixel variants by shader keyword: material-static effects are compiled out, not branched.
 		var pixelShaderVariants = new Dictionary<string, IShaderObject>();
 
 		IShaderObject GetPixelShaderVariant(List<string> keywords)
@@ -70,32 +57,24 @@ public partial class ModelLoader
 			return shader;
 		}
 
-		// pm == null - встроенный дефолтный материал (без текстур/расширений).
+		// pm == null is the built-in default material (no textures, no extensions).
 		List<string> BuildMaterialKeywords(PreparedMaterial pm) => BuildKeywordsFromPrepared(options, pm);
 
 		var defaultMaterial = graphicsApi.CreateMaterial("Default Material");
 
-		// Шейдеры шареные - см. IMaterialObject.OwnsShaders. Этот материал вдобавок раздаётся
-		// НЕСКОЛЬКИМ логическим индексам (все null-материалы модели ссылаются на один объект),
-		// так что его Release зовётся из ModelLoader.Release столько же раз - ещё одна причина не
-		// давать ему трогать шейдеры.
+		// Shaders are shared and this object is handed to several logical indices, so Release
+		// runs once per index - it must not touch shaders.
 		defaultMaterial.OwnsShaders = false;
 		defaultMaterial.SetShader(GetPixelShaderVariant(BuildMaterialKeywords(null)), modelShaderVs);
 
-		// Белый 1x1-филлер для _MainTex/_MetallicRoughnessTex у материалов без соответствующей
-		// текстуры: пиксельный шейдер статически ссылается на оба слота (ветвление по
-		// PbrHas*Texture - динамическое), поэтому непривязанный дескриптор - это undefined
-		// behavior на Vulkan (validation VUID-vkCmdDrawIndexedIndirect-None-08114), а не
-		// безобидный «нулевой» сэмпл. Один общий на модель, создаётся лениво.
+		// 1x1 white filler: the PS references texture slots statically, and an unbound descriptor
+		// is undefined behavior on Vulkan (VUID-vkCmdDrawIndexedIndirect-None-08114).
 		Texture fallbackTexture = null;
 		ISamplerObject fallbackSampler = null;
 
-		// Отдельный филлер для _NormalTex: белый пиксель распаковался бы в наклонённую нормаль
-		// (1,1,1)->(1,1,1), а "плоский" (128,128,255) -> (0,0,1) оставляет геометрическую.
+		// Separate normal-map filler: (128,128,255) unpacks to (0,0,1), white would tilt the normal.
 		Texture flatNormalTexture = null;
 
-		// Создаёт (лениво) оба 1x1-филлера, не привязывая их ни к какому слоту: стриминг ставит их
-		// сам, со СВОИМ (авторским) сэмплером - см. BindPreparedTexture.
 		void EnsureFallbackTextures()
 		{
 			if (fallbackTexture == null)
@@ -160,7 +139,7 @@ public partial class ModelLoader
 
 		void BindFlatNormalFallback(IMaterialObject material)
 		{
-			// Белый филлер создаёт общий сэмплер - гарантируем его наличие.
+			// The white filler is what creates the shared sampler.
 			if (fallbackSampler == null)
 			{
 				BindFallbackTexture(material, "_NormalTex");
@@ -187,9 +166,6 @@ public partial class ModelLoader
 		BindFallbackTexture(defaultMaterial, "_OcclusionTex");
 		BindFlatNormalFallback(defaultMaterial);
 
-		// Все три филлера гарантированно созданы к этой точке (вызовы выше) - публикуем их на модели
-		// для BuildAdditionalMaterialSet (см. поле-комментарии у FallbackWhiteTexture/FallbackSampler/
-		// FallbackFlatNormalTexture).
 		result.FallbackWhiteTexture = fallbackTexture.GpuHandle;
 		result.FallbackSampler = fallbackSampler;
 		result.FallbackFlatNormalTexture = flatNormalTexture.GpuHandle;
@@ -213,12 +189,8 @@ public partial class ModelLoader
 		};
 		result.MaterialPbr[-1] = defaultPbr;
 
-		// Шейдеры + дефолтный материал с 1x1-филлерами - копейки, но это удобная точка отсечки
-		// перед первым «тяжёлым» материалом.
 		yield return 4096;
 
-		// Оценка залитых в GPU байт при материализации материала: сумма несжатых RGBA-пикселей
-		// его текстур (каждый Bind* делает отдельный Upload, так что считаем по слотам).
 		static long EstimateMaterialBytes(PreparedMaterial pm)
 		{
 			if (pm == null)
@@ -226,20 +198,17 @@ public partial class ModelLoader
 				return 4096;
 			}
 
-			// В режиме стриминга Pixels у всех каналов null (заливки на этой фазе нет вовсе) - оценка
-			// честно выходит в «почти ноль», и финализация материалов не тратит кадровый бюджет.
 			long bytes = 4096;
 			bytes += SlotBytes(pm.BaseColorTexture);
 			bytes += SlotBytes(pm.MetallicRoughnessTexture);
 			bytes += SlotBytes(pm.NormalTexture);
 			bytes += SlotBytes(pm.OcclusionTexture);
+			bytes += SlotBytes(pm.EmissiveTexture);
 			bytes += pm.TransmissionFactor > 0f ? SlotBytes(pm.ThicknessTexture) : 0;
 			return bytes;
 
-			// Запечённый слот пикселей не несёт, но заливка в VRAM всё равно стоит времени, и
-			// пропорциональна она объёму данных: BC7/BC5 - байт на тексель, плюс треть на хвост
-			// мип-цепочки. Считать такие слоты бесплатными значило бы финализировать всю сцену
-			// одним куском в одном кадре.
+			// Baked slots carry no pixels but still cost upload time: BC7/BC5 is a byte per texel,
+			// plus a third for the mip tail.
 			static long SlotBytes(PreparedTexture texture)
 			{
 				if (texture == null)
@@ -258,12 +227,8 @@ public partial class ModelLoader
 			}
 		}
 
-		// KHR_materials_volume: толщина задана в ЛОКАЛЬНЫХ координатах меша и по спеке умножается
-		// на масштаб узла (у Khronos-семплов DragonAttenuation/DragonDispersion узел дракона имеет
-		// scale 0.25 - без учёта масштаба экспонента Beer-Lambert завышается в 4 раза, и янтарное
-		// стекло глушится в тёмно-красное, а слегка голубоватое - в тёмно-синее). Толщина -
-		// per-material, масштаб - per-instance; для превью берём масштаб первого инстанса,
-		// использующего материал (модели с volume-стеклом практически всегда один узел на меш).
+		// KHR_materials_volume: thickness is in mesh-local units and the spec scales it by the node
+		// scale. Thickness is per-material, scale per-instance - take the first instance's scale.
 		var materialScales = new Dictionary<int, float>();
 		foreach (var instance in prepared.Instances)
 		{
@@ -271,28 +236,19 @@ public partial class ModelLoader
 			materialScales.TryAdd(instance.materialId, (s.X + s.Y + s.Z) / 3f);
 		}
 
-		// Реестр стрим-текстур по исходнику: один image шарится несколькими слотами/материалами
-		// (типовая ORM-текстура), апгрейд декодируется один раз и раскладывается по всем привязкам.
+		// One source image is shared by several slots/materials (typical ORM): stream it once.
 		var streamEntries = new Dictionary<TextureStreamSource, StreamedTexture>();
 
-		// Кеш ассетов этой загрузки: из него берутся запечённые .dtex, когда модель пришла из .dmdl.
-		// Один экземпляр на всю финализацию - он всего лишь держит пути, но создавать его на каждый
-		// из сотен слотов незачем.
 		var assetCache = options.Cache;
 
-		// Уже созданные GPU-текстуры по ключу кеша. Одна запечённая картинка (типовая ORM) шарится
-		// несколькими слотами и материалами; без этой карты один и тот же .dtex читался бы с диска и
-		// заливался в VRAM столько раз, сколько на него ссылок, - то есть кеш экономил бы время
-		// загрузки и при этом РАЗДУВАЛ бы видеопамять против некешированного пути.
+		// Shared by cache key: without this map one .dtex would be uploaded once per reference,
+		// so the cache would save load time while inflating VRAM.
 		var bakedTextures = new Dictionary<string, IGpuTexture>(StringComparer.Ordinal);
 
-		// Записи стриминга запечённых текстур по ключу кеша - тот же приём, что и streamEntries выше:
-		// одна .dtex, на которую ссылаются несколько слотов, обязана стримиться ОДНОЙ записью, иначе
-		// её ступени читались бы и заливались по разу на ссылку.
+		// Same deduplication for baked streaming entries.
 		var bakedStreamEntries = new Dictionary<string, StreamedTexture>(StringComparer.Ordinal);
 
-		// Читает .dtex и создаёт GPU-текстуру, разделяя результат между всеми слотами с тем же
-		// ключом. null - файла нет (кеш чистили прямо во время загрузки).
+		// null means the .dtex is gone (cache wiped mid-load).
 		IGpuTexture GetOrCreateBakedTexture(string cacheKey, string slot)
 		{
 			if (bakedTextures.TryGetValue(cacheKey, out var existing))
@@ -311,8 +267,6 @@ public partial class ModelLoader
 				return null;
 			}
 
-			// Тот же замер, что и у обычного пути: именно по нему видно, что кеш действительно
-			// убирает время из финализации, а не переносит его в другое место.
 			var swBaked = System.Diagnostics.Stopwatch.StartNew();
 			var texture = new Texture(slot, payload.ToCpuTextureData(slot));
 			texture.Upload(graphicsApi, true);
@@ -324,22 +278,17 @@ public partial class ModelLoader
 			return texture.GpuHandle;
 		}
 
-		// Возвращает привязку (текстура + сэмплер + запись стриминга) - её переиспользует теневой
-		// материал с альфа-тестом (см. ModelLoader.MaterialBaseColor). null - слот получил филлер.
+		// Returns null when the slot got a filler instead of a real texture.
 		BaseColorBinding BindPreparedTexture(IMaterialObject materialObj, string slot, PreparedTexture preparedTexture)
 		{
 			if (preparedTexture == null)
 			{
-				// Белый филлер (для _ThicknessTex G=1 -> толщина остаётся чистым factor-ом).
 				BindFallbackTexture(materialObj, slot);
 				return null;
 			}
 
-			// Режим стриминга: пикселей ещё нет вовсе - слот получает общий 1x1-филлер (белый, для
-			// _NormalTex - плоская нормаль), а первая ступень приедет из ModelStreamer. Заливать
-			// здесь нечего, поэтому финализация материалов стоит копейки и геометрия появляется
-			// почти сразу. Кейворды шейдера при этом ТЕ ЖЕ (ставятся по наличию текстуры в glTF),
-			// так что апгрейд не трогает PSO.
+			// Streaming: no pixels yet, so the slot takes the 1x1 filler and ModelStreamer delivers
+			// the first level. Shader keywords are unchanged, so upgrades never touch the PSO.
 			if (preparedTexture.StreamSource != null)
 			{
 				if (!streamEntries.TryGetValue(preparedTexture.StreamSource, out var streamEntry))
@@ -359,9 +308,8 @@ public partial class ModelLoader
 					result.StreamedTextures.Add(streamEntry);
 				}
 
-				// Текстура-филлер - общая 1x1 (белая; для нормалей плоская), а вот СЭМПЛЕР ставится
-				// сразу авторский: он immutable и печётся в layout PSO, то есть подменить его при
-				// апгрейде уже нельзя - фоллбечный Point/Wrap остался бы с текстурой навсегда.
+				// The authored sampler is set up front: samplers bake into the PSO layout and
+				// cannot be swapped on upgrade.
 				EnsureFallbackTextures();
 				materialObj.SetTexture(slot, slot == "_NormalTex"
 					? flatNormalTexture.GpuHandle
@@ -379,17 +327,13 @@ public partial class ModelLoader
 					border: Vector4.Zero,
 					mipLodBias: options.MipLodBias);
 
-				// Динамический сэмплер (на texture view), а не immutable, - как в прямом пути ниже:
-				// immutable для батч-материалов был мёртв из-за PSO-кэша (см. там же), а стримингу
-				// динамический ещё и роднее - при горячей замене текстуры SetTexture сам перевесит
-				// его на новый view (см. DiligentMaterial.SetTexture).
+				// Dynamic sampler (on the texture view), not immutable: SetTexture re-attaches it
+				// to the new view on hot swap.
 				materialObj.SetSampler(slot + "_sampler", streamSampler);
 				result._samplerCount++;
 
 				streamEntry.Bindings.Add((materialObj, slot));
 
-				// Текстура здесь - общий 1x1-филлер; теневому материалу важна не она, а ЗАПИСЬ
-				// стриминга: он подпишется на неё и получит те же ступени качества.
 				return new BaseColorBinding
 				{
 					Texture = slot == "_NormalTex" ? flatNormalTexture.GpuHandle : fallbackTexture.GpuHandle,
@@ -398,8 +342,7 @@ public partial class ModelLoader
 				};
 			}
 
-			// Запечённая текстура: мип-цепочка лежит на диске готовой к заливке. Ни декода, ни
-			// RGBA8-буфера, ни GenerateMips на GPU.
+			// Baked: the mip chain is on disk ready to upload - no decode, no GPU GenerateMips.
 			if (preparedTexture.CacheKey != null)
 			{
 				var bakedFilter = preparedTexture.FilterMode == TextureFilter.Linear && options.AnisotropicFiltering
@@ -416,10 +359,8 @@ public partial class ModelLoader
 
 				result._samplerCount++;
 
-				// Стриминг поверх кеша: слот получает 1x1-филлер и запись стриминга, а ступени
-				// приезжают ХВОСТАМИ мип-цепочки прямо из .dtex (см. ModelStore). Верхние - самые
-				// тяжёлые - уровни при этом не читаются с диска вовсе, пока качество до них не дошло,
-				// и ни одна ступень не стоит ни декода, ни пересжатия.
+				// Streaming on top of the cache: levels arrive as mip-chain tails straight from
+				// the .dtex, so top levels are never read until quality reaches them.
 				if (options.StreamTextures && assetCache != null)
 				{
 					if (!bakedStreamEntries.TryGetValue(preparedTexture.CacheKey, out var bakedStream))
@@ -432,10 +373,8 @@ public partial class ModelLoader
 							IsBlockCompressed = true,
 							CurrentSize = 0,
 
-							// Потолок качества - СОБСТВЕННЫЙ верхний уровень .dtex, а не предел
-							// импорта: файл уже запечён с этим пределом, и мелкий исходник (256px при
-							// пределе 2048) иначе вечно считался бы «недогруженным» - стример гонялся
-							// бы за качеством, которого в файле нет.
+							// Quality ceiling is the .dtex's own top level, not the import limit:
+							// otherwise a small source would read as permanently under-loaded.
 							TargetSize = Math.Max(preparedTexture.Width, preparedTexture.Height),
 							Texture = null,
 							AddressMode = preparedTexture.AddressMode,
@@ -464,9 +403,8 @@ public partial class ModelLoader
 				var bakedTexture = GetOrCreateBakedTexture(preparedTexture.CacheKey, slot);
 				if (bakedTexture == null)
 				{
-					// .dtex исчез между проверкой кеша и заливкой (кто-то чистил папку прямо во время
-					// загрузки). Пикселей в cooked-модели нет и взять их неоткуда, поэтому слот
-					// получает филлер - следующая загрузка увидит промах и перепечёт.
+					// .dtex vanished mid-load: a cooked model has no pixels to fall back on, so the
+					// slot takes a filler and the next load re-bakes it.
 					BindFallbackTexture(materialObj, slot);
 					return null;
 				}
@@ -493,9 +431,6 @@ public partial class ModelLoader
 
 				var texture = new Texture(cpuData.Name, cpuData);
 
-				// Замер отдельно от остальной финализации: она оказалась 80% времени загрузки и при этом
-				// почти не зависит от ОБЪЁМА текстур - значит цена не в байтах, а в вызовах, и надо
-				// знать, в каких именно.
 				var swUpload = System.Diagnostics.Stopwatch.StartNew();
 				texture.Upload(graphicsApi, true);
 				result._textureMs += swUpload.ElapsedMilliseconds;
@@ -505,8 +440,7 @@ public partial class ModelLoader
 				result._ownedTextures.Add(gpuTexture);
 			}
 
-			// Линейные текстуры апгрейдятся до анизотропных (тумблер в ModelLoadOptions) - без
-			// этого доска/пол мылятся под острым углом; авторский point-фильтр сохраняется.
+			// Linear upgrades to anisotropic; an authored point filter is preserved.
 			var filterMode = preparedTexture.FilterMode == TextureFilter.Linear && options.AnisotropicFiltering
 				? TextureFilter.Anisotropic
 				: preparedTexture.FilterMode;
@@ -525,17 +459,14 @@ public partial class ModelLoader
 
 			materialObj.SetTexture(slot, gpuTexture);
 
-			// ДИНАМИЧЕСКАЯ привязка (сэмплер вешается на texture view), а не SetImmutableSampler:
-			// immutable-путь для батч-материалов молча не срабатывает - Diligent подставляет дефолтный
-			// сэмплер (linear wrap), и все ручки (анизотропия, mip bias) оказываются мёртвыми.
-			// Замерено пробником: кадры с ANISO=0/1 и MIPBIAS=+4 были БИТ-В-БИТ одинаковыми.
+			// Dynamic, not SetImmutableSampler: for batch materials Diligent silently substitutes
+			// its default linear-wrap sampler, killing anisotropy and mip bias.
 			materialObj.SetSampler(slot + "_sampler", samplerObject);
 
 			return new BaseColorBinding { Texture = gpuTexture, Sampler = samplerObject, Stream = null };
 		}
 
-		// Записывает РЕАЛЬНУЮ (не филлер) привязку слота в result.MaterialTextureBindings под ключом
-		// материала - см. поле-комментарий. Единственный писатель этого словаря.
+		// Sole writer of result.MaterialTextureBindings; filler bindings are not recorded.
 		void TrackBinding(int materialKey, string slot, BaseColorBinding binding)
 		{
 			if (binding == null)
@@ -552,23 +483,15 @@ public partial class ModelLoader
 			slots[slot] = binding;
 		}
 
-		// vs передаётся параметром (а не правится повторным SetShader): DiligentMaterial.SetShader
-		// release-ит ранее установленные шейдеры, а они шарятся между материалами - повторный вызов
-		// на живом наборе роняет процесс двойным освобождением.
-		//
-		// materialKey - ключ, под которым будет зарегистрирован ИТОГОВЫЙ материал в
-		// result.materialObjects (обычный логический индекс или синтетический ключ клона топологии,
-		// см. MakeTopologyMaterialKey) - нужен только чтобы разложить реальные привязки текстур в
-		// result.MaterialTextureBindings (см. TrackBinding) для BuildAdditionalMaterialSet.
+		// vs is a parameter rather than a second SetShader call: SetShader releases the previously
+		// set shaders, and those are shared between materials - a double free.
 		IMaterialObject BuildMaterialObject(PreparedMaterial pm, string name, IShaderObject vs, int materialKey,
 			out BaseColorBinding baseColor)
 		{
 			var swCreate = System.Diagnostics.Stopwatch.StartNew();
 			var materialObj = graphicsApi.CreateMaterial(name);
 
-			// Шейдеры ШАРЕНЫЕ между материалами модели (вариантный кэш + один VS): освобождать их
-			// материалу нельзя - это декремент чужого счётчика ссылок и падение на следующем
-			// материале. См. IMaterialObject.OwnsShaders и ModelLoader.Release.
+			// Shaders are shared across the model's materials; releasing them here double-frees.
 			materialObj.OwnsShaders = false;
 			result._matCreateMs += swCreate.ElapsedMilliseconds;
 
@@ -579,17 +502,15 @@ public partial class ModelLoader
 			baseColor = BindPreparedTexture(materialObj, "_MainTex", pm.BaseColorTexture);
 			TrackBinding(materialKey, "_MainTex", baseColor);
 
-			// Слот объявлен в шейдере только под HAS_MR_TEXTURE (см. UnlitInstancedPS.hlsl) - этот
-			// кейворд ставится только когда у материала реально есть MR-текстура, так что фоллбек
-			// тут не нужен и не должен биндиться (иначе immutable sampler без ресурса в шейдере).
+			// Slot exists only under HAS_MR_TEXTURE, so binding a fallback would leave a sampler
+			// with no shader resource.
 			if (pm.MetallicRoughnessTexture != null)
 			{
 				TrackBinding(materialKey, "_MetallicRoughnessTex",
 					BindPreparedTexture(materialObj, "_MetallicRoughnessTex", pm.MetallicRoughnessTexture));
 			}
 
-			// Слот объявлен в шейдере только под MATERIAL_TRANSMISSION (см. UnlitInstancedPS.hlsl) -
-			// у остальных материалов кейворд выключен, и биндить нечего.
+			// Slot exists only under MATERIAL_TRANSMISSION.
 			if (pm.TransmissionFactor > 0f)
 			{
 				TrackBinding(materialKey, "_ThicknessTex",
@@ -606,15 +527,21 @@ public partial class ModelLoader
 				BindFlatNormalFallback(materialObj);
 			}
 
-			// Белый филлер (R=1) = "ничего не заслонено" - has-флаг не нужен.
+			// White filler (R=1) reads as "nothing occluded", so no has-flag is needed.
 			TrackBinding(materialKey, "_OcclusionTex",
 				BindPreparedTexture(materialObj, "_OcclusionTex", pm.OcclusionTexture));
+
+			// Slot exists only under HAS_EMISSIVE_TEXTURE.
+			if (pm.EmissiveTexture != null)
+			{
+				TrackBinding(materialKey, "_EmissiveTex",
+					BindPreparedTexture(materialObj, "_EmissiveTex", pm.EmissiveTexture));
+			}
 
 			return materialObj;
 		}
 
-		// scaleKey - ключ, под которым ИНСТАНСЫ ссылаются на материал (для клонов топологий это
-		// синтетический ключ, см. MakeTopologyMaterialKey), т.к. materialScales собран по инстансам.
+		// scaleKey is the key instances reference the material by, since materialScales is per-instance.
 		MaterialPbrFactors BuildFactors(PreparedMaterial pm, int scaleKey)
 		{
 			var averageBaseColor = ModelImporter.ComputeAverageBaseColor(pm);
@@ -641,6 +568,8 @@ public partial class ModelLoader
 			Dispersion = pm.Dispersion,
 			SheenColorRoughness = new Vector4(pm.SheenColorFactor, pm.SheenRoughnessFactor),
 			SpecularColorFactor = new Vector4(pm.SpecularColorFactor, pm.SpecularFactor),
+			EmissiveFactor = pm.EmissiveFactor,
+			HasEmissiveTexture = pm.EmissiveTexture != null,
 			VolumeAttenuation = ScaleVolumeAttenuation(pm, materialScales, scaleKey),
 			ThicknessWorld = pm.ThicknessFactor *
 				(materialScales.TryGetValue(scaleKey, out var nodeScale) && nodeScale > 0f ? nodeScale : 1f)
@@ -674,10 +603,8 @@ public partial class ModelLoader
 			yield return EstimateMaterialBytes(preparedMaterial);
 		}
 
-		// Материалы-клоны под не-треугольные топологии (см. PrepareModel): тот же шейдинг и
-		// текстуры, но отдельный объект материала - RegisterModelResources назначит ему PSO с
-		// нужной PrimitiveTopology, а батч-рендерер и так группирует индирект-дроу по материалу,
-		// так что смешение топологий в одной модели больше ничего не требует.
+		// Clone materials for non-triangle topologies: same shading, but a separate material object
+		// so RegisterModelResources can give it a PSO with the right PrimitiveTopology.
 		IShaderObject pointShaderVs = null;
 
 		foreach (var (synthKey, clone) in prepared.TopologyMaterialClones)
@@ -688,18 +615,14 @@ public partial class ModelLoader
 				source = prepared.Materials.Find(m => m.LogicalIndex == clone.SourceMaterial && !m.IsNull);
 			}
 
-			// PSO с POINT_LIST обязан писать builtin PointSize из VS (Vulkan
-			// VUID-VkGraphicsPipelineCreateInfo-topology-08773) - точечным клонам достаётся
-			// *PointVS-вариант, лежащий рядом со штатным (конвенция имени; для нестандартного VS
-			// из опций остаётся обычный - валидация ругнётся, но на большинстве драйверов рендер
-			// работает).
+			// A POINT_LIST PSO must write builtin PointSize from the VS
+			// (VUID-VkGraphicsPipelineCreateInfo-topology-08773), hence the *PointVS variant.
 			var cloneVs = modelShaderVs;
 			if (clone.Topology == MeshTopologyPoints)
 			{
 				if (pointShaderVs == null && vsFileName == "UnlitInstancedVS.hlsl")
 				{
-					// Добавляется в _ownedShaders сразу после создания - см. ниже. Кейворды - как у
-					// основного вершинника (DXC-паритет с RT-вариантом пикселя).
+					// Same keywords as the main VS, for DXC parity with the RT pixel variant.
 					pointShaderVs = graphicsApi.CreateSharedShader("Model Point Vertex Shader", vsFactoryPath,
 						"UnlitInstancedPointVS.hlsl", ShaderObjectType.Vertex, keywords: vsKeywords);
 					result._ownedShaders.Add(pointShaderVs);
@@ -714,8 +637,7 @@ public partial class ModelLoader
 			{
 				materialObj = graphicsApi.CreateMaterial($"Default Material (topology {clone.Topology})");
 
-				// Шейдеры здесь ШАРЕНЫЕ (вариантный кэш + один VS на модель) - освобождает их
-				// ModelLoader.Release, по разу на каждый. См. IMaterialObject.OwnsShaders.
+				// Shared shaders: ModelLoader.Release frees them, once each.
 				materialObj.OwnsShaders = false;
 				materialObj.SetShader(GetPixelShaderVariant(BuildMaterialKeywords(null)), cloneVs);
 				BindFallbackTexture(materialObj, "_MainTex");
@@ -768,9 +690,7 @@ public partial class ModelLoader
 		result.Animations.AddRange(prepared.Animations);
 		result.instances.AddRange(prepared.Instances);
 
-		// Потриугольное альбедо из текстур - пока CPU-пиксели base color ещё живы (после
-		// финализации они освобождаются). Потребитель - probe-GI бейкер: цвет отскока и
-		// RT-отражений в разрешении треугольников вместо одного среднего на материал.
+		// Must run while base-color CPU pixels are still alive - finalization frees them.
 		ModelImporter.ComputeTriangleAlbedoFromTextures(result, prepared);
 	}
 

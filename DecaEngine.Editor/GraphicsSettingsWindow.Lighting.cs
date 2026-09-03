@@ -12,8 +12,7 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Секции света и теней: мировой свет, каскады, отладочный захват слайсов shadow map. Часть <see cref="GraphicsSettingsWindow"/> - файл на тему,
-/// поля и применение изменений живут в основном файле.</summary>
+/// <summary>Light and shadow sections: world sun, cascades, shadow map slice capture.</summary>
 public partial class GraphicsSettingsWindow
 {
 	private void DrawLightSection()
@@ -26,39 +25,35 @@ public partial class GraphicsSettingsWindow
 			_settings.PreviewShadows = shadows;
 			_changed = true;
 		}
-		Tooltip("Тени мирового ключа (shadow map каскад). Выключение откатывает свет на камерный риг\nи прячет probe-GI (пробам нужно направление солнца).");
+		Tooltip("Shadows from the world key light (cascaded shadow map). Turning them off falls back\nto the camera light rig and hides probe GI (probes need a sun direction).");
 
-		// Верх диапазона = ровно тот кламп, с которым значение уходит в кбуфер и в бейк
-		// (ModelPreviewViewport: Clamp(..., 0.1f, 16f)); прежние 1000 были фикцией - всё выше 16
-		// движок молча срезал.
+		// Range top mirrors the clamp applied on the way to the cbuffer and the bake.
 		var sun = _settings.ProbeGiSunIntensity;
 		if (Slider("Sun intensity", ref sun, 0.1f, 16f, "%.2f"))
 		{
 			_settings.ProbeGiSunIntensity = sun;
 		}
-		Tooltip("Интенсивность солнца - и аналитического ключа, и баунса в пробах (перепекает их).\nВыше колена тонемапа (~0.76 на светлом альбедо) контраст съедается - крутить вместе с Ambient boost.");
+		Tooltip("Sun intensity - both the analytic key light and the bounce in probes (rebakes them).\nAbove the tonemap knee (~0.76 on bright albedo) contrast flattens out - tune together with Ambient boost.");
 
-		// Порядок - по возрастанию накладных расходов; хранится ШЕЙДЕРНОЕ значение (см.
-		// EditorSettings.ShadowFilterMode: 0 обязан оставаться PCSS), поэтому индексы комбо
-		// мапятся через таблицу. Верхний пункт (Ray-traced) показывается только на устройстве с
-		// inline-трассировкой - без неё вариант шейдера не соберётся вовсе.
+		// The stored value is the SHADER mode (0 must stay PCSS), so combo indices go through a
+		// table. Ray-traced is offered only where inline ray tracing exists.
 		bool rtAvailable = _viewport?.RayTracingSupported ?? false;
 		int[] shadowModeValues = rtAvailable ? [1, 2, 0, 3, 4] : [1, 2, 0, 3];
 		var shadowModeLabels = rtAvailable
 			? new[]
 			{
-				"Hard (1 тап)",
+				"Hard (1 tap)",
 				"PCF 3x3",
-				"PCSS (полутень)",
-				"PCSS HQ (32 тапа)",
-				"Ray-traced (перезагрузка)",
+				"PCSS (soft edge)",
+				"PCSS HQ (32 taps)",
+				"Ray-traced (reload)",
 			}
 			: new[]
 			{
-				"Hard (1 тап)",
+				"Hard (1 tap)",
 				"PCF 3x3",
-				"PCSS (полутень)",
-				"PCSS HQ (32 тапа)",
+				"PCSS (soft edge)",
+				"PCSS HQ (32 taps)",
 			};
 		var shadowModeIndex = Array.IndexOf(shadowModeValues, _settings.ShadowFilterMode);
 		if (shadowModeIndex < 0)
@@ -72,18 +67,18 @@ public partial class GraphicsSettingsWindow
 			_settings.ShadowFilterMode = shadowModeValues[shadowModeIndex];
 			_changed = true;
 		}
-		Tooltip("Фильтр теней солнца И punctual-светов, по возрастанию цены:\n" +
-			"  Hard - один аппаратный тап, край в тексель. Самый дешёвый.\n" +
-			"  PCF 3x3 - постоянная мягкость в тексель, 9 тапов.\n" +
-			"  PCSS - полутень от углового размера источника (контакт резкий, дальше мягче),\n" +
-			"    16+16 тапов по диску Фогеля, зерно усредняет TAAU.\n" +
-			"  PCSS HQ - тот же PCSS с удвоенным веером (32+32) и более широкой полутенью -\n" +
-			"    для стоп-кадров и работы без TAAU.\n" +
-			"  Ray-traced - тень солнца ТЕНЕВЫМИ ЛУЧАМИ по TLAS (8 лучей в конусе диска):\n" +
-			"    физическая полутень без каскадов и байасов. Переключение ПЕРЕЗАГРУЖАЕТ модель\n" +
-			"    (вариант шейдера собирается DXC). Листва с альфа-тестом затеняет монолитом;\n" +
-			"    punctual-света остаются на PCSS.\n" +
-			"Ширину полутени задают Sun angular size (солнце) и SourceRadius света (лампы).");
+		Tooltip("Shadow filter for the sun AND punctual lights, in order of cost:\n" +
+			"  Hard - one hardware tap, edge within a texel. Cheapest.\n" +
+			"  PCF 3x3 - constant one-texel softness, 9 taps.\n" +
+			"  PCSS - penumbra from the source's angular size (sharp at contact, softer with\n" +
+			"    distance), 16+16 taps on a Vogel disk; TAAU averages out the noise.\n" +
+			"  PCSS HQ - the same PCSS with a doubled tap count (32+32) and a wider penumbra -\n" +
+			"    for stills and for working without TAAU.\n" +
+			"  Ray-traced - sun shadow cast by SHADOW RAYS against the TLAS (8 rays in the disk\n" +
+			"    cone): physical penumbra with no cascades and no bias. Switching RELOADS the\n" +
+			"    model (the shader variant is compiled by DXC). Alpha-tested foliage shadows as\n" +
+			"    solid geometry; punctual lights stay on PCSS.\n" +
+			"Penumbra width comes from Sun angular size (sun) and the light's SourceRadius (lamps).");
 
 		var sunSize = _settings.SunAngularSize;
 		if (Slider("Sun angular size", ref sunSize, 0.25f, 8f, "%.2f°",
@@ -91,18 +86,16 @@ public partial class GraphicsSettingsWindow
 		{
 			_settings.SunAngularSize = sunSize;
 		}
-		Tooltip("Видимый ДИАМЕТР диска солнца, градусы - ширина полутени PCSS: чем крупнее диск,\n" +
-			"тем мягче тень с расстоянием от объекта (контактная остаётся резкой).\n" +
-			"Реальное солнце ~0.53°; дефолт 1° - мягкость видна и на коротких тенях.");
+		Tooltip("Apparent DIAMETER of the sun disk, in degrees - the PCSS penumbra width: the larger\n" +
+			"the disk, the softer the shadow gets with distance from the caster (contact stays sharp).\n" +
+			"The real sun is ~0.53°; the default 1° keeps softness visible even on short shadows.");
 
 		ImGui.Spacing();
 		DrawShadowCascadesDebug();
 	}
 
-	/// <summary>Отладочный вид shadow map каскадов: по кнопке вычитывает D32-слайсы выбранного
-	/// вьюпорта на CPU (синхронно, поэтому не live) и показывает их нормализованными ПО-КАСКАДНО -
-	/// сырая глубина крупного каскада «вся белая» не потому, что буфер пуст, а потому что сцена
-	/// занимает узкую полосу его Z-диапазона (far = 2 диаметра сферы каскада) и малую долю площади.</summary>
+	// Synchronous D32 slice readback, normalised per cascade: raw depth of a large cascade looks
+	// almost white because the scene occupies a narrow band of its Z range.
 	private unsafe void DrawShadowCascadesDebug()
 	{
 		if (!ImGui.TreeNode("Shadow cascades (debug)"))
@@ -118,14 +111,14 @@ public partial class GraphicsSettingsWindow
 		{
 			CaptureShadowCascades();
 		}
-		Tooltip("Синхронный ридбек всех слайсов shadow map выбранного вьюпорта (кадр встанет на\nмгновение). Слепок, не live - после смены камеры/света жми снова.");
+		Tooltip("Synchronous readback of every shadow map slice of the selected viewport (the frame\nstalls for a moment). A snapshot, not live - capture again after moving the camera or light.");
 
 		ImGui.SameLine();
 		if (ImGui.Checkbox("Raw depth", ref _shadowDebugRaw))
 		{
 			RefreshShadowDebugTextures();
 		}
-		Tooltip("Глубина как в буфере (0..1 от near до far каскада) вместо растяжки по факт.\nдиапазону геометрии. У крупных каскадов сцена лежит в узкой полосе - картинка\nзакономерно почти белая, это не баг записи.");
+		Tooltip("Depth exactly as stored (0..1 from cascade near to far) instead of stretched over the\nactual geometry range. In large cascades the scene occupies a narrow band, so the image\nis expectedly almost white - that is not a write bug.");
 
 		if (_shadowDebugInfo.Length > 0)
 		{
@@ -145,21 +138,21 @@ public partial class GraphicsSettingsWindow
 				var world = _shadowDebugWorld[i];
 				if (stats.Coverage <= 0f)
 				{
-					ImGui.TextDisabled("пусто (нет геометрии или каскад не рендерится)");
+					ImGui.TextDisabled("empty (no geometry, or the cascade is not rendered)");
 				}
 				else
 				{
-					ImGui.Text($"геометрия: {stats.Coverage * 100f:F1}% текселей");
-					ImGui.Text($"глубина: {stats.Min:F4} .. {stats.Max:F4}");
+					ImGui.Text($"geometry: {stats.Coverage * 100f:F1}% of texels");
+					ImGui.Text($"depth: {stats.Min:F4} .. {stats.Max:F4}");
 					if (world.WorldDepthRange > 0f)
 					{
-						ImGui.Text($"мир: {stats.Min * world.WorldDepthRange:F1} .. {stats.Max * world.WorldDepthRange:F1} ед. (диапазон {world.WorldDepthRange:F1})");
+						ImGui.Text($"world: {stats.Min * world.WorldDepthRange:F1} .. {stats.Max * world.WorldDepthRange:F1} units (range {world.WorldDepthRange:F1})");
 					}
 				}
 				if (world.WorldSize > 0f)
 				{
-					ImGui.Text($"область: {world.WorldSize:F1} x {world.WorldSize:F1} ед. " +
-						$"(тексель {world.WorldSize / ShadowRenderer.ShadowMapSize:F3} ед.)");
+					ImGui.Text($"extent: {world.WorldSize:F1} x {world.WorldSize:F1} units " +
+						$"(texel {world.WorldSize / ShadowRenderer.ShadowMapSize:F3} units)");
 				}
 				ImGui.EndGroup();
 				ImGui.Spacing();
@@ -174,14 +167,14 @@ public partial class GraphicsSettingsWindow
 		var env = _shadowDebugSource == 0 ? _sceneViewport?.Environment : _viewport?.Environment;
 		if (env?.BatchRenderer == null)
 		{
-			_shadowDebugInfo = "окружение ещё не создано";
+			_shadowDebugInfo = "environment not created yet";
 			return;
 		}
 
 		var shadowTarget = env.BatchRenderer.WorldShadowRenderer?.ShadowMapsTarget as DiligentRenderTarget;
 		if (shadowTarget == null)
 		{
-			_shadowDebugInfo = "shadow map недоступна";
+			_shadowDebugInfo = "shadow map unavailable";
 			return;
 		}
 
@@ -219,10 +212,8 @@ public partial class GraphicsSettingsWindow
 				: (0f, 0f, 0f);
 		}
 
-		// Логические размеры каскадов: у Scene View (mainCascades) они лежат в CameraData
-		// каскадных камер солнца - ортоширина в viewport.Z (см. CameraData ортоконструктор),
-		// диапазон глубины far-near. У превью (Simple-путь) камер-каскадов нет - размеры
-		// остаются нулями и строка "мир"/"область" не показывается.
+		// Cascade extents live in the sun cascade cameras: ortho width in viewport.Z, depth
+		// range in far-near. The preview path has no cascade cameras, so these stay zero.
 		var sun = env.SunEntity;
 		if (!sun.IsNull && sun.HasComponent<CascadedShadowComponent>())
 		{
@@ -237,14 +228,12 @@ public partial class GraphicsSettingsWindow
 			}
 		}
 
-		_shadowDebugInfo = $"{sourceName(_shadowDebugSource)}: {width}x{height} x{fullSlices.Length}, даунсемпл {step}x";
+		_shadowDebugInfo = $"{sourceName(_shadowDebugSource)}: {width}x{height} x{fullSlices.Length}, downsample {step}x";
 		RefreshShadowDebugTextures();
 
 		static string sourceName(int source) => source == 0 ? "Scene View" : "Model Preview";
 	}
 
-	/// <summary>Перезаливает RGBA8-текстуры вида из сохранённых float-слайсов (капчер или смена
-	/// Raw depth). Текстуры создаются один раз - API переживает пересоздание окружений.</summary>
 	private void RefreshShadowDebugTextures()
 	{
 		if (_shadowDebugSlices == null)
@@ -278,8 +267,7 @@ public partial class GraphicsSettingsWindow
 				}
 				else
 				{
-					// Пустота (clear 1.0) остаётся белой, геометрия растягивается на 0..230 -
-					// граница «есть геометрия / нет» читается при любом диапазоне глубин.
+					// Cleared texels (1.0) stay white; geometry is stretched into 0..230.
 					b = v >= 1.0f ? (byte)255 : (byte)Math.Clamp((int)((v - stats.Min) / range * 230f), 0, 230);
 				}
 

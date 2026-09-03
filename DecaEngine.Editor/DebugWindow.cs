@@ -55,7 +55,6 @@ namespace DecaEngine.Editor
 				var info = _batchRenderer.ReadInfo();
 				ImGui.Text($"Total Batches: {_batchRenderer.GetBatches().Count}, Draw Calls: {info.pipelineStateCount}");
 
-				// Debug Light Data
 				if (ImGui.TreeNode("Light Debug"))
 				{
 					var lights = _ecsWorld.Query<LightComponent, SunComponent>();

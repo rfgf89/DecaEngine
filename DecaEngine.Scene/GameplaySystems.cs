@@ -4,11 +4,7 @@ using Friflo.Engine.ECS.Systems;
 
 namespace DecaEngine.Scene
 {
-	/// <summary>
-	/// Play-Mode-only system that spins every entity with a <see cref="RotateComponent"/> around its
-	/// configured axis. Registered into a dedicated <see cref="SystemRoot"/> that InspectorWindow only
-	/// updates while Play Mode is running (see <see cref="InspectorWindow.Play"/>).
-	/// </summary>
+	/// <summary>Play-Mode-only system spinning entities with <see cref="RotateComponent"/> around their axis.</summary>
 	public class RotateSystem : QuerySystem<RotateComponent, Rotation>
 	{
 		protected override void OnUpdate()
@@ -27,20 +23,9 @@ namespace DecaEngine.Scene
 		}
 	}
 
-	/// <summary>
-	/// Play-Mode-only система движения по окружности ПРЯМЫМ ЗАДАНИЕМ ТРАНСФОРМА (см.
-	/// <see cref="CircleMoveComponent"/>).
-	///
-	/// Ведёт только персонажей БЕЗ <see cref="CharacterBodyComponent"/>. У остальных позицию задаёт
-	/// тело в физическом мире сцены (CharacterMotionDriver), и запись сюда же перетирала бы результат
-	/// симуляции - персонаж проходил бы сквозь стены, имея при этом честную капсулу и честные
-	/// контакты, что диагностируется на порядок хуже, чем отсутствие физики вовсе.
-	///
-	/// Позиция считается ИЗ ФАЗЫ, а не приращением к текущей позиции. Приращение накапливало бы
-	/// ошибку шага: за минуту на 60 FPS это 3600 сложений, и круг превращается в спираль. Из фазы же
-	/// радиус точен по построению, а накапливается только сама фаза - величина, у которой дрейф
-	/// означает лишь сдвиг по кругу, а не изменение его формы.
-	/// </summary>
+	/// <summary>Play-Mode-only circular motion via direct transform writes; skips entities with
+	/// <see cref="CharacterBodyComponent"/> (physics owns those), and derives position from phase,
+	/// not per-step increments, so error cannot accumulate into a spiral.</summary>
 	public class CircleMoveSystem : QuerySystem<CircleMoveComponent, Position, Rotation>
 	{
 		protected override void OnUpdate()
@@ -49,14 +34,13 @@ namespace DecaEngine.Scene
 			Query.ForEachEntity((ref CircleMoveComponent move, ref Position position, ref Rotation rotation,
 				Entity entity) =>
 			{
-				// Нулевой радиус - не «стоять на месте», а деление на ноль в угловой скорости.
+				// Zero radius would divide by zero in the angular velocity, not "stand still".
 				if (!move.Enabled || move.Radius <= 1e-4f || entity.HasComponent<CharacterBodyComponent>())
 				{
 					return;
 				}
 
-				// Угловая скорость выводится из линейной: скорость шага - величина линейная, и связывать
-				// её дальше придётся именно с ней (клип Walk/Run).
+				// Speed is linear (m/s); angular velocity is derived so Walk/Run clips can bind to it.
 				move.Angle = CircleMotion.Wrap(move.Angle + move.Speed / move.Radius * deltaTime);
 
 				position.value = CircleMotion.PointAt(move, move.Angle);

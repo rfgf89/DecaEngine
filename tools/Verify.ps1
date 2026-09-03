@@ -1,25 +1,25 @@
 ﻿<#
 .SYNOPSIS
-	Полная проверка дерева: сборка решения, юнит-тесты, регрессия проб.
+	Full tree check: solution build, unit tests, probe regression.
 
 .DESCRIPTION
-	Одна команда на весь рефакторинг. Перенос кода между проектами и распил файлов не должны
-	менять поведение - значит, после каждого шага это должно быть зелёным, и если не зелёное,
-	шаг был не механическим.
+	One command for the whole refactor. Moving code between projects and splitting files must not
+	change behaviour - so after every step this must be green, and if it is not green, the step was
+	not mechanical.
 
-	Три уровня, от дешёвого к дорогому, и останов на первом упавшем: гонять пробы на дереве,
-	которое не собирается, смысла нет.
+	Three levels, cheapest to most expensive, stopping at the first failure: running the probes on a
+	tree that does not build makes no sense.
 
 .PARAMETER SkipProbes
-	Только сборка и юнит-тесты (секунды вместо минут). Для проверки на ходу; перед коммитом
-	прогонять полностью.
+	Build and unit tests only (seconds instead of minutes). For checking as you go; run the full
+	thing before committing.
 
 .PARAMETER SkipEditor
-	Не запускать редактор. Запуск открывает окно на несколько секунд - мешает, если проверка идёт
-	фоном.
+	Do not launch the editor. Launching opens a window for a few seconds - annoying if the check runs
+	in the background.
 
 .PARAMETER Backend
-	Бэкенд для проб: d3d12 (по умолчанию) или vulkan.
+	Backend for the probes: d3d12 (default) or vulkan.
 
 .EXAMPLE
 	.\tools\Verify.ps1
@@ -44,22 +44,22 @@ function Write-Step {
 	Write-Host "=== $Text" -ForegroundColor Cyan
 }
 
-# Diligent не работает на AnyCPU - платформа задаётся везде явно.
-Write-Step "Сборка решения (x64)"
+# Diligent does not work on AnyCPU - the platform is set explicitly everywhere.
+Write-Step "Solution build (x64)"
 & dotnet build (Join-Path $RepoRoot 'DecaEngine.sln') -c Debug -p:Platform=x64 --nologo -v q | Out-Null
 if ($LASTEXITCODE -ne 0) {
-	Write-Host "СБОРКА УПАЛА" -ForegroundColor Red
+	Write-Host "BUILD FAILED" -ForegroundColor Red
 	exit 1
 }
-Write-Host "  собралось" -ForegroundColor Green
+Write-Host "  built" -ForegroundColor Green
 
-Write-Step "Юнит-тесты"
+Write-Step "Unit tests"
 $testOutput = & dotnet test (Join-Path $RepoRoot 'DecaEngine.Tests\DecaEngine.Tests.csproj') `
 	-c Debug -p:Platform=x64 --nologo -v q --no-build 2>&1
 $testExit = $LASTEXITCODE
 $summary = $testOutput | Select-String -Pattern 'Passed!|Failed!|error'
 if ($testExit -ne 0) {
-	Write-Host "ТЕСТЫ УПАЛИ" -ForegroundColor Red
+	Write-Host "TESTS FAILED" -ForegroundColor Red
 	$testOutput | Select-Object -Last 40 | ForEach-Object { Write-Host "  $_" }
 	exit 1
 }
@@ -67,29 +67,31 @@ $summary | ForEach-Object { Write-Host "  $_" -ForegroundColor Green }
 
 if ($SkipProbes) {
 	Write-Host ""
-	Write-Host "Пробы пропущены (-SkipProbes). Перед коммитом прогнать полностью." -ForegroundColor Yellow
+	Write-Host "Probes skipped (-SkipProbes). Run the full check before committing." -ForegroundColor Yellow
 	exit 0
 }
 
-Write-Step "Регрессия проб"
+Write-Step "Probe regression"
 & (Join-Path $PSScriptRoot 'Run-ProbeSuite.ps1') -SkipBuild -Backend $Backend
 $probeExit = $LASTEXITCODE
 
 if ($probeExit -eq 0 -and -not $SkipEditor) {
 	<#
-		Пробники поднимают графику, но НЕ поднимают ImGui: у них нет окна. Из-за этого весь набор
-		оставался зелёным, пока редактор вообще не стартовал - шейдеры ImGui приезжали в вывод из
-		проекта СЭМПЛОВ, ссылку на который убрали как ненужную, и первый же запуск падал на
-		NullReferenceException при создании PSO без вершинного шейдера.
+		The probes bring up graphics but do NOT bring up ImGui: they have no window. Because of
+		that the whole suite stayed green while the editor would not start at all - the ImGui
+		shaders used to reach the output from the SAMPLES project, whose reference was removed as
+		unneeded, and the very first launch died with a NullReferenceException while creating a PSO
+		with no vertex shader.
 
-		238 метрик о таком молчат по построению. Поэтому редактор здесь просто ЗАПУСКАЕТСЯ:
-		проверяется ровно то, что не покрывают пробы, - что процесс доходит до кадров и не падает.
+		238 metrics are silent about that by construction. So the editor is simply LAUNCHED here:
+		it checks exactly what the probes do not cover - that the process reaches frames and does
+		not crash.
 	#>
-	Write-Step "Запуск редактора"
+	Write-Step "Editor launch"
 
 	$editorExe = Join-Path $RepoRoot 'DecaEngine.Editor.App\bin\x64\Debug\net10.0\DecaEngine.Editor.App.exe'
 	if (-not (Test-Path $editorExe)) {
-		Write-Host "  нет $editorExe" -ForegroundColor Red
+		Write-Host "  no $editorExe" -ForegroundColor Red
 		$probeExit = 1
 	}
 	else {
@@ -98,19 +100,19 @@ if ($probeExit -eq 0 -and -not $SkipEditor) {
 		$proc = Start-Process -FilePath $editorExe -WorkingDirectory (Split-Path $editorExe) `
 			-PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
 
-		# Инициализация графики, ImGui и первые кадры укладываются в несколько секунд; падение на
-		# старте происходит гораздо раньше.
+		# Graphics init, ImGui and the first frames fit into a few seconds; a startup crash happens
+		# much earlier.
 		Start-Sleep -Seconds 12
 
 		if ($proc.HasExited) {
-			Write-Host "  РЕДАКТОР УПАЛ НА СТАРТЕ (код $($proc.ExitCode))" -ForegroundColor Red
+			Write-Host "  EDITOR CRASHED AT STARTUP (code $($proc.ExitCode))" -ForegroundColor Red
 			Get-Content $errFile -Tail 25 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "      $_" }
 			Get-Content $outFile -Tail 25 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "      $_" }
 			$probeExit = 1
 		}
 		else {
 			Stop-Process -Id $proc.Id -Force
-			Write-Host "  стартовал и держится" -ForegroundColor Green
+			Write-Host "  started and still alive" -ForegroundColor Green
 		}
 	}
 }
@@ -118,9 +120,9 @@ if ($probeExit -eq 0 -and -not $SkipEditor) {
 $stopwatch.Stop()
 Write-Host ""
 if ($probeExit -ne 0) {
-	Write-Host "ПРОВЕРКА НЕ ПРОШЛА за $([int]$stopwatch.Elapsed.TotalSeconds) с" -ForegroundColor Red
+	Write-Host "VERIFY FAILED in $([int]$stopwatch.Elapsed.TotalSeconds) s" -ForegroundColor Red
 	exit 1
 }
 
-Write-Host "Всё зелёное за $([int]$stopwatch.Elapsed.TotalSeconds) с" -ForegroundColor Green
+Write-Host "All green in $([int]$stopwatch.Elapsed.TotalSeconds) s" -ForegroundColor Green
 exit 0

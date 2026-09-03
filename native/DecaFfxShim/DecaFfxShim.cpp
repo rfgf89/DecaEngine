@@ -1,20 +1,17 @@
-// DecaFfxShim - нативный мост DecaEngine <-> AMD FidelityFX ffx-api (FSR upscaler, D3D12).
+// DecaFfxShim - DecaEngine <-> AMD FidelityFX ffx-api bridge (FSR upscaler, D3D12).
 //
-// Зачем шим вообще: managed-биндинг Diligent не открывает D3D12-интерфейсы, но у каждого
-// обёрнутого объекта есть NativePointer (нативный Diligent-объект), а у текстур -
-// GetNativeHandle() (ID3D12Resource*). Этого достаточно:
-//   - ID3D12Device достаётся из ЛЮБОГО ресурса через ID3D12Resource::GetDevice - заголовки
-//     Diligent для этого не нужны вовсе;
-//   - командный лист текущего кадра - через Diligent::IDeviceContextD3D12::GetD3D12CommandList
-//     (QueryInterface от NativePointer immediate-контекста). Заголовки DiligentCore взяты РОВНО
-//     той версии, что нативные DLL биндинга (v2.5.6) - раскладка vtable обязана совпадать.
+// The managed Diligent binding exposes no D3D12 interfaces, only NativePointer and texture
+// GetNativeHandle() (ID3D12Resource*). From those:
+//   - ID3D12Device comes from any resource via ID3D12Resource::GetDevice;
+//   - the frame's command list via Diligent::IDeviceContextD3D12::GetD3D12CommandList. The
+//     DiligentCore headers must be the exact version of the binding's native DLLs (v2.5.6):
+//     the vtable layout has to match.
 //
-// Контракт вызывающего (C#, см. FsrUpscaler.cs):
-//   - все входные ресурсы переведены в ShaderResource, выход - в UnorderedAccess, ДО Dispatch;
-//     ffx-api расставляет свои барьеры сам и ВОЗВРАЩАЕТ ресурсы в заявленные состояния;
-//   - после Dispatch вызывающий обязан позвать IDeviceContext.InvalidateState() (командный лист
-//     трогали мимо Diligent - его кэш стейтов протух; это прямо прописано в доке
-//     GetD3D12CommandList).
+// Caller contract (C#, see FsrUpscaler.cs):
+//   - inputs in ShaderResource and the output in UnorderedAccess BEFORE Dispatch; ffx-api
+//     places its own barriers and restores the declared states;
+//   - after Dispatch the caller must call IDeviceContext.InvalidateState(): the command list
+//     was touched behind Diligent's back (documented on GetD3D12CommandList).
 
 #include <windows.h>
 #include <d3d12.h>
@@ -31,8 +28,8 @@
 #include "ffx_upscale.h"
 
 // ---------------------------------------------------------------------------------------------
-// Динамическая загрузка amd_fidelityfx_upscaler_dx12.dll: она экспортирует плоский ffx-api
-// (ffxCreateContext/ffxDispatch/...) напрямую, отдельный loader не нужен (проверено dumpbin).
+// amd_fidelityfx_upscaler_dx12.dll exports the flat ffx-api (ffxCreateContext/ffxDispatch/...)
+// directly, so no separate loader library is needed.
 // ---------------------------------------------------------------------------------------------
 
 static PfnFfxCreateContext  s_ffxCreateContext  = nullptr;
@@ -41,7 +38,7 @@ static PfnFfxDispatch       s_ffxDispatch       = nullptr;
 static PfnFfxQuery          s_ffxQuery          = nullptr;
 static PfnFfxConfigure      s_ffxConfigure      = nullptr;
 
-// Последнее сообщение рантайма FSR (ошибки валидации и т.п.) - C# забирает его для логов пробы.
+// Last FSR runtime message; C# reads it for probe logs.
 static wchar_t s_lastMessage[1024] = L"";
 
 static void FfxMessageCallback(uint32_t type, const wchar_t* message)
@@ -57,7 +54,7 @@ static bool EnsureFfxLoaded()
         return true;
     }
 
-    // Рядом с шимом (оба кладутся в bin редактора), затем стандартный поиск.
+    // Next to the shim (both land in the editor's bin), then the standard search order.
     HMODULE mod = LoadLibraryW(L"amd_fidelityfx_upscaler_dx12.dll");
     if (!mod)
     {
@@ -89,11 +86,10 @@ struct DecaFsrContext
 
 extern "C" {
 
-// Подключает DirectX Agility SDK: последующие D3D12CreateDevice пойдут через редист из sdkPath
-// (относительный путь от экзешника, файл обязан называться D3D12Core.dll), а не через встроенный
-// рантайм Windows. ЗВАТЬ ДО создания устройства Diligent-ом. Требует включённого режима
-// разработчика Windows (контракт ID3D12SDKConfiguration::SetSDKVersion) - при выключенном вернёт
-// ошибку, и процесс просто останется на встроенном рантайме.
+// Opts into the DirectX Agility SDK: later D3D12CreateDevice calls use the redist from
+// sdkPath (relative to the exe, file must be named D3D12Core.dll) instead of the Windows
+// runtime. MUST be called before Diligent creates the device. Requires Windows developer
+// mode (ID3D12SDKConfiguration::SetSDKVersion contract); otherwise it just fails.
 __declspec(dllexport) int32_t __cdecl DecaAgility_Init(uint32_t sdkVersion, const wchar_t* sdkPath)
 {
     ID3D12SDKConfiguration* config = nullptr;
@@ -111,14 +107,14 @@ __declspec(dllexport) int32_t __cdecl DecaAgility_Init(uint32_t sdkVersion, cons
     config->Release();
 
     printf("[shim] agility: SetSDKVersion(%u, \"%s\") hr=0x%08x%s\n", sdkVersion, utf8Path,
-        (unsigned)hr, FAILED(hr) ? " (нужен режим разработчика Windows?)" : "");
+        (unsigned)hr, FAILED(hr) ? " (Windows developer mode required?)" : "");
     fflush(stdout);
     return (int32_t)hr;
 }
 
 } // extern "C"
 
-// Флаги DecaFsr_Create - зеркалятся в C# (FsrUpscaler.CreateFlags).
+// Mirrored in C# as FsrUpscaler.CreateFlags.
 enum DecaFsrCreateFlags : uint32_t
 {
     DECA_FSR_HDR            = 1u << 0,
@@ -136,7 +132,7 @@ __declspec(dllexport) const wchar_t* __cdecl DecaFsr_LastMessage()
     return s_lastMessage;
 }
 
-// Версия загруженного провайдера апскейла (для лога): пишет имя первой версии в buf.
+// Writes the name of the first upscaler provider version into buf.
 __declspec(dllexport) int32_t __cdecl DecaFsr_QueryVersion(void* anyResource, char* buf, int32_t bufLen)
 {
     if (!EnsureFfxLoaded() || !anyResource || !buf || bufLen < 2)
@@ -183,11 +179,11 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_QueryVersion(void* anyResource, ch
 }
 
 __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
-    void* anyResource,   // ID3D12Resource* (ITexture.GetNativeHandle) - источник устройства
+    void* anyResource,   // ID3D12Resource* (ITexture.GetNativeHandle) - device source
     uint32_t maxRenderW, uint32_t maxRenderH,
     uint32_t displayW, uint32_t displayH,
     uint32_t flags,
-    int32_t providerMajor,   // 0 - автополитика, 2/3/4 - явная ветка (выбор из UI)
+    int32_t providerMajor,   // 0 = auto policy, 2/3/4 = explicit branch (UI choice)
     void** outCtx)
 {
     s_lastMessage[0] = 0;
@@ -213,11 +209,10 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
     backend.device = device;
 
-    // ОБЯЗАТЕЛЬНЫЙ дескриптор версии API (см. ffx_upscale.h: "This must be set to
-    // FFX_UPSCALER_VERSION"): сообщает провайдеру, под какую раскладку структур собрано
-    // приложение. Без него провайдер ГАДАЕТ - и ветка 3.1.x читала наш ffxDispatchDescUpscale по
-    // чужим смещениям: мусор вместо джиттера/масштабов, отсюда каша, нечувствительная ни к каким
-    // параметрам (все они просто не доезжали).
+    // Mandatory API version descriptor (ffx_upscale.h: "This must be set to
+    // FFX_UPSCALER_VERSION"): it tells the provider which struct layout we were built
+    // against. Without it the 3.1.x branch reads ffxDispatchDescUpscale at wrong offsets -
+    // garbage jitter and scales, and no dispatch parameter has any effect.
     ffxCreateContextDescUpscaleVersion apiVersion{};
     apiVersion.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
     apiVersion.version = FFX_UPSCALER_VERSION;
@@ -237,22 +232,18 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
     if (flags & DECA_FSR_DEBUG_CHECKING) desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
     if (flags & DECA_FSR_DEBUG_VISUALIZATION) desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
 
-    // Диагностика доставки: полная нечувствительность выхода к флагам - сама по себе улика, и
-    // первым делом надо видеть, что они вообще доехали.
     printf("[shim] create: flags=0x%x render=%ux%u display=%ux%u\n",
         desc.flags, maxRenderW, maxRenderH, displayW, displayH);
 
-    // Выбор провайдера (запрос версий + ffxOverrideVersion в цепочке создания). ДЕФОЛТ - НОВЕЙШЕЕ
-    // поколение, которое рантайм предлагает под ЭТО железо, за одним известным исключением: ветка
-    // 3.1.x на этой связке SDK/железа сводит кадр в кашу (замерено: mean|grad| 0.23 против 1.89 у
-    // 2.3.4 при идентичных входах - дескрипторы, флаги и параметры диспатча сверены прошивкой),
-    // поэтому без явного запроса она не выбирается. Итого: 4.x+ (FSR4, ML-путь RDNA4) > 2.x >
-    // (если кроме 3.x ничего нет) дефолт рантайма. DECA_FSR_PROVIDER=2|3 - явный выбор ветки,
-    // =0 - отдать выбор рантайму безусловно.
+    // Provider selection: newest generation the runtime offers for this hardware, with one
+    // exception - the 3.1.x branch smears the frame on this SDK/hardware pair (measured:
+    // mean|grad| 0.23 vs 1.89 for 2.3.4 on identical inputs), so it is never auto-selected.
+    // Order: 4.x+ > 2.x > runtime default. DECA_FSR_PROVIDER=2|3 picks a branch, =0 always
+    // defers to the runtime.
     ffxOverrideVersion versionOverride{};
     char wantMajor = (providerMajor >= 2 && providerMajor <= 9) ? (char)('0' + providerMajor) : 0;
 
-    // Env-переопределение - ПОВЕРХ выбора из UI: диагностика важнее настройки.
+    // The env override wins over the UI choice: diagnostics beat settings.
     const char* providerEnv = getenv("DECA_FSR_PROVIDER");
     if (providerEnv)
     {
@@ -284,7 +275,7 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
                 char major = versionNames[i][0];
                 if (wantMajor)
                 {
-                    // Явный запрос: первая (новейшая в списке рантайма) версия своей ветки.
+                    // Explicit request: first (newest listed) version of that branch.
                     if (major == wantMajor) { best = (int32_t)i; break; }
                 }
                 else if (major != '3' && major > bestMajor)
@@ -299,7 +290,7 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
                 versionOverride.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
                 versionOverride.versionId = versionIds[best];
                 backend.header.pNext = &versionOverride.header;
-                printf("[shim] provider: %s (из %llu доступных)\n",
+                printf("[shim] provider: %s (of %llu available)\n",
                     versionNames[best], (unsigned long long)count);
             }
         }
@@ -316,9 +307,8 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
         return (int32_t)rc;
     }
 
-    // Что провайдер считает ОБЯЗАТЕЛЬНЫМИ входами (битовое поле FfxApiQueryResourceIdentifiers:
-    // 1 color, 2 depth, 4 mv, 8 exposure, 16 reactive, 32 transparency) - диагностика веток,
-    // которым молча не хватает входа, который мы передаём пустым.
+    // Inputs the provider considers mandatory (FfxApiQueryResourceIdentifiers bitfield:
+    // 1 color, 2 depth, 4 mv, 8 exposure, 16 reactive, 32 transparency).
     ffxQueryDescUpscaleGetResourceRequirements reqs{};
     reqs.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS;
     if (s_ffxQuery(&ctx->context, &reqs.header) == FFX_API_RETURN_OK)
@@ -328,8 +318,8 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Create(
         fflush(stdout);
     }
 
-    // DECA_FSR_VELFACTOR=<float> - конфиг-ключ fVelocityFactor (расследование каши 3.1.x: 0.0
-    // повышает темпоральную стабильность, см. FfxApiConfigureUpscaleKey).
+    // DECA_FSR_VELFACTOR=<float> sets the fVelocityFactor config key (0.0 raises temporal
+    // stability; see FfxApiConfigureUpscaleKey).
     if (const char* velEnv = getenv("DECA_FSR_VELFACTOR"))
     {
         static float s_velocityFactor;
@@ -351,7 +341,7 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
     void* ctxPtr,
     void* diligentContext,   // Diligent::IDeviceContext* (CppObject.NativePointer)
     void* colorRes, void* depthRes, void* motionRes, void* outputRes,   // ID3D12Resource*
-    void* reactiveRes, void* transparencyRes,   // опциональные маски (может быть null)
+    void* reactiveRes, void* transparencyRes,   // optional masks, may be null
     float jitterX, float jitterY,
     float mvScaleX, float mvScaleY,
     uint32_t renderW, uint32_t renderH,
@@ -368,16 +358,15 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
         return -101;
     }
 
-    // Командный лист текущего кадра из Diligent-контекста. QueryInterface делает AddRef -
-    // отпускаем сразу после использования. Лист НЕ кэшировать: любой вызов Diligent может
-    // сабмитнуть его и сделать невалидным (см. док DeviceContextD3D12.h).
+    // Never cache the command list: any Diligent call may submit it and invalidate it
+    // (see DeviceContextD3D12.h). QueryInterface AddRefs, so release right after use.
     Diligent::IObject* obj = (Diligent::IObject*)diligentContext;
     Diligent::IDeviceContextD3D12* ctx12 = nullptr;
     obj->QueryInterface(Diligent::IID_DeviceContextD3D12, (Diligent::IObject**)&ctx12);
     if (!ctx12)
     {
         swprintf(s_lastMessage, _countof(s_lastMessage),
-            L"QueryInterface(IID_DeviceContextD3D12) failed - контекст не D3D12?");
+            L"QueryInterface(IID_DeviceContextD3D12) failed - context not D3D12?");
         return -103;
     }
 
@@ -388,8 +377,8 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
         return -104;
     }
 
-    // Разовая печать дескрипторов входов - сверка, что хэндлы указывают на ОЖИДАЕМЫЕ ресурсы
-    // (диагностика GetNativeHandle: формат/размер обязаны совпасть с таргетами конвейера).
+    // One-shot dump of the input descriptors: format and size must match the pipeline
+    // targets the handles are supposed to point at.
     static bool s_loggedDescs = false;
     if (!s_loggedDescs)
     {
@@ -418,11 +407,10 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
     dispatch.color = ffxApiGetResourceDX12((ID3D12Resource*)colorRes, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     dispatch.depth = ffxApiGetResourceDX12((ID3D12Resource*)depthRes, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
 
-    // Депт - единственный TYPELESS-вход (Diligent создаёт D32-текстуры как R32_TYPELESS ради
-    // SRV-бинда), и ffxApiGetResourceDX12 честно записывает R32_TYPELESS в дескриптор. Типизируем
-    // принудительно: по typeless SRV не создать, и провайдер, не имеющий special-case (ветка
-    // 3.1.x), читал бы глубину нулями - чёрная плитка глубины и залитая маска дисокклюзии в его
-    // debug-мозаике ровно об этом. DECA_FSR_DEPTH_TYPELESS=1 возвращает сырой формат для A/B.
+    // Depth is the only TYPELESS input (Diligent creates D32 textures as R32_TYPELESS for
+    // SRV binding). No SRV can be made from a typeless format, so a provider without a
+    // special case (3.1.x) reads depth as zeros; force the typed format here.
+    // DECA_FSR_DEPTH_TYPELESS=1 keeps the raw format for A/B.
     if (dispatch.depth.description.format == FFX_API_SURFACE_FORMAT_R32_TYPELESS &&
         !getenv("DECA_FSR_DEPTH_TYPELESS"))
     {
@@ -431,9 +419,8 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
     dispatch.motionVectors = ffxApiGetResourceDX12((ID3D12Resource*)motionRes, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     dispatch.output = ffxApiGetResourceDX12((ID3D12Resource*)outputRes, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
 
-    // Маски по контракту опциональны, но НУЛЕВЫЕ 1x1 честнее пустого дескриптора: официальный
-    // сэмпл AMD всегда подаёт обе, и подозрение по нашей мозаике - что null-биндинг опциональной
-    // маски в новых ветках читается мусором (расследование каши 3.1.x).
+    // The masks are optional by contract, but AMD's own sample always supplies both, and a
+    // null-bound optional mask appears to read as garbage in the newer branches.
     if (reactiveRes)
     {
         dispatch.reactive = ffxApiGetResourceDX12((ID3D12Resource*)reactiveRes, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
@@ -457,8 +444,8 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
     dispatch.viewSpaceToMetersFactor = 1.0f;
     dispatch.flags = debugView ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0u;
 
-    // DECA_FSR_DISPATCH_FLAGS=<int> - принудительные биты FfxApiDispatchFsrUpscaleFlags
-    // (диагностика цветового пространства: 2 = NON_LINEAR_COLOR_SRGB, 4 = PQ).
+    // DECA_FSR_DISPATCH_FLAGS=<int> forces FfxApiDispatchFsrUpscaleFlags bits
+    // (2 = NON_LINEAR_COLOR_SRGB, 4 = PQ).
     if (const char* dfEnv = getenv("DECA_FSR_DISPATCH_FLAGS"))
     {
         dispatch.flags |= (uint32_t)atoi(dfEnv);
@@ -468,7 +455,7 @@ __declspec(dllexport) int32_t __cdecl DecaFsr_Dispatch(
     return rc == FFX_API_RETURN_OK ? 0 : (int32_t)rc;
 }
 
-// Версия АКТИВНОГО провайдера созданного контекста ("2.3.4" и т.п.) - для подписи бэкенда в UI.
+// Version of the context's active provider ("2.3.4" etc) for the backend label in the UI.
 __declspec(dllexport) int32_t __cdecl DecaFsr_GetVersion(void* ctxPtr, char* buf, int32_t len)
 {
     DecaFsrContext* ctx = (DecaFsrContext*)ctxPtr;
@@ -507,10 +494,9 @@ __declspec(dllexport) void __cdecl DecaFsr_Destroy(void* ctxPtr)
 } // extern "C"
 
 // =============================================================================================
-// DLSS (NVIDIA NGX, D3D12) - второй нативный бэкенд того же слота. Статически линкуется
-// nvsdk_ngx_d.lib; рантайм nvngx_dlss.dll NGX ищет сам рядом с экзешником. Отличие от ffx-api:
-// СОЗДАНИЕ фичи требует командный лист (NGX пишет в него init-работы), поэтому фича создаётся
-// ЛЕНИВО на первом диспатче - там лист уже есть.
+// DLSS (NVIDIA NGX, D3D12) - the second native backend of the same slot. Links against
+// nvsdk_ngx_d.lib; NGX finds nvngx_dlss.dll next to the exe itself. Unlike ffx-api, feature
+// CREATION needs a command list (NGX records init work into it).
 // =============================================================================================
 
 #include "nvsdk_ngx.h"
@@ -530,7 +516,7 @@ static bool s_ngxInitialized = false;
 extern "C" {
 
 __declspec(dllexport) int32_t __cdecl DecaDlss_Create(
-    void* anyResource,   // ID3D12Resource* - источник устройства
+    void* anyResource,   // ID3D12Resource* - device source
     uint32_t renderW, uint32_t renderH,
     uint32_t displayW, uint32_t displayH,
     int32_t quality,     // NVSDK_NGX_PerfQuality_Value (0 perf, 1 balanced, 2 quality, 5 DLAA)
@@ -551,8 +537,8 @@ __declspec(dllexport) int32_t __cdecl DecaDlss_Create(
 
     if (!s_ngxInitialized)
     {
-        // Project-ID-инициализация - штатный путь для не-зарегистрированных приложений
-        // (NVSDK_NGX_ENGINE_TYPE_CUSTOM). Каталог данных - текущий (логи NGX).
+        // Project-ID init is the supported path for unregistered applications
+        // (NVSDK_NGX_ENGINE_TYPE_CUSTOM). The data directory holds the NGX logs.
         NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(
             "a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
             L".", device);
@@ -596,7 +582,7 @@ __declspec(dllexport) int32_t __cdecl DecaDlss_Create(
     ctx->displayH = displayH;
     ctx->quality = quality;
 
-    printf("[shim] dlss: доступен, render=%ux%u display=%ux%u quality=%d\n",
+    printf("[shim] dlss: available, render=%ux%u display=%ux%u quality=%d\n",
         renderW, renderH, displayW, displayH, quality);
     fflush(stdout);
 
@@ -604,9 +590,9 @@ __declspec(dllexport) int32_t __cdecl DecaDlss_Create(
     return 0;
 }
 
-// Создание NGX-фичи: пишет init-команды в ТЕКУЩИЙ командный лист Diligent-контекста. Вызывающий
-// ОБЯЗАН сразу после успеха сделать Flush + WaitForIdle + InvalidateState - init должен отработать
-// на GPU до первого evaluate, а кэш стейтов Diligent после чужих команд недостоверен.
+// Records the feature's init commands into the Diligent context's current command list. On
+// success the caller must immediately Flush + WaitForIdle + InvalidateState: init has to run
+// on the GPU before the first evaluate, and Diligent's state cache is stale afterwards.
 __declspec(dllexport) int32_t __cdecl DecaDlss_CreateFeature(void* ctxPtr, void* diligentContext)
 {
     s_lastMessage[0] = 0;
@@ -658,7 +644,7 @@ __declspec(dllexport) int32_t __cdecl DecaDlss_CreateFeature(void* ctxPtr, void*
         return (int32_t)r;
     }
 
-    printf("[shim] dlss: фича создана (quality=%d, HDR|MVLowRes|DepthInverted|AutoExposure)\n", ctx->quality);
+    printf("[shim] dlss: feature created (quality=%d, HDR|MVLowRes|DepthInverted|AutoExposure)\n", ctx->quality);
     fflush(stdout);
     return 0;
 }
@@ -696,9 +682,8 @@ __declspec(dllexport) int32_t __cdecl DecaDlss_Dispatch(
         return -104;
     }
 
-    // Фича создаётся ЗАРАНЕЕ отдельным вызовом DecaDlss_CreateFeature (её init-команды тяжёлые и
-    // обязаны быть засабмичены и исполнены ДО первого кадра): создание внутри кадрового листа с
-    // немедленным evaluate в нём же роняло редактор AV-ом на следующем SetPipelineState.
+    // The feature must be created up front by DecaDlss_CreateFeature: creating it inside the
+    // frame's list and evaluating in the same list AVs on the next SetPipelineState.
     if (!ctx->feature)
     {
         swprintf(s_lastMessage, _countof(s_lastMessage), L"DLSS feature not created (call DecaDlss_CreateFeature)");

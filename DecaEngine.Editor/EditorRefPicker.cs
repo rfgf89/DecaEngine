@@ -4,13 +4,8 @@ using Hexa.NET.ImGui;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Reusable picker for an <see cref="EditorRef"/>, populated from <see cref="EditorAssetDatabase"/>
-/// and filtered by file extension (e.g. ".hlsl"). Mirrors ComponentFieldEditor's AssetRef slot
-/// widget (filled background, file-type icon, current file name, clear button) so an editor-bundled
-/// asset reads the same way a project asset does; clicking the slot opens a popup list instead of
-/// accepting a drag&amp;drop, since EditorAssets isn't browsable from the Asset Browser.
-/// </summary>
+/// <summary>Picker for an <see cref="EditorRef"/>, filtered by extension; uses a popup list because
+/// EditorAssets isn't browsable (and thus not draggable) from the Asset Browser.</summary>
 public static class EditorRefPicker
 {
 	/// <summary>Draws the picker for <paramref name="value"/>. Returns true if the selection changed.</summary>

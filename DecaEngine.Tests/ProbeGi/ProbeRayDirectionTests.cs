@@ -3,12 +3,7 @@ using DecaEngine.Graphics.ProbeGi;
 
 namespace DecaEngine.Tests.ProbeGi;
 
-/// <summary>
-/// Веер лучей раунда probe GI. Проверять его тестами имеет смысл ровно потому, что глазами эти
-/// ошибки не ловятся: неверный веер даёт не чёрный экран, а чуть более шумное поле - его спишут на
-/// недосходимость. При этом CPU-бейкер и ProbeRoundCS обязаны строить веер ЛУЧ В ЛУЧ одинаково,
-/// иначе сверка GPU-пути с CPU-эталоном перестаёт что-либо значить.
-/// </summary>
+// Probe GI ray fan: the CPU baker and ProbeRoundCS must build it ray for ray alike.
 public class ProbeRayDirectionTests
 {
 	private const float Tolerance = 1e-4f;
@@ -25,9 +20,6 @@ public class ProbeRayDirectionTests
 		Assert.All(dirs, d => Assert.Equal(1f, d.Length(), Tolerance));
 	}
 
-	/// <summary>Веер Фибоначчи - равномерная сферическая выборка: сумма направлений должна гаснуть.
-	/// Смещённая выборка тихо перекашивает оценку освещённости в сторону перепредставленной
-	/// полусферы.</summary>
 	[Fact]
 	public void RoundRayDirections_FibonacciFan_IsCentredOnTheSphere()
 	{
@@ -35,7 +27,7 @@ public class ProbeRayDirectionTests
 
 		var mean = dirs.Aggregate(Vector3.Zero, (a, d) => a + d) / dirs.Length;
 
-		Assert.True(mean.Length() < 0.01f, $"веер смещён: средний вектор {mean}");
+		Assert.True(mean.Length() < 0.01f, $"fan is biased: mean vector {mean}");
 	}
 
 	[Fact]
@@ -48,12 +40,7 @@ public class ProbeRayDirectionTests
 		Assert.All(second, d => Assert.Equal(1f, d.Length(), Tolerance));
 	}
 
-	/// <summary>
-	/// Главный контракт фиксированных лучей: по ним принимаются решения о переезде и отключении
-	/// пробы, поэтому от номера раунда они зависеть НЕ должны. Стоит им начать вращаться - у пробы
-	/// на кромке геометрии доля задних граней загуляет от раунда к раунду, и проба начнёт ездить
-	/// туда-сюда, каждый раз сбрасывая накопители.
-	/// </summary>
+	// Relocation decisions ride on the fixed rays, so they must not vary per round.
 	[Fact]
 	public void RoundRayDirections_FixedPrefix_IsIdenticalAcrossRounds()
 	{
@@ -63,10 +50,9 @@ public class ProbeRayDirectionTests
 		var round1 = ProbeGiBaker.RoundRayDirections(rays, sequence: 1, fixedRays);
 		var round9 = ProbeGiBaker.RoundRayDirections(rays, sequence: 9, fixedRays);
 
-		Assert.True(fixedRays > 0, "у веера на 288 лучей в реальном времени должна быть фиксированная часть");
+		Assert.True(fixedRays > 0, "a realtime 288-ray fan must have a fixed part");
 		Assert.Equal(round1[..fixedRays], round9[..fixedRays]);
 
-		// А вращаемая часть обязана как раз отличаться, иначе вращения нет вовсе.
 		Assert.NotEqual(round1[fixedRays..], round9[fixedRays..]);
 	}
 
@@ -88,8 +74,7 @@ public class ProbeRayDirectionTests
 		Assert.Equal(withoutPrefix, explicitlyZero);
 	}
 
-	/// <summary>В запечке веер вращается целиком: CPU и GPU обязаны совпасть луч в луч, а делить
-	/// веер значило бы зеркалить раскладку ещё и в CPU-бейкере.</summary>
+	// Offline bakes rotate the whole fan, so there is no fixed prefix to keep in sync.
 	[Theory]
 	[InlineData(16)]
 	[InlineData(64)]
@@ -101,12 +86,12 @@ public class ProbeRayDirectionTests
 	}
 
 	[Theory]
-	[InlineData(16, 0)]   // короче 64 - деления нет вовсе, шум радианса дороже устойчивости
+	[InlineData(16, 0)]   // below 64 rays there is no split: radiance noise costs more
 	[InlineData(63, 0)]
-	[InlineData(64, 16)]  // пол: по этим лучам ищется ближайшая передняя грань
+	[InlineData(64, 16)]
 	[InlineData(128, 16)]
 	[InlineData(192, 24)]
-	[InlineData(256, 32)] // потолок: сверх 32 устойчивость не растёт, а радианс теряет выборку
+	[InlineData(256, 32)] // above 32 fixed rays stability stops improving, radiance loses samples
 	[InlineData(1024, 32)]
 	public void FixedRayCount_Realtime_ClampsBetweenFloorAndCeiling(int rays, int expected)
 	{

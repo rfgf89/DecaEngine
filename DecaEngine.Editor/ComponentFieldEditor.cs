@@ -1,41 +1,21 @@
 using System.Numerics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json;
 using DecaEngine.Core.Assets;
 using DecaEngine.Core.Entities;
+using DecaEngine.Core.Prefabs;
 using Friflo.Engine.ECS;
 using Hexa.NET.ImGui;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// ????????????? (reflection-based) ???????? ????? ??????????? ??? ??????????. ??????
-	/// ?????????? ???????? ??? ?????? ImGui-????????, ???????? ??????? ?? CLR-???? ????:
-	/// <c>bool</c> ? ???????/toggle, ????? ? Drag*, <c>enum</c> ? Combo (??? ????? ????????? ???
-	/// <see cref="FlagsAttribute"/>), <see cref="Vector2"/>/<see cref="Vector3"/>/
-	/// <see cref="Vector4"/>/<see cref="Quaternion"/> ? DragFloatN, ????????? struct/??????? ?
-	/// ????????? ?????????? (TreeNodeEx), ??? ????????? - ??? read-only ?????.
-	/// </summary>
-	/// <remarks>
-	/// ??? ??? ???????? ??? ?????? ?????????? ????? ??????????? ?? ????? ??????????:
-	/// <list type="number">
-	/// <item>??????? ???????? ?????????? ???????? ??? ? ???? boxed <see cref="object"/> ?????
-	/// <see cref="EntityComponent.Value"/> (??. <see cref="Entity.Components"/>).</item>
-	/// <item>???? ????? boxed-??????? ????????????? ????? FieldInfo.SetValue ?????
-	/// ? ????? boxed-?????????? (??? ??????????? ? ?????????? ?????: boxed struct - ??? ?????????
-	/// ?????? ? ????, ? SetValue ????? ???????? ? ??? ??????, ??? ?????????????? ???????????).</item>
-	/// <item>???? ???-?? ?????????? - ???? boxed-?????? ??????? ???????????? ??????? ? ????????
-	/// ????? <see cref="EntityUtils.AddEntityComponentValue"/> (???? ?? ??????? ?????? ????
-	/// ?????????? ?? ????? ?????????? - ????????? <see cref="ComponentType"/> + <see cref="object"/>).</item>
-	/// </list>
-	/// </remarks>
+	/// <summary>Reflection-based inspector for arbitrary component types: each public field is
+	/// drawn with the ImGui widget matching its CLR type.</summary>
 	public static class ComponentFieldEditor
 	{
-		/// <summary>
-		/// Per-type reflection metadata resolved once and reused every frame: public instance fields
-		/// in declaration order plus the per-field <see cref="AssetTypeAttribute"/> (the only field
-		/// attribute this editor queries).
-		/// </summary>
+		// Per-type reflection metadata resolved once and reused every frame.
 		private sealed class CachedTypeInfo
 		{
 			public readonly FieldInfo[] Fields;
@@ -52,11 +32,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>
-		/// Per-enum-type metadata resolved once: names, parsed boxed values, their numeric bits
-		/// (for [Flags] checkboxes), the prebuilt '\0'-separated combo string and a boxed zero value
-		/// (what Activator.CreateInstance would return for a null field value).
-		/// </summary>
+		// Per-enum metadata resolved once, including the '\0'-separated ImGui combo string.
 		private sealed class CachedEnumInfo
 		{
 			public readonly string[] Names;
@@ -82,9 +58,8 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		// ConditionalWeakTable (not a plain Dictionary keyed by Type) so metadata for types coming
-		// from a collectible AssemblyLoadContext (user project assemblies, see ProjectSession /
-		// AssemblyApp) does not pin the unloaded context forever - entries die with their Type key.
+		// ConditionalWeakTable, not a Dictionary: a Type key from a collectible AssemblyLoadContext
+		// must not pin the unloaded context forever.
 		private static readonly ConditionalWeakTable<Type, CachedTypeInfo> _typeInfoCache = new();
 		private static readonly ConditionalWeakTable<Type, CachedEnumInfo> _enumInfoCache = new();
 
@@ -93,11 +68,8 @@ namespace DecaEngine.Editor
 		private static readonly List<string> _indexLabels = new();
 		private static readonly Dictionary<string, (int Length, string Header)> _arrayHeaders = new(StringComparer.Ordinal);
 
-		/// <summary>
-		/// Drops all cached reflection metadata. Called by <see cref="ComponentRegistry"/> when a new
-		/// component/script type is registered at runtime (e.g. from a freshly loaded user assembly)
-		/// so stale FieldInfo from a previous load is never reused.
-		/// </summary>
+		/// <summary>Drops all cached reflection metadata; must be called when a new component type
+		/// is registered at runtime, or stale FieldInfo from a previous load is reused.</summary>
 		public static void InvalidateCaches()
 		{
 			_typeInfoCache.Clear();
@@ -134,19 +106,13 @@ namespace DecaEngine.Editor
 			return _indexLabels[index];
 		}
 
-		/// <summary>
-		/// ?????? ??? ?????????? ???????? (????? ????????????? ? <paramref name="exclude"/> - ??????
-		/// ??? ??, ??? ??? ?????????? ????????? ?????????????????? UI, ??. Transform-????? ?
-		/// <see cref="InspectorWindow"/>), ?????? - ??? ?????????
-		/// ????????????? ???? ? ???-???? "Remove Component". ?????????? true, ???? ???-?? ??????????
-		/// (???????? ???? ??????????????? ???? ????????? ??????).
-		/// </summary>
+		/// <summary>Draws every component of the entity except those in <paramref name="exclude"/>;
+		/// returns true if anything changed.</summary>
 		public static bool DrawComponents(Entity entity, ISet<Type>? exclude = null, string filter = "")
 		{
 			bool anyChanged = false;
 
-			// ????????????? ? ??????: ?? ????? ???????? ????? ???? ????????? ???????? ??????????,
-			// ? EntityComponents - ????? span/enumerator ?????? ???????? ????????? ????????.
+			// Snapshot first: drawing may add or remove components, invalidating the enumerator.
 			_componentsScratch.Clear();
 			foreach (var c in entity.Components)
 			{
@@ -170,10 +136,34 @@ namespace DecaEngine.Editor
 				ImGui.PushID(ec.Type.StructIndex);
 
 				bool removeRequested = false;
+
+				ImGui.PushStyleColor(ImGuiCol.Header, EditorPalette.WithAlpha(EditorPalette.Selection, 0.16f));
+				ImGui.PushStyleColor(ImGuiCol.HeaderHovered, EditorPalette.WithAlpha(EditorPalette.Selection, 0.28f));
+				ImGui.PushStyleColor(ImGuiCol.HeaderActive, EditorPalette.WithAlpha(EditorPalette.Selection, 0.40f));
 				bool open = ImGui.CollapsingHeader(displayName, ImGuiTreeNodeFlags.DefaultOpen);
+				ImGui.PopStyleColor(3);
 
 				if (ImGui.BeginPopupContextItem("##ComponentCtx"))
 				{
+					// Copied as a JSON fragment in the same format as components in .prefab.json.
+					if (ImGui.MenuItem("Copy Component"))
+					{
+						CopyComponentToClipboard(entity, ec.Type);
+					}
+
+					ImGui.BeginDisabled(_componentClipboardKey is null);
+					if (ImGui.MenuItem(_componentClipboardKey is null
+							? "Paste Component"
+							: $"Paste Component ({_componentClipboardKey})"))
+					{
+						// Pastes by the clipboard's KEY, not by the component whose menu was
+						// clicked, so the target need not already have that component.
+						anyChanged |= TryPasteComponent(entity);
+					}
+					ImGui.EndDisabled();
+
+					ImGui.Separator();
+
 					if (ImGui.MenuItem("Remove Component", string.Empty))
 					{
 						removeRequested = true;
@@ -183,11 +173,12 @@ namespace DecaEngine.Editor
 
 				if (open && !removeRequested && clrType != null)
 				{
+					var spineDrawList = ImGui.GetWindowDrawList();
+					var spineTop = ImGui.GetCursorScreenPos();
+
 					ImGui.Indent();
-					// EntityComponent.Value ??????? Obsolete ? ?????? ???????????????
-					// Entity.GetComponent<T>() - ?? ? ???? reflection-based ????????? ??? T
-					// ??????? ?????????? (?? ???????????? ?????? ? ???????? ????? ComponentType),
-					// ??? ??? ?????????????? API ????? ????????????? ??????????.
+					// EntityComponent.Value is Obsolete in favour of Entity.GetComponent<T>(), but
+					// a reflection-based editor has no static T, so the boxed accessor is required.
 #pragma warning disable CS0618
 					object boxed = ec.Value;
 #pragma warning restore CS0618
@@ -197,6 +188,12 @@ namespace DecaEngine.Editor
 						anyChanged = true;
 					}
 					ImGui.Unindent();
+
+					var spineBottom = ImGui.GetCursorScreenPos();
+					float spineX = spineTop.X + 4f;
+					spineDrawList.AddLine(new Vector2(spineX, spineTop.Y), new Vector2(spineX, spineBottom.Y),
+						ImGui.GetColorU32(EditorPalette.WithAlpha(EditorPalette.Selection, 0.45f)), 2f);
+					ImGui.Spacing();
 				}
 				else if (open && clrType == null)
 				{
@@ -217,7 +214,75 @@ namespace DecaEngine.Editor
 			return anyChanged;
 		}
 
-		/// <summary>?????? ????????? ???? <paramref name="type"/> ????? ?????? ??? ????????????? boxed-??????????.</summary>
+		// Internal component clipboard: Friflo serialization key plus the value JSON. The system
+		// clipboard is filled in parallel, but Paste always sources from this pair.
+		private static string? _componentClipboardKey;
+		private static string? _componentClipboardJson;
+
+		/// <summary>Key of the component in the internal clipboard, null when empty.</summary>
+		public static string? ComponentClipboardKey => _componentClipboardKey;
+
+		private static void CopyComponentToClipboard(Entity entity, ComponentType type)
+		{
+			var key = type.ComponentKey;
+			if (key is null)
+			{
+				return;
+			}
+
+			// Goes through the entity's full components JSON rather than serializing the boxed
+			// value by hand: the fragment must be byte-identical to what would land in the file.
+			using var doc = JsonDocument.Parse(PrefabAsset.GetComponentsJson(entity));
+			if (!doc.RootElement.TryGetProperty(key, out var element))
+			{
+				return;
+			}
+
+			_componentClipboardKey = key;
+			_componentClipboardJson = element.GetRawText();
+			ImGui.SetClipboardText($"{{\"{key}\": {_componentClipboardJson}}}");
+		}
+
+		/// <summary>Applies the clipboard component to the entity, overwriting or adding it; other
+		/// components are left untouched.</summary>
+		public static bool TryPasteComponent(Entity entity)
+		{
+			if (_componentClipboardKey is null || _componentClipboardJson is null)
+			{
+				return false;
+			}
+
+			using var current = JsonDocument.Parse(PrefabAsset.GetComponentsJson(entity));
+			using var fragment = JsonDocument.Parse(_componentClipboardJson);
+
+			using var stream = new MemoryStream();
+			using (var writer = new Utf8JsonWriter(stream))
+			{
+				writer.WriteStartObject();
+				foreach (var property in current.RootElement.EnumerateObject())
+				{
+					if (!property.NameEquals(_componentClipboardKey))
+					{
+						property.WriteTo(writer);
+					}
+				}
+
+				writer.WritePropertyName(_componentClipboardKey);
+				fragment.RootElement.WriteTo(writer);
+				writer.WriteEndObject();
+			}
+
+			var merged = Encoding.UTF8.GetString(stream.ToArray());
+			if (!PrefabAsset.TryApplyComponentsJson(entity, merged, out var error))
+			{
+				DecaEngine.Core.Diagnostics.EngineLog.Add(DecaEngine.Core.Diagnostics.LogLevel.Error,
+					$"Paste Component ({_componentClipboardKey}): {error}");
+				return false;
+			}
+
+			return true;
+		}
+
 		private static bool DrawObjectFields(object boxed, Type type, EntityStore? store)
 		{
 			bool changed = false;
@@ -236,7 +301,6 @@ namespace DecaEngine.Editor
 			return changed;
 		}
 
-		/// <summary>?????? ???? ?????? ??? ???????? ???? <paramref name="type"/>; ?????????? true, ???? ???????? ??????????.</summary>
 		private static bool DrawField(string label, Type type, ref object? value, EntityStore? store, AssetTypeAttribute? assetType = null)
 		{
 			if (type.IsPointer || type == typeof(IntPtr) || type == typeof(UIntPtr))
@@ -381,8 +445,6 @@ namespace DecaEngine.Editor
 				return DrawArray(label, type, array, store, assetType);
 			}
 
-			// ???????????? ????????? struct (????????, ????????? ???????????? ???? ?????? ?????
-			// CameraData) - ?????????? ?????? ??? ???? ?? ????????? ?????????.
 			if (type.IsValueType && !type.IsPrimitive && value != null)
 			{
 				bool changed = false;
@@ -398,11 +460,7 @@ namespace DecaEngine.Editor
 			return false;
 		}
 
-		/// <summary>
-		/// Draws an <see cref="AssetRef"/> field as a button showing the current asset's file name
-		/// (or "(None)"), which also acts as an ImGui drag&amp;drop target: dropping an asset dragged
-		/// from AssetBrowserWindow assigns its project-relative path here.
-		/// </summary>
+		// Draws an AssetRef as a slot that doubles as an ImGui drag&drop target.
 		private static bool DrawAssetRef(string label, ref object? value, AssetTypeAttribute? assetType = null)
 		{
 			var current = value is AssetRef assetRef ? assetRef : default;
@@ -423,10 +481,7 @@ namespace DecaEngine.Editor
 			var slotMin = ImGui.GetCursorScreenPos();
 			var slotMax = slotMin + slotSize;
 
-			// Invisible button reserves the layout space and gives us hover/drag-target hit
-			// testing; the actual visuals (background, icon, text, border) are hand-drawn below
-			// so the field can look like a distinct "asset slot" instead of a plain text button,
-			// which was easy to mistake for a disabled/inert control.
+			// Invisible button reserves layout space and hit testing; visuals are hand-drawn below.
 			ImGui.InvisibleButton("##AssetRefSlot", slotSize);
 			bool hovered = ImGui.IsItemHovered();
 
@@ -434,9 +489,6 @@ namespace DecaEngine.Editor
 			var rounding = ImGui.GetStyle().FrameRounding;
 			drawList.AddRectFilled(slotMin, slotMax, ImGui.GetColorU32(hovered ? ImGuiCol.FrameBgHovered : ImGuiCol.FrameBg), rounding);
 
-			// File-type icon matching AssetBrowserWindow's icon for the assigned asset (or, when
-			// empty, for the type this field accepts) so the slot visually communicates what kind
-			// of asset it holds/expects instead of just showing a bare file name.
 			const float iconPadding = 2f;
 			var iconMin = slotMin + new Vector2(iconPadding, iconPadding);
 			var iconMax = new Vector2(iconMin.X + frameHeight - iconPadding * 2f, slotMax.Y - iconPadding);
@@ -455,8 +507,6 @@ namespace DecaEngine.Editor
 			drawList.AddText(textPos, textColor, displayText);
 			drawList.PopClipRect();
 
-			// Border drawn noticeably thicker/brighter than a normal frame so the slot reads as a
-			// dedicated asset drop target rather than a plain button - brighter still on hover.
 			var borderColor = ImGui.GetColorU32(EditorPalette.WithAlpha(EditorPalette.Selection, hovered ? 0.9f : 0.55f));
 			drawList.AddRect(slotMin, slotMax, borderColor, rounding, ImDrawFlags.None, hovered ? 2f : 1.5f);
 
@@ -477,7 +527,6 @@ namespace DecaEngine.Editor
 				}
 			}
 
-			// Handle drag-drop - this is the critical part
 			if (ImGui.BeginDragDropTarget())
 			{
 				var payload = ImGui.AcceptDragDropPayload(DecaEngine.Core.Assets.AssetRef.DragDropPayloadType);
@@ -497,7 +546,6 @@ namespace DecaEngine.Editor
 				ImGui.EndDragDropTarget();
 			}
 
-			// Clear button - only if there's a value
 			if (hasValue)
 			{
 				ImGui.SameLine(0f, ImGui.GetStyle().ItemSpacing.X);
@@ -515,11 +563,7 @@ namespace DecaEngine.Editor
 			return changed;
 		}
 
-		/// <summary>
-		/// Draws an <see cref="EntityRef"/> field as a button showing the current target entity's name
-		/// (or "(None)"), which also acts as an ImGui drag&amp;drop target: dropping an entity dragged
-		/// from InspectorWindow's hierarchy assigns its persistent id here.
-		/// </summary>
+		// Draws an EntityRef as a button that doubles as an ImGui drag&drop target.
 		private static bool DrawEntityRef(string label, ref object? value, EntityStore? store)
 		{
 			var current = value is EntityRef entityRef ? entityRef : default;
@@ -620,7 +664,7 @@ namespace DecaEngine.Editor
 						long bits = cache.Bits[i];
 						if (bits == 0)
 						{
-							continue; // "None"/??????? ???????? - ?????? ???????????
+							continue; // "None"/zero values have no checkbox
 						}
 
 						bool set = (currentBits & bits) == bits;

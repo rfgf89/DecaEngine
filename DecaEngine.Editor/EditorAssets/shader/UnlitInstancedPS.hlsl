@@ -1,16 +1,9 @@
-// SHADER KEYWORDS (см. IGraphicsApi.CreateShader с keywords / ModelLoader.BuildMaterialKeywords):
-// вариант компилируется под конкретный материал, выключенный эффект не существует в коде вовсе -
-// ни ветвлений, ни сэмплов, ни привязок. Пер-материальные (статичны с загрузки):
-//   HAS_BASECOLOR_TEXTURE  - у материала есть base color текстура (_MainTex в Lighting-режиме)
-//   HAS_MR_TEXTURE         - есть metallic-roughness текстура
-//   MATERIAL_ALPHA_CLIP    - alphaMode MASK/BLEND (clip по PbrAlphaCutoff)
-//   MATERIAL_TRANSMISSION  - KHR_materials_transmission (рефракция/просвет)
-//   MATERIAL_DISPERSION    - KHR_materials_dispersion (пер-канальная рефракция)
-//   MATERIAL_SHEEN         - KHR_materials_sheen (велюровый Charlie-лоб, см. PbrSheenColorRoughness)
-// Фичи превью (по ModelLoadOptions; live-тумблеры настроек остаются битами PbrFeatureFlags
-// ВНУТРИ скомпилированной фичи - выключенный кейвордом код недостижим и для бита):
-//   FEATURE_NORMAL_MAPS / FEATURE_OCCLUSION / FEATURE_SHADOWS
-// Неопределённый кейворд в #if == 0 (стандарт препроцессора).
+// Keywords (see ModelLoader.BuildMaterialKeywords): a keyword-disabled effect is
+// compiled out entirely - no branch, no sample, no binding.
+// Per-material: HAS_BASECOLOR_TEXTURE, HAS_MR_TEXTURE, MATERIAL_ALPHA_CLIP,
+// MATERIAL_TRANSMISSION, MATERIAL_DISPERSION, MATERIAL_SHEEN, HAS_EMISSIVE_TEXTURE.
+// Per-preview: FEATURE_NORMAL_MAPS / FEATURE_OCCLUSION / FEATURE_SHADOWS.
+// PbrFeatureFlags bits only gate code inside an already-enabled keyword.
 #include "Instancing.hlsl"
 
 Texture2D    _MainTex;
@@ -52,38 +45,38 @@ Texture2D    _OcclusionTex;
 SamplerState _OcclusionTex_sampler;
 #endif
 
+#if HAS_EMISSIVE_TEXTURE
+// glTF emissive texture, sRGB: decoded to linear by hand like _MainTex.
+Texture2D    _EmissiveTex;
+SamplerState _EmissiveTex_sampler;
+#endif
+
 // Procedural equirect environment with roughness-prefiltered mips (see PreviewEnvironmentMap):
 // mip N holds the sky analytically re-rendered at the blur a roughness of N/EnvMipMax would
 // produce, so a single SampleLevel stands in for a real prefiltered-IBL convolution.
 Texture2D    _EnvMap;
 SamplerState _EnvMap_sampler;
 
-// Probe-GI (DDGI-лайт, см. DecaEngine.Editor.ProbeGiBaker): атласы SH L1 irradiance-проб,
-// запечённых CPU-трассировкой. Сетка ПЛОТНАЯ - проба есть в каждом узле, а тексель считается из
-// её координат арифметикой: ширина атласа равна оси X сетки, плоскости Z уложены столбиком
-// (см. ProbeGiBakeResult.ShWidth и ProbeGiSampleBody.hlsl).
-// Sh0: rgb = L0, a = sky visibility; Sh1: rgb = L1x, a = валидность пробы (0 = в стене);
-// Sh2/Sh3: rgb = L1y/L1z. Читаются через Load - сэмплер не нужен, трилинейность ручная
-// (SampleProbeGi). Привязаны только в превью с пробами (ProbeGridOrigin.w = 0 иначе - как _EnvMap,
-// объявлены безусловно, но мёртвая ветка их не трогает).
+// Probe-GI SH L1 irradiance atlases (see ProbeGiBaker). Dense grid: atlas width = grid X,
+// Z planes stacked vertically (see ProbeGiBakeResult.ShWidth, ProbeGiSampleBody.hlsl).
+// Sh0: rgb = L0, a = sky visibility; Sh1: rgb = L1x, a = probe validity (0 = inside wall);
+// Sh2/Sh3: rgb = L1y/L1z. Read via Load - trilinear filtering is manual in SampleProbeGi.
+// Bound only when probes exist; ProbeGridOrigin.w = 0 keeps the branch dead otherwise.
 Texture2D _ProbeSh0;
 Texture2D _ProbeSh1;
 Texture2D _ProbeSh2;
 Texture2D _ProbeSh3;
-// DDGI visibility: окто-атлас 8x8 текселей на пробу (r = средняя дистанция до геометрии по
-// направлению, g = средний квадрат) - тест Чебышёва в SampleProbeGi отбрасывает пробы,
-// заслонённые стеной от точки сэмпла. Та же раскладка пула, умноженная на 8 по обеим осям.
+// DDGI visibility: octahedral 8x8 texels per probe (r = mean distance, g = mean square),
+// feeding the Chebyshev occlusion test in SampleProbeGi. Same pool layout scaled 8x on both axes.
 Texture2D _ProbeVis;
-// Релокация: rgb = смещение пробы от её узла сетки в мировых единицах (см.
-// ProbeGiBakeResult.Offset). Проба, стоявшая внутри стены или колонны, отодвинута наружу, и знать
-// об этом обязаны ОБА потребителя: и трилинейный вес, и тест Чебышёва меряют расстояние до пробы.
-// В запечке атлас нулевой - релокация работает только в реальном времени.
+// rgb = probe offset from its grid node, world units (see ProbeGiBakeResult.Offset). Both the
+// trilinear weight and the Chebyshev test must apply it - they measure distance to the probe.
+// Zero in the bake; relocation is runtime-only.
 Texture2D _ProbeOffset;
 
-// КАСКАДЫ (см. SampleProbeGi): те же комплекты атласов для одного-двух дополнительных, более
-// МЕЛКИХ объёмов вокруг точки интереса - _C1 вдвое плотнее базового, _C2 вчетверо. Выборка идёт от
-// мелкого к крупному, базовый объём остаётся гарантией покрытия всей сцены. Активность каскада -
-// ProbeGridOrigin1/2.w (0 = не создан, слоты держат плейсхолдер, мёртвая ветка их не читает).
+// Cascades: same atlas sets for smaller volumes - _C1 twice as dense, _C2 four times.
+// Sampled fine-to-coarse; the base volume guarantees whole-scene coverage.
+// ProbeGridOrigin1/2.w = 0 means "not created" and the slots hold placeholders.
 Texture2D _ProbeSh0_C1;
 Texture2D _ProbeSh1_C1;
 Texture2D _ProbeSh2_C1;
@@ -103,51 +96,36 @@ cbuffer View
     ViewData viewData;
 }
 
-// Мировой направленный свет превью (см. SimpleCullingAndRenderSystem.BuildLightData):
-// LightDirection нулевой = теневой пасс выключен, ключевой свет остаётся камерным.
+// Zero LightDirection = no shadow pass; the key light stays camera-relative.
 cbuffer Light
 {
     LightData lightData;
 }
 
-// Результаты кластеризации punctual-светов (LightClusterCS.hlsl, привязка -
-// DiligentBatchRenderer.Register). Объявлены безусловно: при ClusterParams.y == 0 (превью,
-// камеры без punctual-светов) кластерная ветка мёртвая и буферы не читаются.
+// Punctual light clustering (LightClusterCS.hlsl); ClusterParams.y == 0 keeps the branch dead.
 StructuredBuffer<PunctualLight> PunctualLights;
 StructuredBuffer<uint> ClusterCounts;
 StructuredBuffer<uint> ClusterIndices;
 
-// Тени punctual-светов: texture array слайсов (спот - один, точечный - шесть граней куба) и
-// viewProj-матрицы слайсов (см. PunctualShadowScheduler). Обычный Z (запись Less, clear 1.0),
-// сравнение LessEqual - та же конвенция, что у каскадов солнца. Объявлены безусловно: при
-// ShadowParams.x < 0 ветка мёртвая, а лейаут текстуры держит валидным ForwardPass.
-// ЧЕТЫРЕ float4-СТРОКИ НА СЛАЙС, а не float4x4. Матрицу в структурном буфере держать нельзя:
-// PackMatrixRowMajor (DiligentShader) задаёт раскладку матриц в кбуферах, но на элементы
-// StructuredBuffer не распространяется, и majorness там оказывается РАЗНОЙ У БЭКЕНДОВ - D3D12
-// отдавал элемент транспонированным, Vulkan нет. Симптом был односторонний и потому обманчивый:
-// mul(pos, M) считал не то произведение, w (глубина вдоль оси грани) уходила в минус у 57.5%
-// пикселей и они молча отсекались guard'ом, у остальных 8% shadowUv улетал за квадрат слайса, до
-// сэмплера доходило 5.7% кадра со средним shadowLit 0.957 - теней от punctual-светов не было вовсе.
-// Сборка строк вручную (см. LoadPunctualShadowMatrix) от раскладки не зависит в принципе.
-// Каскады солнца этим не болели и подсказать не могли: их матрицы едут в КБУФЕРЕ
-// (LightData.CascadeMatrix*), а этот буфер - единственное место во всём движке, где матрица лежала
-// в структурном буфере.
+// Per-slice viewProj as FOUR float4 ROWS, not a float4x4: PackMatrixRowMajor governs cbuffers
+// only, and matrix majorness inside a StructuredBuffer differs per backend (D3D12 transposed
+// the element, Vulkan did not). Assembling rows by hand is layout-independent.
 StructuredBuffer<float4> PunctualShadowMatrices;
 
-// viewProj слайса как row-major матрица: строки лежат подряд, слайс занимает четыре элемента.
+// Row-major viewProj of a shadow slice; each slice occupies four consecutive elements.
 float4x4 LoadPunctualShadowMatrix(uint slice)
 {
     uint row = slice * 4;
     return float4x4(PunctualShadowMatrices[row + 0], PunctualShadowMatrices[row + 1],
                     PunctualShadowMatrices[row + 2], PunctualShadowMatrices[row + 3]);
 }
+// One slice per spot, six cube faces per point light. Standard Z (clear 1.0, Less on write),
+// compare LessEqual - same convention as the sun cascades. ShadowParams.x < 0 = branch dead.
 Texture2DArray PunctualShadowMaps;
 SamplerComparisonState PunctualShadowMaps_sampler;
 
 #if FEATURE_SHADOWS
-// Shadow map мирового света (каскад 0; привязывается DiligentBatchRenderer.Register ->
-// ShadowRenderer.SetShadowResources). Обычный Z (clear 1.0 + Less при записи), сравнение
-// LessEqual: SampleCmp возвращает 1 = освещено.
+// Sun cascades. Standard Z (clear 1.0, Less on write), compare LessEqual: SampleCmp 1 = lit.
 Texture2DArray ShadowMaps;
 SamplerComparisonState ShadowMaps_sampler;
 #endif
@@ -187,55 +165,44 @@ cbuffer PreviewSettings
     float4 PbrVolumeAttenuation;
     float PbrNormalScale;
     float PbrOcclusionStrength;
-    // KHR_texture_transform (см. ModelLoader.MaterialPbrFactors.UvTransform): предвычисленная
-    // 2x2-матрица (row-major: u' = dot(uv, xy), v' = dot(uv, zw)) + offset, применяется к
-    // UV0-сэмплам материала ТОЛЬКО при PbrUvHasTransform != 0 - нулевой cbuffer (сцены вне
-    // превью его не заполняют) остаётся тождественным преобразованием.
+    // KHR_texture_transform, precomputed: row-major 2x2 (u' = dot(uv, xy), v' = dot(uv, zw))
+    // plus offset. Applied only when PbrUvHasTransform != 0, so a zeroed cbuffer is identity.
     float2 PbrUvOffset;
     float4 PbrUvTransform;
     int PbrUvHasTransform;
-    // Индекс UV-канала occlusionTexture (glTF texCoord 0/1) - AO часто запечён под уникальную
-    // развёртку ВТОРОГО канала (TEXCOORD_1, см. ChairDamaskPurplegold).
+    // occlusionTexture UV set (glTF texCoord 0/1): AO is often baked onto TEXCOORD_1.
     int PbrOcclusionUvSet;
-    // Пользовательский поворот энвайронмента вокруг Y в радианах (ползунок света в превью, см.
-    // PreviewShadowSettings.EnvYawRadians) - сдвиг equirect-U в SampleEnvironment, чтобы
-    // отражения/ambient вращались синхронно с ключевым светом. 0 (zero-init) = без поворота.
+    // Environment yaw around Y, radians - shifts equirect U so reflections/ambient follow the key.
     float PbrEnvYaw;
-    // Режим фильтрации теней (SHADOW_MODE_*, см. дефайны выше). 0 (zero-init от сцен вне превью)
-    // = PCSS - дефолтное качество.
+    // SHADOW_MODE_*. Zero must stay PCSS: scenes outside preview leave this cbuffer zeroed and
+    // must get default quality, not the cheapest filter.
     int PbrShadowMode;
-    // KHR_materials_sheen: rgb = sheenColorFactor (линейный; ноль = выключено), w =
-    // sheenRoughnessFactor. Читается только под MATERIAL_SHEEN.
+    // KHR_materials_sheen: rgb = sheenColorFactor (linear, zero = off), w = sheenRoughnessFactor.
     float4 PbrSheenColorRoughness;
-    // KHR_materials_specular: rgb = specularColorFactor (может быть >1 - по спеке умножается на
-    // F0 от IOR и КЛАМПИТСЯ к 1 после умножения), w = specularFactor (вес диэлектрического
-    // спекуляра). Каждый пуш Lighting-режима обязан слать (1,1,1,1) для материалов без
-    // расширения - нулевой w глушит спекуляр в чёрный (см. PreviewSettingsData).
+    // KHR_materials_specular: rgb = specularColorFactor (may exceed 1; per spec it multiplies the
+    // IOR F0 and is clamped to 1 AFTER the multiply), w = specularFactor. Every Lighting-mode push
+    // must send (1,1,1,1) for materials without the extension - w = 0 kills specular to black.
     float4 PbrSpecularColorFactor;
 
-    // Probe-GI сетка (см. ProbeGiTextures): xyz = мировая позиция пробы (0,0,0), w = 1 - пробы
-    // запечены и привязаны (0 - zero-init, фича выключена, атласы могут быть не привязаны).
+    // xyz = world position of probe (0,0,0), w = 1 when probes are baked and bound (0 = feature
+    // off and the atlases may be unbound).
     float4 ProbeGridOrigin;
-    // xyz = шаг сетки в мировых единицах, w = normal-бейас точки сэмпла (доля ячейки) - от
-    // утечек света сквозь тонкие стены (аналог DDGI normal bias).
+    // xyz = grid spacing in world units, w = sample-point normal bias as a fraction of a cell.
     float4 ProbeGridCell;
-    // xyz = число проб по осям сетки (float для простоты cbuffer-паковки), w = доля взгляда в
-    // направлении сдвига сэмпла (ручка View bias).
+    // xyz = probe counts per axis (float for cbuffer packing), w = view-bias fraction.
     float4 ProbeGridCounts;
-    // xyz = тороидальное смещение сетки в пробах: узел c лежит в текселе (c + scroll) mod counts
-    // (см. ProbeGiTextures.GridScroll).
+    // xyz = toroidal grid scroll in probes: node c lives in texel (c + scroll) mod counts.
     float4 ProbeGridScroll;
-    // Ручки probe-GI из окна Graphics (см. GraphicsSettingsWindow / EditorSettings): x = флор
-    // глушения солнечной доли эмбиента тенью ключа (дефолт 0.3), y = флор глушения env-спекуляра
-    // видимостью неба (0.2), z = интенсивность солнца (0 = zero-init, берём дефолт 2.0),
-    // w = множитель probe-irradiance (0 = дефолт 1.0).
+    // x = floor for damping the sun ambient share by key shadow (default 0.3), y = floor for
+    // damping env specular by sky visibility (0.2), z = sun intensity (0 = default 2.0),
+    // w = probe irradiance multiplier (0 = default 1.0).
     float4 ProbeGiParams;
-    // x = флор глушения НЕБЕСНОЙ доли эмбиента тенью ключа (1 = небо в тени не гасится - дефолт,
-    // редактор шлёт явно; 0-init вне превью тоже трактуется как 1). yzw - резерв.
+    // x = floor for damping the SKY ambient share by key shadow (1 = no damping; 0-init reads
+    // as 1). yzw reserved.
     float4 ProbeGiParams2;
 
-    // Сетки каскадов 1 и 2 (мелких) - та же семантика, что у базовых ProbeGrid*; Origin.w = 1
-    // означает «каскад создан и атласы _C1/_C2 привязаны» (см. SampleProbeGi).
+    // Finer cascade grids, same semantics as the base ProbeGrid*; Origin.w = 1 means the cascade
+    // exists and its _C1/_C2 atlases are bound.
     float4 ProbeGridOrigin1;
     float4 ProbeGridCell1;
     float4 ProbeGridCounts1;
@@ -245,12 +212,20 @@ cbuffer PreviewSettings
     float4 ProbeGridCounts2;
     float4 ProbeGridScroll2;
 
-    // Режим кривой тонмапа (см. Tonemap.hlsl). Действует только в LDR-режиме: в HDR-конвейере
-    // кривую применяет TonemapPS в самом конце, а здесь кадр остаётся линейным.
+    // Linear emissive: glTF emissiveFactor x KHR_materials_emissive_strength, folded at import.
+    // TAIL ORDER: this float3 must OPEN a 16-byte register, not follow an int. HLSL allows
+    // int + float3 in one register, but SPIR-V std140 needs vec3 aligned to 16 and spirv-opt
+    // refuses reflection ("member at offset 388 is not aligned to 16"). float3 + int + int is
+    // legal in both layouts. The C# mirror PreviewSettingsData must match byte for byte.
+    float3 PbrEmissiveFactor;
+    // Tone curve (Tonemap.hlsl), LDR only: in HDR the curve is applied later by TonemapPS.
     int PbrToneCurve;
+    // 1 = drawn by the BLENDING PSO: clip only culls invisible texels and the authored alpha is
+    // written out for the PSO to blend (straight alpha). Per-ENVIRONMENT, not a keyword - icon
+    // baking has no opaque/transparent split and cuts out the same material instead.
+    int PbrAlphaBlend;
 }
 
-// KHR_texture_transform поверх UV0 (см. PbrUvTransform выше).
 float2 TransformMaterialUv(float2 uv)
 {
     if (PbrUvHasTransform != 0)
@@ -264,134 +239,106 @@ static const int FeatureNormalMaps = 1;
 static const int FeatureOcclusion = 2;
 static const int FeatureShadows = 4;
 
-// HDR-конвейер превью (см. GraphicsPipelineSimple с eyeAdaptation): цветовой таргет - RGBA16F,
-// шейдинг пишет в него ЛИНЕЙНЫЙ радианс без тонмапа и sRGB-энкода, а экспозиция + кривая
-// применяются один раз в TonemapPass после замера яркости кадра. Бит, а не кейворд: HDR - опция
-// окружения, а материалы переживают его пересоздание только через перезагрузку модели, и лишний
-// вариант шейдера на каждый материал того не стоит.
+// HDR pipeline: RGBA16F target takes LINEAR radiance with no tonemap and no sRGB encode;
+// exposure and curve are applied once in TonemapPass. A bit, not a keyword: HDR is an
+// environment option and materials would otherwise need a variant each.
 static const int FeatureHdrOutput = 8;
 
 #if FEATURE_SHADOWS
-// PCF 3x3 по shadow map мирового света с выбором каскада: каскады - концентрические ортобоксы
-// (мелкие вокруг точки интереса камеры, последний накрывает всю сцену, см.
-// SimpleCullingAndRenderSystem.BuildLightData), берётся ПЕРВЫЙ, чей объём содержит точку -
-// он самый детальный. Валидность каскада - ненулевая ширина в CascadeSizes (превью моделей
-// по-прежнему заполняет один каскад, и цикл вырождается в прежний код). За пределами всех
-// каскадов - освещено.
-// Сторона карты теней солнца в текселях (см. ShadowRenderer.ShadowMapSize).
+// Cascades are concentric ortho boxes; the FIRST one containing the point is the most detailed.
+// A cascade is valid when its CascadeSizes width is non-zero; outside all cascades = lit.
+// Sun shadow map side in texels (see ShadowRenderer.ShadowMapSize).
 #define SUN_SHADOW_TEXELS 4096.0
 
-// ОТСТУП от края каскада, в текселях. Каскад не берётся, пока точка не окажется глубже отступа
-// внутрь, - иначе фильтр вылезает за карту. PCF 3x3 тянет тапы на тексель в стороны, сравнивающий
-// сэмплер добавляет свои полтекселя фильтрации, а normal-offset выше уже сдвинул точку на полтора
-// текселя. У края всё это адресуется ЗА пределы карты, сэмплер кламмит адрес - и тапы читают
-// краевой тексель, то есть глубину совсем другого места сцены. На экране это прямой шов поперёк
-// стены на границе каскада (ровно та геометричная линия, что видна на скриншотах).
+// Cascade edge margin in texels: PCF taps (1) + comparison sampler filtering (0.5) +
+// normal-offset (1.5). Nearer the edge the clamped sampler reads unrelated depth and the
+// cascade boundary shows up as a straight seam across the wall.
 #define SUN_CASCADE_MARGIN_TEXELS 3.0
 
-// Ширина полосы перехода в долях стороны каскада. В ней тень берётся из ДВУХ каскадов и
-// смешивается: без неё переход остаётся видимым и после отступа - у соседних каскадов разное
-// разрешение карты, а значит разная мягкость PCF и разный масштаб байеса, и граница читается как
-// ступенька резкости.
+// Cross-fade band as a fraction of the cascade side. Neighbouring cascades differ in map
+// resolution, hence in PCF softness and bias scale; without the blend the seam reads as a
+// sharpness step even with the margin.
 #define SUN_CASCADE_BLEND_UV 0.06
 
-// --- PCSS: полутень от углового размера солнца ---
-// Тангенс ПОЛУугла видимого диска приходит в lightData.SpotAngles.w (см.
-// CullingAndRenderSystem.SunTanHalfAngle). 0 - пайплайн поле не заполняет (превью), берём дефолт:
-// диск в один градус (реальное солнце ~0.53, чуть крупнее - край читается мягким и на коротких
-// тенях).
+// --- PCSS: penumbra from the sun's angular size ---
+// lightData.SpotAngles.w = TANGENT OF THE SUN HALF-ANGLE. 0 = not filled (preview), so use a
+// one-degree disc; the real sun is ~0.53 deg, slightly larger keeps short shadows soft-edged.
 #define SUN_DEFAULT_TAN_HALF_ANGLE 0.00873
 
-// Режимы фильтрации теней (PbrShadowMode, комбо «Shadow filtering» окна Graphics), по
-// возрастанию накладных расходов: HARD - 1 аппаратный тап; PCF - фикс. бокс 3x3; PCSS - полутень
-// от углового размера источника (дефолт); PCSS_HQ - тот же PCSS с удвоенным веером и более
-// широкой полутенью. НОЛЬ обязан оставаться PCSS: сцены вне превью кбуфер не заполняют, и
-// zero-init должен давать дефолтное качество, а не самое дешёвое.
+// Shadow filter modes by ascending cost: HARD = 1 hardware tap; PCF = fixed 3x3 box; PCSS =
+// penumbra from source angular size (default); PCSS_HQ = PCSS with a doubled tap fan.
+// ZERO must stay PCSS - scenes outside preview leave the cbuffer zeroed.
 #define SHADOW_MODE_PCSS 0
 #define SHADOW_MODE_HARD 1
 #define SHADOW_MODE_PCF 2
 #define SHADOW_MODE_PCSS_HQ 3
-// Теневые лучи по TLAS (inline RayQuery) вместо shadow map - только в варианте шейдера с
-// FEATURE_RT_SHADOWS (DXC/SM6.5, см. ниже); без него режим тихо падает в PCSS - в т.ч. на
-// Vulkan, где RaytracingAccelerationStructure не доходит до DXC (см. ProbeRoundPipelines).
+// Inline RayQuery shadows, only in the FEATURE_RT_SHADOWS variant (DXC/SM6.5); without it the
+// mode silently degrades to PCSS, including on Vulkan where the TLAS never reaches DXC.
 #define SHADOW_MODE_RT 4
 
 #if FEATURE_RT_SHADOWS
-// Лучей в конусе углового размера солнца на пиксель. Зерно усредняет TAAU - как у PCSS.
+// Rays per pixel inside the sun's angular cone; TAAU averages the grain, as with PCSS.
 #define RT_SHADOW_RAYS 8
-// Отступ старта луча вдоль нормали от самопересечения с собственным треугольником. Константа в
-// МИРОВЫХ единицах: у RT-луча нет текселя shadow map, от которого масштабировался normal-offset
-// растрового пути.
+// Ray start offset along the normal, in WORLD units: an RT ray has no shadow-map texel to
+// scale the raster path's normal-offset by.
 #define RT_SHADOW_NORMAL_OFFSET 0.02
 #define RT_SHADOW_TMAX 1e4
 
-// TLAS сцены - тот же, что у probe-GI (см. ProbeSceneAccel); привязывается к материалам
-// DiligentBatchRenderer-ом только когда вариант с этим кейвордом реально запрошен.
+// Same TLAS as probe-GI; bound only when this keyword variant is actually requested.
 RaytracingAccelerationStructure _SceneTlas;
 #endif
 
-// Тапов на диск Фогеля - и в поиске блокеров, и в PCF. 16+16 на пиксель вместо полного прохода
-// прямоугольника у классического PCSS: недобор выборок закрывают пер-пиксельное вращение диска
-// (IGN ниже) и temporal-сглаживание (TAAU), которому остаточный шум по вкусу. HQ удваивает веер -
-// для стоп-кадров и сцен без TAAU, где зерно нечем усреднить.
+// Vogel disc taps, used for both blocker search and PCF. 16+16 per pixel instead of classic
+// PCSS's full rectangle sweep; the undersampling is hidden by per-pixel disc rotation (IGN
+// below) and TAAU. HQ doubles the fan for stills and scenes without TAAU.
 #define SUN_PCSS_TAPS 16
 #define SUN_PCSS_HQ_TAPS 32
 
-// Радиус поиска блокеров, тексели. Блокеры дальше не видны - значит и полутень шире
-// SUN_PCSS_MAX_PENUMBRA_TEXELS искать не имеет смысла на этом каскаде: очень длинные мягкие тени
-// уходят в более грубый каскад, у которого тексель крупнее.
+// Blocker search radius in texels. Penumbrae wider than SUN_PCSS_MAX_PENUMBRA_TEXELS are not
+// worth searching on this cascade - very long soft shadows fall into a coarser one.
 #define SUN_PCSS_SEARCH_TEXELS 12.0
 #define SUN_PCSS_MAX_PENUMBRA_TEXELS 20.0
 #define SUN_PCSS_HQ_SEARCH_TEXELS 16.0
 #define SUN_PCSS_HQ_MAX_PENUMBRA_TEXELS 32.0
 
-// Мировой диапазон глубины каскада в ДОЛЯХ его ширины: zfar = 4.5r при ширине 2r (znear 0.01
-// пренебрежим). Зеркалит casterExtension + receiverExtension в CullingAndRenderSystem.UpdateCascades
-// и SimpleCullingAndRenderSystem.BuildLightData - менять только втроём, иначе полутень получит
-// неверный мировой масштаб.
+// Cascade world depth range as a FRACTION of its width: zfar = 4.5r for a width of 2r.
+// Mirrors casterExtension + receiverExtension in CullingAndRenderSystem.UpdateCascades and
+// SimpleCullingAndRenderSystem.BuildLightData - change all three or the penumbra world scale breaks.
 #define SUN_CASCADE_DEPTH_RANGE_RATIO 2.25
 
-// --- PCSS punctual-теней (перспективные слайсы) - те же диски Фогеля, что у солнца ---
-// Дефолтный мировой радиус светящегося тела, метры - когда ShadowParams.w не заполнен
-// (LightComponent.SourceRadius = 0): габарит лампочки.
+// --- Punctual PCSS (perspective slices), same Vogel discs as the sun ---
+// Default emitter radius in metres when ShadowParams.w is unset (SourceRadius = 0).
 #define PUNCTUAL_DEFAULT_SOURCE_RADIUS 0.05
-// Радиус поиска блокеров и потолок радиуса PCF, тексели слайса. Потолок ЖЁСТКИЙ: грани куба
-// рисуются с перехлёстом ~2% (около 20 текселей из 1024, см. PunctualShadowScheduler) - тапы
-// дальше уезжали бы на чужую грань.
+// Blocker search radius and PCF radius ceiling, slice texels. The ceiling is HARD: cube faces
+// are rendered with only ~2% overlap (about 20 of 1024 texels), so wider taps hit a neighbour face.
 #define PUNCTUAL_PCSS_SEARCH_TEXELS 10.0
 #define PUNCTUAL_PCSS_MAX_PENUMBRA_TEXELS 16.0
 
-// Interleaved gradient noise (Jimenez, 2014): дешёвый пер-пиксельный [0,1) для вращения диска.
-// Джиттер TAAU каждый кадр чуть сдвигает привязку пикселей к поверхности, так что паттерн не
-// стоит на месте и усредняется темпорально без отдельного счётчика кадров.
+// Interleaved gradient noise (Jimenez, 2014): cheap per-pixel [0,1) for disc rotation. The TAAU
+// jitter moves the pattern each frame, so it averages temporally without a frame counter.
 float InterleavedGradientNoise(float2 pixel)
 {
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
-// i-й из count тапов диска Фогеля, повёрнутого на phi; радиус нормирован в [0,1].
+// Tap i of count on a Vogel disc rotated by phi; radius normalized to [0,1].
 float2 VogelDiskSample(int i, int count, float phi)
 {
     float r = sqrt((float(i) + 0.5) / float(count));
-    float theta = float(i) * 2.39996323 + phi; // золотой угол
+    float theta = float(i) * 2.39996323 + phi; // golden angle
     float s, c;
     sincos(theta, s, c);
     return r * float2(c, s);
 }
 
-// firstCascade - индекс ПЕРВОГО каскада, который реально дал вклад (-1: точка не попала ни в один и
-// объявлена освещённой). Нужен отладочному каналу 26: «пятно тени» и «пятно от смены каскада»
-// выглядят на экране одинаково, и без индекса их не разделить.
+// firstCascade = index of the FIRST cascade that contributed; -1 = outside all cascades, lit.
 #if FEATURE_RT_SHADOWS
-// Тень солнца ТЕНЕВЫМИ ЛУЧАМИ по TLAS - верх лестницы Shadow filtering: физическая полутень без
-// каскадов, байасов и краевых текселей вовсе. Конус лучей раскрыт на угловой размер диска
-// (Sun angular size), вращение диска - тем же IGN, что у PCSS. Ограничение против shadow map:
-// альфа-тест листвы TLAS не видит (BLAS - сплошная геометрия), крона затеняет монолитом.
+// Ray-traced sun shadow: physical penumbra with no cascades, biases or edge texels. Unlike the
+// shadow map it ignores foliage alpha test - the BLAS is solid, so canopies occlude as a block.
 float SampleWorldLightShadowRT(float3 worldPos, float3 N, float2 pixelPos, float sunTanHalfAngle)
 {
     float3 sunDir = normalize(lightData.LightDirection.xyz);
 
-    // Базис поперёк направления на солнце - в нём раскрывается конус.
     float3 tangentSeed = abs(sunDir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
     float3 tangent1 = normalize(cross(tangentSeed, sunDir));
     float3 tangent2 = cross(sunDir, tangent1);
@@ -410,7 +357,7 @@ float SampleWorldLightShadowRT(float3 worldPos, float3 N, float2 pixelPos, float
         ray.TMin = 0.0;
         ray.TMax = RT_SHADOW_TMAX;
 
-        // ACCEPT_FIRST_HIT - теневому лучу ближайшее попадание не нужно (зеркало SceneTrace.hlsl).
+        // ACCEPT_FIRST_HIT: a shadow ray does not need the nearest hit.
         RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
         query.TraceRayInline(_SceneTlas, RAY_FLAG_NONE, 0xFF, ray);
         query.Proceed();
@@ -433,22 +380,19 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
         : SUN_DEFAULT_TAN_HALF_ANGLE;
 
 #if FEATURE_RT_SHADOWS
-    // RT-режим минует каскады целиком; firstCascade остаётся -1 (отладочный канал 26 честно
-    // покажет «каскад не выбран»). Punctual-света в RT-режиме остаются на PCSS - их ветка сама
-    // падает в PCSS на любом незнакомом значении режима.
+    // RT mode skips cascades entirely; punctual lights stay on PCSS.
     if (PbrShadowMode == SHADOW_MODE_RT)
     {
         return SampleWorldLightShadowRT(worldPos, N, pixelPos, sunTanHalfAngle);
     }
 #endif
 
-    // Одно вращение диска на пиксель - блокер-серч и PCF всех каскадов крутятся согласованно,
-    // иначе полутень на стыке каскадов шумит двумя несовпадающими паттернами.
+    // One disc rotation per pixel: blocker search and PCF of every cascade must stay in phase,
+    // otherwise the cascade seam shows two mismatched noise patterns.
     float phi = InterleavedGradientNoise(pixelPos) * 6.2831853;
 
-    // Последний заполненный каскад: ему полосу перехода не даём - смешивать не с чем, а фейд в
-    // «освещено» на его краю выглядел бы как срез тени в воздухе. Он же покрывает случай превью
-    // одиночной модели, где каскад ровно один.
+    // The last valid cascade gets no cross-fade band - nothing to blend with, and fading to
+    // "lit" at its edge would cut the shadow off in mid-air.
     int lastValid = -1;
     [unroll]
     for (int k = 0; k < 4; k++)
@@ -462,10 +406,8 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
     float shadow = 0.0;
     float acc = 0.0;
 
-    // [loop] здесь и на всех PCSS-тапах ниже - СОЗНАТЕЛЬНО, ради времени КОМПИЛЯЦИИ: FXC (D3D12
-    // компилирует модельные варианты им, см. DiligentShader) разворачивал 4 каскада x 32 тапа плюс
-    // пробные циклы в простыню, и вариант стоил 7.5 с компиляции; с [loop] - 1.3 с, байткод втрое
-    // меньше. Код итераций идентичен, меняется только развёртка.
+    // [loop] here and on every PCSS tap loop below is for COMPILE time: FXC unrolled 4 cascades
+    // x 32 taps into 7.5 s per variant; with [loop] it is 1.3 s and a third of the bytecode.
     [loop]
     for (int c = 0; c < 4; c++)
     {
@@ -480,11 +422,9 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
             continue;
         }
 
-        // Normal-offset bias: точка сэмплирования сдвигается вдоль нормали на ~полтора текселя
-        // shadow map В МИРОВЫХ единицах (CascadeSizes[c] = ширина орто-каскада ЭТОГО уровня).
-        // Депф-bias один не спасает тонкую геометрию (черепица, ткань): её задняя грань лежит в
-        // сантиметрах за передней, и PCF-соседи на рельефе ловят чужие задние грани - крыши
-        // затеняют сами себя. Сдвиг по нормали уводит точку из этой зоны независимо от глубины.
+        // Normal-offset bias of ~1.5 shadow-map texels in WORLD units (CascadeSizes[c] = ortho
+        // width of THIS level). Depth bias alone cannot save thin geometry - shingles and cloth
+        // have back faces centimetres behind, and PCF neighbours pick them up as self-shadow.
         float texelWorld = cascadeWorld / SUN_SHADOW_TEXELS;
         float3 samplePos = worldPos + N * texelWorld * 1.5;
 
@@ -494,12 +434,10 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
 
         if (lightNdc.z <= 0.0 || lightNdc.z >= 1.0)
         {
-            // Точка вне глубинного диапазона этого каскада - пробуем следующий, крупнее.
             continue;
         }
 
-        // Расстояние до края карты за вычетом отступа. Отрицательное - точка в кайме, где фильтр
-        // вылез бы за карту: каскад не годится, идём на следующий.
+        // Distance to the map edge minus the margin; negative = the filter would sample outside.
         float edge = min(min(shadowUv.x, 1.0 - shadowUv.x),
                          min(shadowUv.y, 1.0 - shadowUv.y)) - margin;
         if (edge <= 0.0)
@@ -507,8 +445,6 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
             continue;
         }
 
-        // Вес этого каскада: единица в глубине, плавно к нулю в полосе перехода у кромки. Остаток
-        // веса доберёт следующий каскад - там та же точка лежит глубоко внутри.
         float w = (c == lastValid) ? 1.0 : saturate(edge / SUN_CASCADE_BLEND_UV);
         float take = min(w, 1.0 - acc);
         if (take <= 0.0)
@@ -516,26 +452,20 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
             continue;
         }
 
-        // Небольшое смещение: shadow map пишется БЕЗ отсечения граней (см. ShadowRenderer.GetBaseState -
-        // прежний front-cull делал одностороннюю геометрию прозрачной для света: планки крыши без
-        // задних граней пропускали солнце полосами). Основную работу против acne делают растеризаторные
-        // байасы записи (DepthBias + SlopeScaledDepthBias) и normal-offset выше; константа здесь -
-        // добивка, крупнее нельзя (peter-panning у основания фигур). Глубинный диапазон у всех
-        // каскадов одинаковый (см. BuildLightData), так что константа работает на любом уровне.
+        // Top-up bias only: the shadow map is rendered with NO face culling, and the rasterizer
+        // biases plus the normal-offset above do the real anti-acne work. Larger values cause
+        // peter-panning. All cascades share one depth range, so a constant works at every level.
         float referenceDepth = lightNdc.z - 0.0004;
         float lit;
 
-        // Режим фильтрации - юниформ-ветка (PbrShadowMode одинаков для всего кадра, дивергенции
-        // нет), режимы по возрастанию цены: HARD / PCF / PCSS / PCSS_HQ.
+        // Uniform branch: PbrShadowMode is constant for the whole frame, so no divergence.
         if (PbrShadowMode == SHADOW_MODE_HARD)
         {
-            // Один аппаратный тап: билинейное сравнение даёт край в тексель шириной.
             lit = ShadowMaps.SampleCmpLevelZero(ShadowMaps_sampler,
                 float3(shadowUv, (float)c), referenceDepth);
         }
         else if (PbrShadowMode == SHADOW_MODE_PCF)
         {
-            // Фиксированный бокс 3x3 - прежний путь: постоянная мягкость в тексель, без полутени.
             float pcfSum = 0.0;
             [unroll]
             for (int y = -1; y <= 1; y++)
@@ -555,11 +485,9 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
         bool hq = PbrShadowMode == SHADOW_MODE_PCSS_HQ;
         int taps = hq ? SUN_PCSS_HQ_TAPS : SUN_PCSS_TAPS;
 
-        // --- PCSS, шаг 1: поиск блокеров - средняя глубина текселей, заслоняющих точку, в диске
-        // Фогеля. Load вместо сэмплера: нужна точечная выборка БЕЗ сравнения, а второго сэмплера у
-        // ShadowMaps нет и не надо. Радиус диска (и поиска, и PCF ниже) ограничен запасом до кромки
-        // каскада: edge уже за вычетом margin, так что тапы не адресуются за карту, а пиксель у
-        // кромки всё равно доберёт вес из следующего каскада (полоса перехода шире любого радиуса).
+        // PCSS step 1: blocker search. Load, not a sampler - this needs a point fetch WITHOUT
+        // comparison, and ShadowMaps has no second sampler. Disc radius is capped by the
+        // distance to the cascade edge so taps never address outside the map.
         float maxRadiusTexels = min(hq ? SUN_PCSS_HQ_MAX_PENUMBRA_TEXELS : SUN_PCSS_MAX_PENUMBRA_TEXELS,
             edge * SUN_SHADOW_TEXELS);
         float searchRadius = min(hq ? SUN_PCSS_HQ_SEARCH_TEXELS : SUN_PCSS_SEARCH_TEXELS,
@@ -567,7 +495,7 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
 
         float avgBlocker = 0.0;
         float blockerCount = 0.0;
-        [loop] // время компиляции FXC - см. комментарий у каскадного цикла
+        [loop] // FXC compile time - see the cascade loop
         for (int b = 0; b < taps; b++)
         {
             float2 searchUv = shadowUv + VogelDiskSample(b, taps, phi) * searchRadius * texel;
@@ -579,11 +507,8 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
             }
         }
 
-        // Шаг 2: ширина полутени. Для направленного света это расстояние до блокера, умноженное на
-        // тангенс полуугла диска солнца; глубина ndc переводится в мировую через диапазон каскада
-        // (SUN_CASCADE_DEPTH_RANGE_RATIO). Без блокеров радиус остаётся минимальным - тексель:
-        // полностью освещённые/затенённые области получают дешёвое сглаживание края вместо
-        // жёсткого бокса 3x3.
+        // Step 2: penumbra width = blocker distance x tan(sun half-angle); NDC depth becomes
+        // world depth via SUN_CASCADE_DEPTH_RANGE_RATIO. No blockers = one-texel radius.
         float filterRadius = 1.0;
         if (blockerCount > 0.0)
         {
@@ -592,10 +517,10 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
             filterRadius = clamp(blockerDistWorld * sunTanHalfAngle / texelWorld, 1.0, maxRadiusTexels);
         }
 
-        // Шаг 3: PCF по тому же диску, повёрнутому на полоборота, - тапы не совпадают с тапами
-        // поиска, суммарный паттерн на пиксель вдвое плотнее.
+        // Step 3: PCF over the same disc rotated by half a turn, so its taps miss the search
+        // taps and the per-pixel pattern is twice as dense.
         float sum = 0.0;
-        [loop] // время компиляции FXC - см. комментарий у каскадного цикла
+        [loop] // FXC compile time - see the cascade loop
         for (int t = 0; t < taps; t++)
         {
             float2 tapUv = shadowUv + VogelDiskSample(t, taps, phi + 3.1415926) * filterRadius * texel;
@@ -615,9 +540,7 @@ float SampleWorldLightShadow(float3 worldPos, float3 N, float2 pixelPos, out flo
         acc += take;
     }
 
-    // Недобранный вес - освещён: за пределами всех каскадов тени нет. Раньше здесь стоял ранний
-    // выход с 1.0, и «за пределами» наступало разом; теперь край последнего каскада уходит в свет
-    // тем же плавным весом, что и стыки между каскадами.
+    // Unclaimed weight counts as lit: outside every cascade there is no shadow.
     return shadow + (1.0 - acc);
 }
 #endif
@@ -629,34 +552,24 @@ static const float EnvMipMax = 6.0;
 
 float3 SampleEnvironment(float3 dir, float roughness)
 {
-    // Поворот энвайронмента вокруг Y - для equirect-карты это просто сдвиг U (сэмплер Wrap
-    // заворачивает шов). Знак: +PbrEnvYaw двигает солнце карты в сторону возрастающего ява
-    // ключевого света (см. PreviewShadowSettings.SetAngles).
+    // Yaw around Y is a plain U shift on an equirect map; the Wrap sampler hides the seam.
+    // Sign: +PbrEnvYaw moves the map's sun towards increasing key-light yaw.
     float2 uv = float2(atan2(dir.z, dir.x) / (2.0 * PI) + 0.5 + PbrEnvYaw / (2.0 * PI),
                        acos(clamp(dir.y, -1.0, 1.0)) / PI);
     return _EnvMap.SampleLevel(_EnvMap_sampler, uv, roughness * EnvMipMax).rgb;
 }
 
-// Ручной трилинейный сэмпл probe-GI сетки: 8 угловых проб ячейки, вес = трилинейный ×
-// валидность (пробы внутри геометрии не интерполируются - от утечек тьмы/света). SH L1 →
-// диффузная irradiance по нормали (константы Ramamoorthi: A0*Y00 = 0.886, A1*Y1 = 1.023).
-// Возвращает E/PI - готовый ламбертов множитель альбедо; skyVisibility - доля неба, видимая
-// точкой (глушит env-спекуляр в закрытых местах). Отрицательный x = валидных проб рядом нет,
-// вызывающий откатывается на константный ambient.
-// Сторона окто-карты видимости на пробу. Приходит кбуфером (ProbeGiParams2.y - ручка «Visibility
-// res», см. ProbeGiBakeResult.VisRes): раскладка атласа задаётся ей же на CPU, и разойтись им
-// нельзя. 0 (zero-init кбуфера вне превью) трактуется как дефолтные 8.
+// Octahedral visibility map side per probe. Comes from the cbuffer (ProbeGiParams2.y) because
+// the same value lays out the atlas on the CPU - the two must not drift. 0 reads as 8.
 int ProbeVisRes()
 {
     int res = (int)ProbeGiParams2.y;
     return res > 0 ? res : 8;
 }
 
-// Окто-топология при выходе за край тайла: октаэдр развёрнут в квадрат, поэтому сосед за кромкой -
-// это тексель ЭТОГО ЖЕ тайла с противоположной стороны и зеркальной второй координатой (переход
-// через ребро октаэдра). Нужно для билинейной фильтрации карты глубин: без обёртки края тайла
-// пришлось бы либо клампить (ложная "стена" по краю окто-развёртки), либо держать в атласе
-// border-тексели, то есть переразмечать его и переписывать обе записи (CPU и ProbeRoundCS).
+// Octahedral topology past a tile edge: the neighbour is a texel of the SAME tile on the
+// opposite side with the other coordinate mirrored. Clamping instead would fake a wall along
+// the octahedral seam; border texels would mean relaying out the atlas on CPU and GPU both.
 int2 OctWrapTexel(int2 t, int res)
 {
     if (t.x < 0)         { t.x = 0;         t.y = res - 1 - t.y; }
@@ -668,8 +581,7 @@ int2 OctWrapTexel(int2 t, int res)
     return t;
 }
 
-// Окто-кодирование направления в [0,1]² - обязано бит-в-бит совпадать с ProbeGiBaker.OctEncode
-// (CPU пишет атлас видимости в этой же раскладке).
+// Must match ProbeGiBaker.OctEncode bit for bit - the CPU writes the visibility atlas with it.
 float2 OctEncode(float3 d)
 {
     float sum = abs(d.x) + abs(d.y) + abs(d.z);
@@ -682,24 +594,12 @@ float2 OctEncode(float3 d)
     return p * 0.5 + 0.5;
 }
 
-// sunFraction - доля солнечного света (баунс + переотскоки) в поле, альфа Sh2: экранная тень
-// ключа глушит только её (см. probeShadow в Main) - небесная часть эмбиента в тени легитимна.
-// Нелинейная реконструкция облучённости из L1 (Geomerics/Enlighten, см. Graham Hazel, "Spherical
-// Harmonics for Lighting"). Линейная форма I(n) = R0 + 2*R1.n имеет врождённый дефект: длина R1
-// доходит до R0, поэтому множитель 2 позволяет второму слагаемому превысить первое, и с обратной
-// стороны от яркого направления облучённость становится ОТРИЦАТЕЛЬНОЙ. Физически этого не бывает,
-// а на картинке даёт чёрные пятна напротив ярких проёмов (или потерю энергии, если просто
-// клампить в ноль).
-//
-// Здесь R0 и R1 - в «нормированном» соглашении Хейзела (R0 = среднее по сфере), на канал: у
-// каждого канала своя направленность.
-//
-// ВАЖНО: это не строгое улучшение, а размен, замеренный численно против точного интегрирования.
-// При сильной направленности (r = |R1|/R0 около 0.85-0.99) линейная форма уходит в минус на всю
-// величину R0, и нелинейная точнее вчетверо. Зато на полусферическом источнике (r = 0.5) линейная
-// ТОЧНА, а нелинейная замыливает и не умеет темнеть с изнанки. Поэтому смешиваем по r, и порог не
-// подобран на глаз: при r <= 0.5 линейная форма неотрицательна по построению (2r <= 1), то есть
-// ломаться ей просто негде.
+// Non-linear L1 irradiance reconstruction (Geomerics/Enlighten, Graham Hazel). R0/R1 use
+// Hazel's normalized convention (R0 = sphere average) per channel.
+// The linear form R0 + 2*R1.n goes NEGATIVE opposite a bright direction when |R1| approaches R0.
+// It is a trade, not a strict win: the non-linear form is ~4x more accurate at r = 0.85-0.99 but
+// blurs a hemispherical source where the linear form is exact, so the two are blended by r.
+// The r <= 0.5 threshold is exact, not tuned: there 2r <= 1 keeps the linear form non-negative.
 float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 {
     float len = length(R1v);
@@ -723,9 +623,8 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
     return lerp(linearForm, nonLinear, smoothstep(0.5, 0.8, r));
 }
 
-// Выборка одного объёма (каскада) живёт в ProbeGiSampleBody.hlsl и разворачивается по разу на
-// каскад: HLSL до SM 6.6 не передаёт текстуры параметрами, поэтому один код с разными атласами -
-// это инклюд с макросами, а не функция.
+// One volume's sampler lives in ProbeGiSampleBody.hlsl, included once per cascade: HLSL before
+// SM 6.6 cannot pass textures as parameters, so sharing code means macros, not a function.
 #define PROBE_GI_FN      SampleProbeGiC0
 #define PROBE_GI_SH0     _ProbeSh0
 #define PROBE_GI_SH1     _ProbeSh1
@@ -798,22 +697,9 @@ float NonLinearIrradianceL1(float R0, float3 R1v, float3 n)
 #undef PROBE_GI_COUNTS
 #undef PROBE_GI_SCROLL
 
-// Плавный вес объёма: ноль у грани бокса (и снаружи), единица - не ближе КИРПИЧА от грани. Прямой
-// аналог margin теневых каскадов (Shadows.hlsl, GetDistanceToCascadeMargin): выборка не берёт
-// каскад у самого края, а в полосе перед ним уходит на следующий, более крупный объём.
-//
-// Лечит сразу три видимые беды стыков:
-//   1) тело выборки КЛАМПИТ точку к боксу - без веса пиксель ВНЕ мелкого каскада не проваливался
-//      на крупный, а получал растянутые крайние кирпичи мелкого;
-//   2) даже честная граница переключала разрешение поля жёстко, швом;
-// Отступ 0.5 шага держит выборку подальше от кламп-зоны самой грани.
-//
-// Ширина - два шага сетки, а не кирпич. Кирпич (три шага) здесь стоял недолго и по другому поводу:
-// им гасилась рябь только что въехавших кирпичей, которые прокрутка приводит с краю. Но платить за
-// это геометрией неправильно - полоса в кирпич съедала у каскада 13 ячеек по оси больше половины
-// полного веса, то есть ровно ту плотность, ради которой каскад и заведён. Свежестью и надо гасить
-// свежесть: теперь въехавший кирпич проявляется сам, по своему окну (см. ProbeGiSampleBody,
-// confidence), где бы он ни лежал, а этой полосе остаётся её собственная работа - стык объёмов.
+// Cascade fade band in grid cells: the sample body CLAMPS the point to the box, so without a
+// weight a pixel outside a fine cascade would get its stretched edge probes instead of falling
+// through to the coarse one. Wider bands eat the very density the cascade exists for.
 #define PROBE_CASCADE_MARGIN_CELLS 2.0
 
 float ProbeCascadeWeight(float3 worldPos, float4 origin, float4 cell, float4 counts)
@@ -824,23 +710,15 @@ float ProbeCascadeWeight(float3 worldPos, float4 origin, float4 cell, float4 cou
     return saturate((d - 0.5) / (PROBE_CASCADE_MARGIN_CELLS - 0.5));
 }
 
-// Каскадная выборка: база - гарантия покрытия, мелкие объёмы подмешиваются ПОВЕРХ с весом своего
-// бокса. Плата за плавный стык - в зоне каскада выборок больше одной (до трёх в самом мелком);
-// это ровно те места, ради которых каскады и заведены, так что цена по адресу.
-// probeCoverage - НАСКОЛЬКО результату можно верить как замене константного ambient, 0..1.
-// Заведён из-за свежих кирпичей. Прокрутка каскада приводит их непрерывно, пока летит камера, и в
-// местах, где базовый объём дыряв (он разрежённый - кирпичи есть только у геометрии), свежий кирпич
-// оказывается ЕДИНСТВЕННЫМ источником. Смешивать его по уверенности с нулём, как делалось раньше,
-// значит проявлять освещение из черноты: на резкое движение камеры перед ней шли тёмные
-// прямоугольники размером с кирпич. Смешивать в полную силу - другая крайность, дававшая яркие
-// вспышки. Правильно - смешивать с тем, что стоит под полем: с константным ambient, а он считается
-// в Main. Поэтому наружу отдаётся ВЕС, а сам размен делает вызывающий.
+// Cascaded sampling: the base volume guarantees coverage, finer volumes blend OVER it by their
+// box weight, costing up to three samples inside the finest cascade.
+// probeCoverage (0..1) = how far the result can be trusted in place of constant ambient. The
+// caller owns that trade because the constant ambient it blends against is computed in Main.
 float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out float sunFraction,
                      out float3 probeMarker, out float probeCoverage)
 {
     probeCoverage = 1.0;
-    // Уверенность базового объёма не читается: он не ездит, его кирпичи не бывают свежими, и
-    // гасить последний рубеж покрытия всё равно нечем - под ним только константный ambient.
+    // The base volume's confidence is ignored: it never scrolls, so its probes are never fresh.
     float conf0;
     float3 result = SampleProbeGiC0(worldPos, N, skyVisibility, sunFraction, probeMarker, conf0);
 
@@ -853,24 +731,12 @@ float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out flo
             float3 marker1;
             float3 mid = SampleProbeGiC1(worldPos, N, sky1, sun1, marker1, conf1);
 
-            // Вес каскада гасится уверенностью кирпича: только что въехавший проявляется за свои
-            // раунды, а не вспыхивает готовым (см. ProbeGiSampleBody).
+            // Scale by probe confidence so a freshly scrolled-in probe fades in over its rounds.
             w *= conf1;
             if (mid.x >= 0.0 && w > 0.0)
             {
-                // Базе нечем крыть (дыра без кирпича - базовый объём разрежённый, кирпичи есть
-                // только у геометрии). Тогда подмешивать не к чему, и вес каскада по БОКСУ здесь
-                // ни при чём: гасить единственный источник за отсутствие второго бессмысленно.
-                //
-                // Уверенность объёма при этом остаётся в силе и НЕ затирается единицей - строка
-                // когда-то ставила w = 1.0 поверх уже домноженного на conf1 веса, и свежий кирпич
-                // вспыхивал в полную силу с полем от одного-двух вееров. У плотной сетки conf1
-                // всегда 1 (см. ProbeGiSampleBody), так что сегодня это ничего не меняет; порядок
-                // сохранён нарочно - механизм плавного проявления может понадобиться снова, и
-                // возвращать его придётся ровно сюда.
-                // Базе нечем крыть - значение берём ЦЕЛИКОМ, а неуверенность отдаём наружу весом.
-                // Именно значение, а не его долю: поле свежего кирпича шумно, но по величине это
-                // уже освещение, а не ноль, и тянуть его к нулю - выдумывать темноту, которой нет.
+                // No base value to blend with: take the cascade value WHOLE and pass the
+                // uncertainty out as coverage. Scaling it toward zero would invent darkness.
                 if (result.x < 0.0)
                 {
                     probeCoverage = conf1;
@@ -901,8 +767,6 @@ float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out flo
             w *= conf2;
             if (fine.x >= 0.0 && w > 0.0)
             {
-                // То же, что у каскада выше: дыра в предыдущих объёмах снимает вес по боксу, но не
-                // уверенность кирпича.
                 if (result.x < 0.0)
                 {
                     probeCoverage = conf2;
@@ -925,15 +789,12 @@ float3 SampleProbeGi(float3 worldPos, float3 N, out float skyVisibility, out flo
     return result;
 }
 
-// Кривая тонмапа переехала в общий Tonemap.hlsl - её же применяет TonemapPS.hlsl в HDR-режиме
-// (см. FeatureHdrOutput ниже).
 #include "Tonemap.hlsl"
 
 // Direct-lighting contribution of one light for the Lighting preview mode: Cook-Torrance GGX
 // specular (D - GGX, G - Smith-Schlick with the direct-lighting k remap, F - Schlick) plus
-// energy-conserving Lambert diffuse. dielectricF0 - базовое отражение диэлектрика, выведенное
-// из IOR и перекрашенное KHR_materials_specular (см. вызов в Main); specularWeight - его же
-// specularFactor, вес диэлектрического зеркального лоба (металлы не трогает, по спеке).
+// energy-conserving Lambert diffuse. dielectricF0 comes from IOR tinted by KHR_materials_specular;
+// specularWeight is its specularFactor and, per spec, does not affect metals.
 float3 ShadePbrLight(float3 N, float3 V, float3 L, float3 lightColor,
                      float3 albedo, float metallic, float roughness, float transmission,
                      float3 dielectricF0, float specularWeight)
@@ -967,9 +828,8 @@ float3 ShadePbrLight(float3 N, float3 V, float3 L, float3 lightColor,
 }
 
 #if MATERIAL_SHEEN
-// KHR_materials_sheen: Charlie-лоб (Estevez & Kulla) - ретрорефлективный "световой ворс" велюра.
-// Инвертированный GGX: максимум распределения на КАСАТЕЛЬНЫХ микрогранях, поэтому ткань светится
-// ободком по контуру, а не бликом в центре.
+// KHR_materials_sheen Charlie lobe (Estevez & Kulla): inverted GGX peaking at TANGENT
+// microfacets, so cloth glows along the silhouette instead of a central highlight.
 float SheenDistributionCharlie(float sheenRoughness, float NdotH)
 {
     float alphaG = sheenRoughness * sheenRoughness;
@@ -978,15 +838,14 @@ float SheenDistributionCharlie(float sheenRoughness, float NdotH)
     return (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * PI);
 }
 
-// Ashikhmin visibility - стандартная пара к Charlie в референсном glTF Sample Viewer.
+// Ashikhmin visibility - the glTF Sample Viewer's standard pairing with Charlie.
 float SheenVisibilityAshikhmin(float NdotL, float NdotV)
 {
     return 1.0 / max(4.0 * (NdotL + NdotV - NdotL * NdotV), 1e-4);
 }
 
-// Направленное альбедо Charlie-лоба E(NdotV, roughness) - аналитический фит LUT референсного
-// вьюера (кусочно-квадратичная аппроксимация из three.js). Двойная служба: albedo-scaling
-// базового слоя (энергосохранение - ворс "съедает" часть базового отклика) и вес env-ворса.
+// Directional albedo E(NdotV, roughness) of the Charlie lobe: piecewise-quadratic fit of the
+// reference viewer's LUT (from three.js). Serves both base-layer albedo scaling and env sheen.
 float SheenAlbedoE(float NdotV, float sheenRoughness)
 {
     float r = sheenRoughness;
@@ -997,7 +856,7 @@ float SheenAlbedoE(float NdotV, float sheenRoughness)
     return saturate(DG * (1.0 / PI));
 }
 
-// Вклад одного света в sheen-лоб (аналог ShadePbrLight для ворса).
+// One light's contribution to the sheen lobe; the ShadePbrLight counterpart for cloth.
 float3 ShadeSheenLight(float3 N, float3 V, float3 L, float3 lightColor,
                        float3 sheenColor, float sheenRoughness)
 {
@@ -1030,12 +889,10 @@ struct PSOutput
 {
     float4 color : SV_TARGET; // Final pixel color.
 #if FEATURE_REFLECTION_GBUFFER
-    // Тонкий G-buffer отражений (см. SsrPass / PipelineRenderTargets.NormalRoughnessTarget):
-    // RT1 - нормаль ШЕЙДИНГА в мире (после нормал-мапы и two-sided флипа) + perceptual roughness;
-    // RT2 - множитель env-спекуляра БЕЗ окклюзии неба (Fr * specularWeight * occlusion, rgb) +
-    // сама envOcclusion в альфе. SSR ЗАМЕНЯЕТ префильтрованное окружение трейсом:
-    // hdr += conf * factor * (ssr - envOcclusion * envColor) - что вычитается, ровно то форвард
-    // и сложил, а трейс окклюзией неба не глушится (см. комментарий у записи ниже).
+    // Thin reflection G-buffer (see SsrPass). RT1 = world SHADING normal (post normal-map and
+    // two-sided flip) + perceptual roughness. RT2 = env specular factor WITHOUT sky occlusion
+    // (rgb) and envOcclusion in alpha, so SSR can subtract exactly what forward added:
+    // hdr += conf * factor * (ssr - envOcclusion * envColor).
     float4 gbNormalRough : SV_TARGET1;
     float4 gbEnvFactor : SV_TARGET2;
 #endif
@@ -1045,8 +902,7 @@ PSOutput Main(in PSInput input)
 {
     PSOutput output;
 #if FEATURE_REFLECTION_GBUFFER
-    // Нули по умолчанию: ранние return-ы (режимы превью, отладочные каналы) оставляют пиксель
-    // невидимым для SSR-композита (w = 0), как и очистка таргета в ForwardPass.
+    // Default zeros: early returns leave the pixel invisible to the SSR composite (w = 0).
     output.gbNormalRough = float4(0.0, 0.0, 0.0, 1.0);
     output.gbEnvFactor = float4(0.0, 0.0, 0.0, 0.0);
 #endif
@@ -1063,10 +919,6 @@ PSOutput Main(in PSInput input)
         }
         else if (PreviewChannel == 2)
         {
-            // Precomputed per-vertex tangent (see MeshUtility.GenerateTangents), interpolated and
-            // re-normalized - stable across camera distance/angle, unlike the screen-space-derivative
-            // (ddx/ddy) estimate this used to compute, which is perspective-distorted and gets noisy
-            // up close or at grazing angles.
             float3 tangent = normalize(input.tangent.xyz);
             visualized = tangent * 0.5 + 0.5;
         }
@@ -1091,8 +943,7 @@ PSOutput Main(in PSInput input)
         // Per the glTF spec COLOR_0 multiplies the base color (it is linear, like PbrBaseColor).
         float4 baseColor = PbrBaseColor * input.vertexColor;
 
-        // KHR_texture_transform: все UV0-текстуры материала (base color/MR/normal/thickness)
-        // сэмплируются трансформированными координатами; occlusion - своим UV-каналом ниже.
+        // KHR_texture_transform applies to every UV0 texture; occlusion uses its own set below.
         float2 uv = TransformMaterialUv(input.uv);
 #if HAS_BASECOLOR_TEXTURE
         {
@@ -1106,10 +957,10 @@ PSOutput Main(in PSInput input)
 #endif
 
 #if MATERIAL_ALPHA_CLIP
-        // Alpha clipping (glTF alphaMode MASK, and a near-zero threshold for BLEND - see
-        // ModelLoader.MaterialPbr). Must happen before any shading so discarded texels also skip
-        // depth write, like foliage/decal cutouts expect.
-        clip(baseColor.a - PbrAlphaCutoff);
+        // Must run before any shading so discarded texels also skip the depth write.
+        // A blending material is not cut at the authored threshold - the PSO does the
+        // transparency, and clip only drops fully invisible texels.
+        clip(baseColor.a - (PbrAlphaBlend != 0 ? 0.5 / 255.0 : PbrAlphaCutoff));
 #endif
 
         float3 albedo = baseColor.rgb;
@@ -1144,8 +995,7 @@ PSOutput Main(in PSInput input)
 
 #if FEATURE_NORMAL_MAPS
         // Tangent-space normal mapping: perturbs N by _NormalTex before any lighting math, so
-        // diffuse/specular/env/refraction all pick up the authored micro-relief. Кейворд вырезает
-        // фичу целиком; бит PbrFeatureFlags остаётся live-тумблером настроек внутри варианта.
+        // diffuse/specular/env/refraction all pick up the authored micro-relief.
         // Degenerate tangents (meshes without UVs -> zero/garbage tangent) skip the perturbation.
         if (PbrFeatureFlags & FeatureNormalMaps)
         {
@@ -1154,18 +1004,13 @@ PSOutput Main(in PSInput input)
             if (tangentLength > 1e-4)
             {
                 float3 T = tangent / tangentLength;
-                // Знак битангента (glTF TANGENT.w с поправкой на зеркалирование Z, либо
-                // вычисленный генератором - см. ModelLoader): без него зеркальные UV-развёртки
-                // применяют нормал-мапу с перевёрнутым Y - рельеф инвертируется.
+                // Bitangent sign (glTF TANGENT.w, Z-mirroring corrected): without it mirrored UV
+                // shells apply the normal map with a flipped Y and the relief inverts.
                 float3 B = cross(N, T) * input.tangent.w;
 
-                // Z ВОССТАНАВЛИВАЕТСЯ из XY, а не читается из текстуры. Запечённые карты нормалей
-                // ассет-пайплайна лежат в BC5 (см. TextureImportSettings.AutoFor), а он хранит ровно
-                // два канала - третий приходит из сэмплера нулём. Для тангенциальной нормали это не
-                // потеря: она всегда смотрит наружу поверхности, то есть z однозначно выводится из
-                // длины. Незапечённым RGBA8-картам и плоскому 1x1-филлеру (128,128,255 -> xy≈0,
-                // z≈1) реконструкция даёт то же самое, что дало бы чтение .z, поэтому ветвление по
-                // формату не нужно.
+                // Z is RECONSTRUCTED from XY, not read: baked normal maps are BC5, which stores
+                // two channels and returns zero for the third. A tangent normal always points
+                // out of the surface, so RGBA8 maps reconstruct to the same value they store.
                 float2 mappedXY = _NormalTex.Sample(_NormalTex_sampler, uv).xy * 2.0 - 1.0;
                 float mappedZ = sqrt(saturate(1.0 - dot(mappedXY, mappedXY)));
                 mappedXY *= PbrNormalScale;
@@ -1183,18 +1028,13 @@ PSOutput Main(in PSInput input)
         float3 up = float3(0.0, 1.0, 0.0);
         float3 right = normalize(cross(up, V));
 
-        // Ключевой свет: при включённых тенях и валидном мировом свете (см.
-        // SimpleCullingAndRenderSystem.BuildLightData) - МИРОВОЕ направление «солнца» энвайронмента,
-        // затеняемое shadow map-ой; тогда тень и блик согласованы, а модель может повернуться к
-        // камере теневой стороной (её вытягивают fill и IBL). Иначе - прежний камерный риг: ключ
-        // ~45 градусов сверху-справа от взгляда, всегда освещающий видимую сторону.
+        // Key light: with shadows on and a valid world light, use the WORLD sun direction so
+        // shadow and highlight agree; otherwise fall back to the camera-anchored rig.
         float3 keyDir;
         float keyShadow = 1.0;
         float keyIntensity;
         bool hasWorldLight = false;
 
-        // Индекс каскада солнца, выбранного этим пикселем (-1 - каскад не выбран). Только для
-        // отладочного канала 26.
         float dbgSunCascade = -1.0;
 
 #if FEATURE_SHADOWS
@@ -1203,20 +1043,13 @@ PSOutput Main(in PSInput input)
 
         if (hasWorldLight)
         {
-            // Конвенция ОСНОВНОГО пайплайна (см. CullingAndRenderSystem): LightData.LightDirection
-            // указывает НА солнце - SimpleCullingAndRenderSystem теперь пишет так же.
+            // Convention: LightData.LightDirection points TOWARDS the sun.
             keyDir = normalize(lightData.LightDirection.xyz);
             keyShadow = SampleWorldLightShadow(input.worldPos, N, input.pos.xy, dbgSunCascade);
 
-            // Мировой ключ слабее камерного (3.5 тюнился под риг без IBL-солнца): источник, из
-            // которого он выведен, УЖЕ светит через энвайронмент-отражения - полная двойная
-            // интенсивность пересвечивает глянцевые горизонтальные поверхности в белое.
-            // Та же интенсивность обязана уходить в ProbeGiBaker.Bake sunColor - иначе баунс
-            // разойдётся с прямым светом (вьюпорт шлёт одно значение в оба места, см.
-            // ModelPreviewViewport). Поднимать её "для контраста теней" бесполезно: на светлом
-            // альбедо сумма direct+ambient уходит за колено PBR Neutral (~0.76), и тонемап
-            // сжирает контраст обратно (проверено на DragonAttenuation: при 5.0 тень на шахматке
-            // исчезала совсем). 0 = кбуфер вне превью не заполнен, дефолт 2.0.
+            // The world key is weaker than the camera rig's 3.5: the same source already lights
+            // the scene through environment reflections. This value must also reach
+            // ProbeGiBaker.Bake sunColor or the bounce diverges from the direct light.
             keyIntensity = ProbeGiParams.z > 0.01 ? ProbeGiParams.z : 2.0;
         }
         else
@@ -1227,23 +1060,19 @@ PSOutput Main(in PSInput input)
         }
         float3 keyColor = float3(1.0, 0.98, 0.92) * keyIntensity;
 
-        // Заполняющий свет привязан к камере - осмысленно только для превью-рига одиночной модели
-        // (гарантирует видимую сторону освещённой при орбите). Для сцены с мировым светом свет «из
-        // глаз» нефизичен и уплощает картинку (при виде сверху пол получает fill, стены - ничего);
-        // роль заполняющего там выполняет env-эмбиент, поэтому fill гасится.
+        // The fill is camera-anchored, which only makes sense for the single-model preview rig;
+        // in a world-lit scene the env ambient plays that role, so the fill is muted.
         float3 fillDir = normalize(V - 0.6 * right - 0.1 * up);
         float3 fillColor = float3(0.55, 0.60, 0.70) * (hasWorldLight ? 0.0 : 0.8);
 
-        // Тень должна глушить и энвайронмент-состовляющие: ключ ВЫВЕДЕН из доминантного источника
-        // панорамы (софтбокс/солнце), и его отражение в глянцевой поверхности - тот же свет, что
-        // блокирует окклюдер. Иначе на глянце тень «затирается» ярким зеркальным пятном. Не до
-        // нуля: в тени остаётся рассеянная часть окружения.
+        // The shadow must damp the environment terms too: the key is DERIVED from the panorama's
+        // dominant source, so its glossy reflection is the same light the occluder blocks.
+        // Never to zero - the diffuse part of the environment survives in shadow.
         float envShadow;
         if (hasWorldLight)
         {
-            // БЕЗ веса sunFacing: с ним поверхность, отвёрнутая от солнца, получала бы больше
-            // эмбиента, чем затенённая солнечная - в сцене (двор Sponza) это инвертирует яркость
-            // стен. Мягкое ослабление работает как дешёвая окклюзия отражённого света.
+            // No sunFacing weight here: it would give a surface facing away from the sun more
+            // ambient than a shadowed sunlit one, inverting wall brightness in a courtyard.
             envShadow = lerp(0.25, 1.0, keyShadow);
         }
         else
@@ -1258,26 +1087,17 @@ PSOutput Main(in PSInput input)
         const float transmission = 0.0;
 #endif
 
-        // KHR_materials_ior / KHR_materials_dispersion: per-channel IOR triple. Dispersion is
-        // 20/AbbeNumber per the spec (dragon sample: 2.04); the 0.05 scale is a preview
-        // exaggeration - a physically-scaled spread refracted into a smooth gradient backdrop
-        // would be invisible. Red bends least (lowest IOR), blue most. With no authored
-        // extensions this degenerates to ior 1.5 / zero spread, and the F0 below lands exactly
-        // on the classic dielectric 0.04.
-        // Physical spread per KHR_materials_dispersion: dispersion = 20/AbbeNumber, and the
-        // F-to-C line IOR difference is (ior-1)/Abbe = (ior-1) * dispersion / 20 (half of it on
-        // each side of the center IOR). With a real geometric refraction offset below this is
-        // enough to fringe high-contrast backgrounds exactly like the reference viewer.
+        // KHR_materials_ior / _dispersion: per-channel IOR triple. dispersion = 20/AbbeNumber,
+        // so the F-to-C IOR spread is (ior-1) * dispersion / 20, half on each side of centre.
+        // Red bends least, blue most. No extensions = ior 1.5, zero spread, F0 = 0.04.
         float ior = max(PbrIor, 1.001);
         float dispersionHalf = (ior - 1.0) * PbrDispersion * 0.025;
         float3 iors = float3(max(ior - dispersionHalf, 1.001), ior, ior + dispersionHalf);
         float3 iorF0 = (iors - 1.0) / (iors + 1.0);
         iorF0 *= iorF0;
 
-        // KHR_materials_specular: перекраска диэлектрического F0 (сатиновый цветной блик).
-        // Порядок по спеке: сначала умножение цвета на F0 от IOR, кламп к 1 ПОСЛЕ - авторские
-        // значения >1 (ChairDamaskPurplegold: [1,0.25,2]) осмысленно поднимают канал до предела.
-        // Вес (specularFactor) применяется к зеркальному лобу диэлектрика внутри ShadePbrLight.
+        // Spec order: tint the IOR F0 first, clamp to 1 AFTER - authored values above 1 are meant
+        // to push a channel to the limit.
         float3 dielectricF0 = min(iorF0 * PbrSpecularColorFactor.rgb, 1.0);
         float specularWeight = PbrSpecularColorFactor.w;
 
@@ -1285,9 +1105,8 @@ PSOutput Main(in PSInput input)
                       + ShadePbrLight(N, V, fillDir, fillColor, albedo, metallic, roughness, transmission, dielectricF0, specularWeight);
 
 #if MATERIAL_SHEEN
-        // KHR_materials_sheen: ворс поверх базового слоя. Базовый отклик глушится направленным
-        // альбедо лоба (энергосохранение - что ушло в ворс, не вернётся базой), сверху -
-        // Charlie-лобы ключа и заполняющего (та же тень ключа, что у базового слоя).
+        // Sheen sits on top of the base layer, whose response is scaled down by the lobe's
+        // directional albedo for energy conservation.
         float3 sheenColor = PbrSheenColorRoughness.rgb;
         float sheenRoughness = clamp(PbrSheenColorRoughness.w, 0.07, 1.0);
         float sheenNdotV = saturate(dot(N, V));
@@ -1299,46 +1118,29 @@ PSOutput Main(in PSInput input)
                + ShadeSheenLight(N, V, fillDir, fillColor, sheenColor, sheenRoughness);
 #endif
 
-        // ВРЕМЕННЫЙ отладочный хук (PreviewChannel == 11, см. ниже) - диагностика punctual-теней:
-        // x/y = shadowUv последнего обработанного punctual-света с назначенным слайсом, z = shadowNdc.z,
-        // w = shadowLit (1 = сэмплер не увидел окклюдер, 0 = увидел). -1 в w значит "ветка сэмплинга
-        // не выполнилась вовсе" (shadowClip.w <= 1e-4 или shadowUv/shadowNdc.z вне диапазона).
+        // Debug channel taps; -1 means the branch that would fill them never ran.
         float4 dbgPunctual = float4(0, 0, 0, -1);
-        // Тот же временный хук - какой именно ИНДЕКС слайса (0..LightClusters.MaxShadowSlices-1)
-        // шейдер в итоге выбрал для сэмплинга (база из ShadowParams.x + смещение грани куба у
-        // точечного света). -1 = ветка не дошла до вычисления слайса. Отдельно от dbgPunctual.w
-        // (результат сравнения глубины): белый/лит пиксель сам по себе не отличает "слайс без
-        // окклюдера в кадре" от "слайс вообще пустой/чужой" - индекс тут решает спор (см. канал 12).
         float dbgShadowSlice = -1;
-        float dbgShadowBase = -1; // ВРЕМЕННЫЙ: punctual.ShadowParams.x ДО добавления смещения грани куба.
-        float3 punctualLightPosDbg = 0; // ВРЕМЕННЫЙ: позиция света, которой соответствует dbgPunctual/dbgShadowSlice.
-        float dbgClusterRawCount = -1; // ВРЕМЕННЫЙ: ClusterCounts[clusterIdx] сырьём, до клампа CLUSTER_MAX_LIGHTS.
-        // ВРЕМЕННЫЙ для каналов 22..24: x - глубина ПРИЁМНИКА (этой поверхности) в системе координат
-        // света, y - глубина ОККЛЮДЕРА, лежащая в слайсе по тому же UV, z - far слайса (масштаб
-        // рампы). Обе в МИРОВЫХ единицах вдоль оси слайса. -1 = сэмплинг тени сюда не дошёл.
+        float dbgShadowBase = -1;
+        float3 punctualLightPosDbg = 0;
+        float dbgClusterRawCount = -1;
         float3 dbgShadowDepth = -1;
-        float dbgShadowBiasWorld = 0; // ВРЕМЕННЫЙ: мировой байас этого пикселя - масштаб канала 24.
-        float dbgShadowClipW = -1e9; // ВРЕМЕННЫЙ: shadowClip.w ДО guard'а, для канала 25.
-        float3 dbgSliceAxis = 1e9;    // ВРЕМЕННЫЙ: ось грани из СТОЛБЦА матрицы слайса, для канала 26.
-        float3 dbgSliceAxisRow = 1e9; // ВРЕМЕННЫЙ: то же из СТРОКИ, для канала 27.
-        // ВРЕМЕННЫЙ: координаты фроксела этого пикселя (x/y - тайл экрана, z - экспоненциальный срез
-        // глубины) для канала 20. -1 = сетка не определена (ClusterParams.zw пустые - превью-конвейер).
+        float dbgShadowBiasWorld = 0;
+        float dbgShadowClipW = -1e9;
+        float3 dbgSliceAxis = 1e9;
+        float3 dbgSliceAxisRow = 1e9;
         float3 dbgClusterCell = -1;
 
-        // ----- Clustered punctual-света (point/spot) -------------------------------------------
-        // Пиксель находит свой фроксел-кластер (тайл экрана + экспоненциальный срез по view-z,
-        // обязано зеркалить прямое отображение в LightClusterCS.hlsl) и шейдит только света его
-        // кластера. ClusterParams.y == 0 - punctual-светов у камеры нет, шейдинг мёртвый, но САМО
-        // отображение пиксель->фроксел считается всё равно: канал 20 обязан показывать сетку и на
-        // сцене без единого punctual-света (иначе "кластеры не работают" неотличимо от "светов нет").
+        // ----- Clustered punctual lights -------------------------------------------------------
+        // The pixel-to-froxel mapping (screen tile + exponential view-z slice) MUST mirror
+        // LightClusterCS.hlsl. It is computed even with no punctual lights so the cluster debug
+        // channel still shows the grid.
         uint punctualCount = (uint)lightData.ClusterParams.y;
         float clusterZNear = lightData.ClusterParams.z;
         float clusterZFar = lightData.ClusterParams.w;
         bool clusterGridValid = clusterZFar > clusterZNear && clusterZNear > 0.0;
 
         uint tileX = 0, tileY = 0, tileZ = 0;
-        // Условие однородно по кадру во второй половине (PreviewChannel - константа кбуфера), так что
-        // без светов на сцене обычный проход не платит за отладочный mul вовсе.
         if (clusterGridValid && (punctualCount > 0 || PreviewChannel == 20 || PreviewChannel == 21))
         {
             float clusterViewZ = mul(float4(input.worldPos, 1.0), viewData.view).z;
@@ -1356,9 +1158,6 @@ PSOutput Main(in PSInput input)
         {
             uint clusterIdx = ClusterFlatIndex(uint3(tileX, tileY, tileZ));
             uint clusterLightCount = min(ClusterCounts[clusterIdx], CLUSTER_MAX_LIGHTS);
-            // ВРЕМЕННЫЙ: сколько записей реально в ClusterCounts у этого пикселя ДО клампа - если
-            // >1 при единственном свете в сцене, кластеризация дублирует/мусорит индексы, а
-            // >CLUSTER_MAX_LIGHTS значит, что кластер переполнен и хвост светов молча потерян.
             dbgClusterRawCount = (float)ClusterCounts[clusterIdx];
 
             for (uint li = 0; li < clusterLightCount; li++)
@@ -1373,8 +1172,8 @@ PSOutput Main(in PSInput input)
                 float punctualDist = sqrt(max(punctualDistSq, 1e-6));
                 float3 punctualL = toLight / punctualDist;
 
-                // Гладкое окно затухания (Frostbite/glTF punctual): обратный квадрат, приглушенный
-                // к нулю на границе радиуса - без ступеньки на срезе кулинга.
+                // Frostbite/glTF windowed inverse square: fades to zero at the range boundary so
+                // the culling cutoff leaves no step.
                 float distFactor = saturate(1.0 - pow(punctualDist / punctualRange, 4.0));
                 float punctualAtten = distFactor * distFactor / (punctualDistSq + 1e-2);
 
@@ -1385,9 +1184,8 @@ PSOutput Main(in PSInput input)
                     punctualAtten *= spotFactor * spotFactor;
                 }
 
-                // Тень света: спот сэмплирует свой единственный слайс, точечный выбирает грань куба
-                // по доминирующей оси вектора свет-фрагмент (индексация граней ОБЯЗАНА совпадать с
-                // PunctualShadowScheduler.FaceDirs: +X,-X,+Y,-Y,+Z,-Z).
+                // A point light picks its cube face by the dominant axis; the face order MUST
+                // match PunctualShadowScheduler.FaceDirs: +X,-X,+Y,-Y,+Z,-Z.
                 if (punctual.ShadowParams.x >= 0.0 && punctualAtten > 0.0)
                 {
                     uint shadowSlice = (uint)punctual.ShadowParams.x;
@@ -1406,13 +1204,11 @@ PSOutput Main(in PSInput input)
                     }
                     dbgShadowSlice = (float)shadowSlice;
 
-                    // Normal-offset bias (аналог SampleWorldLightShadow выше): сдвиг точки сэмплирования
-                    // вдоль нормали на ~1.5 текселя перспективного слайса В МИРОВЫХ единицах. В отличие
-                    // от орто-каскадов тексель здесь растёт с глубиной: 2*tan(halfFov)*z/1024. Точная
-                    // view-space глубина известна только ПОСЛЕ трансформации, поэтому для размера текселя
-                    // берём дистанцию до света punctualDist - для маленького bias-сдвига этого достаточно.
-                    // tan(halfFov) слайса: у спота - из внешнего конуса (SpotAngles.z/.x = sin/cos
-                    // внешнего полуугла), у точечного каждая грань куба ~90 градусов -> tan(45) = 1.
+                    // Normal-offset of ~1.5 slice texels in WORLD units. Unlike the ortho cascades
+                    // the texel grows with depth (2*tan(halfFov)*z/size); exact view depth is only
+                    // known after the transform, so punctualDist stands in for it.
+                    // Spot tan(halfFov) comes from the outer cone (SpotAngles.z/.x = sin/cos of the
+                    // outer half-angle); a cube face is 90 degrees, hence tan(45) = 1.
                     float shadowTanHalfFov = punctual.DirectionType.w > 0.5
                         ? punctual.SpotAngles.z / max(punctual.SpotAngles.x, 1e-4)
                         : 1.0;
@@ -1421,23 +1217,11 @@ PSOutput Main(in PSInput input)
 
                     float4x4 shadowMatrix = LoadPunctualShadowMatrix(shadowSlice);
                     float4 shadowClip = mul(float4(shadowSamplePos, 1.0), shadowMatrix);
-                    // ВРЕМЕННЫЙ замер для канала 25 - w ДО guard'а ниже. Отдельно от dbgShadowDepth.x
-                    // (тот пишется уже ВНУТРИ guard'а и про отказавшие пиксели молчит), а вопрос
-                    // именно в них: w = проекция вектора свет->фрагмент на ось выбранной грани, и по
-                    // построению выбора грани она обязана быть положительной. Отрицательная w - это
-                    // либо матрица не той грани, либо позиция света в матрице не та, что в шейдинге.
                     dbgShadowClipW = shadowClip.w;
-                    dbgShadowDepth.z = punctual.PositionRange.w; // far слайса - масштаб рампы канала 25
-                    // ВРЕМЕННЫЙ для канала 26: w-столбец матрицы слайса, как её видит ШЕЙДЕР. Это
-                    // ось грани в мире (у корректной матрицы обязана совпасть с FaceDirs[грань]).
-                    // Сверяется с дампом PunctualShadowScheduler (sliceAxis) - расхождение CPU/GPU
-                    // означает, что до шейдера доезжает не та матрица, а не что выбор грани врёт.
+                    dbgShadowDepth.z = punctual.PositionRange.w;
+                    // Face axis from the matrix COLUMN; the row variant below is the layout
+                    // regression check - in a correctly assembled matrix only the column matches.
                     dbgSliceAxis = float3(shadowMatrix._m03, shadowMatrix._m13, shadowMatrix._m23);
-                    // Та же ось, но из СТРОКИ - канал 27. Держится регресс-тестом раскладки: у
-                    // правильно собранной матрицы ось грани лежит в СТОЛБЦЕ, поэтому канал 26 обязан
-                    // совпадать с выбранной гранью (канал 19), а канал 27 - НЕТ. Если они поменяются
-                    // местами, значит раскладка строк снова разъехалась (см. комментарий у
-                    // LoadPunctualShadowMatrix) - на обоих бэкендах это видно одним прогоном.
                     dbgSliceAxisRow = float3(shadowMatrix._m30, shadowMatrix._m31, shadowMatrix._m32);
                     if (shadowClip.w > 1e-4)
                     {
@@ -1448,35 +1232,20 @@ PSOutput Main(in PSInput input)
                         dbgPunctual = float4(shadowUv, shadowNdc.z, dbgUvOk ? (dbgZOk ? -2 : -4) : -3);
                         if (dbgUvOk && dbgZOk)
                         {
-                            // Депф-bias перспективного слайса. Каскады солнца - орто, там NDC-глубина
-                            // ЛИНЕЙНА по view-Z, и константа в NDC-единицах работает на любой дистанции.
-                            // Здесь проекция перспективная (PunctualShadowScheduler.AddSlice,
-                            // CreatePerspectiveFieldOfViewLeftHanded): ndc = f/(f-n) - n*f/((f-n)*z),
-                            // так что та же NDC-константа на разной глубине z стоит РАЗНОЕ число метров -
-                            // близко к свету это мало, а у границы дальности разгоняется до целого
-                            // метра просадки тени под объект (peter-panning). Вместо этого bias задаётся
-                            // в МИРОВЫХ единицах (в масштабе текселя слайса, см. ниже) и
-                            // переводится в NDC локальной производной d(ndc)/dz = n*f/((f-n)*z^2) в точке
-                            // приёмника (z = shadowClip.w - view-space глубина вдоль оси света).
-                            // near берётся ГОТОВЫМ из ShadowParams.z (PunctualShadowScheduler.
-                            // SliceNearPlane - то же число, что ушло в проекцию слайса). Своей копии
-                            // формулы здесь больше нет: прошлая - max(0.05, range*0.001) - не знала
-                            // про потолок 0.25, добавленный на стороне планировщика, и на дальнобойной
-                            // лампе (Range 20000) считала near = 20 вместо 0.25, завышая производную
-                            // d(ndc)/dz и с ней депф-байас на два порядка.
+                            // Perspective slice depth bias. NDC depth is non-linear here
+                            // (ndc = f/(f-n) - n*f/((f-n)*z)), so a constant in NDC units would be
+                            // worth wildly different metres at different z. The bias is therefore
+                            // specified in WORLD units and converted with the local derivative
+                            // d(ndc)/dz = n*f/((f-n)*z^2) at the receiver (z = shadowClip.w).
+                            // near MUST come ready-made from ShadowParams.z - recomputing it here
+                            // misses the scheduler's own clamp on long-range lights.
                             float shadowFar = punctual.PositionRange.w;
                             float shadowNear = max(punctual.ShadowParams.z, 1e-4);
                             float shadowZ = max(shadowClip.w, shadowNear);
-                            // Мировая величина байаса задаётся В ТЕКСЕЛЯХ СЛАЙСА, а не константой в
-                            // метрах. Прежняя пара (склон 0.05*(1-N.L) с полом 0.005) не знала о
-                            // разрешении и дальности: у перспективного слайса тексель растёт линейно с
-                            // дистанцией (shadowTexelWorld выше), и на замеренном кадре - лампа far=6.4
-                            // на высоте 5.15 над полом - тексель на полу выходит ~0.010 мировых единиц,
-                            // то есть ВДВОЕ больше, чем весь байас в этой точке (N.L=1 -> пол 0.005).
-                            // Байас меньше кванта растра акне не давит по определению, а под косыми
-                            // углами перепад глубины ВНУТРИ одного текселя ещё и умножается на tan угла
-                            // падения - отсюда слагаемое с тангенсом (кламп 4.0 держит скользящие углы
-                            // от ухода байаса в бесконечность, дальше работает peter-panning).
+                            // The world bias is measured in SLICE TEXELS, not metres: a bias below
+                            // the raster quantum cannot suppress acne. At grazing angles the depth
+                            // step within one texel scales by tan(incidence), hence the tangent
+                            // term; the 4.0 clamp stops it running away into peter-panning.
                             float shadowNdotL = saturate(dot(N, punctualL));
                             float shadowTanTheta = sqrt(saturate(1.0 - shadowNdotL * shadowNdotL))
                                 / max(shadowNdotL, 0.15);
@@ -1485,17 +1254,13 @@ PSOutput Main(in PSInput input)
                                 / max((shadowFar - shadowNear) * shadowZ * shadowZ, 1e-6);
                             float shadowBias = shadowWorldBias * shadowNdcPerWorld;
 
-                            // PCSS - как у каскадов солнца (см. SampleWorldLightShadow), но слайс
-                            // перспективный: глубины NDC нелинейны, поэтому и средний блокер, и
-                            // ширина полутени считаются в МИРОВЫХ метрах вдоль оси слайса через
-                            // инверсию проекции z = n*f / (f - ndc*(f-n)). Выход за грань куба
-                            // держит потолок PUNCTUAL_PCSS_MAX_PENUMBRA_TEXELS (перехлёст граней
-                            // ~20 текселей, см. PunctualShadowScheduler) плюс Clamp-адресация.
+                            // PCSS as for the sun, but the slice is perspective: NDC depths are
+                            // non-linear, so blocker depth and penumbra width are computed in
+                            // WORLD metres via z = n*f / (f - ndc*(f-n)).
                             const float punctualTexel = 1.0 / PUNCTUAL_SHADOW_MAP_SIZE;
                             float shadowSum;
                             float shadowTapCount;
 
-                            // Тот же режим фильтрации, что у солнца (PbrShadowMode, юниформ-ветка).
                             if (PbrShadowMode == SHADOW_MODE_HARD)
                             {
                                 shadowSum = PunctualShadowMaps.SampleCmpLevelZero(
@@ -1506,7 +1271,6 @@ PSOutput Main(in PSInput input)
                             }
                             else if (PbrShadowMode == SHADOW_MODE_PCF)
                             {
-                                // Фиксированный бокс 3x3 - прежний путь punctual-теней.
                                 shadowSum = 0.0;
                                 shadowTapCount = 9.0;
                                 [unroll]
@@ -1528,11 +1292,11 @@ PSOutput Main(in PSInput input)
                             int punctualTaps = punctualHq ? SUN_PCSS_HQ_TAPS : SUN_PCSS_TAPS;
                             float punctualPhi = InterleavedGradientNoise(input.pos.xy) * 6.2831853;
 
-                            // Шаг 1: средний блокер по диску Фогеля (Load - точечный тап без
-                            // сравнения, второй сэмплер не нужен).
+                            // Step 1: average blocker over a Vogel disc (Load = point tap, no
+                            // comparison, so no second sampler is needed).
                             float avgBlockerNdc = 0.0;
                             float blockerCount = 0.0;
-                            [loop] // время компиляции FXC - см. комментарий у каскадного цикла солнца
+                            [loop] // FXC compile time - see the sun cascade loop
                             for (int pb = 0; pb < punctualTaps; pb++)
                             {
                                 float2 sUv = shadowUv
@@ -1547,9 +1311,8 @@ PSOutput Main(in PSInput input)
                                 }
                             }
 
-                            // Шаг 2: ширина полутени = (глубина приёмника - глубина блокера) *
-                            // радиус тела света / глубина блокера (подобие треугольников источник-
-                            // блокер-приёмник), в текселях слайса НА ГЛУБИНЕ ПРИЁМНИКА.
+                            // Step 2: penumbra = (receiverZ - blockerZ) * sourceRadius / blockerZ,
+                            // expressed in slice texels AT THE RECEIVER's depth.
                             float sourceRadius = punctual.ShadowParams.w > 0.0
                                 ? punctual.ShadowParams.w
                                 : PUNCTUAL_DEFAULT_SOURCE_RADIUS;
@@ -1567,10 +1330,10 @@ PSOutput Main(in PSInput input)
                                     1.0, PUNCTUAL_PCSS_MAX_PENUMBRA_TEXELS);
                             }
 
-                            // Шаг 3: PCF по диску, повёрнутому на полоборота от диска поиска.
+                            // Step 3: PCF over the disc rotated half a turn from the search disc.
                             shadowSum = 0.0;
                             shadowTapCount = (float)punctualTaps;
-                            [loop] // время компиляции FXC - см. комментарий у каскадного цикла солнца
+                            [loop] // FXC compile time - see the sun cascade loop
                             for (int pt = 0; pt < punctualTaps; pt++)
                             {
                                 float2 tapUv = shadowUv
@@ -1582,18 +1345,9 @@ PSOutput Main(in PSInput input)
                             }
                             }
 
-                            // ВРЕМЕННЫЙ замер для каналов 22..24 - ДВЕ глубины в системе координат
-                            // света, обе в МИРОВЫХ единицах вдоль оси слайса:
-                            //   x - глубина ПРИЁМНИКА (этой поверхности), она же shadowClip.w;
-                            //   y - глубина ОККЛЮДЕРА, реально лежащая в слайсе по тому же UV.
-                            // Вторая берётся Load'ом (точечный тап центрального тексела): у текстуры
-                            // сравнивающий сэмплер, обычный Sample с ним невалиден, а Load сэмплера не
-                            // требует вовсе. Обратное преобразование перспективной NDC-глубины в
-                            // view-z - ровно инверсия проекции слайса (PunctualShadowScheduler.AddSlice,
-                            // CreatePerspectiveFieldOfViewLeftHanded): ndc = f/(f-n) - n*f/((f-n)*z)
-                            // => z = n*f / (f - ndc*(f-n)). Именно поэтому сравнивать надо ЗДЕСЬ, в
-                            // метрах: в NDC обе глубины у дальней плоскости слипаются в неразличимые
-                            // тысячные доли и по картинке о зазоре приёмник/окклюдер сказать нечего.
+                            // Receiver and occluder depth in WORLD metres along the slice axis;
+                            // in NDC the two collapse near the far plane. Load, not Sample: the
+                            // texture only has a comparison sampler.
                             uint2 dbgShadowTexel = (uint2)clamp(shadowUv * PUNCTUAL_SHADOW_MAP_SIZE,
                                 0.0, PUNCTUAL_SHADOW_MAP_SIZE - 1.0);
                             float dbgOccluderNdc = PunctualShadowMaps.Load(
@@ -1601,9 +1355,6 @@ PSOutput Main(in PSInput input)
                             float dbgOccluderZ = shadowNear * shadowFar
                                 / max(shadowFar - dbgOccluderNdc * (shadowFar - shadowNear), 1e-6);
                             dbgShadowDepth = float3(shadowClip.w, dbgOccluderZ, shadowFar);
-                            // Мировой байас этого пикселя - масштаб для канала 24: разница
-                            // приёмник/окклюдер осмысленна только В СРАВНЕНИИ с ним (меньше байаса -
-                            // пиксель считается освещённым, больше - уходит в тень).
                             dbgShadowBiasWorld = shadowWorldBias;
 
                             float shadowLit = shadowSum / shadowTapCount;
@@ -1618,9 +1369,6 @@ PSOutput Main(in PSInput input)
                     albedo, metallic, roughness, transmission, dielectricF0, specularWeight);
 
 #if MATERIAL_SHEEN
-                // Ворс - как у ключа/заполняющего выше: базовый отклик глушится альбедо лоба
-                // (энергосохранение), сверху Charlie-лоб этого света. Без этого ткань под лампой
-                // теряла сатиновый блик, который в солнечном свете есть.
                 punctualContrib = punctualContrib * sheenScaling
                     + ShadeSheenLight(N, V, punctualL, punctualRadiance, sheenColor, sheenRoughness);
 #endif
@@ -1629,46 +1377,34 @@ PSOutput Main(in PSInput input)
             }
         }
 
-        // NB: the per-channel F0 spread is left at its physical (subtle) level on purpose - an
-        // amplified F0 acts at EVERY angle and painted the whole model with a flat blue cast
-        // instead of edge fringes; the visible dispersion cue lives in the edge-weighted
-        // transmitted term below.
+        // The per-channel F0 spread stays at its physical (subtle) level on purpose: an amplified
+        // F0 acts at EVERY angle and casts the whole model blue instead of fringing the edges.
 
-        // Environment irradiance: the env map's top (fully-prefiltered) mip sampled along the
-        // normal - a proper diffuse ambient replacing the old two-tone hemisphere. Diffuse ONLY:
-        // metals get their entire environment response from envSpecular below - an extra
-        // F0-tinted ambient here double-counts the environment and turns chrome into glossy
-        // plastic (the pre-IBL "so metals don't go black" hack is obsolete now).
-        // Kept deliberately below the key's level: ambient that rivals the key is exactly what makes
-        // the render look light-less (it re-flattens the NdotL contrast the key creates).
-        // Baked AO (feature-gated): darkens only the ambient/env terms - per the glTF spec direct
-        // light is not occluded. Strength remap: lerp(1, sample, strength).
+        // Environment irradiance is DIFFUSE only - metals take their whole environment response
+        // from envSpecular below, and a second F0-tinted ambient here double-counts it.
+        // Deliberately kept below the key's level so the NdotL contrast survives.
+        // Baked AO darkens ambient/env terms only: per the glTF spec direct light is not occluded.
         float occlusion = 1.0;
 #if FEATURE_OCCLUSION
         if (PbrFeatureFlags & FeatureOcclusion)
         {
-            // AO сэмплится своим UV-каналом (glTF texCoord occlusion-текстуры): второй канал
-            // (TEXCOORD_1) - как есть, UV0 - с материальной трансформацией (типичный ORM-атлас
-            // делит трансформацию с MR-текстурой).
+            // TEXCOORD_1 is used raw; UV0 goes through the material transform, as a shared ORM
+            // atlas expects.
             float2 occlusionUv = PbrOcclusionUvSet == 1 ? input.uv1 : uv;
             float occlusionSample = _OcclusionTex.Sample(_OcclusionTex_sampler, occlusionUv).r;
             occlusion = 1.0 + PbrOcclusionStrength * (occlusionSample - 1.0);
         }
 #endif
 
-        // KHR_materials_specular участвует и в env-отклике - иначе сатиновый цветной блик виден
-        // только в прямом свете, а отражение окружения остаётся "бесцветно стеклянным".
+        // KHR_materials_specular must tint the env response too, not just direct light.
         float3 ambientF0 = lerp(dielectricF0, albedo, metallic);
 
-        // Probe-GI: запечённая irradiance (небо × видимость + отскоки) вместо константного
-        // ambient-уровня - пол двора светлее ниш под арками, отскок от освещённого камня тёплый.
-        // Тень ключа НЕ применяется: заслонённость уже запечена в пробах (envShadow был её
-        // экранной аппроксимацией). skyVisibility ниже глушит env-спекуляр.
+        // Probe-GI replaces the constant ambient level. The key shadow is NOT applied: occlusion
+        // is already baked into the probes (envShadow was its screen-space approximation).
         float skyVisibility = 1.0;
         float probeSunFraction = 0.0;
-        // Отметка ближайшей пробы для канала 10 (расстановка проб); вне его не используется.
         float3 probeMarker = float3(1e6, 0.0, 0.0);
-        // Доля, в которой поле проб заменяет константный ambient - см. SampleProbeGi.
+        // Fraction by which the probe field replaces the constant ambient - see SampleProbeGi.
         float probeCoverage = 1.0;
         bool probeGi = ProbeGridOrigin.w > 0.5;
         float3 probeIrradiance = 0.0;
@@ -1679,31 +1415,21 @@ PSOutput Main(in PSInput input)
             probeGi = probeIrradiance.x >= 0.0;
         }
 
-        // 0.15 тюнился под превью-риг, где тени добирал камерный fill. В сцене с мировым светом
-        // fill выключен и эмбиент - ЕДИНСТВЕННЫЙ свет в тени; без буста двор Sponza проваливается
-        // в черноту (небо/отскок от камня в реальности много ярче студийной панорамы).
+        // 0.15 is tuned for the preview rig where the camera fill lifts shadows. With a world
+        // light the fill is off and ambient is the ONLY light in shadow, hence the boost.
         float ambientLevel = hasWorldLight ? 0.55 : 0.15;
 
-        // Экранное глушение тенью ключа ТОЛЬКО солнечной доли probe-поля (probeSunFraction,
-        // печётся бейкером в Sh2.a): пробы стоят на ~1/22 габарита и контактную тень разрешить
-        // не могут - точка в тени получает поле соседних ЛИТ-проб, где солнечный баунс
-        // доминирует, и тень заливается (шахматка DragonAttenuation). Небесная же часть в тени
-        // НЕ трогается: затенённый двор освещён небом - это и есть референсный вид GI (Intel
-        // Sponza); равномерное глушение всего эмбиента (прежний lerp(0.1..0.4, 1, keyShadow))
-        // topило двор в черноте. sunFraction=0 (чисто небесное поле) - тень эмбиент не трогает,
-        // sunFraction=1 (чисто солнечное) - глушение как у прежнего envShadow. Флоры и множитель
-        // эмбиента - ручки окна Graphics (ProbeGiParams/ProbeGiParams2, см. кбуфер). Небесная
-        // доля по умолчанию тенью не гасится (skyFloor=1, физически честно - см. Intel Sponza),
-        // но у художника есть отдельная ручка затемнить тень целиком под нужный муд.
+        // The screen key shadow damps ONLY the sun share of the probe field: probes are too
+        // coarse to resolve contact shadows, so a shadowed point picks up lit neighbours where
+        // the sun bounce dominates. The sky share is left alone - a shadowed courtyard really
+        // is lit by the sky, and damping all ambient sinks it into black.
         float skyFloor = ProbeGiParams2.x > 0.001 ? saturate(ProbeGiParams2.x) : 1.0;
         float sunDamp = lerp(saturate(ProbeGiParams.x), 1.0, keyShadow);
         float skyDamp = lerp(skyFloor, 1.0, keyShadow);
         float probeShadow = lerp(skyDamp, sunDamp, probeSunFraction);
         float probeBoost = ProbeGiParams.w > 0.01 ? ProbeGiParams.w : 1.0;
-        // Запасной ambient считается ВСЕГДА: он нужен не только там, где поля нет совсем, но и
-        // там, где оно есть, да не в полную силу - свежий кирпич проявляется из него, а не из
-        // черноты (см. probeCoverage в SampleProbeGi). Лишний SampleEnvironment на пиксель - цена
-        // за то, что перед летящей камерой больше не идут прямоугольники размером с кирпич.
+        // The fallback ambient is computed ALWAYS: partially-covered probes fade in from it
+        // rather than from black. It costs one extra SampleEnvironment per pixel.
         float3 envAmbient =
             SampleEnvironment(N, 1.0) * ambientLevel * albedo * (1.0 - metallic) * occlusion * envShadow;
         float3 ambient = probeGi
@@ -1725,11 +1451,9 @@ PSOutput Main(in PSInput input)
         // alpha 0), fall back to the analytic backdrop gradient the UI composites behind the
         // image (constants mirror ModelPreviewViewport.Render).
 #if MATERIAL_TRANSMISSION
-        // Константы подложки заданы в ОТОБРАЖАЕМОМ пространстве (ровно те, что рисует ImGui). В
-        // HDR-конвейере кадр линейный до самого TonemapPS, и подмешивать сюда sRGB-значение
-        // нельзя - стекло на фоне подложки поехало бы по яркости; поэтому под FeatureHdrOutput
-        // градиент разворачивается в линейное пространство той же гаммой 2.2, какой его потом
-        // свернёт обратно тонемап.
+        // Backdrop constants are in DISPLAY space (exactly what ImGui draws). In HDR the frame
+        // stays linear until TonemapPS, so they are expanded with the same 2.2 gamma the
+        // tonemap will fold back.
         float backdropBottom = 0.26;
         float backdropTop = 0.55;
         if ((PbrFeatureFlags & FeatureHdrOutput) != 0)
@@ -1750,16 +1474,13 @@ PSOutput Main(in PSInput input)
         float3 transmitted;
 
 #if MATERIAL_DISPERSION
-        // Пер-канальная рефракция (KHR_materials_dispersion): три преломлённых луча со своими IOR,
-        // цветная кайма возникает там, где преломлённый фон контрастен.
         [unroll]
         for (int c = 0; c < 3; c++)
         {
             float3 refr = refract(-V, N, 1.0 / iors[c]);
 
-            // Проекция точки выхода луча и точки входа через один и тот же viewProj - разница их
-            // NDC не зависит от соглашений о начале координат, остаётся только направление оси Y
-            // (NDC вверх -> UV вниз).
+            // Entry and exit projected through the same viewProj, so only the Y direction
+            // matters in the NDC difference (NDC up -> UV down).
             float3 exitPoint = input.worldPos + refr * thicknessWorld;
             float4 exitClip = mul(float4(exitPoint, 1.0), viewData.viewProj);
             float2 ndcDelta = exitClip.xy / max(exitClip.w, 1e-4) - entryNdc;
@@ -1770,7 +1491,6 @@ PSOutput Main(in PSInput input)
             transmitted[c] = lerp(backdrop, scene[c], scene.a);
         }
 #else
-        // Без дисперсии - одна рефракция средним IOR, один сэмпл сцены.
         {
             float3 refr = refract(-V, N, 1.0 / ior);
             float3 exitPoint = input.worldPos + refr * thicknessWorld;
@@ -1805,17 +1525,14 @@ PSOutput Main(in PSInput input)
         float3 R = reflect(-V, N);
         float3 envColor = SampleEnvironment(R, roughness);
         float3 Fr = ambientF0 + (max((1.0 - roughness).xxx, ambientF0) - ambientF0) * pow(1.0 - NdotV, 5.0);
-        // С пробами env-отражение глушится запечённой видимостью неба (интерьеру арки нечего
-        // зеркалить из зенита) И экранной тенью ключа (см. probeShadow выше - глянец в тени иначе
-        // затирается ярким зеркальным пятном), без них - прежней аппроксимацией envShadow.
+        // With probes the env reflection is damped by baked sky visibility and the screen key
+        // shadow; without them by the envShadow approximation.
         float envOcclusion = probeGi ? lerp(saturate(ProbeGiParams.y), 1.0, skyVisibility) * probeShadow : envShadow;
         float3 envSpecular = envColor * Fr * lerp(specularWeight, 1.0, metallic) * occlusion * envOcclusion;
 
 #if MATERIAL_SHEEN
-        // Env-ворс: окружение вдоль отражённого луча, взвешенное направленным альбедо лоба.
-        // Мипы _EnvMap префильтрованы под GGX, а не Charlie - для превью приемлемая аппроксимация
-        // (широкий лоб ворса ~ высокая GGX-шероховатость). Базовые env-термы глушатся тем же
-        // albedo-scaling, что и direct.
+        // _EnvMap mips are prefiltered for GGX, not Charlie; the wide sheen lobe approximates to
+        // high GGX roughness well enough for the preview.
         float3 envSheen = SampleEnvironment(R, sheenRoughness) * sheenColor
                         * SheenAlbedoE(NdotV, sheenRoughness) * occlusion * envShadow;
         ambient *= sheenScaling;
@@ -1824,13 +1541,10 @@ PSOutput Main(in PSInput input)
 
 #if FEATURE_REFLECTION_GBUFFER
         {
-            // Множитель БЕЗ envOcclusion: окклюзия неба (запечённая видимость probe GI /
-            // аппроксимация envShadow) гасит только ПРЕФИЛЬТРОВАННУЮ карту - интерьеру нечего
-            // зеркалить из зенита, - но SSR-трейс отражает реальную экранную геометрию, и глушить
-            // его этой окклюзией значило убивать отражения именно там, где они нужнее всего
-            // (зеркало в интерьере). envOcclusion уезжает отдельно в альфу: композит вычитает
-            // ровно тот env-вклад, что сложил форвард (factor * envOcclusion * envColor), а
-            // трейс подмешивает без неё (factor * ssr).
+            // Factor WITHOUT envOcclusion: sky occlusion only applies to the prefiltered map,
+            // while the SSR trace reflects real on-screen geometry and must not be damped by it.
+            // envOcclusion travels separately in alpha so the composite can subtract exactly
+            // what forward added.
             float3 gbFactor = Fr * lerp(specularWeight, 1.0, metallic) * occlusion;
 #if MATERIAL_SHEEN
             gbFactor *= sheenScaling;
@@ -1841,16 +1555,9 @@ PSOutput Main(in PSInput input)
 #endif
 
         // Diagnostic hooks (PreviewProbe): raw linear dumps of the individual lighting terms.
-        // Канал 9 - отладочный вид probe-GI (чекбокс Probe debug view в окне Graphics): R = доля
-        // солнечного света в поле (то, что глушит Sun bounce in shadow), G = видимость неба
-        // (то, что глушит Env specular occlusion), B = экранная тень ключа. Позволяет художнику
-        // видеть, на какие места сцены реально влияет каждая ручка.
-        // Канал 10 - РАССТАНОВКА проб: где каждая проба стоит и что с ней сделала релокация.
-        // Рисуется пятном на поверхности, оказавшейся рядом с пробой: зелёная - проба на своём
-        // узле сетки, жёлтая-красная - отодвинута (тем сильнее, чем краснее), синяя - признана
-        // невалидной, то есть замурована и в интерполяцию не идёт. Фон - валидность поля.
-        // Пробы в открытом воздухе, рядом с которыми нет поверхности, не отмечаются: рисовать их
-        // нечем, здесь нет своего прохода геометрии - зато именно застрявшие в стенах видны все.
+        // Channel 10 is probe PLACEMENT, drawn as a blob on whatever surface is near a probe:
+        // green = on its grid node, yellow to red = relocated, blue = invalid (walled in).
+        // Probes in open air with no nearby surface are not marked - there is nothing to draw on.
         if (PreviewChannel == 10)
         {
             float3 col = float3(0.05, 0.05, 0.05) * probeMarker.z;
@@ -1867,8 +1574,8 @@ PSOutput Main(in PSInput input)
         }
         if (PreviewChannel == 9)
         {
-            // sRGB-кодирование вручную, как у основного пути ниже: таргет UNORM, и линейные
-            // 0.1-0.2 (типичная видимость неба в интерьере) без него читаются как чёрный.
+            // Manual sRGB encode as on the main path: the target is UNORM, so linear 0.1-0.2
+            // would read as black.
             float3 probeDebug = float3(probeSunFraction, skyVisibility, keyShadow);
             output.color = float4(pow(saturate(probeDebug), 1.0 / 2.2), 1.0);
             return output;
@@ -1888,44 +1595,22 @@ PSOutput Main(in PSInput input)
             output.color = float4(envSpecular, 1.0);
             return output;
         }
-        // ВРЕМЕННЫЙ отладочный канал 11 - визуализация punctual-теневого сэмплинга (см. dbgPunctual
-        // выше), закодирован в цвет для 8-бит ридбека (PreviewProbe.ReadRgba8):
-        //   магента (1,0,1) - ветка сэмплинга не выполнилась вовсе (punctual.ShadowParams.x < 0
-        //     или punctualAtten <= 0 - свет без назначенного слайса/вне радиуса)
-        //   жёлтый  (1,1,0) - shadowClip посчитан, но отброшен guard'ом (shadowUv/shadowNdc.z вне
-        //     диапазона - точка приёмника вне фрустума слайса)
-        //   градация серого - реальный shadowLit сэмплера (0 чёрный = окклюдер найден/тень,
-        //     1 белый = не найден/свет)
+        // Punctual shadow sampling: magenta = sampling branch never ran, orange = past the far
+        // plane, cyan = UV outside the slice square, grey ramp = shadowLit.
         if (PreviewChannel == 11)
         {
             float3 dbgColor =
-                dbgPunctual.w < -4.5 ? float3(1, 0, 1)   // -5 (default/no light path) сюда не попадает - оставлено на всякий
-                : dbgPunctual.w < -3.5 ? float3(1, 0.5, 0) // -4: UV в допуске, ndc.z >= 1.0 (за дальней плоскостью)
-                : dbgPunctual.w < -2.5 ? float3(0, 1, 1)   // -3: UV вне [0,1] (точка вне квадрата слайса)
-                // -1: ветка не выполнилась вовсе. Порог именно -0.5, а НЕ -1.5: дефолт dbgPunctual.w
-                // равен -1 и условию "< -1.5" не удовлетворял никогда, так что случай "света сюда не
-                // дошло" молча проваливался в серую ветку и рисовался чёрным - неотличимо от глухой
-                // тени. Значение -2 пишется только транзитом (перед сэмплером) и тут же затирается
-                // его результатом, так что магента не появлялась вообще ни при каких условиях.
+                dbgPunctual.w < -4.5 ? float3(1, 0, 1)
+                : dbgPunctual.w < -3.5 ? float3(1, 0.5, 0)
+                : dbgPunctual.w < -2.5 ? float3(0, 1, 1)
                 : dbgPunctual.w < -0.5 ? float3(1, 0, 1)
-                // Сэмплировано: тень .. свет, но поднято с 0 до 0.15 - ЧИСТО ЧЁРНЫЙ обязан остаться
-                // только у фона. Пиксельный шейдер на пикселях без геометрии не запускается вовсе, и
-                // они держат цвет очистки таргета; при отображении тени нулём небо за силуэтом стены
-                // и затенённая стена были В КАНАЛЕ НЕОТЛИЧИМЫ, из-за чего "тень залила весь кадр"
-                // читалось там, где полкадра просто фон.
+                // Floor at 0.15: pure black must stay unique to the background, where the pixel
+                // shader never runs and the target keeps its clear colour.
                 : lerp(0.15, 1.0, saturate(dbgPunctual.w)).xxx;
             output.color = float4(dbgColor, 1.0);
             return output;
         }
-        // ВРЕМЕННЫЙ отладочный канал 12 - какой ИНДЕКС слайса шейдер выбрал для сэмплинга этого
-        // пикселя (dbgShadowSlice, см. выше), закодирован как 8-бит серый = slice * 16 (0 слайс -
-        // почти чёрный, 15 слайс - почти белый; шаг между соседями хорошо различим на глаз/в ридбеке).
-        // Магента (1,0,1) - ветка не выполнилась вовсе (нет назначенного слайса/вне радиуса), та же
-        // семантика, что магента в канале 11. Отвечает на вопрос "слайс N дал geometry в SHADOWDUMP,
-        // а слайс, который РЕАЛЬНО сэмплит этот пиксель, - тот же N или другой?" - белый/"лит" пиксель
-        // из канала 11 сам по себе не отличает "в кадре этого слайса нет окклюдера" от "слайс вообще
-        // не тот" (расхождение записи/сэмплинга индекса выглядело бы ИДЕНТИЧНО - см. заметку задачи
-        // про Depth-only Pass #5 vs PunctualShadowMaps почти белым на forward-дроу).
+        // Sampled slice index as grey = slice * 16; magenta = no slice, as in channel 11.
         if (PreviewChannel == 12)
         {
             float3 dbgColor = dbgShadowSlice < -0.5
@@ -1934,10 +1619,7 @@ PSOutput Main(in PSInput input)
             output.color = float4(dbgColor, 1.0);
             return output;
         }
-        // ВРЕМЕННЫЙ отладочный канал 13 - punctual.ShadowParams.x (БАЗОВЫЙ слайс света ДО смещения
-        // грани куба), та же кодировка *16/255, что канал 12 - изолирует, врёт ли БАЗА (назначение
-        // слайса в LightCulling.TryBuildPunctualLight) или смещение грани (UnlitInstancedPS выбор
-        // доминирующей оси).
+        // Base slice BEFORE the cube-face offset, same encoding as channel 12.
         if (PreviewChannel == 13)
         {
             float3 dbgColor = dbgShadowBase < -0.5
@@ -1946,16 +1628,9 @@ PSOutput Main(in PSInput input)
             output.color = float4(dbgColor, 1.0);
             return output;
         }
-        // ВРЕМЕННЫЙ отладочный канал 14 - сырое ClusterCounts[clusterIdx] (до клампа) этого пикселя,
-        // та же кодировка *16/255. Магента = punctualCount == 0 (ветка кластеров вообще не вошла).
-        // Кодировка ЦВЕТОМ, а не серым *16/255, как было: на 8 битах один свет давал 16/255 - на глаз
-        // неотличимо от нуля, и «в кластере нет светов» читалось там, где свет ровно один (ровно эта
-        // ловушка съела прогон пробника: канал показывал сплошной чёрный при работающей
-        // кластеризации). Теперь ноль отделён от единицы качественно, а не количественно:
-        //   чёрный  - 0 светов (кластер пуст);
-        //   синий -> циан -> зелёный -> жёлтый -> красный - 1..CLUSTER_MAX_LIGHTS по возрастанию;
-        //   белый   - счётчик БОЛЬШЕ CLUSTER_MAX_LIGHTS: кластер переполнен, хвост светов потерян;
-        //   магента - ветка кластеров не выполнялась (у камеры нет punctual-светов).
+        // Raw ClusterCounts before the clamp. Colour-coded, not grey, so zero is qualitatively
+        // distinct from one: black = empty, blue..red = 1..CLUSTER_MAX_LIGHTS, white = overflow
+        // (tail lights silently dropped), magenta = the cluster branch never ran.
         if (PreviewChannel == 14)
         {
             if (dbgClusterRawCount < -0.5)
@@ -1984,13 +1659,7 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // ВРЕМЕННЫЙ отладочный канал 15 - величина выхода shadowUv за [0,1] для пикселей канала 11
-        // с кодом -3 (циан, UV вне диапазона): dbgPunctual.xy несёт СЫРОЙ shadowUv независимо от
-        // guard'а (см. запись dbgPunctual выше), так что маргинальный перехлёст (чуть больше 1) и
-        // грубо неверный слайс (UV в разы за пределами) различимы численно, а не только визуально.
-        // excess = максимум по x/y расстояния от [0,1] (0 - внутри, растёт с выходом за границу),
-        // закодирован r=g=b = saturate(excess / 2.0) - excess=2.0 бьёт в белый потолок; для пикселей
-        // ветки, что НЕ дали -3 (не циан), пишем чёрный.
+        // How far shadowUv left [0,1] on channel-11 cyan pixels, as saturate(excess / 2).
         if (PreviewChannel == 15)
         {
             float excessX = max(-dbgPunctual.x, dbgPunctual.x - 1.0);
@@ -2000,10 +1669,7 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // ВРЕМЕННЫЙ отладочный канал 16 - dbgShadowSlice (та же кодировка *16/255, что канал 12), но
-        // ТОЛЬКО для пикселей, у которых канал 11 дал циан (dbgPunctual.w == -3, UV вне [0,1]) -
-        // остальные чёрные. Отвечает "какой слайс выбран именно у циан-пикселей" напрямую, без
-        // визуального сравнения двух отдельных картинок.
+        // Slice index of channel-11 cyan pixels only; everything else black.
         if (PreviewChannel == 16)
         {
             bool isCyan = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5;
@@ -2014,10 +1680,7 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // ВРЕМЕННЫЙ отладочный канал 17 - сырой shadowUv.xy циан-пикселей канала 11, закодирован как
-        // (uv/8 + 0.5) чтобы уместить диапазон примерно [-4, 4] в 8 бит (excess до 2.0 наблюдался,
-        // берём запас). r=x, g=y, b=0. Чёрный (0,0,0 ТОЧНО) - не циан-пиксель (excess=0 у циан
-        // пикселя тоже даёт крошечное ненулевое значение из-за +0.5, так что чёрный однозначен).
+        // Raw shadowUv of cyan pixels as uv/8 + 0.5, fitting roughly [-4,4] into 8 bits.
         if (PreviewChannel == 17)
         {
             bool isCyan = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5;
@@ -2028,10 +1691,7 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // ВРЕМЕННЫЙ отладочный канал 18 - toFrag (worldPos - light) циан-пикселей канала 11, r/g/b =
-        // (toFrag.xyz/16 + 0.5): нужен, чтобы вручную пересчитать на CPU, какую грань ДОЛЖНА была
-        // выбрать доминирующая ось для ЭТОЙ ТОЧКИ, и сравнить с тем, что реально выбрал шейдер
-        // (канал 16/dbgShadowSlice) - расхождение укажет, врёт ли выбор грани или сама проекция.
+        // toFrag (worldPos - light) of cyan pixels as xyz/16 + 0.5, to recheck the face choice.
         if (PreviewChannel == 18)
         {
             bool isCyan = dbgPunctual.w < -2.5 && dbgPunctual.w > -3.5;
@@ -2041,20 +1701,10 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // ВРЕМЕННЫЙ отладочный канал 19 - ВЫБРАННАЯ ГРАНЬ КУБА своим цветом, для ВСЕХ пикселей, куда
-        // свет со слайсом вообще дотянулся (не только для циан). Каналы 12/16 кодируют слайс серым
-        // (*16/255), и на глаз соседние грани там неразличимы - приходилось сравнивать по пипетке.
-        // Здесь грань = dbgShadowSlice - dbgShadowBase, и у каждой свой цвет:
-        //   +X красный / -X тёмно-красный, +Y зелёный / -Y тёмно-зелёный, +Z синий / -Z тёмно-синий.
-        // Белый - грань вне 0..5 (у спота смещение не добавляется, так что там всегда «+X»/красный:
-        // для спота это норма, у него один слайс). Магента - ветка не дошла до выбора слайса.
-        //
-        // Зачем: раскладка граней на плоскости ПРЕДСКАЗУЕМА аналитически. Пол под точечным светом
-        // виден гранью -Y ровно там, где вертикаль до пола больше горизонтального выноса, то есть
-        // пока высота лампы над полом > Range/sqrt(2); дальше кольцом идут ±X/±Z, и границы между
-        // ними - прямые под 45 градусов от проекции лампы. Если картинка канала расходится с этим
-        // рисунком (одна грань на весь кадр, или граница не там), выбор грани врёт; если совпадает -
-        // врёт не он, и дальше смотреть надо в саму проекцию.
+        // Selected cube face by colour: +X red / -X dark red, +Y green / -Y dark green,
+        // +Z blue / -Z dark blue. White = face outside 0..5 (normal for a spot, which has one
+        // slice); magenta = the branch never chose a slice. The expected on-screen pattern is
+        // analytic: -Y under the light, then a ring of +-X/+-Z split by 45-degree lines.
         if (PreviewChannel == 19)
         {
             float dbgFace = dbgShadowSlice - dbgShadowBase;
@@ -2071,25 +1721,9 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Канал 20 - СРЕЗ ГЛУБИНЫ фроксел-сетки (dbgClusterCell.z) своим цветом: прямой аналог
-        // "Display depth Slices" из статьи aortiz (Clustered Shading), по которой сделан
-        // LightClusterCS. Отвечает на вопрос, который каналы 11..19 не задают вовсе: правильно ли
-        // пиксель находит СВОЙ кластер. Каналы теней (11..19) диагностируют совсем другую половину -
-        // сэмплинг PunctualShadowMaps, и по ним о кластеризации нельзя сказать ничего.
-        //
-        // Как ЧИТАТЬ картинку (в этом вся ценность канала - ожидаемый вид известен аналитически):
-        //   - Полосы обязаны идти по ГЛУБИНЕ, а не по экрану: на плоском полу, уходящем от камеры,
-        //     это полосы поперёк направления взгляда, сгущающиеся вдаль (срезы экспоненциальные);
-        //     на стене, перпендикулярной взгляду, - ОДИН ровный цвет на всю стену.
-        //   - Цвет обязан МЕНЯТЬСЯ при движении камеры вперёд/назад и НЕ меняться при повороте
-        //     камеры вокруг своей оси.
-        //   - Весь кадр одного цвета = срезы вырождены (ClusterParams.zw пустые/равные, см. магенту)
-        //     или view-z считается неверно; полосы ВЕРТИКАЛЬНЫЕ/ГОРИЗОНТАЛЬНЫЕ по экрану вместо
-        //     глубинных = в срез утёк экранный x/y.
-        // Палитра - 8 цветов по кругу (срез % 8), яркость ступенькой по номеру восьмёрки
-        // (0..7 тусклее, 8..15 средние, 16..23 яркие), так что соседние срезы всегда контрастны, а
-        // абсолютный номер среза читается по яркости. Магента - сетка не определена (ClusterParams
-        // .zw пустые: превью-конвейеры, где кластеризация не гоняется вовсе).
+        // Froxel DEPTH slice, palette of 8 hues cycling by slice with brightness stepping every
+        // eighth, so neighbours contrast and the absolute index stays readable. Magenta = grid
+        // undefined. Correct output shows bands running by depth, not across the screen.
         if (PreviewChannel == 20)
         {
             if (dbgClusterCell.z < -0.5)
@@ -2114,13 +1748,9 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Канал 21 - ТАЙЛ фроксел-сетки по экрану (dbgClusterCell.xy) шахматкой: контроль второй
-        // половины отображения пиксель->кластер. Ожидаемый вид известен точно: ровная сетка
-        // CLUSTER_GRID_X x CLUSTER_GRID_Y (16x8) клеток НА ВЕСЬ кадр. Если клеток видно меньше и они
-        // сжаты в угол - input.pos.xy и viewData.viewport.zw живут в разных разрешениях (рендер-скейл
-        // апскейлера, см. GraphicsPipelineSimple.LatchRenderResolution); если сетка съезжает при
-        // ресайзе окна - viewport камеры отстаёт от таргета. Красный канал - номер тайла по X,
-        // зелёный - по Y (плавная градация), синий - шахматка (x+y) % 2 для видимости границ.
+        // Froxel screen TILE: r = tile X, g = tile Y, b = checkerboard. Expect an even
+        // CLUSTER_GRID_X x CLUSTER_GRID_Y grid over the whole frame; cells squeezed into a corner
+        // mean input.pos.xy and viewData.viewport.zw are at different resolutions.
         if (PreviewChannel == 21)
         {
             if (dbgClusterCell.z < -0.5)
@@ -2135,20 +1765,10 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Каналы 22..24 - ПРОЕЦИРУЕМАЯ ГЛУБИНА СВЕТА НА ПОВЕРХНОСТЬ, то есть обе глубины, которые
-        // сравнивает теневой сэмплер, в МИРОВЫХ единицах вдоль оси слайса (см. dbgShadowDepth):
-        //   22 - глубина ПРИЁМНИКА: как далеко от света лежит ЭТА поверхность;
-        //   23 - глубина ОККЛЮДЕРА: что записано в слайсе по тому же UV, то есть до чего свет
-        //        реально "дострелил" в этом направлении;
-        //   24 - их знаковая разница в масштабе применённого байаса - собственно вердикт сэмплера.
-        // Зачем в метрах, а не в NDC: проекция слайса перспективная, у дальней плоскости NDC-глубины
-        // приёмника и окклюдера слипаются в неразличимые тысячные, и по NDC-картинке о зазоре между
-        // ними сказать нечего. Рампа общая у 22 и 23 (нормировка на far слайса), поэтому их можно
-        // сравнивать переключением туда-сюда: там, где поверхность НЕ в тени, картинки обязаны
-        // СОВПАДАТЬ (свет видит ровно её); расхождение = либо перед ней есть окклюдер (законная
-        // тень), либо сэмплится ЧУЖОЙ слайс (тогда расхождение сплошное и бессистемное).
-        // Рампа: чёрный (у света) -> синий -> циан -> зелёный -> жёлтый -> красный (far слайса).
-        // Магента - сэмплинг тени сюда не дошёл (нет слайса, точка вне радиуса/вне квадрата слайса).
+        // 22 = receiver depth, 23 = occluder depth, 24 = their signed difference scaled by the
+        // applied bias, all in WORLD metres along the slice axis. 22 and 23 share one ramp
+        // (black at the light -> red at slice far) so they can be compared by toggling; magenta
+        // means shadow sampling never reached this pixel.
         if (PreviewChannel == 22 || PreviewChannel == 23)
         {
             if (dbgShadowDepth.x < 0.0)
@@ -2159,9 +1779,8 @@ PSOutput Main(in PSInput input)
 
             float dbgDepth = PreviewChannel == 22 ? dbgShadowDepth.x : dbgShadowDepth.y;
             float dbgT = saturate(dbgDepth / max(dbgShadowDepth.z, 1e-4));
-            // Шеститочечная рампа кусочными lerp-ами (пять равных отрезков по 0.2, стыки НЕПРЕРЫВНЫ:
-            // конец каждого отрезка - начало следующего): у линейной серой шкалы дальняя половина
-            // диапазона неразличима на глаз, а весь смысл канала - именно в сравнении двух картинок.
+            // Six-point ramp in five continuous 0.2 segments: a linear grey scale is unreadable
+            // over the far half of the range.
             float3 dbgColor =
                   dbgT < 0.2 ? lerp(float3(0, 0, 0), float3(0, 0, 1), dbgT / 0.2)
                 : dbgT < 0.4 ? lerp(float3(0, 0, 1), float3(0, 1, 1), (dbgT - 0.2) / 0.2)
@@ -2172,18 +1791,10 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Канал 24 - зазор (приёмник - окклюдер) В ЕДИНИЦАХ ПРИМЕНЁННОГО МИРОВОГО БАЙАСА. Именно
-        // байас, а не метры: акне и peter-panning - это всегда вопрос "зазор больше или меньше
-        // байаса", и абсолютная величина в метрах на него не отвечает (у перспективного слайса
-        // тексель, а с ним и байас, растёт с дистанцией - см. shadowTexelWorld).
-        //   зелёный - зазор в пределах байаса: поверхность сама себе окклюдер, пиксель освещён (норма);
-        //   красный - зазор БОЛЬШЕ байаса: перед поверхностью реальный окклюдер, пиксель в тени;
-        //   синий   - зазор ОТРИЦАТЕЛЬНЫЙ (приёмник ближе к свету, чем всё записанное в слайсе):
-        //             в норме это только там, куда каст не рисовался, сплошная синева = слайс пустой
-        //             или сэмплится чужой.
-        // Яркость - |зазор|/байас с потолком 4: тонкая красная кайма вдоль контактов при зелёном
-        // фоне и есть здоровая картинка, широкая красная полоса от объекта = байас велик
-        // (peter-panning), рваная красная сыпь по освещённой плоскости = байас мал (акне).
+        // Receiver-occluder gap in UNITS OF THE APPLIED WORLD BIAS - acne and peter-panning are
+        // always about the gap versus the bias, and metres cannot answer that. Green = within
+        // bias (lit), red = beyond it (shadowed), blue = negative gap, which is normal only
+        // where no caster was drawn. Brightness = |gap|/bias capped at 4.
         if (PreviewChannel == 24)
         {
             if (dbgShadowDepth.x < 0.0)
@@ -2202,16 +1813,10 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Канал 25 - ЗНАК shadowClip.w у пикселей, ДОШЕДШИХ до проекции в слайс (см. dbgShadowClipW).
-        // Отвечает на вопрос, который каналы 11..24 обходят стороной: они все живут ЗА guard'ом
-        // shadowClip.w > 1e-4 и про отброшенные им пиксели молчат - в канале 11 такой пиксель
-        // неотличим от «света сюда не дошло» (и то, и другое магента).
-        //   магента - до проекции не дошли (света нет в кластере / вне радиуса / нет слайса);
-        //   СИНИЙ   - w <= 0: точка ПОЗАДИ ближней плоскости выбранной грани. По построению выбора
-        //             грани (доминирующая ось вектора свет->фрагмент) этого быть не может вовсе:
-        //             w и есть проекция того самого вектора на ось той самой грани. Синева здесь -
-        //             прямая улика, что матрица слайса не соответствует выбранной грани;
-        //   зелёный->жёлтый->красный - w от 0 до far слайса (нормальный случай).
+        // Sign of shadowClip.w BEFORE the guard, which channels 11..24 all live behind. Magenta =
+        // never projected; BLUE = w <= 0, impossible by construction (w is the light-to-fragment
+        // vector projected on the chosen face axis) and hence proof the slice matrix does not
+        // match the chosen face; green->yellow->red = w from 0 to slice far.
         if (PreviewChannel == 25)
         {
             if (dbgShadowClipW < -1e8)
@@ -2232,14 +1837,10 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Канал 26 - ОСЬ ГРАНИ ИЗ МАТРИЦЫ СЛАЙСА глазами шейдера (w-столбец viewProj), закодированная
-        // цветом ровно как грани в канале 19: +X красный / -X тёмно-красный, +Y зелёный / -Y тёмно-
-        // зелёный, +Z синий / -Z тёмно-синий. Белый - ось не единичная и не осевая (единичная матрица
-        // даёт (0,0,0), нулевая тоже - обе сюда). Магента - до чтения матрицы не дошли.
-        // Смысл: канал 19 показывает, какую грань шейдер ВЫБРАЛ, а этот - какая грань лежит в
-        // матрице, которую он по этому выбору ПРОЧИТАЛ. Совпадают - виновата не индексация; расходятся
-        // (или белое) - до шейдера доезжает не тот набор матриц, и дальше искать надо в заливке
-        // буфера, а не в HLSL.
+        // Face axis as it appears in the slice matrix the shader actually read, coloured like
+        // channel 19. White = the axis is neither unit nor axis-aligned (identity and zero
+        // matrices both land here). Compare with channel 19 to separate a wrong face choice from
+        // a wrong matrix reaching the shader.
         if (PreviewChannel == 26 || PreviewChannel == 27)
         {
             if (dbgSliceAxis.x > 1e8)
@@ -2261,18 +1862,10 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        // Канал 28 - ТЕНЬ СОЛНЦА и КАСКАД, которым она взята, одной картинкой. Существует потому,
-        // что на кадре пятно тени, пятно акне и пятно от смены каскада выглядят одинаково - тёмное
-        // пятно на стене, - а лечатся тремя разными вещами. Тон отвечает «каким каскадом», яркость -
-        // «сколько тени»:
-        //   магента       - мирового света нет (тени выключены / LightDirection пустой);
-        //   ЧЁРНЫЙ        - каскад не выбран ни один, точка объявлена освещённой. На геометрии,
-        //                   которая обязана быть в объёме каскадов, это и есть просвет;
-        //   красный   (0) - каскад 0, зелёный (1), синий (2), жёлтый (3);
-        //   яркость тона  - множитель тени: полный тон = свет, чёрный = полная тень.
-        // Как читать: тень от реального окклюдера повторяет силуэт и НЕ меняет тон на своей границе;
-        // смена каскада - это смена ТОНА, и если тьма начинается ровно на ней, виноват каскад, а не
-        // окклюдер; акне - мелкая рябь ВНУТРИ одного тона, повторяющая сетку текселей карты.
+        // Sun shadow and the cascade it came from in one image: hue = cascade (red 0, green 1,
+        // blue 2, yellow 3), brightness = shadow term. Magenta = no world light; BLACK = no
+        // cascade selected, point declared lit. A real occluder's shadow does not change hue at
+        // its boundary; a cascade artifact does.
         if (PreviewChannel == 28)
         {
             if (!hasWorldLight)
@@ -2292,14 +1885,24 @@ PSOutput Main(in PSInput input)
             return output;
         }
 
-        float3 lit = direct + ambient + envSpecular;
+        // Emissive is added AFTER all lighting: per the glTF spec it is not occluded by AO.
+        float3 emissive = PbrEmissiveFactor;
+#if HAS_EMISSIVE_TEXTURE
+        // sRGB -> linear by hand, same pow 2.2 as base color: textures upload as UNORM.
+        emissive *= pow(_EmissiveTex.Sample(_EmissiveTex_sampler, uv).rgb, 2.2);
+#endif
 
-        // HDR-конвейер: таргет RGBA16F, и кадр уходит дальше линейным - экспозицию по замеренной
-        // яркости, кривую и sRGB-энкод делает TonemapPass (см. TonemapPS.hlsl). Тонмапить здесь
-        // значило бы мерить яркость уже сжатого кадра - авто-экспозиции нечего было бы ловить.
+        float3 lit = direct + ambient + envSpecular + emissive;
+
+        // Blending materials output the authored alpha for the PSO to blend with; everything
+        // else outputs 1, because refraction and compositing read target alpha as coverage.
+        float outAlpha = PbrAlphaBlend != 0 ? baseColor.a : 1.0;
+
+        // HDR: leave the frame linear for TonemapPass. Tonemapping here would make auto-exposure
+        // measure an already-compressed frame.
         if ((PbrFeatureFlags & FeatureHdrOutput) != 0)
         {
-            output.color = float4(lit, 1.0);
+            output.color = float4(lit, outAlpha);
             return output;
         }
 
@@ -2307,17 +1910,12 @@ PSOutput Main(in PSInput input)
         // specular punch, and a plain saturate would clip it into flat white blotches.
         float3 mapped = ApplyToneCurve(lit, PbrToneCurve);
 
-        // Back to display (sRGB) space by hand - the preview color target is UNORM, not *_SRGB,
-        // so nothing downstream encodes for the monitor. Without this the physically-linear result
-        // reads as "no light at all": shadows crush to black and midtones lose half their level
-        // (a linear 0.35 displays like ~0.1).
-        output.color = float4(pow(mapped, 1.0 / 2.2), 1.0);
+        // Back to display (sRGB) space by hand: the color target is UNORM, not *_SRGB, so
+        // nothing downstream encodes for the monitor.
+        output.color = float4(pow(mapped, 1.0 / 2.2), outAlpha);
         return output;
     }
 
-    // View-facing rim highlight: real camera direction (ViewData.CameraWorldPos, populated per
-    // frame - see RenderingComponents.CreateViewData) rather than a normal pushed through the
-    // clip-space viewProj matrix, with a power falloff for a crisper edge than a linear one.
     float3 viewDir = normalize(viewData.CameraWorldPos - input.worldPos);
     const float rimPower = 2.0;
     float rim = pow(saturate(dot(normal, viewDir)), rimPower);

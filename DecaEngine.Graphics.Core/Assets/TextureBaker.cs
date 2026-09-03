@@ -4,32 +4,15 @@ using CommunityToolkit.HighPerformance;
 
 namespace DecaEngine.Graphics.Assets;
 
-/// <summary>
-/// Оффлайновая часть ассет-пайплайна: RGBA8 -&gt; мип-цепочка -&gt; BC-блоки -&gt; <see cref="DtexFile"/>.
-/// Работает чистым CPU без единого обращения к графическому API, поэтому вызывается из фоновых
-/// потоков загрузки и из бейкера редактора одинаково.
-/// </summary>
+/// <summary>Offline asset step: RGBA8 -&gt; mip chain -&gt; BC blocks -&gt; <see cref="DtexFile"/>.</summary>
+// Pure CPU, no graphics API calls, so background loader threads and the editor baker share it.
 public static class TextureBaker
 {
-	/// <summary>
-	/// Бампается при ЛЮБОМ изменении того, что баркер кладёт в .dtex: смена фильтра уменьшения,
-	/// перенормировки, версии кодировщика, авто-выбора формата. Входит в ключ кеша, поэтому старые
-	/// файлы перебейкиваются автоматически.
-	///
-	/// Без этого счётчика единственной проверкой протухания осталось бы время изменения ИСХОДНИКА -
-	/// а он при правке кода пайплайна не меняется, и весь уже накопленный кеш (у крупной сцены это
-	/// гигабайты) навсегда застревал бы в старом виде. Ровно на эти грабли уже наступал кеш иконок,
-	/// см. ModelIconCache.BakeVersion.
-	/// </summary>
+	/// <summary>Bump on ANY change to what the baker writes; it is part of the cache key.</summary>
 	public const int PipelineVersion = 1;
 
-	/// <summary>
-	/// Кодирует готовые RGBA8-пиксели в блочно-сжатую мип-цепочку.
-	/// </summary>
-	/// <param name="rgba">Пиксели верхнего уровня, 4 байта на тексель.</param>
-	/// <param name="maxParallelism">Ограничение внутреннего параллелизма кодировщика. Вызывающий,
-	/// который сам разложил картинки по потокам, обязан ставить 1 - иначе потоки перемножаются и
-	/// машина уходит в переподписку.</param>
+	/// <summary>Encodes RGBA8 pixels (4 bytes per texel) into a block-compressed mip chain.</summary>
+	// maxParallelism must be 1 when the caller already spreads images across threads.
 	public static DtexFile.Payload Bake(byte[] rgba, int width, int height, TextureImportSettings settings,
 		int maxParallelism = 0)
 	{
@@ -63,19 +46,14 @@ public static class TextureBaker
 				Format = ToCompressionFormat(settings.Format),
 				Quality = ToCompressionQuality(settings.Quality),
 
-				// Мипы строим сами - тем же боксом 2x2, каким их всегда делал рантайм-путь (генерация
-				// на GPU при создании текстуры, см. DiligentGraphicsApi.CreateTexture). Совпадение
-				// фильтров тут принципиально: кешированная и некешированная загрузка одной модели
-				// обязаны давать неотличимую картинку, иначе «включил кеш - поплыли дальние планы»
-				// станет отдельным классом багов, который невозможно свести к чему-то одному.
+				// Mips built here with the same 2x2 box the GPU path uses; cached and uncached loads
+				// of one model must look identical.
 				GenerateMipMaps = false,
 			},
 			Options =
 			{
-				// Кодировщик распараллеливает БЛОКИ внутри одной картинки. Вызывающий, который сам
-				// разложил картинки по потокам, обязан это выключить: иначе потоки перемножаются и
-				// машина уходит в переподписку, где на переключениях контекста теряется больше, чем
-				// выигрывается на параллелизме.
+				// The encoder parallelizes blocks within one image; nesting that under per-image
+				// threading oversubscribes the machine.
 				IsParallel = maxParallelism != 1,
 			},
 		};
@@ -98,10 +76,7 @@ public static class TextureBaker
 			mips[level] = EncodeLevel(encoder, pixels, levelWidth, levelHeight);
 		}
 
-		// Размеры берём от ФАКТИЧЕСКОГО нулевого уровня, а не пересчитываем кламп заново: повтор
-		// одной и той же арифметики в двух местах - классический источник рассинхрона заголовка с
-		// данными, а DtexFile.TryRead как раз сверяет длины уровней с размерами и отверг бы такой
-		// файл как битый.
+		// Size taken from the ACTUAL level 0, never recomputed: DtexFile.TryRead cross-checks it.
 		return new DtexFile.Payload
 		{
 			Format = settings.Format,
@@ -120,13 +95,12 @@ public static class TextureBaker
 			colors[i] = new ColorRgba32(rgba[src], rgba[src + 1], rgba[src + 2], rgba[src + 3]);
 		}
 
-		// GenerateMipMaps выключен, поэтому массив всегда ровно из одного уровня.
+		// GenerateMipMaps is off, so the result always holds exactly one level.
 		var encoded = encoder.EncodeToRawBytes(new ReadOnlyMemory2D<ColorRgba32>(colors, height, width));
 		return encoded[0];
 	}
 
-	/// <summary>Ужимает до <paramref name="maxSize"/> последовательными делениями пополам. Отдаёт
-	/// исходный буфер без копии, если ужимать нечего.</summary>
+	// Returns the source buffer uncopied when nothing needs shrinking.
 	private static (byte[] Pixels, int Width, int Height) ClampToMaxSize(byte[] rgba, int width, int height, int maxSize)
 	{
 		while (maxSize > 0 && (width > maxSize || height > maxSize) && (width > 1 || height > 1))
@@ -137,9 +111,7 @@ public static class TextureBaker
 		return (rgba, width, height);
 	}
 
-	/// <summary>Бокс-фильтр 2x2. Намеренно работает прямо в хранимом пространстве, БЕЗ разворота
-	/// sRGB в линейное: ровно так же мипы генерирует GPU для RGBA8_UNORM-текстуры, а расхождение
-	/// кешированного и некешированного путей дороже теоретически более правильного усреднения.</summary>
+	// 2x2 box filter in STORAGE space, no sRGB decode: matches how the GPU mips RGBA8_UNORM.
 	private static (byte[] Pixels, int Width, int Height) DownscaleHalf(byte[] pixels, int width, int height)
 	{
 		int newWidth = Math.Max(1, width >> 1);
@@ -172,8 +144,7 @@ public static class TextureBaker
 		return (result, newWidth, newHeight);
 	}
 
-	/// <summary>Возвращает усреднённым тангенциальным нормалям единичную длину (см.
-	/// <see cref="TextureImportSettings.RenormalizeMips"/>). Работает на месте.</summary>
+	// Restores unit length to averaged tangent-space normals, in place.
 	private static void Renormalize(byte[] rgba)
 	{
 		for (int i = 0; i < rgba.Length; i += 4)
@@ -185,7 +156,7 @@ public static class TextureBaker
 			float length = MathF.Sqrt(x * x + y * y + z * z);
 			if (length < 1e-6f)
 			{
-				// Выродившийся тексель (чёрный пиксель в карте нормалей) - плоская нормаль.
+				// Degenerate texel (a black pixel in a normal map) becomes a flat normal.
 				rgba[i] = 128;
 				rgba[i + 1] = 128;
 				rgba[i + 2] = 255;

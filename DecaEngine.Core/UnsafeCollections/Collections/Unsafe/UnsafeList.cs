@@ -116,12 +116,8 @@ namespace UnsafeCollections.Collections.Unsafe
             list->_count = 0;
         }
 
-        /// <summary>
-        /// Дописывает <paramref name="count"/> элементов из <paramref name="source"/> ОДНИМ
-        /// копированием памяти, разом обеспечив нужную ёмкость. Поэлементный Add на больших
-        /// массивах (мега-буферы геометрии: миллионы вершин и десятки миллионов индексов) стоит
-        /// именно из-за роста ёмкости удвоением - каждое удвоение перекопирует всё накопленное.
-        /// </summary>
+        /// <summary>Appends count elements in ONE memcpy, reserving capacity up front; per-element
+        /// Add costs far more on huge buffers because each doubling recopies everything.</summary>
         public static void AddRange<T>(UnsafeList* list, T* source, int count) where T : unmanaged
         {
             UDebug.Assert(list != null);

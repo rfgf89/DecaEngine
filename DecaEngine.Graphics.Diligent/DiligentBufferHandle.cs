@@ -19,12 +19,7 @@ public class DiligentBufferHandle : IBufferHandle
 		_device = device;
 	}
 
-	/// <summary>
-	/// Wraps an already-created native buffer (e.g. one owned and allocated by the render graph)
-	/// without creating a new one, so render graph resources can flow through the same
-	/// <see cref="ICommandBuffer"/>/<see cref="IMaterialObject"/> code paths as any other
-	/// <see cref="IBufferHandle"/>. See <see cref="DiligentRenderGraphContext.GetBuffer"/>.
-	/// </summary>
+	/// <summary>Wraps a native buffer owned elsewhere (e.g. by the render graph) without creating one.</summary>
 	public DiligentBufferHandle(IBuffer buffer, BufferInfo info)
 	{
 		_buffer = buffer;
@@ -91,19 +86,15 @@ public class DiligentBufferHandle : IBufferHandle
 		var usage = Info.dynamic ? Usage.Dynamic : Usage.Default;
 		var cpuAccessFlags = Info.dynamic ? CpuAccessFlags.Write : CpuAccessFlags.None;
 
-		// BUFFER_MODE_STRUCTURED - только когда буферу реально нужен шейдерный вид (SRV или UAV),
-		// то есть когда в access есть Compute/Pixel/Vertex. Структурированный режим описывает именно
-		// РАСКЛАДКУ ДЛЯ ШЕЙДЕРА, и для чисто вершинного или индексного буфера он бессмыслен: D3D12
-		// такое сочетание прямо отвергает ("Failed to create D3D12 buffer" при
-		// Mode=STRUCTURED + BindFlags=BIND_VERTEX_BUFFER), а CreateBuffer возвращает обёртку с
-		// пустым нативным объектом - падение случается позже и далеко от причины.
+		// D3D12 rejects Mode=STRUCTURED combined with BIND_VERTEX_BUFFER, so ask for it only
+		// when the buffer actually needs an SRV or UAV.
 		bool needsShaderView = Info.type is not BufferHandleType.Constant && Info.access != 0;
 
 		var desc = new BufferDesc
 		{
 			Name = Info.name,
 			Size = Info.sizeInBytes,
-			// Шаг элемента имеет смысл только у структурированного буфера.
+			// Element stride is meaningful only for a structured buffer.
 			ElementByteStride = needsShaderView ? Info.stride : 0,
 			BindFlags = bindFlags,
 			Usage = usage,
@@ -120,12 +111,7 @@ public class DiligentBufferHandle : IBufferHandle
 		_buffer = null;
 	}
 
-	/// <summary>
-	/// DECA_BUFDIAG=&lt;подстрока имени&gt; - печатать каждое освобождение буфера, чьё имя содержит
-	/// подстроку, вместе со стеком вызова. Нужен, когда падение происходит на ОБРАЩЕНИИ к
-	/// освобождённому буферу: в этот момент виновник уже давно отработал, и в стеке падения его нет.
-	/// Пустая строка или "1" - печатать все.
-	/// </summary>
+	// DECA_BUFDIAG=<name substring> logs matching buffer releases with a stack trace; "1" or "" logs all.
 	private static readonly string? DiagFilter = Environment.GetEnvironmentVariable("DECA_BUFDIAG");
 
 	public void Release()

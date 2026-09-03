@@ -10,26 +10,10 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Scene;
 
-/// <summary>
-/// Мир физики сцены префаба: обёртка над <see cref="PhysicsWorld"/>, которая знает про РЕДАКТОР -
-/// про то, что геометрия сцены меняется под руками, что кадр может быть на паузе, и что всё
-/// происходящее нужно уметь показать.
-///
-/// Заводится ЛЕНИВО - только когда в сцене появился персонаж, которому физика нужна (foot IK или
-/// рэгдолл, см. <see cref="AnimationDriver"/>). В сцене без таких персонажей физики нет вовсе, и
-/// кадр не платит за неё ничего: построение статики - это BVH по всем треугольникам сцены, и делать
-/// его «на всякий случай» нельзя.
-///
-/// Статика - ОДИН меш на всю сцену, а не тело на объект. Причина в том, для чего она здесь нужна:
-/// луч foot IK спрашивает «что подо мной», и ему безразлично, к какому объекту относится
-/// треугольник. Один меш - один BVH, одна пересборка, и стоимость движения объекта не зависит от
-/// того, сколько объектов в сцене.
-/// </summary>
+/// <summary>Editor-aware physics world for a prefab scene; statics are one merged mesh.</summary>
 public sealed class ScenePhysics : IDisposable
 {
-	/// <summary>Луч, пущенный за последний кадр, - для дебага. Именно ЛУЧ, а не только его попадание:
-	/// самый частый диагноз при разъезжающемся foot IK - «луч летит не туда» или «луч короткий», и
-	/// оба видны только по самому лучу.</summary>
+	/// <summary>A ray cast during the last frame, kept whole for debug drawing.</summary>
 	public struct RecordedRay
 	{
 		public Vector3 Origin;
@@ -40,9 +24,6 @@ public sealed class ScenePhysics : IDisposable
 		public Vector3 HitNormal;
 	}
 
-	/// <summary>Потолок на записанные лучи. Райкастов за кадр бывает много (две ноги на персонажа -
-	/// это мало, а вот произвольный код может звать их сотнями), и накопитель дебага не должен уметь
-	/// расти неограниченно.</summary>
 	private const int MaxRecordedRays = 256;
 
 	private readonly List<Vector3> _staticVertices = new();
@@ -58,31 +39,30 @@ public sealed class ScenePhysics : IDisposable
 
 	public PhysicsWorld World { get; }
 
-	/// <summary>Идёт ли симуляция. Пауза - НЕ нулевой шаг времени: нулевой шаг тоже проходит через
-	/// накопитель и в какой-то момент выдаёт шаг, а пауза обязана останавливать мир целиком, чтобы
-	/// разобрать позу тела, которое только что провалилось сквозь пол.</summary>
+	/// <summary>Stops the world entirely; not the same as stepping with dt = 0.</summary>
 	public bool Paused { get; set; }
 
-	/// <summary>Замедление/ускорение времени симуляции. Отдельно от паузы: рэгдолл, разлетающийся за
-	/// три кадра, на 0.1 разбирается по кадрам, а на паузе - никак.</summary>
+	/// <summary>Simulation time multiplier.</summary>
 	public float TimeScale { get; set; } = 1f;
 
-	/// <summary>Пишутся ли лучи в <see cref="Rays"/>. Выключено - список пуст и не растёт.</summary>
+	/// <summary>Whether casts are recorded into <see cref="Rays"/>.</summary>
 	public bool RecordRays { get; set; }
 
 	public IReadOnlyList<RecordedRay> Rays => _rays;
 
-	// --- Счётчики последнего кадра (для окна дебага) ---------------------------------------------
+	// --- Last-frame counters ---------------------------------------------------------------------
 
 	public int LastStepCount { get; private set; }
 	public double LastStepMilliseconds { get; private set; }
 	public int StaticTriangleCount { get; private set; }
+
+	/// <summary>False until the first non-empty rebuild: bodies must not be spawned floorless.</summary>
+	public bool HasStatics => _hasStatic;
 	public int RayCastsThisFrame { get; private set; }
 
 	public int BodyCount => World.Simulation.Bodies.ActiveSet.Count + SleepingBodyCount;
 
-	/// <summary>Спящих тел. Bepu держит их в отдельных наборах, и «сколько всего тел» без этого
-	/// счётчика систематически занижается ровно на успокоившиеся - то есть на большинство.</summary>
+	/// <summary>Bepu keeps sleeping bodies in sets past index 0, outside the active set.</summary>
 	public int SleepingBodyCount
 	{
 		get
@@ -106,11 +86,9 @@ public sealed class ScenePhysics : IDisposable
 		World = new PhysicsWorld(gravity);
 	}
 
-	// --- Статика сцены ---------------------------------------------------------------------------
+	// --- Scene statics ---------------------------------------------------------------------------
 
-	/// <summary>Начинает пересборку статики. Между Begin и End вызывающий сваливает сюда мировые
-	/// треугольники сцены; старая статика живёт до самого <see cref="EndStatics"/>, чтобы неудачная
-	/// или пустая пересборка не оставила сцену без пола.</summary>
+	/// <summary>Starts a rebuild; the previous statics stay live until <see cref="EndStatics"/>.</summary>
 	public void BeginStatics()
 	{
 		_staticVertices.Clear();
@@ -118,9 +96,7 @@ public sealed class ScenePhysics : IDisposable
 		_building = true;
 	}
 
-	/// <summary>Добавляет меш В МИРОВЫХ КООРДИНАТАХ. Порядок вершин передаётся КАК ЕСТЬ - см.
-	/// PhysicsWorld.AddTriangleMesh: разворот обхода «по документации» даёт односторонний меш,
-	/// сквозь который тела проваливаются без единого столкновения.</summary>
+	/// <summary>Adds a mesh in WORLD space; winding is passed through unchanged.</summary>
 	public void AddStaticMesh(ReadOnlySpan<Vector3> positions, ReadOnlySpan<uint> indices)
 	{
 		if (!_building || positions.Length == 0 || indices.Length < 3)
@@ -135,8 +111,7 @@ public sealed class ScenePhysics : IDisposable
 			_staticVertices.Add(position);
 		}
 
-		// Кратность трём обеспечивается здесь, а не проверкой у вызывающего: хвост в один-два индекса
-		// приехал бы в Mesh уже как треугольник из чужих вершин.
+		// Drop the ragged tail: Bepu's Mesh would read it as a triangle of foreign vertices.
 		int triangleIndices = indices.Length - indices.Length % 3;
 		for (int i = 0; i < triangleIndices; i++)
 		{
@@ -144,7 +119,7 @@ public sealed class ScenePhysics : IDisposable
 		}
 	}
 
-	/// <summary>Завершает пересборку: снимает прежний статик и заводит новый одним мешом.</summary>
+	/// <summary>Finishes the rebuild: swaps the old statics for one merged mesh.</summary>
 	public void EndStatics()
 	{
 		if (!_building)
@@ -154,15 +129,7 @@ public sealed class ScenePhysics : IDisposable
 
 		_building = false;
 
-		// Пустая пересборка НЕ ТРОГАЕТ прежнюю статику - проверка стоит ДО сноса.
-		//
-		// Раньше она стояла после, и это ровно противоречило замыслу, описанному у BeginStatics:
-		// «старая статика живёт до самого EndStatics, чтобы неудачная или пустая пересборка не
-		// оставила сцену без пола». Оставляла. Пересборка идёт на любое движение объекта, а
-		// геометрия сцены СТРИМИТСЯ - в кадре, где модель пола ещё не дошла (или её выселили), сбор
-		// давал ноль треугольников, пол снимался, и всё, что на нём стояло, уходило в свободное
-		// падение. Причём молча и НАВСЕГДА: следующая пересборка случится только от следующего
-		// движения, а падать уже начали все.
+		// Must precede the removal: scene geometry streams, so an empty rebuild is transient.
 		if (_staticIndices.Count < 3)
 		{
 			_staticVertices.Clear();
@@ -183,23 +150,21 @@ public sealed class ScenePhysics : IDisposable
 			System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_staticIndices),
 			Vector3.One);
 
-		// Меш уже в мире - поза статика единичная. Масштаб тоже: он запечён в вершины, и повторить
-		// его здесь значило бы применить дважды.
+		// Vertices are already world-space, so pose and scale must stay identity.
 		_staticHandle = World.AddStatic(new RigidPose(Vector3.Zero), _staticShape);
 		_hasStatic = true;
 		StaticTriangleCount = _staticIndices.Count / 3;
 
-		// Списки держат мировые копии всей сцены - на Sponza это десятки мегабайт, которые после
-		// постройки BVH не нужны никому.
+		// These hold a world-space copy of the whole scene: tens of MB once the BVH is built.
 		_staticVertices.Clear();
 		_staticIndices.Clear();
 		_staticVertices.TrimExcess();
 		_staticIndices.TrimExcess();
 	}
 
-	// --- Кадр ------------------------------------------------------------------------------------
+	// --- Frame -----------------------------------------------------------------------------------
 
-	/// <summary>Двигает симуляцию и обновляет счётчики. Возвращает число проинтегрированных шагов.</summary>
+	/// <summary>Advances the simulation and returns the number of integrated steps.</summary>
 	public int Update(float deltaSeconds)
 	{
 		_rays.Clear();
@@ -220,18 +185,9 @@ public sealed class ScenePhysics : IDisposable
 		return LastStepCount;
 	}
 
-	// --- Запросы ---------------------------------------------------------------------------------
+	// --- Queries ---------------------------------------------------------------------------------
 
-	/// <summary>
-	/// Райкаст с записью для дебага. Возвращает <see cref="GroundSample"/>, а не <see cref="RayHit"/>,
-	/// потому что главный потребитель здесь - foot IK, который принимает райкаст ДЕЛЕГАТОМ и про
-	/// Bepu ничего не знает (см. FootIk: солвер живёт в графическом слое и физику за собой не тянет).
-	///
-	/// Луч видит ТОЛЬКО СТАТИКУ. «Пол» - это сцена, а вся динамика в ней - капсулы персонажей: луч
-	/// высоты подъёма попадал в туловище лежащего рэгдолла (персонаж вставал НА СЕБЯ, на 0.288 вместо
-	/// 0), а лучи foot IK у персонажа с kinematic-рэгдоллом точно так же находят «пол» на собственных
-	/// капсулах ног.
-	/// </summary>
+	/// <summary>Casts against STATICS ONLY, so a character never hits its own ragdoll.</summary>
 	public GroundSample SampleGround(Vector3 origin, Vector3 direction, float maximumT)
 	{
 		RayCastsThisFrame++;
@@ -261,8 +217,7 @@ public sealed class ScenePhysics : IDisposable
 
 	public void Dispose()
 	{
-		// Формы освобождает Simulation.Dispose вместе с пулом, поэтому отдельного снятия статика
-		// здесь нет: оно только удлинило бы путь выхода.
+		// Simulation.Dispose frees the shapes along with the pool; no explicit static removal.
 		World.Dispose();
 	}
 }

@@ -22,91 +22,53 @@ namespace DecaEngine.Graphics.Diligent
 		private IRenderTarget _shadowMaps;
 		private IRenderTarget _punctualShadowMaps;
 
-		/// <summary>1x1x1 D32-заглушка слотов ShadowMaps/PunctualShadowMaps у материалов,
-		/// зарегистрированных ДО первого настоящего теневого дроу (см. EnsureShadowMaps,
-		/// EnsurePunctualShadowMaps). Vulkan требует валидный дескриптор на каждый объявленный в
-		/// шейдере слот уже на Register() - заводить ради этого полные 4096х4 / 1024х16 массива
-		/// значило бы платить их память в ЛЮБОМ окружении, включая те, что тени не рисуют вовсе
-		/// (например asset-browser icon baker: shadows=false, ShadowPass в граф не входит).</summary>
+		// 1x1 D32 stub: Vulkan needs a valid descriptor per declared slot at Register(),
+		// before any real shadow draw allocates the full arrays.
 		private IRenderTarget _shadowMapPlaceholder;
 
-		// Числа раскладки живут в ShadowLayout (Graphics.Core): их читает и сборщик каскадов в
-		// сцене, а сюда они входят как псевдонимы, чтобы бэкенд не менялся.
+		// Layout numbers live in ShadowLayout so the scene-side cascade builder shares them.
 		public const int MaxCascades = ShadowLayout.MaxCascades;
 		public const int ShadowMapSize = ShadowLayout.ShadowMapSize;
 
-		/// <summary>Поле каймы у ортокаскада, в текселях shadow map: орто-матрица описывается не
-		/// вокруг сферы каскада, а вокруг сферы ПЛЮС эта кайма (см. UpdateCascades /
-		/// SimpleCullingAndRenderSystem.BuildLightData).
-		///
-		/// Без каймы объём каскада ложится в карту ровно от края до края, а шейдер точки у края
-		/// НЕ БЕРЁТ: SampleWorldLightShadow отбрасывает каскад, пока точка не ушла внутрь на
-		/// SUN_CASCADE_MARGIN_TEXELS (иначе тапы PCF адресуются за карту и читают краевой тексель,
-		/// то есть глубину другого места сцены). Получалось, что кайма отъедалась ИЗНУТРИ объёма:
-		/// точка проваливалась в следующий каскад - грубее и с другим байасом, - а на последнем в
-		/// «освещено». Это и есть просветы по границам каскадов.
-		///
-		/// Восемь = 3 (отступ шейдера) + 1 (тап PCF) + 1.5 (normal-offset) + 1 (снап центра к сетке
-		/// текселей двигает саму сферу) с запасом. Цена - 0.4% линейного разрешения каскада.</summary>
+		/// <summary>Ortho cascade margin, in shadow-map texels: the ortho matrix covers the cascade
+		/// sphere PLUS this margin, so the shader's edge rejection (SUN_CASCADE_MARGIN_TEXELS),
+		/// PCF taps, normal offset and texel-grid snap never sample outside the map.</summary>
 		public const float CascadeMarginTexels = ShadowLayout.CascadeMarginTexels;
 
-		/// <summary>Реальный каскадный массив, если уже заведён (был хотя бы один каскадный дроу),
-		/// иначе временная заглушка - геттер безопасен ДО первого кадра теней: его дергает КАЖДЫЙ
-		/// батчинг-дроу (см. DiligentBatchRenderer.ExecuteDrawBatching) вне зависимости от того,
-		/// рисуются ли тени в этом окружении вообще.</summary>
+		/// <summary>Real cascade array once allocated, else the placeholder; safe before the first shadow frame.</summary>
 		public IRenderTarget ShadowMapsTarget => _shadowMaps ?? _shadowMapPlaceholder;
 
-		/// <summary>Texture array теней punctual-светов (спот - слайс, точечный - шесть граней куба;
-		/// раскладка кадра - <see cref="DecaEngine.Graphics.Diligent.LightClusters.MaxShadowSlices"/>,
-		/// см. PunctualShadowScheduler). Та же конвенция глубины, что у каскадов: обычный Z, запись
-		/// Less, сравнение LessEqual. Заглушка до первого punctual-дроу - см. <see cref="ShadowMapsTarget"/>.</summary>
+		/// <summary>Punctual shadow array (spot = one slice, point = six cube faces). Depth convention
+		/// matches cascades: standard Z, write Less, compare LessEqual. Placeholder until first punctual draw.</summary>
 		public IRenderTarget PunctualShadowMapsTarget => _punctualShadowMaps ?? _shadowMapPlaceholder;
 		public ISamplerObject ShadowComparisonSampler => _shadowComparisonSampler;
 		public ISamplerObject ShadowPointSampler => _shadowPointSampler;
 
-		// Материалы с альфа-тестом при записи тени (листва, ажурные решётки) - СВОЙ материал на
-		// каждый, а не один общий с перепривязкой текстуры перед дроу: SetTexture обновляет SRB, а
-		// трогать дескриптор-сет, пока предыдущий кадр ещё в полёте, роняет валидацию Vulkan
-		// ("bound VkDescriptorSet was destroyed or updated") - та же причина, по которой у
-		// FogPassResources отдельный кбуфер вместо SetConstant.
-		//
-		// Материалов здесь единицы: критерий отбора (см. ModelViewportGeometry) пропускает только
-		// реально «дырявую» геометрию, а не всё, что экспортер пометил MASK.
+		// One material per alpha-tested caster: rebinding a texture on a shared SRB while the
+		// previous frame is in flight trips Vulkan validation ("bound VkDescriptorSet was destroyed").
 		private readonly Dictionary<int, IMaterialObject> _alphaTestedMaterials = new();
 
-		/// <summary>Punctual-аналог <see cref="_alphaTestedMaterials"/> - свой PSO с уменьшенным
-		/// байасом (см. EnsurePunctualShadowMaterial), заводится лениво при первом punctual-дроу.</summary>
+		// Punctual variant of _alphaTestedMaterials (smaller-bias PSO), built lazily on first punctual draw.
 		private readonly Dictionary<int, IMaterialObject> _punctualAlphaTestedMaterials = new();
 
-		/// <summary>Параметры, которыми был зарегистрирован каждый масочный материал - нужны, чтобы
-		/// собрать его punctual-вариант ПОЗЖЕ, при первом реальном punctual-дроу (см.
-		/// EnsurePunctualShadowMaterial), если он ещё не существовал на момент RegisterAlphaTestedMaterial.</summary>
+		// Registration params kept so the punctual variant can be built later, on first punctual draw.
 		private readonly Dictionary<int, AlphaTestedMaterialParams> _alphaTestedMaterialParams = new();
 
-		/// <summary>Материалы, получившие SetShadowResources, - когда заглушка сменяется на реальный
-		/// массив (EnsureShadowMaps/EnsurePunctualShadowMaps), их слоты перепривязываются на месте
-		/// тем же SetTexture, что и горячая замена текстур при стриминге (см. ModelLoader.cs,
-		/// "SRB живого материала обновляется на месте" / ModelStore.PumpTextureUpgrades) - безопасный
-		/// для этого движка приём, не тот единичный-в-кадре случай, которого боится комментарий выше.</summary>
+		// Materials given SetShadowResources; rebound in place when the placeholder swaps for the real array.
 		private readonly List<IMaterialObject> _shadowBoundMaterials = new();
 
 		private IBufferHandle _viewConstants, _lightConstants, _gpuInstances;
 
-		/// <summary>Сколько материалов пишут тень с альфа-тестом (см. <see cref="RegisterAlphaTestedMaterial"/>).
-		/// Ноль на сцене с листвой означает, что критерий отбора её не признал, - без этого числа
-		/// отличить «крона монолитная» от «крона не помечена» можно только в RenderDoc.</summary>
+		/// <summary>Number of materials writing shadows with alpha test (selection diagnostic).</summary>
 		public int AlphaTestedMaterialCount => _alphaTestedMaterials.Count;
 
-		/// <summary>Материалы, которые в shadow map не пишутся вовсе - см.
-		/// <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
+		// Materials excluded from shadow casting; see IBatchRenderer.SetMaterialShadowCasting.
 		private readonly HashSet<int> _nonCastingMaterials = new();
 
-		/// <summary>Сколько материалов исключено из кастеров. Парная к
-		/// <see cref="AlphaTestedMaterialCount"/> диагностика: «декали перестали отбрасывать тень» и
-		/// «декалей в сцене не нашлось» на картинке выглядят одинаково.</summary>
+		/// <summary>Number of materials excluded from shadow casting.</summary>
 		public int NonCastingMaterialCount => _nonCastingMaterials.Count;
 
-		/// <summary>См. <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
+		/// <summary>See <see cref="IBatchRenderer.SetMaterialShadowCasting"/>.</summary>
 		public void SetMaterialShadowCasting(int materialId, bool casts)
 		{
 			if (casts)
@@ -142,20 +104,12 @@ namespace DecaEngine.Graphics.Diligent
 			CreateSamplers();
 			CreatePlaceholder();
 
-			// Большие массивы (_shadowMaps/_punctualShadowMaps) и базовые теневые материалы/PSO -
-			// НЕ здесь: см. EnsureShadowMaps/EnsurePunctualShadowMaps/EnsureShadowMaterial/
-			// EnsurePunctualShadowMaterial, заводятся при первом настоящем теневом дроу.
+			// Shadow arrays and base materials/PSOs are created lazily on the first real shadow draw.
 		}
 
-		/// <summary>Заводит альфа-тестовый теневой материал для <paramref name="materialId"/>: тот же
-		/// depth-only PSO, что у сплошной геометрии, плюс пиксельный шейдер с clip() по альфе
-		/// базовой текстуры (см. ShadowMaskedPS.hlsl). Пока такой материал не заведён, геометрия
-		/// пишет в shadow map сплошные квады - прежнее поведение.
-		///
-		/// <paramref name="stream"/> - запись стриминга этой текстуры (null вне режима стриминга):
-		/// теневой материал добавляется в её список привязок, иначе крона осталась бы с белым
-		/// 1x1-филлером (альфа 1 - clip не срабатывает) навсегда, пока экранный материал получал бы
-		/// ступени качества.</summary>
+		/// <summary>Registers a depth-only alpha-tested shadow material (clip() on base-color alpha).
+		/// The shadow material must join the texture's streaming bindings, or it stays on the 1x1
+		/// white filler (alpha 1, clip never fires) while the screen material upgrades.</summary>
 		public void RegisterAlphaTestedMaterial(int materialId, IGpuTexture baseColorTexture,
 			ISamplerObject baseColorSampler, float alphaCutoff, ModelLoader.StreamedTexture stream)
 		{
@@ -170,9 +124,8 @@ namespace DecaEngine.Graphics.Diligent
 			_alphaTestedMaterials[materialId] =
 				CreateAlphaTestedShadowMaterial(materialId, "Shadow Masked", GetBaseState(), parms);
 
-			// Punctual-вариант - только если punctual-набор УЖЕ поднят (см. EnsurePunctualShadowMaterial);
-			// иначе он соберётся из _alphaTestedMaterialParams при первом настоящем punctual-дроу, чтобы
-			// не тащить punctual PSO/шейдеры в окружение, которое punctual-тени вообще не рисует.
+			// Punctual variant only if the punctual set is already up; otherwise built lazily
+			// on first punctual draw so shadow-free environments never pay for it.
 			if (_punctualShadowMaterial != null)
 			{
 				_punctualAlphaTestedMaterials[materialId] =
@@ -180,15 +133,11 @@ namespace DecaEngine.Graphics.Diligent
 			}
 		}
 
-		/// <summary>Общее тело для каскадного и punctual масочного теневого материала - тот же
-		/// шейдер/раскладка, разный только базовый rasterizer state (байас, см. GetBaseState vs
-		/// GetPunctualBaseState).</summary>
+		// Shared body for cascade and punctual masked materials; only base rasterizer state (bias) differs.
 		private IMaterialObject CreateAlphaTestedShadowMaterial(int materialId, string namePrefix,
 			GraphicsStateInfo stateInfo, AlphaTestedMaterialParams parms)
 		{
-			// СВОИ экземпляры шейдеров - как в SsaoPassResources и по той же причине: шареный
-			// освобождался бы дважды. Реальной компиляции это почти не стоит, у загрузчика есть
-			// кэш вариантов (см. "load compile: N вызовов, M РЕАЛЬНЫХ").
+			// Own shader instances per material: a shared one would be released twice.
 			var vs = new DiligentShader(_api, $"{namePrefix} VS {materialId}", "EditorAssets/shader",
 				"ShadowVS.hlsl", ShaderObjectType.Vertex, "Main");
 			var ps = new DiligentShader(_api, $"{namePrefix} PS {materialId}", "EditorAssets/shader",
@@ -202,15 +151,13 @@ namespace DecaEngine.Graphics.Diligent
 			stateInfo.DepthStencilState.DepthFunc = ComparisonFunctionType.Less;
 			material.SetState(_api.CreateGraphicsState(stateInfo));
 
-			// Буферов может ещё не быть (модель регистрируется до первой реаллокации инстансов) -
-			// тогда их привяжет ближайший UpdateMaterialResources, он же зовётся при каждой
-			// реаллокации.
+			// Instance buffers may not exist yet; UpdateMaterialResources rebinds on every realloc.
 			BindFrameBuffers(material);
 
 			material.SetTexture("_MainTex", parms.BaseColorTexture);
 			material.SetImmutableSampler("_MainTex", parms.BaseColorSampler);
 
-			// Единственный пуш константы - ДО первого кадра (см. комментарий в ShadowMaskedPS.hlsl).
+			// Constant must be pushed before the first frame (see ShadowMaskedPS.hlsl).
 			var cutoffConstant = new Vector4(MathF.Max(parms.AlphaCutoff, 1e-3f), 0f, 0f, 0f);
 			material.SetConstant("ShadowMaterial", ref cutoffConstant);
 
@@ -221,11 +168,8 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void CreatePlaceholder()
 		{
-			// arraySize = 2, а не 1: DiligentRenderTarget выводит TextureType из arraySize
-			// (Texture2DArray только при arraySize > 1, см. DiligentRenderTarget.cs) - заглушка
-			// биндится в те же слоты ShadowMaps/PunctualShadowMaps, что и реальные массивы, а те
-			// объявлены в шейдере как Texture2DArray. Texture2D под тем же именем прошёл бы
-			// компиляцию материала, но был бы несовместимого измерения дескриптора.
+			// arraySize = 2: DiligentRenderTarget infers Texture2DArray only when arraySize > 1,
+			// and the shader slots are declared Texture2DArray - a Texture2D descriptor would mismatch.
 			_shadowMapPlaceholder = _api.CreateRenderTarget(new TextureInfo
 			{
 				name = "Shadow Map Placeholder",
@@ -238,15 +182,14 @@ namespace DecaEngine.Graphics.Diligent
 
 		private void CreateSamplers()
 		{
-			// Sampler for hardware PCF comparison
 			_shadowComparisonSampler = _api.CreateSampler(
 				"Shadow Comparison Sampler",
 				TextureFilter.ComparisonLinear,
 				TextureAddress.Clamp,
-				CompFunction.LessEqual, // Correct for reversed-Z depth buffer (clear value 0.0, depth func Greater)
+				CompFunction.LessEqual,
 				new Vector4(1.0f, 1.0f, 1.0f, 1.0f));
 
-			// Sampler for raw depth reads (blocker search in PCSS)
+			// Point sampler for raw depth reads (PCSS blocker search).
 			_shadowPointSampler = _api.CreateSampler(
 				"Shadow Point Sampler",
 				TextureFilter.Point,
@@ -255,9 +198,7 @@ namespace DecaEngine.Graphics.Diligent
 				new Vector4(1.0f, 1.0f, 1.0f, 1.0f));
 		}
 
-		/// <summary>Заводит каскадный массив теней (4096^2 x MaxCascades) при первом настоящем
-		/// каскадном дроу (см. ExecuteDrawShadows) и перепривязывает слот ShadowMaps у всех уже
-		/// зарегистрированных материалов (см. _shadowBoundMaterials) с заглушки на реальный массив.</summary>
+		// Creates the cascade array on first real cascade draw and rebinds materials off the placeholder.
 		private void EnsureShadowMaps()
 		{
 			if (_shadowMaps != null)
@@ -280,8 +221,7 @@ namespace DecaEngine.Graphics.Diligent
 			}
 		}
 
-		/// <summary>Punctual-аналог <see cref="EnsureShadowMaps"/> - заводится независимо, при первом
-		/// настоящем punctual-дроу (см. ExecuteDrawPunctualShadow), не при каскадном.</summary>
+		// Punctual analog of EnsureShadowMaps; created independently, on first punctual draw.
 		private void EnsurePunctualShadowMaps()
 		{
 			if (_punctualShadowMaps != null)
@@ -320,7 +260,6 @@ namespace DecaEngine.Graphics.Diligent
 			stateInfo.Name = "Shadow PSO";
 			stateInfo.RenderTargetFormats = [];
 			stateInfo.DepthStencilFormat = TextureObjectFormat.D32Float;
-			// Using Less (with reversed-Z this behaves as "closer to light") during shadow map generation
 			stateInfo.DepthStencilState.DepthFunc = ComparisonFunctionType.Less;
 
 			_shadowMaterial.SetState(_api.CreateGraphicsState(stateInfo));
@@ -328,9 +267,7 @@ namespace DecaEngine.Graphics.Diligent
 			BindFrameBuffers(_shadowMaterial);
 		}
 
-		/// <summary>Punctual-аналог <see cref="EnsureShadowMaterial"/>: свой PSO с уменьшенным
-		/// байасом (см. GetPunctualBaseState) плюс punctual-варианты уже зарегистрированных масочных
-		/// материалов, которых до этой точки не существовало (см. RegisterAlphaTestedMaterial).</summary>
+		// Punctual analog of EnsureShadowMaterial: smaller-bias PSO plus deferred masked variants.
 		private void EnsurePunctualShadowMaterial()
 		{
 			if (_punctualShadowMaterial != null)
@@ -365,15 +302,12 @@ namespace DecaEngine.Graphics.Diligent
 
 		public void UpdateMaterialResources(IBufferHandle viewConstants, IBufferHandle lightConstants, IBufferHandle gpuInstances)
 		{
-			// Запоминаются и для альфа-тестовых материалов: те заводятся ПОЗЖЕ, при регистрации
-			// модели, и своих ручек к этим буферам не имеют.
+			// Also remembered for alpha-tested materials created later at model registration.
 			_viewConstants = viewConstants;
 			_lightConstants = lightConstants;
 			_gpuInstances = gpuInstances;
 
-			// Базовые теневые материалы могут ещё не существовать (лениво заводятся первым реальным
-			// дроу, см. EnsureShadowMaterial/EnsurePunctualShadowMaterial) - тогда их привяжет
-			// собственный BindFrameBuffers внутри Ensure*, вызванный позже с уже актуальными полями.
+			// Base shadow materials may not exist yet; Ensure* binds them with current fields later.
 			if (_shadowMaterial != null)
 			{
 				BindFrameBuffers(_shadowMaterial);
@@ -384,11 +318,8 @@ namespace DecaEngine.Graphics.Diligent
 				BindFrameBuffers(_punctualShadowMaterial);
 			}
 
-			// Перепривязка масочных материалов - ОБЯЗАТЕЛЬНА, а не подстраховка: этот метод зовётся
-			// при КАЖДОЙ реаллокации инстанс-буферов (см. DiligentBatchRenderer), и буфер инстансов
-			// там пересоздаётся заново. Материал, схвативший старый на момент регистрации модели,
-			// уходит в дроу с мёртвым дескриптором - Vulkan валит это как VUID-08114, а картинка
-			// пропадает целиком.
+			// Mandatory rebind: instance buffers are recreated on every realloc, and a material
+			// holding the old one draws with a dead descriptor (Vulkan VUID-08114).
 			foreach (var material in _alphaTestedMaterials.Values)
 			{
 				BindFrameBuffers(material);
@@ -400,8 +331,7 @@ namespace DecaEngine.Graphics.Diligent
 			}
 		}
 
-		/// <summary>Покадровые буферы теневого дроу. View в ShadowVS.hlsl не объявлен и привязка в
-		/// него - no-op; она сохранена ради симметрии с остальными материалами движка.</summary>
+		// View is not declared in ShadowVS.hlsl; that bind is a no-op kept for symmetry.
 		private void BindFrameBuffers(IMaterialObject material)
 		{
 			if (_viewConstants is null)
@@ -420,15 +350,11 @@ namespace DecaEngine.Graphics.Diligent
 			material.SetSampler("ShadowMaps_sampler", ShadowComparisonSampler);
 			material.SetSampler("ShadowMaps_sampler_point", ShadowPointSampler);
 
-			// Тени punctual-светов - тем же PCF-сэмплером сравнения. Шейдеры без этих объявлений
-			// (фуллскрин-пассы через BindShadowResources) просто игнорируют привязку.
+			// Shaders without these declarations simply ignore the bind.
 			material.SetTexture("PunctualShadowMaps", PunctualShadowMapsTarget);
 			material.SetSampler("PunctualShadowMaps_sampler", ShadowComparisonSampler);
 
-			// И ShadowMaps, и PunctualShadowMaps сейчас смотрят на заглушку (см. ShadowMapsTarget/
-			// PunctualShadowMapsTarget), если соответствующий массив ещё не заведён, - запоминаем
-			// материал, чтобы EnsureShadowMaps/EnsurePunctualShadowMaps перепривязали слот на
-			// реальный массив, когда он появится.
+			// Remember the material so Ensure* can swap the slot from placeholder to the real array.
 			_shadowBoundMaterials.Add(material);
 		}
 
@@ -441,9 +367,6 @@ namespace DecaEngine.Graphics.Diligent
 		{
 			if (cascadeIndex < 0 || cascadeIndex >= MaxCascades) return;
 
-			// Первый настоящий каскадный дроу - здесь и только здесь заводится реальный массив и
-			// базовый PSO (см. EnsureShadowMaps/EnsureShadowMaterial); окружения без ShadowPass
-			// (shadows=false, см. ModelViewportEnvironment) сюда вообще не заходят.
 			EnsureShadowMaps();
 			EnsureShadowMaterial();
 
@@ -455,18 +378,13 @@ namespace DecaEngine.Graphics.Diligent
 
 			cmd.SetRenderTarget(null, _shadowMaps, 0, cascadeIndex);
 			cmd.SetViewport(ShadowMapSize, ShadowMapSize);
-			// Clear depth to 0.0 for reversed-Z
 			cmd.ClearDepthStencil(_shadowMaps, ClearDepthStencilFlags.Depth, 1.0f, 0, cascadeIndex);
 
 			cmd.SetVertexBuffers(0, [megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 			cmd.SetIndexBuffer(megaIndexBufferGPU, 0);
 
-			// Быстрый путь: масочных материалов в сцене нет вовсе - вся геометрия рисуется ОДНИМ
-			// indirect-дроу, ровно как раньше. Диапазоны материалов лежат непрерывно от нуля (см.
-			// DiligentBatchRenderer.UpdateDrawRangesCache), поэтому суммы каунтов достаточно.
-			//
-			// Разделение по материалам стоит по дроу-коллу на материал НА КАЖДЫЙ каскад, и платить
-			// эту цену на сцене без листвы не за что.
+			// Fast path: no masked/non-casting materials -> one indirect draw. Material ranges
+			// are contiguous from zero, so summing counts is enough.
 			if (_alphaTestedMaterials.Count == 0 && _nonCastingMaterials.Count == 0)
 			{
 				cmd.SetPipelineState(_shadowMaterial);
@@ -482,9 +400,7 @@ namespace DecaEngine.Graphics.Diligent
 			}
 			else
 			{
-				// Есть масочные - каждому материалу свой дроу со своим PSO. Соседние сплошные
-				// диапазоны НЕ склеиваются: они непрерывны, но склейка потребовала бы сортировки и
-				// учёта дыр, а выигрыш - единицы дроу-коллов на каскад.
+				// Per-material draws; merging contiguous solid ranges would save only a few calls.
 				foreach (var kvp in cullResult.MaterialDrawRanges)
 				{
 					if (kvp.Value.DrawCount == 0)
@@ -492,7 +408,6 @@ namespace DecaEngine.Graphics.Diligent
 						continue;
 					}
 
-					// Материал вообще не кастер (BLEND-накладки) - его дроу просто не делаем.
 					if (_nonCastingMaterials.Contains(kvp.Key))
 					{
 						continue;
@@ -508,15 +423,13 @@ namespace DecaEngine.Graphics.Diligent
 				}
 			}
 
-			// DepthRead, а не общий ShaderResource: SRV депт-текстуры на Vulkan биндится с лейаутом
-			// DEPTH_STENCIL_READ_ONLY_OPTIMAL (VUID-VkDescriptorImageInfo-imageLayout-00344).
+			// DepthRead, not ShaderResource: Vulkan depth SRVs need DEPTH_STENCIL_READ_ONLY_OPTIMAL
+			// (VUID-VkDescriptorImageInfo-imageLayout-00344).
 			cmd.TransitionResource(_shadowMaps, ResourceState.DepthRead);
 		}
 
-		/// <summary>Пишет ОДИН слайс теней punctual-света (см. PunctualShadowScheduler) - та же
-		/// механика, что у каскада: ShadowVS трансформирует по CascadeMatrix[0] текущего Light-кбуфера,
-		/// который вызывающий залил матрицей слайса. Мёртвый слайс (drawCount = 0 в культе) чистится и
-		/// рисует пусто - замороженная петля ForwardPass зовёт это для ВСЕХ слайсов кадра.</summary>
+		/// <summary>Renders ONE punctual shadow slice; the caller uploads the slice matrix as
+		/// CascadeMatrix[0]. Empty slices are still cleared - the pass runs for every frame slice.</summary>
 		public void ExecuteDrawPunctualShadow(
 			ICommandBuffer cmd,
 			DiligentBufferHandle megaVertexBufferGPU,
@@ -526,9 +439,6 @@ namespace DecaEngine.Graphics.Diligent
 		{
 			if (sliceIndex >= LightClusters.MaxShadowSlices) return;
 
-			// Первый настоящий punctual-дроу - заводит punctual-массив и punctual-PSO (свой, меньший
-			// байас - см. GetPunctualBaseState) НЕЗАВИСИМО от каскадного набора: окружение может
-			// рисовать каскад солнца без punctual-теней или наоборот.
 			EnsurePunctualShadowMaps();
 			EnsurePunctualShadowMaterial();
 
@@ -545,10 +455,8 @@ namespace DecaEngine.Graphics.Diligent
 			cmd.SetVertexBuffers(0, [megaVertexBufferGPU, cullResult.FinallyInstancesBuffer], [0ul, 0ul], SetVertexBuffersFlags.Reset);
 			cmd.SetIndexBuffer(megaIndexBufferGPU, 0);
 
-			// Та же логика масочных материалов, что у каскадов (см. ExecuteDrawShadows), но по
-			// punctual-набору - _shadowMaterial/_alphaTestedMaterials калиброваны под 4096^2
-			// ортографический каскад и дают акне/peter-panning на 1024^2 перспективном срезе (см.
-			// GetPunctualBaseState).
+			// Same masked-material logic as cascades, but with the punctual set: cascade materials
+			// are biased for a 4096^2 ortho cascade and cause acne on a 1024^2 perspective slice.
 			if (_punctualAlphaTestedMaterials.Count == 0 && _nonCastingMaterials.Count == 0)
 			{
 				cmd.SetPipelineState(_punctualShadowMaterial);
@@ -571,7 +479,6 @@ namespace DecaEngine.Graphics.Diligent
 						continue;
 					}
 
-					// Не кастер - не кастер и для punctual-светов (см. ExecuteDrawShadows).
 					if (_nonCastingMaterials.Contains(kvp.Key))
 					{
 						continue;
@@ -588,12 +495,9 @@ namespace DecaEngine.Graphics.Diligent
 			}
 		}
 
-		/// <summary>Переводит массив теней punctual-светов в состояние чтения из шейдера. Зовётся
-		/// КАЖДЫМ ForwardPass перед камерными дроу - в том числе когда слайсы не рисовались вовсе
-		/// (превью без светов): текстура объявлена в PS безусловно, и лейаут обязан быть валиден
-		/// (VUID-08114/00344), пусть содержимое и не читается при ShadowParams.x = -1. Через геттер, а
-		/// не поле напрямую: до первого punctual-дроу массив ещё не заведён и транзишен идёт по
-		/// заглушке (см. PunctualShadowMapsTarget) - дешёвый no-op layout transition на 1х1 текстуре.</summary>
+		/// <summary>Transitions the punctual shadow array (or its placeholder) to shader read.
+		/// Must run before every ForwardPass: the PS declares the texture unconditionally, so the
+		/// layout must be valid even when no slice was drawn (VUID-08114/00344).</summary>
 		public void TransitionPunctualShadowsForRead(ICommandBuffer cmd)
 		{
 			cmd.TransitionResource(PunctualShadowMapsTarget, ResourceState.DepthRead);
@@ -601,29 +505,10 @@ namespace DecaEngine.Graphics.Diligent
 
 		private GraphicsStateInfo GetBaseState() => GetBaseState(2000, 2f);
 
-		/// <summary>Байас для punctual-среза (1024^2 ПЕРСПЕКТИВНАЯ проекция). Основную анти-акне работу
-		/// делает шейдерный байас в масштабе текселя (UnlitInstancedPS.hlsl, мировые единицы, переведён
-		/// в NDC под глубину приёмника) - здесь гасится только квантование самого растра.
-		///
-		/// Прежние 100 единиц были назначены "на порядок меньше каскадных" по аналогии, и это не
-		/// работает: у D32_FLOAT константный байас масштабируется как bias * 2^(exp(z) - 23), где exp -
-		/// экспонента максимальной глубины примитива. У перспективного слайса вся геометрия жмётся к
-		/// единице (замеренный кадр: лампа near 0.05 / far 6.4, пол на 5.15 даёт ndc 0.998), то есть
-		/// exp = -1 и шаг равен 2^-24. Сотня таких шагов - 6e-6 NDC, а это на той же дистанции ~3 мм
-		/// против следа текселя в ~10 мм. У ортокаскада глубина размазана по всему [0,1], экспонента в
-		/// среднем много меньше, и его 2000 единиц весят несопоставимо больше. Тысяча даёт ~3 см на
-		/// пяти метрах - ниже порога заметного peter-panning и выше кванта растра.</summary>
-		/// <summary>У punctual-слайсов ближний клип ВКЛЮЧЁН, в отличие от каскадов. У орто-каскада
-		/// глаз оттянут от сцены на радиус, и кастер перед ближней плоскостью - легитимный окклюдер,
-		/// его надо клампить, а не резать (см. depthClipDisable ниже). У ПЕРСПЕКТИВНОЙ грани
-		/// точечного света "перед ближней плоскостью" означает "вплотную к лампе или за ней":
-		/// треугольник, пересекающий плоскость глаза грани (w=0), при отключённом клипе
-		/// растеризуется размазанной проекцией с глубиной, прижатой к near, и закрашивает огромный
-		/// кусок карты грани - ВЕСЬ конус этой грани уходит в тень, на приёмниках это круглая "дыра"
-		/// в свете, чей радиус не зависит от Range (репро: вертикальная панель в 0.3 от лампы,
-		/// пересекающая её высоту). Кастер честно ближе near (0.05..0.25, см.
-		/// PunctualShadowScheduler.SliceNearPlane) при включённом клипе тени не пишет - и не должен:
-		/// он практически внутри светильника.</summary>
+		// Bias 1000: D32 constant bias scales as 2^(exp(z)-23) and perspective slices pack depth
+		// near 1.0, so cascade-sized values are far too small in world terms.
+		// Depth clip stays ON: with clip off, a triangle crossing a face's eye plane rasterizes
+		// as a smeared near-depth blob that shadows the whole face cone.
 		private GraphicsStateInfo GetPunctualBaseState() => GetBaseState(1000, 2f, depthClipDisable: false);
 
 		private GraphicsStateInfo GetBaseState(int depthBias, float slopeScaledDepthBias,
@@ -636,22 +521,15 @@ namespace DecaEngine.Graphics.Diligent
 				PrimitiveTopology = PrimitiveTopologyType.TriangleList,
 				RasterizerState = new RasterizerStateInfo
 				{
-					// БЕЗ отсечения: прежний Front-cull (глубина задних граней, классическая
-					// анти-акне конвенция) делал ОДНОСТОРОННЮЮ геометрию прозрачной для света -
-					// у планок крыши/ткани/листвы нет задних граней, и солнце прошивало крышу
-					// полосами света на пол двора (Sponza-двор, "тени линиями сквозь объекты").
-					// Акне от записи лицевых граней давится байасами ниже + normal-offset на
-					// сэмплинге (см. UnlitInstancedPS.SampleWorldLightShadow).
+					// No culling: front-cull makes single-sided geometry (roofs, foliage)
+					// transparent to light; acne is handled by bias + normal offset instead.
 					CullMode = CullModeType.None,
 					DepthBias = depthBias,
 					SlopeScaledDepthBias = slopeScaledDepthBias,
 
-					// Кастеры перед ближней плоскостью не отсекаются, а кламмятся к ней - см.
-					// RasterizerStateInfo.DepthClipDisable. Оттяжка глаза каскада считается от его
-					// РАДИУСА, а до реальных окклюдеров расстояние своё у сцены, поэтому первому,
-					// самому мелкому каскаду ближняя плоскость режет кастеров раньше всех - в его
-					// тени появляются дыры, которых у крупных каскадов на том же месте нет.
-					// У punctual-слайсов клип ВКЛЮЧЁН - см. GetPunctualBaseState.
+					// Casters in front of the near plane are clamped, not clipped: the smallest
+					// cascade's near plane would cut casters first and punch holes in its shadow.
+					// Punctual slices keep clip ON - see GetPunctualBaseState.
 					DepthClipDisable = depthClipDisable,
 				},
 				DepthStencilState = new DepthStencilStateInfo
@@ -664,11 +542,8 @@ namespace DecaEngine.Graphics.Diligent
 					new InputLayoutElementInfo { InputIndex = 0, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo { InputIndex = 1, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo { InputIndex = 2, NumComponents = 3, ValueType = InputElementValueType.Float32, IsNormalized = false },
-					// Unused by ShadowVS.hlsl (it only reads position), but must still be declared: this
-					// PSO reads from the same mega vertex buffer as DiligentBatchRenderer's (see
-					// GetBaseState there), and Diligent auto-computes each buffer slot's stride from its
-					// declared layout elements - omitting Tangent/Color here would under-report slot 0's
-					// true per-vertex stride and misalign every vertex after the first.
+					// Unused by ShadowVS but required: Diligent derives slot 0's stride from the
+					// declared elements; omitting Tangent/Color would misalign every vertex.
 					new InputLayoutElementInfo { InputIndex = 4, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo { InputIndex = 5, NumComponents = 4, ValueType = InputElementValueType.Float32, IsNormalized = false },
 					new InputLayoutElementInfo { InputIndex = 6, NumComponents = 2, ValueType = InputElementValueType.Float32, IsNormalized = false },

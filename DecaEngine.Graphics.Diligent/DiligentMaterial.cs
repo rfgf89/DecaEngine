@@ -19,15 +19,11 @@ public class DiligentMaterial : IMaterialObject
 
 	private readonly Dictionary<ShaderObjectType, IShader> _shaders = new();
 
-	/// <summary>См. <see cref="IMaterialObject.OwnsShaders"/>. По умолчанию true - историческое
-	/// поведение, на которое опираются все пассы движка.</summary>
 	public bool OwnsShaders { get; set; } = true;
 	private readonly Dictionary<string, DiligentBufferHandle> _constantBuffers = new();
 	private readonly Dictionary<string, IDeviceObject> _pendingResources = new();
 
-	/// <summary>Массивные переменные (Texture2D name[N] в шейдере): все элементы биндятся одним
-	/// SetArray. Параллельный стор к <see cref="_pendingResources"/> - там переменная одноэлементная
-	/// по построению.</summary>
+	// Array variables (Texture2D name[N]); bound with one SetArray, unlike _pendingResources.
 	private readonly Dictionary<string, IDeviceObject[]> _pendingResourceArrays = new();
 	private readonly Dictionary<string, ImmutableSamplerDesc> _immutableSamplers = new();
 
@@ -38,22 +34,15 @@ public class DiligentMaterial : IMaterialObject
 	private bool _isDirty = true;
 	private GraphicsPipelineStateCreateInfo? _basePsoCreateInfo;
 
-	/// <summary>Объект, из которого пришёл <see cref="_basePsoCreateInfo"/>. Хранится ради ключа
-	/// разделяемого PSO: растровые состояния, форматы таргетов, input layout и топология целиком
-	/// приходят из него, и сравнивать их по полям незачем - стейт-объекты и так шарятся между
-	/// материалами (см. ModelViewportEnvironment), так что тождество объекта и есть тождество
-	/// конфигурации.</summary>
+	// Source of _basePsoCreateInfo; state objects are shared, so object identity keys the PSO.
 	private object? _baseStateOwner;
 
-	/// <summary>PSO принадлежит менеджеру и разделяется с другими материалами - диспозить нельзя.</summary>
+	// PSO is owned by the manager and shared: must not be disposed here.
 	private bool _pipelineStateIsShared;
 
 	private readonly object _psoRebuildLock = new object();
 
-	/// <summary>DECA_PSO_SHARE=0 - вернуть прежнее поведение: PSO на КАЖДЫЙ материал, имя с именем
-	/// материала. Нужна как ступень диагностической лестницы (как DECA_PSO_CACHE=0): если после
-	/// объединения PSO картинка разъехалась, этот флаг за один запуск отвечает, виновато объединение
-	/// или что-то ещё.</summary>
+	// DECA_PSO_SHARE=0 falls back to one PSO per material, for diagnostics.
 	private static readonly bool SharePsos = Environment.GetEnvironmentVariable("DECA_PSO_SHARE") != "0";
 
 	public DiligentMaterial(string name, DiligentGraphicsApi api)
@@ -102,8 +91,7 @@ public class DiligentMaterial : IMaterialObject
 	private void SetBasePipelineState(GraphicsPipelineStateCreateInfo psoCreateInfo, object? owner = null)
 	{
 		_basePsoCreateInfo = psoCreateInfo;
-		// Владельцем считается сам createInfo, если стейт-объекта нет: он тоже живёт ровно столько,
-		// сколько живёт конфигурация, и по тождеству годится так же.
+		// With no state object the createInfo itself is the identity: same lifetime, same config.
 		_baseStateOwner = owner ?? psoCreateInfo;
 		_isDirty = true;
 	}
@@ -112,12 +100,8 @@ public class DiligentMaterial : IMaterialObject
 	{
 		if (bufferHandle is DiligentBufferHandle dilBuffer)
 		{
-			// БЕЗ Compute-стадии: у графического материала её не бывает, а буфер, созданный с
-			// HandleAccess.Compute в access (UAV для компьют-пассов, см. кластерные буферы
-			// DiligentBatchRenderer), тащил её через GetShaderType в дескриптор переменной.
-			// Переменная с compute-стадией в лейауте ГРАФИЧЕСКОГО PSO ломает привязку на Vulkan -
-			// остальные переменные сета молча оставались без дескрипторов (GPURenderInstances
-			// "has never been updated", весь батч-дроу рисовал пустоту).
+			// Compute stage must be masked off: in a graphics PSO layout it silently breaks
+			// binding on Vulkan, leaving the other variables of the set without descriptors.
 			var shaderStages = (dilBuffer.GetShaderType() | DiligentGraphicsUtility.AccessToShaderType(access))
 				& ~ShaderType.Compute;
 			DiligentGraphicsUtility.UpdateVariableDesc(_variablesDesc, name, shaderStages, ref _isDirty);
@@ -135,11 +119,8 @@ public class DiligentMaterial : IMaterialObject
 		}
 	}
 
-	/// <summary>Привязка TLAS (inline ray tracing в пиксельном шейдере - RT-режим Shadow filtering,
-	/// см. FEATURE_RT_SHADOWS в UnlitInstancedPS.hlsl). Стадия строго пиксельная - Compute в
-	/// лейауте графического PSO ломает привязку на Vulkan (см. комментарий в SetBuffer). Дескриптор
-	/// указывает на САМ объект TLAS, так что его пересборка (Rebuild при движении сцены) привязку
-	/// не протухает - то же свойство, что у ProbeRoundGpu.BindAccel.</summary>
+	/// <summary>Binds a TLAS for inline ray tracing; pixel stage only (see SetBuffer). The descriptor
+	/// points at the TLAS object, so rebuilding it does not invalidate the binding.</summary>
 	public void SetAccelStructure(string name, ITopLevelAS tlas)
 	{
 		if (tlas == null)
@@ -152,10 +133,8 @@ public class DiligentMaterial : IMaterialObject
 		DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
 	}
 
-	/// <summary>Привязка «сырого» структурированного Diligent-буфера как SRV пиксельной стадии -
-	/// таблицы атрибутов сцены для inline-трассировки в пиксельном шейдере (_SceneMeshTriangles /
-	/// _SceneInstances у SSR с FEATURE_RT_REFLECTIONS, см. ProbeSceneAccel). Стадия строго пиксельная
-	/// по той же причине, что у <see cref="SetAccelStructure"/>.</summary>
+	/// <summary>Binds a raw structured buffer as a pixel-stage SRV; pixel-only for the same reason as
+	/// <see cref="SetAccelStructure"/>.</summary>
 	public void SetStructuredBufferSrv(string name, IBuffer buffer)
 	{
 		if (buffer == null)
@@ -168,12 +147,8 @@ public class DiligentMaterial : IMaterialObject
 		DiligentGraphicsUtility.UpdatePendingResources(_isDirty, _variables, name, _pendingResources);
 	}
 
-	/// <summary>Привязка МАССИВА текстур в одну шейдерную переменную `Texture2D name[N]` (SRV
-	/// пиксельной стадии) - «bindless»-режим текстур RT-хитов у SSR. Размер массива обязан
-	/// совпадать с N в шейдере, и КАЖДЫЙ слот обязан держать живой view (Vulkan не терпит пустых
-	/// дескрипторов - см. плейсхолдер shadow map-ов): свободные слоты вызывающий заполняет любым
-	/// валидным Texture2D. Стадия строго пиксельная - по той же причине, что у
-	/// <see cref="SetAccelStructure"/>.</summary>
+	/// <summary>Binds a texture array to `Texture2D name[N]`. Count must equal N and every slot needs
+	/// a live view - Vulkan rejects empty descriptors, so pad with any valid texture.</summary>
 	public void SetTextureSrvArray(string name, IReadOnlyList<IGpuTexture> textures)
 	{
 		if (textures == null || textures.Count == 0)
@@ -225,7 +200,6 @@ public class DiligentMaterial : IMaterialObject
 			var viewFlags = access == HandleAccess.Compute ? TextureViewType.UnorderedAccess : TextureViewType.ShaderResource;
 			var view = dilTexture.GetDefaultView(viewFlags);
 			
-			// Если для этой текстуры уже был задан динамический семплер, привязываем его к view
 			if (_pendingResources.TryGetValue(name + "_sampler", out var res) && res is ISampler sampler)
 			{
 				view.SetSampler(sampler);
@@ -243,7 +217,7 @@ public class DiligentMaterial : IMaterialObject
 			return;
 		}
 
-		// DECA_MAT_DIAG=1 - трассировка привязки сэмплеров (диагностика мёртвых ручек bias/aniso).
+		// DECA_MAT_DIAG=1 traces sampler binding.
 		if (Environment.GetEnvironmentVariable("DECA_MAT_DIAG") == "1")
 		{
 			var attached = name.EndsWith("_sampler") &&
@@ -288,8 +262,7 @@ public class DiligentMaterial : IMaterialObject
 		var shaderStages = DiligentGraphicsUtility.AccessToShaderType(access);
 		if (shaderStages == ShaderType.Unknown) shaderStages = ShaderType.Pixel;
 
-		// Сравнение ВМЕСТЕ с Desc: прежний ранний выход по одним лишь стадиям молча глотал НОВЫЙ
-		// дескриптор (смену анизотропии/bias на живом материале) - PSO оставался со старым.
+		// Desc must be part of the check: comparing stages alone swallows aniso/bias changes.
 		if (_immutableSamplers.TryGetValue(name, out var existing) &&
 		    existing.ShaderStages == shaderStages && existing.Desc.Equals(dilSampler.Desc))
 		{
@@ -361,16 +334,8 @@ public class DiligentMaterial : IMaterialObject
 			
 			var psoDesc = psoCreateInfo.PSODesc;
 
-			// Конфигурация immutable-сэмплеров - ЧАСТЬ ИМЕНИ, потому что имя - ключ дискового
-			// PSO-кэша (D3D12 pipeline library, см. DiligentPsoManager). Сэмплеры живут в
-			// рут-сигнатуре внутри кэшированного блоба, и совпадение имени возвращало блоб со
-			// СТАРЫМИ сэмплерами первого запуска: ручки анизотропии и mip bias были мертвы, что ни
-			// делай (замерено: кадры с ANISO=0/1 и MIPBIAS=+4 бит-в-бит, с DECA_PSO_CACHE=0 bias
-			// сразу ожил). Сигнатура строится детерминированно (HashCode рандомизирован на процесс
-			// и в ключ кэша не годится).
-			// Порядок словаря не гарантирован, а сигнатура обязана быть одной и той же у двух
-			// материалов с одним набором сэмплеров - иначе они разъедутся по разным PSO просто
-			// из-за порядка вызовов SetImmutableSampler.
+			// Samplers live in the root signature inside the cached PSO blob, so they must be part
+			// of the PSO name. Sorted and built without HashCode: the key must be deterministic.
 			var samplerSignature = "";
 			foreach (var s in _immutableSamplers.Values.OrderBy(s => s.SamplerOrTextureName, StringComparer.Ordinal))
 			{
@@ -415,25 +380,9 @@ public class DiligentMaterial : IMaterialObject
 			layout.ImmutableSamplers = _immutableSamplers.Values.ToArray();
 			psoDesc.ResourceLayout = layout;
 
-			// ИМЯ PSO - это ключ дискового кэша (D3D12 pipeline library), поэтому оно обязано
-			// описывать конфигурацию и НЕ обязано описывать материал. Имя материала из него убрано
-			// сознательно: пока оно там было, 53 материала сцены давали 53 разных PSO и 53 записи в
-			// библиотеке при том, что различались они ничем - стейт-объект общий, вариантов
-			// пиксельного шейдера четыре (замерено на Sponza: 71 создание, 71 уникальное имя, 2.9 с).
-			//
-			// Ключ обязан покрывать ВСЁ, из чего собран psoCreateInfo, иначе материал молча поедет
-			// чужим пайплайном:
-			//   S  - стейт-объект (растеризация, depth/stencil, форматы таргетов, input layout,
-			//        топология) - по тождеству объекта, см. _baseStateOwner;
-			//   P  - нативные шейдеры по стадиям (варианты кейвордов - это РАЗНЫЕ объекты,
-			//        см. DiligentGraphicsApi.GetOrCreateShader);
-			//   |..- immutable-сэмплеры: они живут в рут-сигнатуре внутри блоба, и раньше совпадение
-			//        имени возвращало блоб со СТАРЫМИ сэмплерами первого запуска - ручки анизотропии
-			//        и mip bias были мертвы (замерено: кадры с ANISO=0/1 и MIPBIAS=+4 бит-в-бит);
-			//   V  - лейаут переменных с их стадиями и типом: набор у живого материала растёт (ресайз
-			//        довешивает _SceneColor), и блоб под старым именем нёс рут-сигнатуру БЕЗ неё -
-			//        библиотека отвергала создание, Diligent возвращал null, а бинд null-PSO ронял
-			//        процесс AV-ом на первом же ресайзе превью.
+			// The PSO name keys the disk cache (D3D12 pipeline library), so it must describe the
+			// configuration and nothing else: state object (S), shaders (P), immutable samplers and
+			// the variable layout (V). Anything omitted makes a material run someone else's PSO.
 			var shaderSignature = "";
 			foreach (var shader in _shaders.OrderBy(s => (int)s.Key))
 			{
@@ -452,10 +401,8 @@ public class DiligentMaterial : IMaterialObject
 			psoDesc.Name = SharePsos ? "Material PSO|" + psoKey : $"{Name} Material PSO|{psoKey}";
 			psoCreateInfo.PSODesc = psoDesc;
 
-			// СТАТИЧЕСКИЕ переменные живут в самом PSO, а не в SRB, - разделяемый PSO означал бы, что
-			// материалы затирают их друг другу. У материалов движка их не бывает (лейаут строится
-			// Mutable по умолчанию, а совпадения по имени принудительно переводятся в Mutable выше),
-			// но проверка стоит копейки, а цена ошибки - ресурс не того материала в кадре.
+			// Static variables live in the PSO, not the SRB: sharing one would let materials
+			// overwrite each other's resources.
 			bool shareable = SharePsos && !allVariables.Any(v => v.Type == ShaderResourceVariableType.Static);
 
 			ReleaseOwnedPipelineState();
@@ -464,11 +411,11 @@ public class DiligentMaterial : IMaterialObject
 				? _api.PsoManager.GetOrCreateSharedGraphicsPipelineState(psoKey, psoCreateInfo)
 				: _api.PsoManager.CreateGraphicsPipelineState(psoCreateInfo);
 
-			// Протухший/несовместимый блоб дискового кэша - не повод ронять процесс: пересоздаём
-			// БЕЗ кэша. null дальше по коду означал бинд null-PSO и AV без единого сообщения.
+			// A stale disk-cache blob must not be fatal: retry without the cache, since a null PSO
+			// would be bound and crash later.
 			if (_pipelineState is null)
 			{
-				Console.WriteLine($"[material] PSO '{psoDesc.Name}': кэш отверг создание - пересоздаю без кэша");
+				Console.WriteLine($"[material] PSO '{psoDesc.Name}': cache rejected creation - recreating without the cache");
 				_pipelineStateIsShared = false;
 				_pipelineState = _api.Device.CreateGraphicsPipelineState(psoCreateInfo);
 			}
@@ -544,7 +491,7 @@ public class DiligentMaterial : IMaterialObject
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public void SetPipelineState(IDeviceContext ctx)
 	{
-		// DECA_MAT_DIAG=2 - трассировка биндов PSO (охота на AV в реплее после ресайза).
+		// DECA_MAT_DIAG=2 traces PSO binds.
 		if (Environment.GetEnvironmentVariable("DECA_MAT_DIAG") == "2")
 		{
 			Console.WriteLine($"[matdiag] SetPipelineState '{Name}' dirty={_isDirty}");
@@ -561,12 +508,7 @@ public class DiligentMaterial : IMaterialObject
 		ctx.CommitShaderResources(_srb, transition);
 	}
 
-	/// <summary>Идемпотентен: повторный вызов ничего не делает. Материал законно оказывается в
-	/// нескольких коллекциях сразу (дефолтный материал модели раздаётся всем её null-материалам),
-	/// и без обнуления полей второй Release дважды диспозил бы нативные SRB/PSO - то есть обращался
-	/// к освобождённой памяти.</summary>
-	/// <summary>Отпускает текущий PSO. Разделяемый (выданный менеджером) НЕ диспозится: его держат
-	/// другие материалы, а живёт он до Dispose самого менеджера.</summary>
+	// Nulls the fields so a repeated Release is a no-op; a shared PSO is never disposed here.
 	private void ReleaseOwnedPipelineState()
 	{
 		if (!_pipelineStateIsShared)
@@ -583,8 +525,7 @@ public class DiligentMaterial : IMaterialObject
 		_srb?.Dispose();
 		_srb = null;
 		ReleaseOwnedPipelineState();
-		// Только СВОИ шейдеры: у шареных владелец другой, и лишний Release здесь - это декремент
-		// чужого счётчика ссылок и падение на следующем владельце (см. IMaterialObject.OwnsShaders).
+		// Owned shaders only: releasing a shared one decrements someone else's refcount.
 		if (OwnsShaders)
 		{
 			foreach (var shader in _shaders.Values) shader.Release();

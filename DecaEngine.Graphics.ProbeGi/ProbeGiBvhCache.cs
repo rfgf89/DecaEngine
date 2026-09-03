@@ -6,27 +6,14 @@ using DecaEngine.Core.Diagnostics;
 
 namespace DecaEngine.Graphics.ProbeGi
 {
-	/// <summary>
-	/// Дисковый кеш BVH проб: файл &lt;модель&gt;.bhv.bin рядом с самой моделью. Сборка BVH - чистый
-	/// CPU по всем треугольникам сцены, и на ассете уровня Sponza (~7.7 млн треугольников) она стоит
-	/// ДЕСЯТКИ СЕКУНД при каждом открытии модели. Геометрия при этом не меняется, так что второй и
-	/// последующие разы её можно просто прочитать с диска.
-	///
-	/// Валидность: файл привязан к (версия формата, размер и время модификации файла модели). Любое
-	/// расхождение - кеш игнорируется и перестраивается; порченый/обрезанный файл тоже, поэтому
-	/// чтение обёрнуто в try (кеш - оптимизация, а не источник правды).
-	/// </summary>
+	/// <summary>On-disk BVH cache keyed by format version plus model file size and timestamp.</summary>
 	public static class ProbeGiBvhCache
 	{
 		private const uint Magic = 0x48564842; // "BHVH"
 
-		/// <summary>Версия формата - поднимать при любом изменении раскладки полей ниже, иначе старый
-		/// файл прочитается как мусорная геометрия. v2: массивы пишутся БЛОКАМИ (побайтовый образ
-		/// структур), а не по одному float - на дереве Sponza это 884 МБ, и поэлементный BinaryWriter
-		/// читал их почти пять секунд, съедая весь смысл кеша.</summary>
-		private const int Version = 6; // v6: шероховатость треугольника (бывший Pad4); v5: вершинные окто-нормали (80 байт); v4: металличность; v3: UV/TextureIndex/HitTextureKeys
+		// Bump on any layout change below: an old file would be read as garbage geometry.
+		private const int Version = 6;
 
-		/// <summary>Блочная запись массива blittable-структур: один Write вместо N*полей.</summary>
 		private static void WriteArray<T>(Stream stream, BinaryWriter writer, T[] values) where T : unmanaged
 		{
 			writer.Write(values.Length);
@@ -36,9 +23,7 @@ namespace DecaEngine.Graphics.ProbeGi
 			}
 		}
 
-		/// <summary>Блочное чтение массива blittable-структур. ReadExactly - потому что Read с
-		/// большого файла вправе вернуть меньше запрошенного, и частично заполненный массив выглядел
-		/// бы как валидное (но битое) дерево.</summary>
+		// ReadExactly, not Read: a short read would look like a valid but corrupt tree.
 		private static T[] ReadArray<T>(Stream stream, BinaryReader reader) where T : unmanaged
 		{
 			var count = reader.ReadInt32();
@@ -56,10 +41,9 @@ namespace DecaEngine.Graphics.ProbeGi
 			return values;
 		}
 
-		/// <summary>Путь кеша для модели: рядом с ней, суффиксом (Sponza.gltf -&gt; Sponza.gltf.bhv.bin).</summary>
+		/// <summary>Cache path for a model: the model path plus a .bhv.bin suffix.</summary>
 		public static string GetCachePath(string modelPath) => modelPath + ".bhv.bin";
 
-		/// <summary>Отпечаток исходника - по нему кеш признаётся годным.</summary>
 		private static bool TryGetStamp(string modelPath, out long length, out long modifiedTicks)
 		{
 			length = 0;
@@ -92,8 +76,7 @@ namespace DecaEngine.Graphics.ProbeGi
 
 			var cachePath = GetCachePath(modelPath);
 
-			// Пишем во временный файл и переименовываем: прерванная запись (закрыли редактор на
-			// середине) иначе оставила бы обрезанный файл, который следующий запуск считал бы своим.
+			// Write-then-rename: an interrupted write would otherwise leave a truncated cache file.
 			var tempPath = cachePath + ".tmp";
 
 			try
@@ -134,12 +117,11 @@ namespace DecaEngine.Graphics.ProbeGi
 				}
 				catch (Exception)
 				{
-					// Уборка мусора - не повод шуметь ещё раз.
 				}
 			}
 		}
 
-		/// <summary>Читает кеш, если он есть и совпадает по отпечатку. null - строить заново.</summary>
+		/// <summary>Reads the cache if present and current; null means the BVH must be rebuilt.</summary>
 		public static ProbeGiBaker.BvhCacheData? TryRead(string modelPath)
 		{
 			var cachePath = GetCachePath(modelPath);

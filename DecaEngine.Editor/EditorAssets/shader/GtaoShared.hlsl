@@ -1,94 +1,63 @@
-// Константы и общая математика GTAO, разделяемые главным пассом (GtaoCommon.hlsl), построителем
-// мип-цепочки глубин (GtaoDepthMipPS.hlsl) и денойзером (GtaoDenoisePS.hlsl). Значения - дефолты
-// XeGTAO (см. XeGTAO.h, XE_GTAO_DEFAULT_*); держим их в одном месте, потому что фильтр мипов
-// обязан пользоваться ТЕМ ЖЕ радиусом влияния, что и сам пасс: он взвешивает глубины по тому же
-// falloff, и разъедься эти два радиуса - мипы начали бы усреднять то, чего пасс на этой дальности
-// уже не видит.
+// Shared GTAO constants (XeGTAO XE_GTAO_DEFAULT_*): the depth-mip filter must use the
+// same effect radius as the main pass, so they live in one place.
 
 static const float GtaoPI = 3.14159265359;
 static const float GtaoHalfPI = 1.57079632679;
 
-// Фиксированный FOV 45 градусов превью (CameraData в ModelViewportEnvironment) и его near.
+// Preview camera is a fixed 45-degree FOV (ModelViewportEnvironment.CameraData).
 static const float GtaoTanHalfFov = 0.41421356;
 static const float GtaoNearPlane = 0.05;
 
-// Потолок вью-спейсной глубины - предел half (таргеты цепочки RGBA16F), см.
-// GtaoDepthPrefilterCommon.hlsl.
+// View-space depth ceiling: the half limit, the mip chain targets are RGBA16F.
 static const float GtaoMaxViewDepth = 65504.0;
 
-// Сколько звеньев в цепочке глубин (mip 0 - полное разрешение). Пять - как в XeGTAO
-// (XE_GTAO_DEPTH_MIP_LEVELS); дальше уменьшать нечего, шаг сэмплов такой дальности уже не
-// достигает.
+// Depth chain length including mip 0, matching XE_GTAO_DEPTH_MIP_LEVELS.
 #define GTAO_DEPTH_MIP_LEVELS 5
 
-// Радиус эффекта задаётся не «как есть», а с поправкой: экранное пространство систематически
-// недооценивает заслонённость (за силуэтом нет данных), и множитель компенсирует это смещение -
-// XeGTAO подобрал его подгонкой под трассированный ground truth.
+// Compensates for screen space under-estimating occlusion; fitted against ray-traced truth.
 static const float GtaoRadiusMultiplier = 1.457;
 
-// Доля радиуса, на которой вес сэмпла спадает с единицы до нуля: вес держится единицей до
-// 38.5% радиуса и линейно гаснет к самому радиусу.
+// Sample weight stays 1 up to 38.5% of the radius, then falls linearly to zero at it.
 static const float GtaoFalloffRange = 0.615;
 
-// Распределение шагов вдоль среза: >1 стягивает сэмплы к точке, где контактное затемнение
-// важнее всего.
+// Step distribution along a slice: >1 pulls samples towards the contact-shadow end.
 static const float GtaoSampleDistributionPower = 2.0;
 
-// «Толщинная» эвристика XeGTAO: сэмпл, ушедший ЗА точку по глубине, теряет вес быстрее бокового -
-// компенсация того, что экранный горизонт неявно считает любой окклюдер бесконечно толстым.
-// Дефолт XeGTAO - ноль (эвристика выключена, ожидаемый диапазон [0, 0.7]).
+// XeGTAO thin-occluder heuristic, off by default; expected range [0, 0.7].
 static const float GtaoThinOccluderCompensation = 0.0;
 
-// Контраст итоговой видимости (аналог Intensity у SSAO). Перебивается ручкой aoPower окна Graphics.
+// Final visibility contrast; overridden by the Graphics window aoPower knob.
 static const float GtaoFinalValuePower = 2.2;
 
-// Смещение при выборе мипа по длине шага: чем больше, тем позже включаются грубые уровни -
-// главный компромисс «пропускная способность памяти против временной стабильности и тонких
-// объектов».
+// Mip selection bias: higher delays coarse mips, trading bandwidth for thin-object detail.
 static const float GtaoDepthMipSamplingOffset = 3.30;
 
-// Видимость до денойза может перескочить единицу (усреднится обратно только после фильтрации),
-// поэтому в UNORM8 она пакуется поделённой на этот множитель, а денойзер домножает обратно.
+// Pre-denoise visibility can exceed 1, so UNORM8 storage divides by this and the denoiser undoes it.
 static const float GtaoOcclusionTermScale = 1.5;
 
-// Ближе этого расстояния (в пикселях) сэмпл не несёт информации - зато исправно ловит квантование
-// глубины и поднимает горизонт на ровной поверхности.
+// Below this pixel distance a sample only picks up depth quantisation, not occlusion.
 static const float GtaoPixelTooCloseThreshold = 1.3;
 
-// Сила размытия денойзера: вес центрального пикселя относительно соседей (XeGTAO DenoiseBlurBeta).
+// Denoiser blur strength: centre pixel weight vs neighbours (XeGTAO DenoiseBlurBeta).
 static const float GtaoDenoiseBlurBeta = 1.2;
 
-// Легаси-режим (мировой радиус никто не пушил - probe без модели, сторонние потребители): радиус
-// живёт в долях высоты экрана.
+// Legacy mode with no world radius pushed: radius as a fraction of screen height.
 static const float GtaoLegacyScreenRadius = 0.06;
 
-// Потолок экранного радиуса: при экстремальном зуме иначе шаг сэмплов разогнало бы на весь экран,
-// а цена кадра - вместе с ним.
+// Screen radius ceiling: extreme zoom would otherwise stretch the sample step screen-wide.
 static const float GtaoMaxScreenRadiusFraction = 0.25;
 
-// Нижний предел видимости по умолчанию: экранный AO не вправе гасить свет в ноль. Перебивается
-// ручкой aoFloor окна Graphics.
+// Default visibility floor; overridden by the Graphics window aoFloor knob.
 static const float GtaoDefaultFloor = 0.12;
 
-/// Размер пикселя в мировых единицах на глубине z: viewX = ndc.x * tan(fov/2) * aspect * z, шаг
-/// ndc.x на пиксель равен 2/width, а aspect = width/height - ширина сокращается, остаётся высота.
+// Pixel size in world units at view depth z; width cancels out, only height remains.
 float GtaoPixelWorldSize(float viewZ, float viewportHeight)
 {
     return 2.0 * GtaoTanHalfFov * viewZ / max(viewportHeight, 1.0);
 }
 
-/// Мировой радиус влияния AO на глубине viewZ.
-///
-/// worldRange > 0 - радиус задан в мировых единицах (пушится после кадрирования модели, см.
-/// SsaoPassResources.SetWorldRange): контактная тень не схлопывается при приближении камеры.
-/// Сверху он всё равно ограничен экранным потолком, причём ИМЕННО как мировая величина, а не
-/// зажатием одного лишь шага сэмплов: falloff считается от того же радиуса, и зажми мы только
-/// шаг - сэмплы попадали бы в зону полного веса, которой на экране уже нет.
-///
-/// worldRange == 0 - легаси: радиус в долях высоты экрана, пересчитанный в мир на этой глубине.
-/// Раньше в этом режиме радиус поиска и дальность falloff задавались НЕЗАВИСИМО (0.06 высоты
-/// экрана против 0.22 глубины точки), то есть falloff покрывал примерно вчетверо большее
-/// расстояние, чем куда вообще дотягивались сэмплы, и просто не срабатывал.
+// AO world-space effect radius; the screen ceiling clamps the radius itself, not just the
+// sample step, because falloff is derived from the same radius.
 float GtaoEffectRadius(float viewZ, float viewportHeight, float worldRange)
 {
     float pixelWorldSize = GtaoPixelWorldSize(viewZ, viewportHeight);
@@ -98,21 +67,14 @@ float GtaoEffectRadius(float viewZ, float viewportHeight, float worldRange)
         : GtaoLegacyScreenRadius * viewportHeight * pixelWorldSize;
 }
 
-/// Быстрый обратный корень через манипуляцию экспонентой (Drobot2014a) - точности хватает
-/// аргументу FastACos, зато нет полноценного sqrt в самом горячем цикле.
+// Exponent-hack sqrt (Drobot2014a): accurate enough for FastACos, no sqrt in the hot loop.
 float GtaoFastSqrt(float x)
 {
     return asfloat(0x1fbd1df5 + (asint(x) >> 1));
 }
 
-/// acos с полиномиальным приближением: вход [-1, 1], выход [0, PI]. В главном цикле acos зовётся
-/// по два раза на срез, и точный вариант там заметно дороже, чем стоит его точность.
-///
-/// Аргумент КЛАМПИТСЯ, и это не перестраховка: на вход идёт dot двух нормализованных векторов,
-/// который в fp32 регулярно выходит за единицу на единицы ulp. GtaoFastSqrt - битовый трюк над
-/// экспонентой, у него нет понятия «корень из отрицательного»: он молча вернёт отрицательное
-/// число, res сменит знак, и угол горизонта уедет в другую сторону. В XeGTAO кламп не нужен,
-/// потому что там та же арифметика идёт в half - у неё до единицы попросту не хватает разрядов.
+// Polynomial acos, input [-1, 1] -> [0, PI]. The clamp is required: fp32 dots overshoot 1 by
+// a few ulp and GtaoFastSqrt would silently return a negative, flipping the horizon angle.
 float GtaoFastACos(float inX)
 {
     float x = min(abs(inX), 1.0);
@@ -121,9 +83,8 @@ float GtaoFastACos(float inX)
     return inX >= 0.0 ? res : GtaoPI - res;
 }
 
-/// «Рёбра» LRTB - мера того, лежит ли сосед на той же поверхности, что и центр (1 - лежит,
-/// 0 - обрыв глубины). Ключевое здесь - поправка на СКЛОН: без неё честный наклон плоскости
-/// неотличим от силуэта, и на скользящем полу все четыре соседа выглядят «чужими».
+// LRTB edges: 1 if the neighbour shares the surface, 0 at a depth break. The slope
+// correction is what keeps a grazing plane from reading as a silhouette.
 float4 GtaoCalculateEdges(float centerZ, float leftZ, float rightZ, float topZ, float bottomZ)
 {
     float4 edgesLRTB = float4(leftZ, rightZ, topZ, bottomZ) - centerZ;
@@ -135,9 +96,7 @@ float4 GtaoCalculateEdges(float centerZ, float leftZ, float rightZ, float topZ, 
     return saturate(1.25 - edgesLRTB / (centerZ * 0.011));
 }
 
-/// Упаковка рёбер в один UNORM8-канал: по 2 бита на ребро, то есть четыре градации (0, 1/3, 2/3, 1) -
-/// достаточно, чтобы денойзер получал плавные переходы, и ровно столько, сколько влезает рядом с
-/// самой видимостью в RGBA8-таргете (отдельный таргет под рёбра не заводим).
+// Edges packed into one UNORM8 channel, 2 bits each: all that fits beside visibility in RGBA8.
 float GtaoPackEdges(float4 edgesLRTB)
 {
     edgesLRTB = round(saturate(edgesLRTB) * 2.9);

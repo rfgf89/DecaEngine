@@ -4,16 +4,7 @@ using System.Numerics;
 
 namespace DecaEngine.Core;
 
-/// <summary>
-/// Матрицы и плоскости на чистой System.Numerics.
-///
-/// Лежал в DecaEngine.Graphics.Diligent, хотя ничего от Diligent тут нет, и внутри самого бэкенда
-/// им не пользовался никто - звали его только из редактора, причём всегда с полным именем, потому
-/// что в редакторе был СВОЙ MathUtils с ToEulerAngles. Оба слились сюда.
-///
-/// Из-за прежнего места <see cref="TransformSystem"/> в Core не мог сослаться на CreateTrs и
-/// держал собственную копию с комментарием «то же самое, но Core не видит графику».
-/// </summary>
+/// <summary>Matrix and plane helpers on plain System.Numerics.</summary>
 public static class MathUtils
 {
 	public static Matrix4x4 CreateTrs(Vector3 translate, Quaternion rotation, Vector3 scale)
@@ -83,8 +74,7 @@ public static class MathUtils
 		return corners;
 	}
 
-	/// <summary>Кватернион в углы Эйлера - для полей поворота в инспекторе: править кватернион
-	/// руками невозможно.</summary>
+	/// <summary>Quaternion to Euler angles, for inspector rotation fields.</summary>
 	public static Vector3 ToEulerAngles(Quaternion q)
 	{
 		Vector3 angles = new();

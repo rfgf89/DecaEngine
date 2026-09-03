@@ -8,12 +8,7 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Проверка рэгдолла на реальном риге. Три вопроса, и все три - «молчаливые»: кинематический
-/// рэгдолл может не следовать за анимацией (и персонаж поедет отдельно от своей физики), суставы
-/// могут расходиться (конечности отрываются), а динамический рэгдолл - взорваться, разогнав тела в
-/// бесконечность. Ни одно из трёх не даёт исключения; всё это видно только числами.
-/// </summary>
+/// <summary>Ragdoll checks on a real rig: kinematic tracking, joint limits and dynamic stability.</summary>
 public static class RagdollProbe
 {
 	public static void Run(PreparedSkeleton skeleton, OzzPose pose, Matrix4x4[] models)
@@ -21,7 +16,7 @@ public static class RagdollProbe
 		var description = BuildDescription(skeleton);
 		if (description.Count < 4)
 		{
-			Console.WriteLine("[probe] ragdoll: риг не опознан - пропущено");
+			Console.WriteLine("[probe] ragdoll: rig not recognised - skipped");
 			return;
 		}
 
@@ -35,8 +30,7 @@ public static class RagdollProbe
 		var floor = world.AddBox(new Vector3(400f, 4f, 400f));
 		world.AddStatic(new RigidPose(new Vector3(0f, -2f, 0f)), floor);
 
-		// Мировые матрицы джойнтов = модельные: трансформ сущности единичный, персонаж и так стоит
-		// над полом (bind-поза лисы держит стопы на y~23).
+		// Joint world matrices equal model ones here: the entity transform is identity.
 		var jointWorld = (Matrix4x4[])models.Clone();
 		MarkHinges(description, skeleton, jointWorld);
 		var ragdoll = Ragdoll.Build(world, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(description),
@@ -49,9 +43,7 @@ public static class RagdollProbe
 		ProbeSceneScale(skeleton, models);
 	}
 
-	/// <summary>Те же шарниры, что ставит редактор (см. AnimationDriver.MarkHingeBones), по именам
-	/// костей лисы: проба, гоняющая рэгдолл без шарниров, проверяла бы не тот рэгдолл, который живёт
-	/// в сцене.</summary>
+	// Must mirror AnimationDriver.MarkHingeBones, else this probes a different ragdoll.
 	private static void MarkHinges(List<RagdollBoneDesc> description, PreparedSkeleton skeleton,
 		Matrix4x4[] jointWorld)
 	{
@@ -83,14 +75,8 @@ public static class RagdollProbe
 		}
 	}
 
-	/// <summary>
-	/// Шарнир колена - ПАРОЙ: голени полсекунды принудительно выкручивают к прямой и дальше, в
-	/// обратный сгиб. С шарниром знаковый угол сгиба обязан остаться у предела разгибания
-	/// (положительным, около пяти градусов запаса до прямой), без шарнира - уйти в уверенный минус:
-	/// конус 120° разгибание через прямую разрешает. Одно число с шарниром ничего не доказывает -
-	/// «не вывернулось» бывает и у сустава, который просто никто не выкручивал.
-	/// Без гравитации: меряется сустав, а не падение.
-	/// </summary>
+	// Run as a PAIR (hinged and free): one number alone cannot tell "held" from "never twisted".
+	// Gravity off - this measures the joint, not a fall.
 	private static void ProbeKneeHinge(PreparedSkeleton skeleton, Matrix4x4[] models)
 	{
 		int knee = skeleton.FindJoint("b_LeftLeg02_016");
@@ -146,12 +132,11 @@ public static class RagdollProbe
 
 			var body = world.Simulation.Bodies[ragdoll.BodyOf(kneeBone)];
 
-			// Полсекунды, НЕ дольше: знаковая метрика меряет угол в диапазоне ±180°, и свободное
-			// колено, выкручиваемое дольше, прокручивается на почти полный оборот - знак замыкается
-			// обратно в плюс, и вывернутый сустав отчитывается «согнутым правильно».
+			// Half a second, NO longer: the signed angle wraps at +-180 deg and a free knee twisted
+			// further wraps back to positive, reporting an inverted joint as correctly bent.
 			for (int i = 0; i < 60; i++)
 			{
-				// Минус вокруг оси сборки - разгибание: от позы сборки к прямой и дальше в выворот.
+				// Negative around the assembly axis extends the joint towards and past straight.
 				body.Velocity.Angular = -axis * 6f;
 				body.Velocity.Linear = Vector3.Zero;
 				body.Awake = true;
@@ -179,35 +164,22 @@ public static class RagdollProbe
 			ragdoll.Destroy();
 		}
 
-		// Граница - ЗНАК: суть пары «прошло колено через прямую или нет», а не глубина выворота
-		// (её задаёт борьба принудительной скорости с пружинами, и она деталь постановки). С
-		// шарниром сгиб обязан остаться положительным, без - уйти в минус: без второй ветки «не
-		// вывернулось» неотличимо от «нечем было выворачивать».
+		// The verdict is the SIGN, not the depth: depth depends on the forcing setup.
 		bool hingedOk = hingedBend > 0f;
 		bool freeInverted = freeBend < -5f * MathF.PI / 180f;
 
-		Console.WriteLine($"[probe] ragdoll: шарнир колена - выкручивание к прямой: с шарниром " +
-			$"{hingedBend * 180f / MathF.PI:0.#}°, без {freeBend * 180f / MathF.PI:0.#}° " +
-			$"{(hingedOk && freeInverted ? "ДЕРЖИТ OK" : "НЕ ДЕРЖИТ/ПАРА НЕ РАЗОШЛАСЬ")}");
+		Console.WriteLine($"[probe] ragdoll: knee hinge - extension past straight: hinged " +
+			$"{hingedBend * 180f / MathF.PI:0.#}°, free {freeBend * 180f / MathF.PI:0.#}° " +
+			$"{(hingedOk && freeInverted ? "HOLDS OK" : "DOES NOT HOLD/PAIR DID NOT DIVERGE")}");
 	}
 
-	/// <summary>
-	/// Тот же рэгдолл, но в МАСШТАБЕ СЦЕНЫ.
-	///
-	/// Всё остальное здесь считает лису в её собственных единицах (габарит ~160), а в демо-сцене она
-	/// стоит с масштабом сущности 0.01, то есть её кости - это капсулы радиусом 2 сантиметра, и
-	/// падают они в поле 9.81 м/с². Относительно собственного размера это в сто раз более резкое
-	/// падение, чем в модельных единицах, а настройки суставов (жёсткости пружин, пороги засыпания,
-	/// спекулятивная маржа) заданы АБСОЛЮТНЫМИ числами и вместе с масштабом не едут.
-	///
-	/// Проверка сравнивает два масштаба между собой, а не судит один: «рэгдолл успокоился» само по
-	/// себе ничего не значит без второй точки, потому что порог успокоения зависит от размера.
-	/// </summary>
+	// The same ragdoll at SCENE scale. Joint settings (spring stiffness, sleep thresholds,
+	// speculative margin) are ABSOLUTE numbers and do not scale with the entity, so the two scales
+	// are compared against each other rather than judged separately.
 	private static void ProbeSceneScale(PreparedSkeleton skeleton, Matrix4x4[] models)
 	{
-		// Третий прогон - НАМЕРЕННО без предела скручивания. Без него метрика слепа: «50° при пределе
-		// 50°» одинаково выглядит и у работающего ограничителя, и у рэгдолла, который просто некуда
-		// было скручивать. Пара с выключенным пределом показывает, что мерить есть что.
+		// The third run deliberately drops the twist limit: without it "50 deg at a 50 deg limit"
+		// looks the same whether the limiter works or there was nothing to twist.
 		foreach (var (scale, twistLimited) in new[] { (1f, true), (0.01f, true), (0.01f, false) })
 		{
 			var description = BuildDescription(skeleton);
@@ -260,48 +232,34 @@ public static class RagdollProbe
 			int overlaps = CountSelfOverlaps(world, ragdoll, description);
 			float worstTwist = WorstTwist(world, ragdoll, description, restRelative, restAxis);
 
-			// Разлёт меряется ОТНОСИТЕЛЬНО начального габарита: у рэгдолла, оставшегося рэгдоллом,
-			// он около единицы, а у разлетевшегося растёт в разы. Абсолютное число тут бессмысленно -
-			// оно и есть масштаб, который проверяется.
+			// Measured RELATIVE to the initial extent; an absolute number would just be the scale.
 			float growth = initialSpread > 1e-6f ? finalSpread / initialSpread : 0f;
 			bool intact = growth < 1.5f && finalSpeed <= impactSpeed;
 
 			float twistDegrees = worstTwist * 180f / MathF.PI;
 			string twistVerdict = twistLimited
-				? twistDegrees <= TwistLimitDegrees + TwistToleranceDegrees ? "OK" : "ВЫВОРАЧИВАЕТСЯ"
+				? twistDegrees <= TwistLimitDegrees + TwistToleranceDegrees ? "OK" : "TWISTS OUT"
 				: twistDegrees > TwistLimitDegrees + TwistToleranceDegrees
-					? "(без предела - и есть что ограничивать)"
-					: "(без предела, но и так не крутит - ПРОВЕРКА СЛЕПАЯ)";
+					? "(no limit - so there is something to limit)"
+					: "(no limit, yet it does not twist - CHECK IS BLIND)";
 
-			Console.WriteLine($"[probe] ragdoll: масштаб {scale}, скручивание " +
-				$"{(twistLimited ? $"±{TwistLimitDegrees}°" : "без предела")} - габарит " +
-				$"{initialSpread:0.###} -> {finalSpread:0.###} (×{growth:0.##}), скорость " +
-				$"{impactSpeed:0.###} -> {finalSpeed:0.###} {(intact ? "OK" : "РАЗЛЕТЕЛСЯ")}, " +
-				$"самопересечений {overlaps} {(overlaps == 0 ? "OK" : "СКЛАДЫВАЕТСЯ СКВОЗЬ СЕБЯ")}, " +
-				$"худшее скручивание {twistDegrees:0.#}° {twistVerdict}");
+			Console.WriteLine($"[probe] ragdoll: scale {scale}, twist " +
+				$"{(twistLimited ? $"±{TwistLimitDegrees}°" : "no limit")} - extent " +
+				$"{initialSpread:0.###} -> {finalSpread:0.###} (×{growth:0.##}), speed " +
+				$"{impactSpeed:0.###} -> {finalSpeed:0.###} {(intact ? "OK" : "BLEW APART")}, " +
+				$"self-overlaps {overlaps} {(overlaps == 0 ? "OK" : "FOLDS THROUGH ITSELF")}, " +
+				$"worst twist {twistDegrees:0.#}° {twistVerdict}");
 		}
 	}
 
-	/// <summary>Предел скручивания, который проба ставит рэгдоллу (см. BuildDescription), градусы.</summary>
+	// Twist limit this probe applies to the ragdoll, in degrees.
 	private const float TwistLimitDegrees = 50f;
 
-	/// <summary>
-	/// Допуск сверх предела. Не придирка: <see cref="TwistLimit"/> - это ПРУЖИНА, а не стенка. Она
-	/// возвращает сустав в разрешённый диапазон с конечной жёсткостью, и на ударе о пол сустав
-	/// законно проскакивает предел на несколько градусов. Ноль здесь означал бы проверку, падающую
-	/// на исправном ограничителе.
-	/// </summary>
+	// The twist limit is a SPRING, not a wall: a joint legitimately overshoots it on impact.
 	private const float TwistToleranceDegrees = 15f;
 
-	/// <summary>
-	/// Худшее скручивание кости вокруг собственной длинной оси относительно родителя.
-	///
-	/// Меряется swing-twist разложением: относительный поворот раскладывается на «куда отклонилась»
-	/// и «на сколько провернулась вокруг себя», и берётся вторая часть. Именно её конус
-	/// (<see cref="SwingLimit"/>) не ограничивает вовсе - кость может провернуться на любой угол,
-	/// оставаясь внутри разрешённого конуса, и на картинке это выглядит как вывернутая лапа при
-	/// формально соблюдённых ограничениях.
-	/// </summary>
+	// Worst twist of a bone around its own long axis relative to its parent, via swing-twist
+	// decomposition. The swing cone does not constrain twist at all.
 	private static float WorstTwist(PhysicsWorld world, Ragdoll ragdoll, List<RagdollBoneDesc> description,
 		Quaternion[] restRelative, Vector3[] restAxis)
 	{
@@ -316,21 +274,17 @@ public static class RagdollProbe
 
 			var relative = RelativeRotation(world, ragdoll, description[i].Parent, i);
 
-			// Поворот ОТ ПОЗЫ СБОРКИ, а не от нуля. Первая версия меряла от нуля и показывала 117°
-			// на исправном ограничителе: в позе сборки кость уже повёрнута относительно родителя, и
-			// этот постоянный сдвиг целиком уезжал в «скручивание».
+			// Measured FROM THE ASSEMBLY POSE, not from zero: bones are already rotated there.
 			var delta = Quaternion.Concatenate(Quaternion.Conjugate(restRelative[i]), relative);
 
-			// Swing-twist вокруг ФИКСИРОВАННОЙ оси - оси кости в позе сборки. Брать ось из текущего
-			// поворота нельзя: разложение тогда определено относительно самого себя, и «скручивание»
-			// смешивается с отклонением.
+			// Around a FIXED axis (the assembly-pose bone axis): taking it from the current
+			// rotation would define the decomposition relative to itself.
 			var axis = restAxis[i];
 			float projection = delta.X * axis.X + delta.Y * axis.Y + delta.Z * axis.Z;
 
 			float twist = 2f * MathF.Atan2(projection, delta.W);
 
-			// Приведение в (-π, π]: 2*atan2 даёт диапазон вдвое шире, и поворот на 350° иначе
-			// читался бы как 350°, а не как -10°.
+			// Wrap into (-pi, pi]: 2*atan2 spans twice that, so 350 deg would not read as -10.
 			twist = MathF.IEEERemainder(twist, MathF.Tau);
 
 			worst = MathF.Max(worst, MathF.Abs(twist));
@@ -339,7 +293,6 @@ public static class RagdollProbe
 		return worst;
 	}
 
-	/// <summary>Поворот кости в пространстве её родителя.</summary>
 	private static Quaternion RelativeRotation(PhysicsWorld world, Ragdoll ragdoll, int parent, int child)
 	{
 		var parentPose = world.Simulation.Bodies[ragdoll.BodyOf(parent)].Pose;
@@ -348,8 +301,7 @@ public static class RagdollProbe
 		return Quaternion.Concatenate(childPose.Orientation, Quaternion.Conjugate(parentPose.Orientation));
 	}
 
-	/// <summary>Снимок позы сборки: относительные повороты и оси костей. Точка отсчёта для замера
-	/// скручивания - предел в связи задан ОТ НЕЁ же.</summary>
+	// Assembly-pose snapshot: the reference the joint's own twist limit is defined against.
 	private static (Quaternion[] Relative, Vector3[] Axis) CaptureRest(PhysicsWorld world, Ragdoll ragdoll,
 		List<RagdollBoneDesc> description)
 	{
@@ -368,7 +320,6 @@ public static class RagdollProbe
 
 			relative[i] = RelativeRotation(world, ragdoll, description[i].Parent, i);
 
-			// Длинная ось капсулы ребёнка, выраженная в пространстве родителя.
 			var bone = Vector3.Transform(Vector3.UnitY, relative[i]);
 			float length = bone.Length();
 			axis[i] = length > 1e-5f ? bone / length : Vector3.UnitY;
@@ -377,18 +328,8 @@ public static class RagdollProbe
 		return (relative, axis);
 	}
 
-	/// <summary>
-	/// Сколько НЕСМЕЖНЫХ костей проникают друг в друга глубже допуска.
-	///
-	/// Это и есть числовой ответ на «должна ли кукла складываться сквозь себя». Смежные (родитель и
-	/// ребёнок) пересекаются по построению - у них общий сустав, - и они не считаются. А голова,
-	/// лежащая ВНУТРИ туловища, или лапа, прошедшая сквозь бок, - это ровно то, что видно на
-	/// картинке как «свернулся в узел», и никакой другой метрикой это не ловится: габарит у
-	/// сложившегося персонажа как раз маленький, скорости нулевые, всё «успокоилось».
-	///
-	/// Расстояние - между ОТРЕЗКАМИ капсул, а не между центрами: две длинные кости, лежащие
-	/// параллельно бок о бок, по центрам далеки, а пересекаются всей длиной.
-	/// </summary>
+	// Counts NON-ADJACENT bones interpenetrating; adjacent ones share a joint by construction.
+	// Distance is between capsule SEGMENTS, not centers: parallel bones overlap along their length.
 	private static int CountSelfOverlaps(PhysicsWorld world, Ragdoll ragdoll,
 		List<RagdollBoneDesc> description)
 	{
@@ -406,9 +347,8 @@ public static class RagdollProbe
 				var (a0, a1, ra) = Segment(world, ragdoll, description, i);
 				var (b0, b1, rb) = Segment(world, ragdoll, description, j);
 
-				// Допуск в четверть суммы радиусов: контакты Bepu живут с небольшим постоянным
-				// проникновением (contact softness), и нулевой допуск считал бы нормальное касание
-				// лежащих рядом костей за проникновение.
+				// Bepu contacts sit at a small steady penetration, so zero tolerance would
+				// count normal touching as overlap.
 				float allowed = (ra + rb) * 0.75f;
 
 				if (SegmentDistance(a0, a1, b0, b1) < allowed)
@@ -421,7 +361,6 @@ public static class RagdollProbe
 		return count;
 	}
 
-	/// <summary>Отрезок оси капсулы кости в мире плюс её радиус.</summary>
 	private static (Vector3 A, Vector3 B, float Radius) Segment(PhysicsWorld world, Ragdoll ragdoll,
 		List<RagdollBoneDesc> description, int bone)
 	{
@@ -438,14 +377,12 @@ public static class RagdollProbe
 			halfLength = capsule.HalfLength;
 		}
 
-		// Капсула Bepu лежит вдоль собственной Y.
+		// A Bepu capsule lies along its own Y.
 		var axis = Vector3.Transform(Vector3.UnitY, pose.Orientation) * halfLength;
 		return (pose.Position - axis, pose.Position + axis, radius);
 	}
 
-	/// <summary>Кратчайшее расстояние между двумя отрезками. Перебором по параметру: отрезков здесь
-	/// два десятка, точная формула с вырожденными случаями стоила бы больше внимания, чем экономит
-	/// времени.</summary>
+	// Sampled rather than solved: with ~20 segments the closed form is not worth its edge cases.
 	private static float SegmentDistance(Vector3 a0, Vector3 a1, Vector3 b0, Vector3 b1)
 	{
 		const int steps = 16;
@@ -464,8 +401,6 @@ public static class RagdollProbe
 		return best;
 	}
 
-	/// <summary>Габарит рэгдолла - максимальное расстояние между телами. Именно он растёт у
-	/// разлетающегося и стоит на месте у целого.</summary>
 	private static float Spread(PhysicsWorld world, Ragdoll ragdoll)
 	{
 		float worst = 0f;
@@ -484,12 +419,7 @@ public static class RagdollProbe
 		return worst;
 	}
 
-	/// <summary>
-	/// Кинематический режим: тела обязаны ехать за позой. Проверяется тем, что поза, ПРОЧИТАННАЯ
-	/// обратно из тел, совпадает с той, которую в них гнали. Расхождение здесь означает ошибку в
-	/// переводе «джойнт -> тело» (капсула лежит вдоль своей Y, джойнт смотрит куда угодно), и
-	/// проявляется она как персонаж, у которого физика живёт отдельно от картинки.
-	/// </summary>
+	// Kinematic mode: a mismatch here means a bad joint -> body transform conversion.
 	private static void ProbeKinematicTracking(PhysicsWorld world, Ragdoll ragdoll, Matrix4x4[] jointWorld,
 		Matrix4x4[] reference)
 	{
@@ -510,24 +440,14 @@ public static class RagdollProbe
 				Vector3.Distance(readBack[joint].Translation, reference[joint].Translation));
 		}
 
-		Console.WriteLine($"[probe] ragdoll: кинематическое слежение - максимальное расхождение " +
-			$"{worst:0.####} {(worst < 0.05f ? "OK" : "НЕ СЛЕДУЕТ ЗА ПОЗОЙ")}");
+		Console.WriteLine($"[probe] ragdoll: kinematic tracking - worst mismatch " +
+			$"{worst:0.####} {(worst < 0.05f ? "OK" : "DOES NOT FOLLOW THE POSE")}");
 	}
 
-	/// <summary>
-	/// Слежение на кадре МНОГО КОРОЧЕ шага симуляции (1/600 против 1/120) - редактор на высоком FPS.
-	/// Скорость, посчитанная как «дельта / кадр», интегрируется целым шагом и проезжает в
-	/// (шаг/кадр) раз дальше нужного; следующий кадр исправляет перелёт новым перелётом. При
-	/// кадре короче ПОЛОВИНЫ шага коэффициент перелёта больше двух, и колебание РАСХОДИТСЯ - тела
-	/// улетают в бесконечность, широкая фаза Bepu умирает переполнением стека на NaN-габаритах (в
-	/// редакторе это краш «SplitSubtreesIntoChildrenBinned x1850», без единого слова о телах).
-	///
-	/// Обе особенности постановки обязательны, без любой из них проверка слепа:
-	/// - тела стартуют СО СМЕЩЕНИЕМ в метр - раскачка усиливает ОШИБКУ, а у тел, уже стоящих на
-	///   цели, усиливать нечего (первая версия проверки прошла и на сломанном делителе);
-	/// - кадр 1/600, а не 1/240: на 1/240 коэффициент ровно два - граница устойчивости, колебание
-	///   не растёт.
-	/// </summary>
+	// Frame MUCH shorter than the sim step (1/600 vs 1/120): a velocity of delta/frame integrates
+	// over a whole step and overshoots by step/frame, which diverges below half a step. Both setup
+	// details are load-bearing: bodies start one metre OFF (divergence amplifies error, not zero),
+	// and the frame is 1/600 rather than 1/240, which sits exactly on the stability boundary.
 	private static void ProbeHighFpsTracking(PhysicsWorld world, Ragdoll ragdoll, Matrix4x4[] jointWorld,
 		Matrix4x4[] reference)
 	{
@@ -541,8 +461,6 @@ public static class RagdollProbe
 
 		ragdoll.TeleportToPose(displaced);
 
-		// Полсекунды: исправному делителю хватает одного шагового кадра, чтобы закрыть метр,
-		// сломанному - пятнадцати, чтобы уйти в тысячи единиц.
 		for (int i = 0; i < 300; i++)
 		{
 			ragdoll.DriveToPose(jointWorld, frame);
@@ -565,27 +483,18 @@ public static class RagdollProbe
 				Vector3.Distance(position, reference[joint].Translation));
 		}
 
-		Console.WriteLine($"[probe] ragdoll: слежение на кадре 1/600 из смещения в метр - расхождение " +
-			$"{worst:0.####} {(finite && worst < 0.05f ? "OK" : "РАСКАЧКА/УЛЕТЕЛ")}");
+		Console.WriteLine($"[probe] ragdoll: tracking at a 1/600 frame from a one-metre offset - mismatch " +
+			$"{worst:0.####} {(finite && worst < 0.05f ? "OK" : "OSCILLATED/FLEW AWAY")}");
 	}
 
-	/// <summary>
-	/// Динамический режим: рэгдолл падает на пол. Проверяется, что он ОСТАНАВЛИВАЕТСЯ (а не
-	/// продолжает разгоняться), что все тела конечны и что ни одно не оказалось под полом.
-	/// Разлетающийся рэгдолл - самый частый способ сломать физику персонажа, и ловится он ровно
-	/// проверкой на конечность и на скорость в конце.
-	/// </summary>
+	// Dynamic mode: the ragdoll must settle, stay finite and stay above the floor.
 	private static void ProbeDynamicFall(PhysicsWorld world, Ragdoll ragdoll, Matrix4x4[] jointWorld,
 		PreparedSkeleton skeleton)
 	{
 		ragdoll.SetAnimationDriven(false);
 
-		// Толчок вбок. Без него проверка теперь проверяла бы не то: после отключения самостолкновений
-		// (см. Ragdoll.Build) идеально выставленный в bind-позу рэгдолл СТОИТ на капсулах ног, как
-		// статуэтка, - раньше его валили контакты собственных ног друг о друга, то есть падение
-		// начинал побочный эффект бага. В игре переход в рэгдолл всегда происходит с ненулевой
-		// скоростью, и толчок - её модель. Масштаб - от высоты таза: абсолютное число в единицах
-		// модели было бы верным ровно для одного рига.
+		// Sideways nudge: with self-collision off, a bind-pose ragdoll just stands on its legs.
+		// Scaled off hip height so it is not tied to one rig's units.
 		var hip = world.Simulation.Bodies[ragdoll.BodyOf(0)];
 		hip.Velocity.Linear += new Vector3(jointWorld[ragdoll.JointOf(0)].Translation.Y * 0.5f, 0f, 0f);
 		hip.Awake = true;
@@ -598,10 +507,8 @@ public static class RagdollProbe
 			world.Update(1f / 60f);
 			simulated += 1f / 60f;
 
-			// Скорость сразу после приземления - точка отсчёта. Абсолютный порог «успокоился»
-			// бессмыслен: он зависит от масштаба модели (у лисы габарит ~160 единиц), а вот
-			// ТРЕБОВАНИЕ УБЫВАНИЯ от него не зависит и ловит именно то, что нужно, - расходящуюся
-			// симуляцию, в которой энергия растёт вместо того, чтобы гаситься.
+			// Speed just after landing is the reference: an absolute "settled" threshold would
+			// depend on model scale, whereas requiring a DECREASE does not.
 			if (simulated >= 3f && speedAtImpact == 0f)
 			{
 				speedAtImpact = MaxSpeed(world, ragdoll);
@@ -625,11 +532,11 @@ public static class RagdollProbe
 
 		highestSpeed = MaxSpeed(world, ragdoll);
 
-		Console.WriteLine($"[probe] ragdoll: свободное падение 6 с - " +
-			$"{(finite ? "координаты конечны OK" : "NaN/Inf - РАЗЛЕТЕЛСЯ")}, " +
-			$"нижняя кость на y={lowest:0.##} {(lowest > -5f ? "OK" : "ПРОВАЛИЛСЯ")}, " +
-			$"скорость {speedAtImpact:0.##} -> {highestSpeed:0.##} " +
-			$"{(highestSpeed < speedAtImpact ? "гасится OK" : "РАСХОДИТСЯ")}");
+		Console.WriteLine($"[probe] ragdoll: free fall 6 s - " +
+			$"{(finite ? "coordinates finite OK" : "NaN/Inf - BLEW APART")}, " +
+			$"lowest bone at y={lowest:0.##} {(lowest > -5f ? "OK" : "FELL THROUGH")}, " +
+			$"speed {speedAtImpact:0.##} -> {highestSpeed:0.##} " +
+			$"{(highestSpeed < speedAtImpact ? "damping OK" : "DIVERGING")}");
 	}
 
 	private static float MaxSpeed(PhysicsWorld world, Ragdoll ragdoll)
@@ -643,8 +550,7 @@ public static class RagdollProbe
 		return speed;
 	}
 
-	/// <summary>Описание рэгдолла лисы по именам костей. Радиусы подобраны под масштаб модели
-	/// (~160 единиц в длину): капсула тоньше кости выглядит как скелет, толще - как бочка.</summary>
+	// Fox ragdoll by bone name; radii are tuned for the model's own scale (~160 units long).
 	private static List<RagdollBoneDesc> BuildDescription(PreparedSkeleton skeleton)
 	{
 		var bones = new List<RagdollBoneDesc>();
@@ -670,9 +576,7 @@ public static class RagdollProbe
 				Length = 8f,
 				Mass = mass,
 
-				// Те же ограничения, что ставит редактор (см. AnimationDriver.BuildRagdollDescription):
-				// проба, гоняющая рэгдолл со СВОИМИ настройками, проверяла бы не тот рэгдолл, который
-				// живёт в сцене.
+				// Must mirror AnimationDriver.BuildRagdollDescription.
 				SwingLimitCos = -0.5f,
 				TwistLimitAngle = TwistLimitDegrees * (MathF.PI / 180f),
 			});

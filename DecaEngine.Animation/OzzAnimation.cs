@@ -6,16 +6,10 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Animation;
 
-/// <summary>
-/// Обёртка нативного ozz-animation (см. native/DecaOzzShim). Граница проведена по КРУПНЫМ
-/// операциям - «просемплируй клип», «сблендь позы», «переведи в модельные матрицы»: выигрыш ozz в
-/// том, что поза считается пачками по четыре кости в SIMD-регистре, и поштучный переход границы
-/// managed/native съел бы его целиком.
-///
-/// Переупорядочивание костей, которое ozz делает при сборке скелета, наружу НЕ протекает: шим
-/// принимает и отдаёт всё в порядке <see cref="PreparedSkeleton"/>. Поэтому ozz-путь и C#-путь
-/// (<see cref="ClipSampler"/>) взаимозаменяемы и дают позу в одном и том же виде.
-/// </summary>
+/// <summary>Interop with the native ozz-animation shim (native/DecaOzzShim).</summary>
+// The boundary is drawn at coarse operations only: ozz poses four bones per SIMD register, and a
+// per-joint managed/native crossing would eat the whole win. The joint reordering ozz does
+// internally does not leak out - everything crosses in PreparedSkeleton order.
 public static unsafe class Ozz
 {
 	private const string Library = "DecaOzzShim";
@@ -30,9 +24,8 @@ public static unsafe class Ozz
 		public Vector3 Scale;
 	}
 
-	/// <summary>Ключ дорожки. Поля - ОТДЕЛЬНЫЕ float-ы, а не Vector3/Vector4: у векторных типов
-	/// System.Numerics выравнивание задаётся джитом (они интринсики), и структура рискует разъехаться
-	/// с плотно упакованной C-шной. Для полей-скаляров такого риска нет.</summary>
+	// Separate floats, not Vector3/Vector4: JIT-chosen alignment of the intrinsic vector types can
+	// diverge from the packed C struct.
 	[StructLayout(LayoutKind.Sequential)]
 	internal struct Key
 	{
@@ -102,11 +95,7 @@ public static unsafe class Ozz
 
 	private static bool? _available;
 
-	/// <summary>
-	/// Загрузился ли нативный ozz. Проверяется ОДИН РАЗ и мягко: шим - опциональная зависимость,
-	/// собираемая отдельным CMake-шагом, и его отсутствие обязано означать «работаем C#-семплером»
-	/// (<see cref="ClipSampler"/>), а не падение редактора при открытии первой же модели с ригом.
-	/// </summary>
+	/// <summary>Whether the native ozz shim loaded; absence falls back to the C# ClipSampler.</summary>
 	public static bool IsAvailable
 	{
 		get
@@ -118,9 +107,8 @@ public static unsafe class Ozz
 
 			try
 			{
-				// Пробный вызов, а не NativeLibrary.TryLoad: убедиться нужно не только в том, что DLL
-				// нашлась, но и в том, что она резолвится (у неё статически влинкован ozz, но CRT -
-				// динамический) и экспортирует ожидаемое имя.
+				// A probe call, not NativeLibrary.TryLoad: this also proves the CRT resolves and the
+				// expected export exists.
 				DecaOzz_SkeletonJointCount(IntPtr.Zero);
 				_available = true;
 			}
@@ -138,8 +126,7 @@ public static unsafe class Ozz
 	}
 }
 
-/// <summary>Рантайм-скелет ozz, собранный из <see cref="PreparedSkeleton"/>. Один на модель -
-/// позы (<see cref="OzzPose"/>) на нём заводятся по одной на инстанс.</summary>
+/// <summary>Runtime ozz skeleton, one per model; poses are created per instance from it.</summary>
 public sealed unsafe class OzzSkeleton : IDisposable
 {
 	internal IntPtr Handle { get; private set; }
@@ -154,8 +141,7 @@ public sealed unsafe class OzzSkeleton : IDisposable
 		Source = source;
 	}
 
-	/// <summary>Собирает ozz-скелет. null - ozz недоступен или скелет не прошёл валидацию ozz
-	/// (например, иерархия оказалась не топологичной); вызывающий падает на C#-семплер.</summary>
+	/// <summary>Builds an ozz skeleton; null when ozz is unavailable or the hierarchy is invalid.</summary>
 	public static OzzSkeleton Build(PreparedSkeleton skeleton)
 	{
 		if (skeleton == null || skeleton.JointCount == 0 || !Ozz.IsAvailable)
@@ -192,7 +178,7 @@ public sealed unsafe class OzzSkeleton : IDisposable
 		}
 		finally
 		{
-			// Имена нужны ozz только на время сборки - он копирует их в свой скелет.
+			// ozz copies the names into its own skeleton, so they are only needed during the build.
 			foreach (var name in names)
 			{
 				if (name != IntPtr.Zero)
@@ -213,9 +199,7 @@ public sealed unsafe class OzzSkeleton : IDisposable
 	}
 }
 
-/// <summary>Рантайм-клип ozz, собранный из <see cref="PreparedAnimation"/>. ozz перепаковывает
-/// ключи в свой сжатый формат, поэтому исходный PreparedAnimation после сборки нужен только для
-/// имени и длительности.</summary>
+/// <summary>Runtime ozz clip built from a PreparedAnimation, which it repacks and no longer needs.</summary>
 public sealed unsafe class OzzClip : IDisposable
 {
 	internal IntPtr Handle { get; private set; }
@@ -260,9 +244,8 @@ public sealed unsafe class OzzClip : IDisposable
 			scaleCounts[i] = scales[i].Length;
 		}
 
-		// Каждый массив ключей пиннится отдельно: нативной стороне нужен МАССИВ УКАЗАТЕЛЕЙ на них, а
-		// собрать его можно только когда все адреса зафиксированы. GCHandle, а не fixed - число
-		// дорожек известно лишь в рантайме, и вложенных fixed на него не написать.
+		// Native side wants an array of pointers, so every key array must be pinned first. GCHandle
+		// rather than fixed: the track count is only known at runtime.
 		var handles = new List<GCHandle>(trackCount * 3);
 		try
 		{
@@ -307,9 +290,7 @@ public sealed unsafe class OzzClip : IDisposable
 	{
 		if (keys.Length == 0)
 		{
-			// Пустая дорожка: нативная сторона не разыменует указатель, потому что счётчик нулевой,
-			// но пиннить массив нулевой длины бессмысленно - GC вернул бы адрес, по которому нечего
-			// читать, и это только запутывало бы отладку.
+			// Empty track: the zero count keeps native from dereferencing this.
 			return IntPtr.Zero;
 		}
 
@@ -358,11 +339,9 @@ public sealed unsafe class OzzClip : IDisposable
 	}
 }
 
-/// <summary>
-/// Поза одного инстанса на стороне ozz. Держит внутри контекст семплирования с курсорами ключей -
-/// ради него позу и нельзя создавать на вызов: именно в курсорах вся скорость ozz на
-/// последовательном воспроизведении.
-/// </summary>
+/// <summary>One instance's pose on the ozz side.</summary>
+// Holds the sampling context with key cursors, so it must be kept alive across frames rather than
+// created per call - the cursors are where ozz's sequential-playback speed comes from.
 public sealed unsafe class OzzPose : IDisposable
 {
 	private IntPtr _handle;
@@ -386,8 +365,7 @@ public sealed unsafe class OzzPose : IDisposable
 		return handle != IntPtr.Zero ? new OzzPose(handle, skeleton) : null;
 	}
 
-	/// <summary>Семплирует клип. Время - в СЕКУНДАХ; нормализацию в ratio, которого ждёт ozz, делаем
-	/// здесь, чтобы соглашение ozz не протекало в вызывающий код.</summary>
+	/// <summary>Samples a clip; time is in seconds, normalized to ozz's ratio here.</summary>
 	public bool Sample(OzzClip clip, float timeSeconds)
 	{
 		if (clip == null || clip.Duration <= 0f)
@@ -399,8 +377,8 @@ public sealed unsafe class OzzPose : IDisposable
 		return Ozz.DecaOzz_SamplePose(_handle, clip.Handle, ratio) != 0;
 	}
 
-	/// <summary>Смешивает позы-слои в эту. Веса НЕ нормализуются: ozz сам добирает разницу до
-	/// единицы rest-позой, и «нормализация» здесь ломала бы аддитивные сценарии.</summary>
+	/// <summary>Blends layer poses into this one.</summary>
+	// Weights are NOT normalized: ozz fills the remainder to 1 with the rest pose.
 	public bool Blend(ReadOnlySpan<OzzPose> layers, ReadOnlySpan<float> weights)
 	{
 		if (layers.Length == 0 || layers.Length != weights.Length)
@@ -421,12 +399,9 @@ public sealed unsafe class OzzPose : IDisposable
 		}
 	}
 
-	/// <summary>
-	/// Смешивает позы-слои с ПОСУСТАВНЫМИ весами (частичный бленд ozz: верх тела играет свой клип,
-	/// ноги - базовый). На слой - либо null (вес всюду единица), либо массив по числу костей
-	/// скелета В ИСХОДНОМ порядке. Приёмник может совпадать с одним из слоёв: бленд ozz пишет
-	/// выход посуставно после чтения всех слоёв того же сустава.
-	/// </summary>
+	/// <summary>Blends layer poses with per-joint weights (partial blend).</summary>
+	// Per layer: null (weight 1 everywhere) or an array of JointCount in PreparedSkeleton order.
+	// The destination may alias a layer: ozz writes each joint after reading all layers of it.
 	public bool Blend(ReadOnlySpan<OzzPose> layers, ReadOnlySpan<float> weights,
 		ReadOnlySpan<float[]?> jointWeights)
 	{
@@ -440,8 +415,7 @@ public sealed unsafe class OzzPose : IDisposable
 		{
 			handles[i] = layers[i]._handle;
 
-			// Короткая маска - выход за границу managed-массива УЖЕ В НАТИВНОМ коде: шим читает её
-			// по числу костей скелета, и проверять длину обязан управляемый берег.
+			// A short mask overruns in native code: the shim reads JointCount entries regardless.
 			if (jointWeights[i] != null && jointWeights[i]!.Length < Skeleton.JointCount)
 			{
 				return false;
@@ -483,11 +457,9 @@ public sealed unsafe class OzzPose : IDisposable
 		}
 	}
 
-	/// <summary>
-	/// Бленд с аддитивными слоями: слой с флагом true обязан содержать ДЕЛЬТУ (см.
-	/// <see cref="AdditiveClip"/>) и суммируется ПОВЕРХ результата обычных слоёв, не участвуя в
-	/// усреднении весов. Маски по суставам работают и на аддитивных слоях.
-	/// </summary>
+	/// <summary>Blend with additive layers.</summary>
+	// A layer flagged additive must hold a DELTA pose; it is added on top of the normal layers and
+	// takes no part in weight averaging.
 	public bool BlendLayered(ReadOnlySpan<OzzPose> layers, ReadOnlySpan<float> weights,
 		ReadOnlySpan<float[]?> jointWeights, ReadOnlySpan<bool> additive)
 	{
@@ -549,8 +521,7 @@ public sealed unsafe class OzzPose : IDisposable
 
 	public bool LocalToModel() => Ozz.DecaOzz_LocalToModel(_handle) != 0;
 
-	/// <summary>Выгружает модельные матрицы В ПОРЯДКЕ <see cref="PreparedSkeleton"/> - переупорядочивание
-	/// ozz остаётся его внутренним делом (см. шим).</summary>
+	/// <summary>Reads model matrices in PreparedSkeleton joint order.</summary>
 	public bool ReadModelMatrices(Matrix4x4[] destination)
 	{
 		if (destination == null || destination.Length < Skeleton.JointCount)
@@ -564,11 +535,7 @@ public sealed unsafe class OzzPose : IDisposable
 		}
 	}
 
-	/// <summary>
-	/// Локальные TRS в порядке <see cref="PreparedSkeleton"/> - вход процедурного слоя (spring
-	/// bones, ручная правка костей, рэгдолл). Распаковка из SoA делается нативно: SoA - внутренняя
-	/// раскладка ozz, и знать о ней C#-стороне незачем.
-	/// </summary>
+	/// <summary>Reads local TRS in PreparedSkeleton joint order; input of the procedural layer.</summary>
 	public bool ReadLocalTransforms(Transform[] destination)
 	{
 		if (destination == null || destination.Length < Skeleton.JointCount)
@@ -582,8 +549,8 @@ public sealed unsafe class OzzPose : IDisposable
 		}
 	}
 
-	/// <summary>Правленые локальные TRS обратно в позу. После записи модельные матрицы устарели -
-	/// вызывающий обязан заново позвать <see cref="LocalToModel"/>.</summary>
+	/// <summary>Writes edited local TRS back into the pose.</summary>
+	// Model matrices are stale afterwards: the caller must call LocalToModel again.
 	public bool WriteLocalTransforms(Transform[] source)
 	{
 		if (source == null || source.Length < Skeleton.JointCount)
@@ -597,8 +564,8 @@ public sealed unsafe class OzzPose : IDisposable
 		}
 	}
 
-	/// <summary>Two-bone IK (нога, рука). Требует АКТУАЛЬНЫХ модельных матриц, поэтому порядок
-	/// вызова - Sample -> LocalToModel -> TwoBoneIk -> LocalToModel.</summary>
+	/// <summary>Two-bone IK (leg, arm).</summary>
+	// Needs up-to-date model matrices: Sample -> LocalToModel -> TwoBoneIk -> LocalToModel.
 	public bool TwoBoneIk(int startJoint, int midJoint, int endJoint, Vector3 target, Vector3 poleVector,
 		Vector3 midAxis, float weight = 1f, float soften = 1f, float twistAngle = 0f)
 	{
@@ -606,7 +573,7 @@ public sealed unsafe class OzzPose : IDisposable
 			(float*)&target, (float*)&poleVector, (float*)&midAxis, weight, soften, twistAngle) != 0;
 	}
 
-	/// <summary>Aim IK: доворот одной кости на цель (голова, торс, ствол оружия).</summary>
+	/// <summary>Aim IK: turns a single bone toward a target (head, torso, weapon barrel).</summary>
 	public bool AimIk(int joint, Vector3 target, Vector3 forward, Vector3 up, Vector3 poleVector,
 		float weight = 1f)
 	{

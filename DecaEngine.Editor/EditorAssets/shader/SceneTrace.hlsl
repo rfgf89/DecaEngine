@@ -1,22 +1,9 @@
-// Трассировка лучей по сцене - ОДИН интерфейс, две реализации. Всё, что пускает лучи (обновление
-// проб, кэш поверхностей, final gather), пишется против него один раз и не знает, на чём едет:
-//
-//   SCENE_TRACE_HARDWARE  - inline-трассировка (RayQuery, DXR 1.1) по TLAS. Основной путь на
-//                           современном железе: обход делает сам GPU, динамика решается
-//                           пересборкой TLAS (см. DiligentRayTracingScene).
-//   иначе                 - обход собственного BVH в structured-буферах. Запасной путь для железа
-//                           без аппаратной трассировки; структура и математика в точности те же,
-//                           что у CPU-трассировщика в ProbeGiBaker, поэтому оба пути сверяются
-//                           луч в луч (см. смоук-тест в PreviewProbe).
-//
-// Кейворд ставит вызывающий при компиляции варианта шейдера (см. IGraphicsApi.CreateShader с
-// keywords), исходя из IGraphicsApi.RayTracing.
+// One scene tracing interface, two implementations: inline RayQuery over a TLAS when
+// SCENE_TRACE_HARDWARE is set, otherwise a software BVH walk matching the CPU tracer.
 
 #ifndef SCENE_TRACE_INCLUDED
 #define SCENE_TRACE_INCLUDED
 
-// Результат трассировки. Нормаль и альбедо отдаются сразу: вызывающему они нужны всегда, а достать
-// их самому он бы не смог - материалов у него нет.
 struct SceneHit
 {
     bool   hit;
@@ -25,25 +12,19 @@ struct SceneHit
     float3 normal;
     float3 albedo;
 
-    // Текстурное альбедо хита (только аппаратный путь): интерполированный UV треугольника,
-    // индекс base color текстуры в наборе текстур хитов (-1 - текстуры нет) и линейный
-    // BaseColorFactor материала (текстура его не содержит). Потребитель один - RT-отражения SSR
-    // (см. SsrHitAlbedo в SsrTracePS.hlsl); probe GI остаётся на усреднённом albedo выше.
+    // Textured albedo, hardware path only; textureIndex -1 means no texture.
     float2 uv;
     int    textureIndex;
     float3 baseColorFactor;
 
-    // Металличность и шероховатость хита (потриугольные, см. BvhTriangle; программный путь -
-    // 0 и 1: там эти атрибуты не заполняются, а «полностью шероховатый» - безопасный дефолт).
+    // Per-triangle; the software path leaves these at 0 and 1 (fully rough).
     float  metalness;
     float  roughness;
 
-    // Сглаженная (интерполяция вершинных) нормаль - ШЕЙДИНГ RT-хитов: геометрическая normal
-    // выше остаётся у probe GI (паритет с CPU-трассой) и у теста задней грани. Программный
-    // путь дублирует геометрическую.
+    // Interpolated vertex normal for shading; the software path duplicates the geometric one.
     float3 smoothNormal;
 
-    // Луч вышел изнутри геометрии (попал в заднюю грань) - для проб это признак «проба в стене».
+    // Hit a back face, i.e. the ray started inside geometry.
     bool   backface;
 };
 
@@ -69,24 +50,16 @@ SceneHit SceneHitMiss()
 
 RaytracingAccelerationStructure _SceneTlas;
 
-// Атрибуты попадания собираются через ИНДИРЕКЦИЮ по инстансу: BLAS строится на меш в ОБЪЕКТНОМ
-// пространстве (см. ProbeSceneAccel), поэтому CommittedPrimitiveIndex нумерует примитивы внутри
-// меша, а не сцены. Плюс индирекции - геометрия не зависит от поз, и движение объекта стоит одной
-// пересборки TLAS вместо перестройки всей структуры; это и есть цена динамики.
+// BLAS is per mesh in object space, so CommittedPrimitiveIndex numbers primitives within the
+// mesh; the instance table supplies the base index.
 struct BvhTriangle
 {
-    // uvA/uvB/uvC - UV вершин (A, A+e1, A+e2) двумя half-ами в битах float (бывшие паддинги;
-    // заворот свёрнут к нулю бейкером - см. BvhTriangleGpu.PackUv). Заполнены только у объектной
-    // геометрии аппаратного пути.
+    // uvA/uvB/uvC hold the vertex UVs of (A, A+e1, A+e2) as two halves packed in a float.
     float3 a;      float uvA;
     float3 e1;     float uvB;
     float3 e2;     float uvC;
-    // metalness - B-канал MR-текстуры в центроиде UV x MetallicFactor (бывший паддинг):
-    // детект металла у RT-хита («зеркало в зеркале», см. SsrTracePS).
     float3 albedo; float metalness;
-    // Вершинные окто-нормали (объектное пространство) - сглаженный шейдинг RT-хитов
-    // (см. BvhTriangleGpu.PackOctNormal). У мировой похлёбки программного пути - нули.
-    // roughness - G-канал MR-текстуры x RoughnessFactor: резкость продолжения цепочки.
+    // nA/nB/nC are object-space octahedral vertex normals; zero on the software path.
     float nA; float nB; float nC; float roughness;
 };
 
@@ -104,15 +77,13 @@ float3 SceneUnpackOctNormal(float bits)
     return normalize(n);
 }
 
-// Альбедо здесь у ИНСТАНСА, а не у треугольника: один меш законно стоит в сцене с разными
-// материалами, а геометрия у его инстансов общая.
+// Material lives on the instance: one mesh may appear with different materials.
 struct SceneInstance
 {
     float3 albedo;
-    uint   firstTriangle;   // база нумерации примитивов меша в _SceneMeshTriangles
+    uint   firstTriangle;   // base index of this mesh in _SceneMeshTriangles
 
-    // Текстурное альбедо хита: линейный BaseColorFactor материала и индекс base color текстуры
-    // в наборе текстур хитов (-1 - текстуры нет). Зеркало InstanceGpu в ProbeSceneAccel.
+    // Mirrors InstanceGpu in ProbeSceneAccel; textureIndex -1 means no texture.
     float3 baseColorFactor;
     int    textureIndex;
 };
@@ -134,8 +105,7 @@ SceneHit SceneTraceClosest(float3 origin, float3 direction, float tMax)
     ray.TMin = 0.0;
     ray.TMax = tMax;
 
-    // Без отбрасывания задних граней: пробам нужно ЗНАТЬ о попадании изнутри геометрии (признак
-    // «проба в стене»), ровно как в программном пути.
+    // No back-face culling: probes must learn about hits from inside geometry.
     RayQuery<RAY_FLAG_NONE> query;
     query.TraceRayInline(_SceneTlas, RAY_FLAG_NONE, 0xFF, ray);
     query.Proceed();
@@ -148,11 +118,8 @@ SceneHit SceneTraceClosest(float3 origin, float3 direction, float tMax)
     SceneInstance instance = _SceneInstances[query.CommittedInstanceID()];
     BvhTriangle tri = _SceneMeshTriangles[instance.firstTriangle + query.CommittedPrimitiveIndex()];
 
-    // Нормаль считается по рёбрам, УЖЕ перенесённым в мир, а не переносом готовой объектной нормали:
-    // для нормали правильный перенос - обратно-транспонированной матрицей, и на неравномерном
-    // масштабе наивный mul дал бы наклон. Через рёбра вопрос не встаёт вовсе - векторное
-    // произведение переносится вместе с ними, - и заодно сохраняется обход вершин, от которого
-    // зависит признак задней грани.
+    // Normal from world-space edges, not a transformed object normal: avoids the inverse-transpose
+    // issue under non-uniform scale and preserves winding for the back-face test.
     float3x4 objectToWorld = query.CommittedObjectToWorld3x4();
     float3 e1 = mul((float3x3)objectToWorld, tri.e1);
     float3 e2 = mul((float3x3)objectToWorld, tri.e2);
@@ -163,13 +130,10 @@ SceneHit SceneTraceClosest(float3 origin, float3 direction, float tMax)
     result.t = query.CommittedRayT();
     result.position = origin + direction * result.t;
     result.normal = n;
-    // ПОТРИУГОЛЬНОЕ альбедо, как в программном пути ниже (tri.albedo): инстансовое - один
-    // плоский цвет на весь объект, и отражения RT-фолбэка SSR выглядели цветными пятнами
-    // вместо деталей. Треугольники несут альбедо, усреднённое бейкером из текстур.
+    // Per-triangle albedo, matching the software path; instance albedo is one flat color.
     result.albedo = tri.albedo;
 
-    // Текстурное альбедо хита: барицентрики примитива интерполируют UV вершин ровно в том же
-    // базисе (b.x - вес вершины A+e1, b.y - вес A+e2), что и упаковка бейкера.
+    // DXR convention: bary.x weights vertex A+e1, bary.y weights A+e2.
     float2 bary = query.CommittedTriangleBarycentrics();
     float2 uvA = SceneUnpackUv(tri.uvA);
     result.uv = uvA + (SceneUnpackUv(tri.uvB) - uvA) * bary.x
@@ -179,14 +143,8 @@ SceneHit SceneTraceClosest(float3 origin, float3 direction, float tMax)
     result.metalness = tri.metalness;
     result.roughness = tri.roughness;
 
-    // Сглаженная нормаль: интерполяция вершинных окто-нормалей теми же барицентриками
-    // (конвенция DXR: bary.x - вес вершины 1 (A+e1), bary.y - вес вершины 2 (A+e2), см.
-    // D3D12 Raytracing spec, TriangleIntersectionAttributes). Перенос в мир - ОБРАТНО-
-    // ТРАНСПОНИРОВАННОЙ матрицей: mul(вектор-строка, WorldToObject3x4) и есть
-    // transpose(WorldToObject) = inverse-transpose(ObjectToWorld) - прямой перенос линейной
-    // частью ObjectToWorld наклонял нормаль на неравномерном масштабе (та же причина, по
-    // которой геометрическая нормаль выше считается по мировым рёбрам). Прижимается к
-    // полусфере геометрической: интерполяция на силуэтах может «перевалить» за грань.
+    // mul(row-vector, WorldToObject3x4) is the inverse-transpose transform normals require;
+    // clamped to the geometric hemisphere, since interpolation can flip it on silhouettes.
     float3 nSmoothObj = SceneUnpackOctNormal(tri.nA) * (1.0 - bary.x - bary.y)
                       + SceneUnpackOctNormal(tri.nB) * bary.x
                       + SceneUnpackOctNormal(tri.nC) * bary.y;
@@ -206,34 +164,31 @@ bool SceneTraceAnyHit(float3 origin, float3 direction, float tMax)
     ray.TMin = 0.0;
     ray.TMax = tMax;
 
-    // ACCEPT_FIRST_HIT - теневому лучу ближайшее попадание не нужно, любое обрывает обход.
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     query.TraceRayInline(_SceneTlas, RAY_FLAG_NONE, 0xFF, ray);
     query.Proceed();
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
-#else // ---- Программный обход BVH ---------------------------------------------------------------
+#else // ---- Software BVH traversal ---------------------------------------------------------------
 
-// Раскладка обязана совпадать с BvhNodeGpu/BvhTriangleGpu (ProbeGi.cs).
+// Layout must match BvhNodeGpu/BvhTriangleGpu (ProbeGi.cs).
 struct BvhNode
 {
     float3 boundsMin;
-    int    left;      // < 0 - лист; start/count тогда задают срез в _SceneBvhOrder
+    int    left;      // < 0 = leaf; start/count then slice into _SceneBvhOrder
     float3 boundsMax;
-    int    start;     // внутренний узел: индекс ПРАВОГО ребёнка (левый - в left)
+    int    start;     // inner node: index of the right child
     int    count;
 
-    // Паддинг ТРЕМЯ скалярами, а не int3: трёхкомпонентный вектор обязан лежать по адресу,
-    // кратному 16, а здесь смещение 36 - SPIR-V такой буфер отвергает целиком, и шейдер молча
-    // перестаёт работать (поймано сверкой с CPU).
+    // Three scalars, not an int3: a float3 at offset 36 breaks 16-byte alignment and SPIR-V
+    // rejects the whole buffer.
     int    pad0, pad1, pad2;
 };
 
 struct BvhTriangle
 {
-    // Раскладка обязана совпадать с BvhTriangleGpu (80 байт): паддинги здесь не читаются
-    // (UV/металличность/нормали - атрибуты аппаратного пути), но стрид общий.
+    // Layout must match BvhTriangleGpu (80 bytes); the padding here is the hardware path's data.
     float3 a;      float pad0;
     float3 e1;     float pad1;
     float3 e2;     float pad2;
@@ -245,8 +200,7 @@ StructuredBuffer<BvhNode>     _SceneBvhNodes;
 StructuredBuffer<uint>        _SceneBvhOrder;
 StructuredBuffer<BvhTriangle> _SceneBvhTriangles;
 
-// Глубина стека обхода - как у CPU-трассировщика (Span<int> stack на 64): BVH строится делением
-// пополам, так что 64 уровня недостижимы на любой реальной сцене.
+// Matches the CPU tracer's stack depth; median splits keep real scenes well under 64 levels.
 #define SCENE_BVH_STACK 64
 
 bool SceneRayBox(float3 origin, float3 invDir, float tMax, BvhNode node)
@@ -260,8 +214,7 @@ bool SceneRayBox(float3 origin, float3 invDir, float tMax, BvhNode node)
     return tmax >= max(tmin, 0.0) && tmin <= tMax;
 }
 
-// Мёллер-Трумбор без предварительного отбрасывания задних граней: пробам нужно ЗНАТЬ о попадании в
-// заднюю грань (признак «внутри геометрии»), а не молча его пропускать.
+// Moller-Trumbore without back-face culling: probes need to see hits from inside geometry.
 float SceneRayTri(float3 origin, float3 direction, BvhTriangle tri)
 {
     float3 pv = cross(direction, tri.e2);
@@ -291,8 +244,7 @@ float SceneRayTri(float3 origin, float3 direction, BvhTriangle tri)
 
 float3 SceneSafeInvDir(float3 direction)
 {
-    // Деление на строгий ноль дало бы NaN в пересечении с коробкой; подменяем на крошечное со
-    // знаком - ровно как в CPU-версии.
+    // Exact zero would make the slab test NaN; substitute a signed epsilon, as the CPU tracer does.
     float3 d;
     d.x = abs(direction.x) < 1e-12 ? (direction.x < 0.0 ? -1e-12 : 1e-12) : direction.x;
     d.y = abs(direction.y) < 1e-12 ? (direction.y < 0.0 ? -1e-12 : 1e-12) : direction.y;

@@ -4,17 +4,7 @@ using System.Numerics;
 
 namespace DecaEngine.Physics;
 
-/// <summary>
-/// Сборщик точек контакта для дебага. Контакты - единственное, что показывает, ПОЧЕМУ тело ведёт
-/// себя так, а не иначе: висящее в воздухе тело с контактом в пустоте и лежащее тело без единого
-/// контакта выглядят одинаково, пока контакты не нарисованы.
-///
-/// Живёт отдельным классом, а не полем в колбэках, по двум причинам. Во-первых,
-/// <see cref="PhysicsNarrowPhaseCallbacks"/> - структура, которую Bepu копирует к себе, и любое
-/// состояние в ней пришлось бы читать обратно через симуляцию. Во-вторых, узкая фаза идёт НА
-/// ВОРКЕРАХ: общий список сюда писать нельзя, поэтому у каждого воркера свой, а слияние делает уже
-/// один поток между шагами (см. <see cref="Flush"/>).
-/// </summary>
+/// <summary>Debug collector of contact points; narrow phase runs on workers, so buffers are per-worker.</summary>
 public sealed class PhysicsContactRecorder
 {
 	public struct Contact
@@ -23,27 +13,21 @@ public sealed class PhysicsContactRecorder
 		public Vector3 Normal;
 		public float Depth;
 
-		/// <summary>Участвует ли в паре статик. Контакт со статикой (пол) и контакт двух тел
-		/// (конечности рэгдолла между собой) - разные диагнозы, и различать их надо на глаз.</summary>
 		public bool AgainstStatic;
 	}
 
-	/// <summary>Потолок на воркер. Сцена с рэгдоллом и мешем пола даёт сотни контактов за шаг, а за
-	/// кадр шагов до восьми; без потолка список рос бы быстрее, чем его успевают рисовать.</summary>
+	// Per-worker cap: contacts accumulate faster than the debug view can draw them.
 	private const int MaxPerWorker = 512;
 
 	private readonly List<Contact>[] _perWorker;
 	private readonly List<Contact> _merged = new();
 
-	/// <summary>Пишутся ли контакты вообще. Выключено - узкая фаза не платит ничего, кроме одной
-	/// проверки поля: сбор контактов стоит чтения поз обоих коллайдеров на КАЖДУЮ пару, и держать
-	/// его включённым постоянно нельзя.</summary>
+	/// <summary>Off by default: recording reads both collider poses on every pair.</summary>
 	public bool Enabled;
 
 	public PhysicsContactRecorder()
 	{
-		// По числу ядер: столько воркеров максимум заводит IThreadDispatcher, а лишние пустые списки
-		// не стоят ничего. Индекс воркера всё равно проверяется - см. Record.
+		// Sized by core count: that is the worker ceiling of IThreadDispatcher.
 		_perWorker = new List<Contact>[Math.Max(1, Environment.ProcessorCount)];
 		for (int i = 0; i < _perWorker.Length; i++)
 		{
@@ -51,12 +35,10 @@ public sealed class PhysicsContactRecorder
 		}
 	}
 
-	/// <summary>Контакты последнего <see cref="Flush"/>. Между шагами симуляции содержимое не
-	/// обновляется - это снимок, а не живой список.</summary>
+	/// <summary>Snapshot taken by the last <see cref="Flush"/>, not a live list.</summary>
 	public IReadOnlyList<Contact> Contacts => _merged;
 
-	/// <summary>Сколько контактов отброшено потолком на последнем сливе - чтобы окно дебага могло
-	/// честно сказать «показано не всё», а не тихо соврать полнотой картины.</summary>
+	/// <summary>Contacts discarded by the per-worker cap during the last flush.</summary>
 	public int Dropped { get; private set; }
 
 	internal void Record(int workerIndex, in Contact contact)
@@ -75,8 +57,7 @@ public sealed class PhysicsContactRecorder
 		list.Add(contact);
 	}
 
-	/// <summary>Сливает буферы воркеров в один список и очищает их под следующий шаг. Звать между
-	/// шагами симуляции, из ОДНОГО потока.</summary>
+	/// <summary>Merges worker buffers; call between simulation steps, from one thread.</summary>
 	public void Flush()
 	{
 		_merged.Clear();
@@ -94,8 +75,7 @@ public sealed class PhysicsContactRecorder
 		}
 	}
 
-	/// <summary>Забывает всё, не сливая. Нужен при выключении сбора: иначе на экране навсегда
-	/// остался бы снимок последнего шага, в котором галочка ещё была включена.</summary>
+	/// <summary>Drops everything without merging; used when recording is turned off.</summary>
 	public void Clear()
 	{
 		_merged.Clear();

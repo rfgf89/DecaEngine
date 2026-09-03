@@ -15,23 +15,10 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// ????????? (????????????? ?? ??????? ????? / Game View) ????????? ??????-?????: ????
-	/// EntityStore, DiligentBatchRenderer, GraphicsPipeline ? off-screen color/depth render-???????.
-	/// ???????????? <see cref="InspectorWindow"/> ??? 3D-?????? .gltf/.glb ???????, ????????? ?
-	/// <see cref="AssetBrowserWindow"/> - ?????? ??????????? ????? <see cref="ModelLoader"/> ? ????
-	/// EntityStore (????? ?? ???????????? ?? ? ??????? ??????, ?? ? EntityStore-?? ????????
-	/// Inspector-?), ? ?????? ???? ?????????? ? ??????????? offscreen-????????, ??????? ?????
-	/// ???????????? ????? ImGui.Image (?????????? ????, ??? <see cref="GameViewWindow"/>
-	/// ?????????? ??????? ????? ????? ???? ??????????? IRenderHandle).
-	/// </summary>
+	/// <summary>Self-contained off-screen model preview: own EntityStore, renderer and targets.</summary>
 	public partial class ModelPreviewViewport
 	{
-		/// <summary>Sub-mesh view mode, selectable from the Inspector while a single sub-mesh is isolated
-		/// (see <see cref="InspectorWindow.RenderModelPreview"/>). Irrelevant for the whole-model view,
-		/// which is always rendered in Lighting/PBR (see <see cref="ApplyPreviewSettingsToMaterials"/>).
-		/// Orthogonal to <see cref="WireframeEnabled"/> - the wireframe overlay can be toggled on top of
-		/// either mode.</summary>
+		/// <summary>Sub-mesh view mode; only meaningful while a single sub-mesh is isolated.</summary>
 		public enum SubMeshPreviewMode
 		{
 			Highlight,
@@ -51,13 +38,7 @@ namespace DecaEngine.Editor
 		private const uint InitialHeight = 256;
 		private const float CameraFovDegrees = ModelViewportEnvironment.CameraFovDegrees;
 
-		/// <summary>
-		/// How long the requested ImGui image size must stay unchanged before the off-screen targets
-		/// are actually resized - resizing recreates GPU resources (see <see cref="ResizeTargets"/>),
-		/// so applying it every frame while the user is still dragging the window edge would mean a
-		/// GPU stall (<see cref="Diligent.IDeviceContext.WaitForIdle"/>) on every single frame of the
-		/// drag instead of once after they let go.
-		/// </summary>
+		// Debounce: each resize costs a GPU stall, so wait out the user's drag.
 		private const float ResizeSettleSeconds = 0.3f;
 
 		private readonly IGraphicsApi _graphicsApi;
@@ -66,18 +47,13 @@ namespace DecaEngine.Editor
 		private readonly SharedViewportResources _sharedResources;
 		private ModelViewportEnvironment _env;
 
-		/// <summary>Есть ли у объёмного света каскадные тени - без них god rays невозможны
-		/// (см. VolumetricLightPassResources.ShadowsAvailable). Читается окном Graphics, чтобы
-		/// предупредить человека, а не оставлять его крутить мёртвый ползунок.</summary>
+		/// <summary>Whether volumetric light has cascaded shadows; god rays need them.</summary>
 		public bool VolumetricShadowsAvailable => _env?.VolumetricShadowsAvailable ?? false;
 
-		/// <summary>Текущее оффскрин-окружение - для отладочных инструментов (дамп shadow map
-		/// каскадов в окне Graphics). Пересоздаётся при смене env-level настроек - не кэшировать.</summary>
+		/// <summary>Current off-screen environment; recreated on env-level settings - do not cache.</summary>
 		public ModelViewportEnvironment Environment => _env;
 
-		// Конфигурация, с которой создано ТЕКУЩЕЕ окружение (env-level опции пекутся в его
-		// таргеты/пассы/PSO): диф с настройками в OnGraphicsSettingsChanged решает, нужно ли
-		// пересоздание (см. RecreateEnvironment).
+		// Config baked into the CURRENT environment; diffed to decide if it must be recreated.
 		private bool _appliedSsao;
 		private AmbientOcclusionMode _appliedAoMode;
 		private bool _appliedSsgi;
@@ -85,39 +61,31 @@ namespace DecaEngine.Editor
 		private string _appliedHdrPath = "";
 		private bool _appliedAniso;
 
-		// Потолок стороны текстуры печётся в декодер загрузчика (см. BuildLoadOptions), то есть
-		// живёт в уже залитых на GPU текстурах: применить его можно только перечитыванием модели.
-		// Раньше он молча ждал следующей загрузки - смена ручки не давала НИЧЕГО до ручного
-		// переоткрытия ассета; теперь он в дифе перезагрузки, наравне с анизотропией.
+		// Baked into the loader's decoder, i.e. into GPU textures: only a reload can apply it.
 		private int _appliedMaxTextureSize;
 
-		// Авто-экспозиция - опция уровня создания окружения: с ней конвейер превью становится HDR
-		// (линейный RGBA16F-кадр + отдельный TonemapPass), а формат таргета печётся в PSO.
+		// Creation-level: turns the preview pipeline HDR, and target format is baked into PSOs.
 		private bool _appliedEyeAdaptation;
 
-		// Туман - тоже опция УРОВНЯ СОЗДАНИЯ: пассу нужны депт и scene-copy, он создаётся
-		// вместе с конвейером (см. GraphicsPipelineSimple), так что галка требует пересоздания окружения.
+		// Creation-level: the pass needs depth and scene-copy, built with the pipeline.
 		private bool _appliedFog;
 
-		// Объёмный свет - тоже уровня создания: пассу нужны депт, scene-copy и shadow map
-		// (см. VolumetricLightPass), он создаётся вместе с конвейером.
+		// Creation-level: the pass needs depth, scene-copy and the shadow map.
 		private bool _appliedVolumetric;
 
-		// Блум - тоже уровня создания: он владеет своей цепочкой таргетов (см. BloomPassResources).
+		// Creation-level: owns its own target chain.
 		private bool _appliedBloom;
 
-		// Грейдинг - тоже уровня создания: пасс владеет своей копией кадра.
+		// Creation-level: the pass owns its own frame copy.
 		private bool _appliedColorGrade;
 
-		// Векторы движения - пасс владеет своим RG16F-буфером (см. MotionVectorPassResources).
+		// Creation-level: the pass owns its RG16F buffer.
 		private bool _appliedMotionVectors;
 
-		// Последний ImGuiRender из Render() - RecreateEnvironment должен отвязать ImGui-биндинг
-		// старого таргета до его освобождения (см. ResizeTargets - тот же порядок).
+		// RecreateEnvironment must unbind the old target from ImGui before releasing it.
 		private ImGuiRender? _lastImGuiRender;
 
-		// Заявка на пересоздание окружения из OnGraphicsSettingsChanged; исполняется в начале
-		// Update() - до записи кадра, когда старые биндинги ещё нигде не задействованы.
+		// Executed at the top of Update(), before frame recording, while old bindings are idle.
 		private bool _pendingEnvironmentRecreate;
 
 		private readonly List<Entity> _instanceEntities = new();
@@ -128,68 +96,47 @@ namespace DecaEngine.Editor
 		private string? _loadingPath;
 		private int _loadingSubMesh = -1;
 
-		// --- Активность вьюпорта -------------------------------------------------------------------
-		// Модель редактора грузится РОВНО В ОДНОМ месте: либо здесь (Inspector в режиме Model), либо в
-		// PrefabSceneViewport (открыт префаб), но никогда в обоих сразу - иначе одна и та же модель
-		// держит два набора материалов/инстансов и два полных кадра офскрин-конвейера. Переключает
-		// EditorManager.OnUpdate по режиму Inspector-а (см. SetActive); неактивное превью отдаёт
-		// модель с GPU и не пишет кадр вовсе (его никто не видит: RenderModelPreview зовётся только в
-		// режиме Model). По умолчанию активно - пробы (PreviewLoopProbe/FullLoopProbe) гоняют вьюпорт
-		// без EditorManager-а и SetActive не зовут.
+		// The editor model is resident in EXACTLY one viewport - here or PrefabSceneViewport, never
+		// both. Defaults to active: CLI probes drive the viewport without ever calling SetActive.
 		private bool _active = true;
 		private bool _activeRequested = true;
 
-		/// <summary>Путь/сабмеш, снятые уходом в паузу, - возвращаются загрузкой при активации, если к
-		/// тому моменту не запрошена другая модель (см. <see cref="ApplyPendingActiveChange"/>).</summary>
+		// Selection captured on suspend; restored on activation unless another model was requested.
 		private string? _suspendedPath;
 		private int _suspendedSubMesh = -1;
 
-		/// <summary>Идёт возврат сохранённой моделью после паузы - гасит диагностику «FULL reload» в
-		/// <see cref="LoadModel"/>: резидента здесь нет по построению.</summary>
 		private bool _restoringAfterResume;
 
-		/// <summary>Стриминг модели превью (см. <see cref="ModelStreamer"/>): фоновая загрузка,
-		/// покадровая финализация и владение жизненным циклом ModelLoader-а. Превью - эксклюзивный
-		/// потребитель: перед загрузкой нового файла предыдущий ПОЛНОСТЬЮ очищается (ClearAll),
-		/// поэтому резидентна всегда максимум одна модель. Кадровый шаг - ModelStreamingSystem в
-		/// SystemRoot окружения.</summary>
+		// Preview is the exclusive consumer: the previous model is fully cleared before a new load.
 		private readonly ModelStreamer _streamer;
 
-		/// <summary>Ссылка стримера на грузящуюся/загруженную модель текущего выбора; null - ничего
-		/// не запрошено. Готовность опрашивает PollPendingLoad.</summary>
 		private ModelStreamer.Resident? _streamingModel;
 
-		// Радиус, посчитанный последним FrameAll (см. его комментарий) - PollPendingLoad пушит AO
-		// world-range из него сам, ПОСЛЕ своего Flush()+WaitForIdle() барьера.
+		// Material set owned by THIS environment: the primary set may belong to the prefab scene,
+		// and writing into it would clobber that scene's lighting and color.
+		private OrderedDictionary<int, IMaterialObject>? OwnMaterials =>
+			_streamingModel?.Materials ?? _residentModel?.materialObjects;
+
+		// Radius from the last FrameAll; PollPendingLoad pushes the AO world range from it only
+		// AFTER its own Flush()+WaitForIdle() barrier.
 		private float _framedRadius;
 
-		// Резидентная модель: тот же .gltf/.glb, что уже полностью распарсен и зарегистрирован в
-		// _env.BatchRenderer с предыдущего LoadModel - переключение сабмеша той же модели (см.
-		// LoadModel) должно просто перенаселить сцену данными, уже сидящими в памяти/на GPU, а не
-		// заново читать файл с диска и гонять прогресс-бар (см. ModelIconBaker, тот же приём).
+		// Already parsed and registered with _env.BatchRenderer: switching sub-mesh must repopulate
+		// from memory rather than re-read the file.
 		private string? _residentPath;
 		private ModelLoader? _residentModel;
 
-		// --- Probe GI (DDGI-lite, см. ProbeGi.cs) ---------------------------------------------------
-		// ПРОГРЕССИВНЫЙ CPU-бейк сетки irradiance-проб + sky visibility. Сессия живёт вместе с
-		// резидентной моделью, а фоновая задача крутит по одному раунду (RaysPerRound лучей на пробу,
-		// единицы миллисекунд) за раз: поле показывается уже после первого раунда и уточняется
-		// дальше, вместо секундного «бейка одним куском» с дебаунсом. Поворот света накопленное не
-		// выбрасывает (см. ProbeGiBakeSession.SetLighting) - пересоздание сессии нужно только при
-		// смене модели или параметров сетки/качества.
+		// Progressive CPU bake of the irradiance probe grid; one round at a time on a background
+		// task. Rotating the light keeps accumulated data - only model or grid changes reset it.
 		private ProbeGiBaker? _probeBaker;
 
-		/// <summary>Фоновая сборка BVH под пробы (см. BeginProbeSession): на тяжёлой сцене это
-		/// десятки секунд чистого CPU, и на потоке рендера она вешала редактор целиком уже ПОСЛЕ
-		/// того, как модель показалась.</summary>
+		// BVH build is tens of CPU-seconds on a heavy scene; must not run on the render thread.
 		private Task<ProbeGiBaker>? _probeBakerTask;
 
-		/// <summary>Модель, по которой считается <see cref="_probeBakerTask"/>: результат для чужой
-		/// (успели переключить) выбрасывается, а её освобождение обязано задачу дождаться.</summary>
+		// Model _probeBakerTask is computed for: a result for another model is dropped, and
+		// releasing that model must await the task.
 		private ModelLoader? _probeBakerModel;
 
-		/// <summary>Время сборки/чтения BVH и откуда он взялся - отладочная строка в консоли: без
-		/// неё «почему пробы появились только через полминуты» не диагностируется.</summary>
 		private System.Diagnostics.Stopwatch? _probeBakerSw;
 		private volatile bool _probeBakerFromCache;
 
@@ -197,58 +144,36 @@ namespace DecaEngine.Editor
 		private Task? _probeRoundTask;
 		private ProbeGiTextures? _probeTextures;
 		private Vector3 _probeBoundsMin, _probeBoundsMax;
-		private float _probeSessionDelay = -1f;  // секунды до пересоздания сессии; <0 = не запрошено
-		private int _probeTextureGeneration;     // суффикс имён GPU-текстур (имена в API уникальны)
+		private float _probeSessionDelay = -1f;  // seconds until session rebuild; <0 = not requested
+		private int _probeTextureGeneration;     // suffix for GPU texture names (must be unique)
 
-		// GPU-путь раунда (см. ProbeRoundGpu). Живёт вместе с сессией и сам владеет своими буферами
-		// (BVH, поле, кэш); атласы в этом режиме заводятся с UAV и пишутся шейдером напрямую, минуя
-		// упаковку на CPU. null = крутим раунды на CPU, как раньше.
+		// GPU round path; owns its own buffers and writes atlases via UAV. null = CPU rounds.
 		private ProbeRoundGpu? _probeGpu;
 
-		// Конвейеры GPU-раунда живут дольше сессии и модели: их компиляция стоит ~650 мс, а сессия
-		// пересоздаётся на каждое изменение настроек. Пока компиляция сидела в конструкторе
-		// ProbeRoundGpu, каждая правка ползунка означала полусекундный стопор на потоке рендера, и
-		// кадровый цикл swap chain этого не переживал.
-		/// <summary>Сколько порций GPU-раунда выпускать за кадр. Порция стоит ~2 мс счёта, так что
-		/// восемь укладываются в кадр с запасом; ограничение нужно лишь чтобы на плотной сетке один
-		/// кадр не утащил раунд целиком и не подвесил презентацию.</summary>
+		// ~2 ms of GPU work per chunk; capped so one frame can't swallow a whole round.
 		private const int ProbeChunksPerFrame = 8;
 
+		// Outlive session and model: compiling them costs ~650 ms on the render thread.
 		private ProbeRoundPipelines? _probePipelines;
 		private DiligentGraphicsApi? _probePipelinesApi;
 
-		/// <summary>Аппаратные структуры ускорения под GPU-раунд (см. ProbeSceneAccel). null, если
-		/// аппаратная трассировка выключена или недоступна.
-		///
-		/// Живут по МОДЕЛИ, а не по сессии: BLAS строится из геометрии, а её изменение настроек
-		/// probe-GI не трогает. Пересоздание на каждую правку ползунка добавляло за цикл десятки
-		/// мегабайт (BLAS плюс scratch на сотни тысяч треугольников) и упиралось в исчерпание
-		/// ресурсов - на третьей запечке не создавалась уже текстура 80x80.</summary>
+		// Lives per MODEL, not per session: rebuilding BLAS per settings tweak exhausted GPU memory.
 		private ProbeSceneAccel? _probeAccel;
 
-		/// <summary>Позы инстансов, под которыми собран текущий TLAS - по ним PollProbeAccel решает,
-		/// шевелилась ли сцена. Порядок - порядок ProbeInstancedGeometry.Instances.</summary>
+		// Instance poses the current TLAS was built from; order matches ProbeInstancedGeometry.
 		private readonly List<Matrix4x4> _probeInstancePoses = new();
 
-		// Пересборка TLAS однажды сорвалась - больше не пробуем (иначе отказ повторялся бы каждый
-		// кадр движения). Сцена для трассировки замирает, пробы продолжают считаться.
+		// A failed TLAS rebuild is never retried, else it would fail again every moving frame.
 		private bool _probeAccelFrozen;
 
-		/// <summary>Дебаг-вид проб (шарики, см. ProbeDebugOverlay). Помнит атласы, под которые
-		/// создан, - их пересоздание (новая сессия, смена сетки) пересобирает набор.</summary>
+		// Remembers the atlases it was built for; recreating them rebuilds the overlay set.
 		private readonly List<(ProbeDebugOverlay Overlay, ProbeGiTextures Textures)> _probeDebugOverlays = new();
 		private bool _probeDebugFailed;
 
-		/// <summary>Умеет ли устройство inline-трассировку - по этому флагу окно Graphics гасит
-		/// галочку аппаратного ускорения.</summary>
+		/// <summary>Whether the device supports inline ray tracing.</summary>
 		public bool RayTracingSupported => _graphicsApi.RayTracing >= RayTracingSupport.Inline;
 
-		/// <summary>TLAS для RT-теней (режим «Ray-traced» комбо Shadow filtering, см.
-		/// FEATURE_RT_SHADOWS в UnlitInstancedPS.hlsl). Отдельный от <see cref="_probeAccel"/>:
-		/// тот живёт от бейкера проб и только при аппаратном GPU-пути GI, а теневым лучам TLAS
-		/// нужен независимо от проб. Строится из GPU-мешей резидентной модели
-		/// (DiligentRayTracingScene), в превью модель статична - пересборка только на смену
-		/// модели/сабмеша.</summary>
+		// TLAS for RT shadows, separate from _probeAccel: shadow rays need it without probe GI.
 		private DiligentRayTracingScene? _rtShadowScene;
 
 		public ModelPreviewViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings, ModelStore modelStore,
@@ -258,9 +183,6 @@ namespace DecaEngine.Editor
 			_editorSettings = editorSettings;
 			_modelStore = modelStore;
 
-			// CLI-гарнессы (FullLoopProbe/PreviewLoopProbe) конструируют этот вьюпорт изолированно и не
-			// делят контейнер ни с чем - им годится собственный, локальный (см. class-doc
-			// SharedViewportResources: "или per CLI-harness").
 			_sharedResources = sharedResources ?? new SharedViewportResources(graphicsApi);
 
 			_env = CreateEnvironment();
@@ -270,14 +192,11 @@ namespace DecaEngine.Editor
 
 			ApplyGraphicsSettings();
 
-			// Настройки из окна Settings (см. SettingsWindow.PreviewGraphicsApplied): вьюпорт
-			// один и живёт всю сессию редактора, отписка не требуется.
+			// The viewport lives for the whole editor session, so no unsubscribe is needed.
 			SettingsWindow.PreviewGraphicsApplied += OnGraphicsSettingsChanged;
 		}
 
-		/// <summary>Создаёт превью-окружение по текущим настройкам и запоминает применённую
-		/// env-level конфигурацию (для дифа в <see cref="OnGraphicsSettingsChanged"/>). Тени
-		/// создаются всегда: их пасс дёшев и no-op-ится live через ShadowSettings.Enabled.</summary>
+		// Shadows are always created: the pass is cheap and no-ops live via ShadowSettings.Enabled.
 		private ModelViewportEnvironment CreateEnvironment()
 		{
 			_appliedSsao = _editorSettings.PreviewSsao;
@@ -308,21 +227,18 @@ namespace DecaEngine.Editor
 				bloom: _appliedBloom,
 				colorGrade: _appliedColorGrade,
 				volumetric: _appliedVolumetric,
-				// SSR тянет векторы за собой (репроекция истории) - как TemporalUpscale.
+				// SSR needs motion vectors for history reprojection, same as TemporalUpscale.
 				motionVectors: _appliedMotionVectors || _editorSettings.PreviewSsr,
 				temporalUpscale: _appliedMotionVectors && _editorSettings.TemporalUpscale,
 				upscalerBackend: _appliedMotionVectors && _editorSettings.TemporalUpscale
 					? Math.Clamp(_editorSettings.UpscalerBackend, 0, 2)
 					: 0,
 				ssr: _editorSettings.PreviewSsr,
-				// RT-фолбэк догоняет ApplyPipelineFeatures - accel проб в момент создания окружения
-				// ещё не существует (см. PrefabSceneViewport.CreateEnvironment, та же причина).
+				// ApplyPipelineFeatures turns RT fallback on later: no probe accel exists yet here.
 				ssrRayTraced: false);
 
-			// Полный набор каскадов, как у Scene View: один орто-каскад на все баунды (прежний
-			// дефолт) на сцене-уровне (Sponza) даёт мыльную тень - вся карта растянута на габарит.
-			// Выставляется ДО первого кадра: SimpleCullingAndRenderSystem замораживает под это
-			// ёмкость DirectionalLightCascadeData (см. CascadeCount там).
+			// Must be set BEFORE the first frame: SimpleCullingAndRenderSystem freezes the
+			// DirectionalLightCascadeData capacity from it.
 			if (env.ShadowSettings != null)
 			{
 				env.ShadowSettings.CascadeCount = ShadowRenderer.MaxCascades;
@@ -333,13 +249,11 @@ namespace DecaEngine.Editor
 
 		private void FrameAll(Vector3 min, Vector3 max)
 		{
-			// ????????? bounds - ???? ??? ???????? NaN ??? Infinity, ?????????? ?????????? ????????
 			if (float.IsNaN(min.X) || float.IsNaN(min.Y) || float.IsNaN(min.Z) ||
 			    float.IsNaN(max.X) || float.IsNaN(max.Y) || float.IsNaN(max.Z) ||
 			    float.IsInfinity(min.X) || float.IsInfinity(min.Y) || float.IsInfinity(min.Z) ||
 			    float.IsInfinity(max.X) || float.IsInfinity(max.Y) || float.IsInfinity(max.Z))
 			{
-				// Если bounds некорректны, используем значения по умолчанию
 				_orbitTarget = Vector3.Zero;
 				_distance = 4f;
 				_yaw = -0.6f;
@@ -350,47 +264,30 @@ namespace DecaEngine.Editor
 
 			_orbitTarget = (min + max) * 0.5f;
 
-			// Half-diagonal of the (mesh-bounds-based, see PopulateFromScene) AABB, used as a
-			// bounding-sphere radius around _orbitTarget - simple and good enough for auto-framing.
+			// AABB half-diagonal used as a bounding-sphere radius around _orbitTarget.
 			var radius = MathF.Max(0.05f, (max - min).Length() * 0.5f);
 
-			// Те же баунды питают ортокамеру мирового света (см.
-			// SimpleCullingAndRenderSystem.BuildLightData) - тени пересчитаются со следующего кадра.
+			// The same bounds drive the sun's ortho camera; shadows follow from the next frame.
 			if (_env.ShadowSettings != null)
 			{
 				_env.ShadowSettings.BoundsCenter = _orbitTarget;
 				_env.ShadowSettings.BoundsRadius = radius;
 			}
 
-			// Радиус AO в мировых единицах от габаритов модели (см. SsaoPassResources.SetWorldRange):
-			// с экранным радиусом контактная тень под нависающей геометрией (корона ферзя и т.п.)
-			// схлопывалась при приближении камеры - нависание выпадало из радиуса поиска. НЕ пушим
-			// его отсюда - FrameAll выполняется из PopulateFromScene ДО Flush()+WaitForIdle() в
-			// PollPendingLoad, а SetConstant трогает GPU-буфер и помечает AoMaterial dirty (следующий
-			// draw пересоберёт его PSO) на ImmediateContext, которым в этот момент может ещё
-			// пользоваться предыдущий, ещё не дождавшийся кадр - гонка с рендером основной сцены (см.
-			// PollPendingLoad, который пушит его сам, уже после барьера).
+			// World-space AO radius, pushed by PollPendingLoad instead of here: touching the GPU
+			// buffer before its Flush()+WaitForIdle() barrier races the in-flight frame.
 			_framedRadius = radius;
 
-			// Distance at which a sphere of this radius exactly fills the vertical FOV, plus a
-			// small margin so the model isn't touching the viewport edges.
 			_distance = ModelViewportGeometry.ComputeFramingDistance(radius, CameraFovDegrees);
 
 			_yaw = -0.6f;
 			_pitch = 0.35f;
 		}
 
-		/// <summary>Показывается ли превью прямо сейчас (Inspector в режиме Model). В паузе модель с
-		/// GPU снята и кадр не пишется - см. <see cref="SetActive"/>.</summary>
+		/// <summary>Whether the preview is shown right now; when paused the model is off the GPU.</summary>
 		public bool IsActive => _activeRequested;
 
-		/// <summary>
-		/// Включает/ставит на паузу превью модели. Заявка исполняется в начале ближайшего
-		/// <see cref="Update"/> (там мы под GPU-локом редактора): пауза отдаёт модель с GPU целиком,
-		/// активация грузит обратно ту же, если за время паузы не выбрали другую. Зовёт
-		/// EditorManager.OnUpdate по режиму Inspector-а, чтобы модель редактора была загружена ровно в
-		/// одном месте - здесь ИЛИ в <see cref="PrefabSceneViewport"/>.
-		/// </summary>
+		/// <summary>Resumes or pauses the preview; applied at the start of the next <see cref="Update"/>.</summary>
 		public void SetActive(bool active)
 		{
 			_activeRequested = active;
@@ -402,7 +299,6 @@ namespace DecaEngine.Editor
 
 			if (!_active)
 			{
-				// Что показывали (или как раз грузили) - вернём при активации.
 				_suspendedPath = _loadedPath ?? _loadingPath;
 				_suspendedSubMesh = _loadedPath != null ? _loadedSubMesh : _loadingSubMesh;
 
@@ -416,9 +312,7 @@ namespace DecaEngine.Editor
 			_suspendedPath = null;
 			_suspendedSubMesh = -1;
 
-			// Заявка, пришедшая ПОКА мы стояли на паузе (Asset Browser -> InspectorWindow.ShowModel
-			// зовёт LoadModel сразу, а активность переключается лишь следующим кадром), главнее
-			// сохранённого выбора - иначе клик по новой модели откатывался бы на старую.
+			// A request that arrived WHILE paused wins over the saved selection.
 			if (restorePath != null && _loadedPath == null && _loadingPath == null)
 			{
 				_restoringAfterResume = true;
@@ -433,27 +327,20 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>
-		/// ?????????? ??????????? (?????????) ECS/render-graph ?????? ?? ???? ????. ??????
-		/// ?????????? ??? ? ???? ????????? (??. EditorManager.OnUpdate) ??? ??? ?? GPU-?????, ??? ?
-		/// ???????? ?????, ????????? ?????????? ????? IGraphicsApi/??????????.
-		/// </summary>
+		/// <summary>Steps this viewport's ECS/render graph and records one off-screen frame.</summary>
 		public void Update(float deltaTime, float time)
 		{
-			// Переход активности исполняется ЗДЕСЬ, а не в SetActive: внутри выгрузка с барьером
-			// GPU (см. UnloadResidentModel), а под локом редактора мы только в Update.
+			// Applied here, not in SetActive: unloading needs a GPU barrier and the editor's lock.
 			if (_activeRequested != _active)
 			{
 				ApplyPendingActiveChange();
 			}
 
-			// Пауза: модель уже отдана, кадр не пишем - его всё равно некому показать (см. _active).
 			if (!_active)
 			{
 				return;
 			}
 
-			// Собственный accel SSR (RT-фолбэк без probe GI) - опрос покадровый, см. метод.
 			PollSsrOwnRayScene(deltaTime);
 
 			if (_pendingEnvironmentRecreate)
@@ -462,8 +349,7 @@ namespace DecaEngine.Editor
 				RecreateEnvironment();
 			}
 
-			// После возможного пересоздания окружения и ДО записи кадра - безопасная точка для
-			// смены бэкенда апскейлера (GPU-барьер + init-команды NGX).
+			// Only safe point to swap the upscaler backend: after any recreate, before recording.
 			ApplyPendingUpscalerSettings();
 
 			PollPendingLoad();
@@ -471,8 +357,6 @@ namespace DecaEngine.Editor
 			PollBvhDebugOverlay();
 			PollProbeDebugOverlay();
 
-			// Live-ручки probe-GI/солнца из окна Graphics - пуш по факту изменения значения
-			// (дёшево: сравнение кортежа), в начале Update, до записи кадра.
 			var liveProbeParams = (_editorSettings.ProbeGiShadowFloor, _editorSettings.ProbeGiSkyShadowFloor,
 				_editorSettings.ProbeGiSpecularFloor, _editorSettings.ProbeGiSunIntensity,
 				_editorSettings.ProbeGiAmbientBoost, _editorSettings.ProbeGiNormalBias,
@@ -483,9 +367,7 @@ namespace DecaEngine.Editor
 				ApplyPreviewSettingsToMaterials();
 			}
 
-			// Шаг времени временной адаптации - каждый кадр, до записи: заморожённый командный буфер
-			// графа берёт его из кбуфера (см. EyeAdaptationPassResources.SetDeltaTime). Кламп сверху -
-			// защита от «прыжка» экспозиции после долгих пауз редактора (загрузка модели, бейк проб).
+			// Clamped: long editor stalls (model load, probe bake) would jump the exposure.
 			_env.SetEyeAdaptationDeltaTime(Math.Min(deltaTime, 0.1f));
 
 			try
@@ -493,37 +375,22 @@ namespace DecaEngine.Editor
 				var eye = ModelViewportGeometry.ComputeOrbitEye(_orbitTarget, _distance, _yaw, _pitch);
 				_env.SetCameraTransform(eye, _orbitTarget);
 
-				// Кадр исполняется ВСЕГДА, даже без единой модели - пустая сцена показывает небо
-				// окружения (батч-рендерер безопасен при нуле инстансов), а загрузку первой модели
-				// ведёт ModelStreamingSystem ВНУТРИ Root.Update (курица и яйцо иначе не разрешается:
-				// стример шагает по позиции камерной сущности стора, которую SetCameraTransform выше
-				// только что обновил). Раньше эта ветка при отсутствии модели вызывала
-				// _streamer.Tick(...) напрямую и выходила без записи кадра - теперь это делает сама
-				// система внутри Root, а кадр (пустое небо) пишется как обычно (см. PrefabSceneViewport.Update
-				// - тот же приём).
+				// The frame is recorded even with no model: ModelStreamingSystem drives loading
+				// from INSIDE Root.Update, off the camera entity SetCameraTransform just updated.
 				_env.Root.Update(new UpdateTick(deltaTime, time));
 				_env.Pipeline.Execute();
 			}
 			catch (Exception ex)
 			{
-				// This runs every frame while a model is loaded (unlike the one-time load path in
-				// PollPendingLoad, which already has its own try/catch) - EditorManager.OnUpdate calls
-				// this BEFORE the main scene's _pipeline.Execute()/Present() inside the same GPU lock
-				// (see the ordering comment there), so an exception escaping here would skip Present()
-				// for this frame and, since the model stays loaded, do so again on every frame after -
-				// i.e. the editor would appear to freeze/stop presenting entirely instead of just
-				// losing this one preview.
+				// This runs inside the editor's GPU lock, before the main scene's Present(): an
+				// escaping exception would skip Present() on this and every following frame.
 				_loadError = ex.Message;
 				EngineLog.Add(LogLevel.Error, $"Model preview: render failed for '{_loadedPath}': {ex.Message}");
 				ClearInstances();
 			}
 		}
 
-		/// <summary>
-		/// ?????? ImGui.Image ?????? ? ???????????? orbit/pan/zoom ???? ???? ??? ??? (??????????
-		/// <see cref="PrefabSceneViewport"/>). ?????? ?????????? ?? ??????????? ImGui-????, ???????
-		/// ??? ?????????? (??. InspectorWindow.RenderModelPreview).
-		/// </summary>
+		/// <summary>Draws the off-screen image as an ImGui.Image and handles orbit/pan/zoom input.</summary>
 		public void Render(ImGuiRender imGuiRender, Vector2 size)
 		{
 			_lastImGuiRender = imGuiRender;
@@ -535,10 +402,8 @@ namespace DecaEngine.Editor
 
 			if (!_textureBound)
 			{
-				// Bind immediately, not just allocate the ImGui texture id - otherwise the very first
-				// ~ResizeSettleSeconds of the viewport's life (see TrackAndApplyResize) show an unbound
-				// image (nothing drawn) instead of the empty-scene sky, because BindRenderTarget below
-				// used to run ONLY on a settled resize. Same fix as PrefabSceneViewport.Render.
+				// Bind now, not on the first settled resize: the first ~ResizeSettleSeconds of the
+				// viewport's life would otherwise draw an unbound image.
 				_textureRef = imGuiRender.GetNewTexture();
 				imGuiRender.BindRenderTarget(_textureRef.GetTexID(), _env.ColorTarget);
 				_textureBound = true;
@@ -548,22 +413,15 @@ namespace DecaEngine.Editor
 
 			if (resized)
 			{
-				// Resizing recreates the underlying GPU texture (see DiligentRenderTarget.Resize), so
-				// the shader resource binding ImGui captured at bind time now points at a disposed
-				// texture - rebind onto the same ImTextureID rather than allocating a new one each time,
-				// which would otherwise leak an entry in ImGuiDiligentRender's texture table per resize.
+				// Resize recreates the GPU texture; rebind onto the SAME ImTextureID, since a fresh
+				// one would leak an entry in ImGuiDiligentRender's texture table per resize.
 				imGuiRender.BindRenderTarget(_textureRef.GetTexID(), _env.ColorTarget);
 			}
 
 			var cursor = ImGui.GetCursorScreenPos();
 
-			// Вертикальный градиент-подложка в духе glTF Sample Viewer: сам оффскрин-таргет
-			// очищается с alpha 0 (см. ModelViewportEnvironment), так что фон картинки прозрачен и
-			// ImGui-блендинг кладёт модель поверх этого прямоугольника. Цвета - строго нейтральные
-			// (R=G=B): тонированные значения здесь выходили на экран с перекошенным оттенком
-			// (тёплый низ вместо холодного - похоже на R/B-swap в цветовом пути ImGui-бэкенда),
-			// а нейтральному серому перестановка каналов безразлична. Должны совпадать с backdrop
-			// в UnlitInstancedPS.hlsl (просвет стекла) и PreviewProbe.CompositeOverBackdrop.
+			// Backdrop gradient behind the alpha-0 off-screen target. Must stay neutral (R=G=B):
+			// the ImGui color path swaps R/B here. Must match UnlitInstancedPS.hlsl's backdrop.
 			var backdropDrawList = ImGui.GetWindowDrawList();
 			uint backdropTop = ImGui.GetColorU32(new Vector4(0.55f, 0.55f, 0.55f, 1f));
 			uint backdropBottom = ImGui.GetColorU32(new Vector4(0.26f, 0.26f, 0.26f, 1f));
@@ -585,17 +443,8 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>
-		/// Debounces <see cref="ResizeTargets"/>: only applies once the requested ImGui image size has
-		/// stayed unchanged for <see cref="ResizeSettleSeconds"/>, i.e. once the user has finished
-		/// resizing the window/panel rather than on every frame while they're still dragging it.
-		///
-		/// Сюда же сведён и МАСШТАБ РЕНДЕРА: это единственная точка кадра, где ресайз таргетов
-		/// безопасен (картинка превью ещё не добавлена в draw list ImGui, а вызывающий после
-		/// ресайза сам перевешивает биндинг - см. Render). Настройка перечитывается каждый кадр,
-		/// а не пушится событием: так расхождение сценовых таргетов с масштабом чинится само -
-		/// и после драга слайдера (с тем же дебаунсом, что у ресайза окна), и после пересоздания
-		/// окружения, у которого масштаб сбрасывается в 1.</summary>
+		// Debounces ResizeTargets, and is also the only point in the frame where resizing targets
+		// is safe: the preview image is not in the ImGui draw list yet.
 		private bool TrackAndApplyResize(ImGuiRender imGuiRender, Vector2 imGuiSize)
 		{
 			var width = (uint)Math.Max(1, MathF.Round(imGuiSize.X));
@@ -613,8 +462,8 @@ namespace DecaEngine.Editor
 				return false;
 			}
 
-			// Сценовые таргеты сверяются по ФАКТУ (депт против SceneSizeFor), а не по «изменилась ли
-			// настройка»: факт переживает пересоздание окружения и любые пропущенные события.
+			// Compared against actual target sizes, not against a "settings changed" flag: that
+			// survives environment recreation and any missed event.
 			if (requestedSize == _env.ColorTarget.Size &&
 			    _env.Pipeline.SceneSizeFor(requestedSize) == _env.DepthTarget.Size)
 			{
@@ -630,71 +479,49 @@ namespace DecaEngine.Editor
 			return ResizeTargets(imGuiRender, requestedSize);
 		}
 
-		/// <summary>
-		/// Resizes the off-screen color/depth targets and camera viewport to match the given size so
-		/// the preview renders at native resolution instead of a fixed one.
-		/// </summary>
 		private bool ResizeTargets(ImGuiRender imGuiRender, Vector2 newSize)
 		{
 			var width = (uint)newSize.X;
 			var height = (uint)newSize.Y;
 
-			// Resize disposes and recreates the underlying GPU texture (see
-			// DiligentRenderTarget.Resize) - without waiting for any in-flight GPU work that still
-			// reads/writes the old texture (this engine currently has no frame-in-flight fence, see
-			// DiligentGraphicsApi.Present) to finish first, disposing it here races the GPU and can
-			// crash the driver with an access violation. Flush() must precede WaitForIdle(): otherwise
-			// commands recorded on the immediate context but not yet submitted are still pending when
-			// WaitForIdle() returns (see the same Flush()+WaitForIdle() pairing in
-			// DiligentGraphicsUtility's buffer readback), so the old texture could still be disposed out
-			// from under work the GPU hasn't actually started yet.
+			// There is no frame-in-flight fence, so disposing the old texture races the GPU.
+			// Flush() must precede WaitForIdle(), else unsubmitted commands are still pending.
 			_env.DilApi.ImmediateContext.Flush();
 			_env.DilApi.ImmediateContext.WaitForIdle();
 
-			// Must happen before Resize() disposes the color target's texture/views below: the cached
-			// ImGui shader-resource binding for this texture id holds a reference to a view of the
-			// CURRENT (about to be stale) texture, and releasing that binding after the view is gone
-			// crashes instead of cleanly releasing it (see ImGuiRender.ReleaseRenderTargetBinding).
+			// Must precede Resize(): releasing the cached ImGui binding after its view is gone crashes.
 			imGuiRender.ReleaseRenderTargetBinding(_textureRef.GetTexID());
 
-			// Сценовые таргеты (депт/HDR/scene-copy/AO/GI) - в РЕНДЕР-размере: при масштабе
-			// рендера меньше 1 сцена рисуется в уменьшенные, а до отображаемого её поднимает тонемап
-			// (см. GraphicsPipelineSimple.SetRenderScale). ColorTarget всегда display - его сэмплирует
-			// ImGui.
+			// Scene targets live at RENDER size; ColorTarget stays at display size for ImGui.
 			var sceneSize = _env.Pipeline.SceneSizeFor(newSize);
 
 			_env.ColorTarget.Resize(newSize);
 			_env.DepthTarget.Resize(sceneSize);
 
-			// Снимок сцены обязан совпадать по размеру с таргетом геометрии (CopyTexture копирует 1:1),
-			// а после Resize это уже ДРУГАЯ нативная текстура - резидентным материалам нужно перепривязать
-			// _SceneColor, иначе они продолжат сэмплировать уничтоженную (см. RegisterModelResources).
+			// CopyTexture copies 1:1, so this must match the geometry target size; _SceneColor is
+			// rebound below because Resize hands out a different native texture.
 			_env.SceneCopyTarget.Resize(sceneSize);
 
-			// G-buffer отражений живёт в рендер-размере вместе с дептом (его читают SSR-пассы).
+			// Reflection G-buffer lives at render size alongside depth; the SSR passes read it.
 			_env.Pipeline.Targets?.NormalRoughnessTarget?.Resize(sceneSize);
 			_env.Pipeline.Targets?.EnvFactorTarget?.Resize(sceneSize);
 			_env.AoTarget?.Resize(sceneSize);
 			_env.GiTarget?.Resize(sceneSize);
 
-			// HDR-кадр - размером со сцену, как и остальные; таргеты цепочки замера яркости
-			// фиксированного размера и ресайза не требуют (см. EyeAdaptationPass).
+			// The luminance-reduction chain is fixed-size and needs no resize.
 			_env.HdrColorTarget?.Resize(sceneSize);
 
 			_env.RebindPostProcessTargets();
 			if (_residentModel != null)
 			{
-				foreach (var material in _residentModel.materialObjects.Values)
+				foreach (var material in OwnMaterials!.Values)
 				{
 					material.SetTexture("_SceneColor", _env.SceneCopyTarget);
 				}
 			}
 
-			// Must happen immediately after Resize(), before any code below that could throw (e.g.
-			// GetComponent/RecalculateProjection) - Resize() already disposed the old GPU
-			// texture/views, so if Invalidate() were skipped the render graph would keep replaying
-			// its frozen command buffer, which still references those disposed views, on every
-			// subsequent frame until something else happens to invalidate it.
+			// Must run right after Resize(), before anything below that could throw: otherwise the
+			// render graph keeps replaying a frozen command buffer over disposed views.
 			_env.Pipeline.SetOffscreenViewportSize(newSize);
 
 			ref var cameraComponent = ref _env.CameraEntity.GetComponent<CameraComponent>();

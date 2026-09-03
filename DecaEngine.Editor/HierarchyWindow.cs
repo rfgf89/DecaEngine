@@ -10,7 +10,6 @@ namespace DecaEngine.Editor
 
 		protected override void OnRender(uint dockId)
 		{
-			// TODO: Implement hierarchy window UI
 		}
 	}
 }

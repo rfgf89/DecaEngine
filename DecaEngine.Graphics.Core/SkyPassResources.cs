@@ -13,9 +13,7 @@ public sealed class SkyPassResources : IReleaseObject
 {
 	private readonly IMaterialObject _material;
 
-	/// <param name="colorFormat">Формат цветового таргета, в который небо рисуется инлайн внутри
-	/// <see cref="ForwardPass"/> - в HDR-режиме превью это RGBA16F, и PSO обязан совпадать с
-	/// привязанным таргетом (см. <see cref="PipelineRenderTargets.RenderColorFormat"/>).</param>
+	// colorFormat must match the target ForwardPass has bound, or the PSO is invalid.
 	public SkyPassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer, IGpuTexture environmentMap,
 		TextureObjectFormat colorFormat = TextureObjectFormat.R8G8B8A8UNorm)
 	{
@@ -46,20 +44,18 @@ public sealed class SkyPassResources : IReleaseObject
 		_material.SetTexture("_EnvMap", environmentMap);
 		_material.SetImmutableSampler("_EnvMap", skySampler);
 
-		// SkySettings обязан быть привязан до первого Draw: без этого дескриптор пустой
-		// (VUID-vkCmdDraw-None-08114) и шейдер читает мусор, пока пользователь не тронет ползунок
-		// света (единственный другой вызов SetEnvironmentYaw - ApplyLightRotation).
+		// SkySettings must be bound before the first Draw: otherwise the descriptor is empty
+		// (VUID-vkCmdDraw-None-08114) and the shader reads garbage.
 		_hdrOutput = colorFormat != TextureObjectFormat.R8G8B8A8UNorm;
 		SetEnvironmentYaw(0f);
 	}
 
-	/// <summary>Layout of the SkySettings cbuffer in SkyBackgroundPS.hlsl - см.
-	/// <see cref="SetEnvironmentYaw"/>.</summary>
+	// Layout of the SkySettings cbuffer in SkyBackgroundPS.hlsl.
 	private struct SkySettingsData
 	{
 		public float EnvYawRadians;
 
-		/// <summary>>0.5 - писать линейную яркость вместо display-энкода (HDR-конвейер).</summary>
+		// >0.5 writes linear luminance instead of a display encode.
 		public float HdrOutput;
 
 		public float Pad1, Pad2;
@@ -68,19 +64,16 @@ public sealed class SkyPassResources : IReleaseObject
 	private bool _hdrOutput;
 	private float _envYawRadians;
 
-	/// <summary>Пользовательский поворот энвайронмента вокруг Y в радианах (ползунок света в
-	/// превью): сдвигает equirect-U фонового неба тем же значением, что уходит в PbrEnvYaw
-	/// материалов модели (см. UnlitInstancedPS.hlsl), - фон и отражения вращаются синхронно.</summary>
+	/// <summary>Environment yaw around Y, radians; must match the model materials' PbrEnvYaw.</summary>
 	public void SetEnvironmentYaw(float radians)
 	{
 		_envYawRadians = radians;
 		PushSettings();
 	}
 
-	/// <summary>Писать ли небу ЛИНЕЙНУЮ яркость. Обычно совпадает с HDR-режимом конвейера, но
-	/// сбрасывается на время passthrough-режимов тонемапа (отладочные каналы/AO debug): там кадр
-	/// копируется в отображаемый таргет как есть, и линейное небо ушло бы туда без энкода - заметно
-	/// темнее, чем то же небо в LDR-конвейере. См. <see cref="TonemapPassResources.SetPassthrough"/>.</summary>
+	/// <summary>Whether the sky writes linear luminance.</summary>
+	// Normally follows the pipeline HDR mode, but must be cleared for tonemap passthrough modes,
+	// which copy the frame to the display target unencoded.
 	public void SetHdrOutput(bool hdrOutput)
 	{
 		_hdrOutput = hdrOutput;
@@ -93,10 +86,8 @@ public sealed class SkyPassResources : IReleaseObject
 		_material.SetConstant("SkySettings", ref data, HandleAccess.Pixel);
 	}
 
-	/// <summary>Фон-энвайронмент: фуллскрин-треугольник без вершинного буфера, рисуется ДО геометрии
-	/// с выключенным depth-тестом - геометрия его перекроет. Заодно наполняет scene copy настоящим
-	/// небом, так что рефракция стекла на фоне показывает окружение, а не аналитический
-	/// градиент-фолбэк. Вызывающий обязан уже забиндить целевой render target (см. ForwardPass).</summary>
+	/// <summary>Draws the sky as a fullscreen triangle with depth test off.</summary>
+	// Must run BEFORE geometry, and the caller must have bound the render target already.
 	public void Draw(ICommandBuffer cmd)
 	{
 		cmd.SetPipelineState(_material);

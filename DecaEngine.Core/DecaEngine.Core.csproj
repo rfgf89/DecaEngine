@@ -18,15 +18,15 @@
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
       <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="5.3.0" ExcludeAssets="runtime" />
       <!--
-        Microsoft.CodeAnalysis.Workspaces.MSBuild транзитивно тянет свою версию
-        Microsoft.Build/Microsoft.Build.Framework. Без явного пиннинга их версии
-        с ExcludeAssets="runtime" их DLL копируются в выходную папку и конфликтуют
-        по версии с тем, что резолвит Microsoft.Build.Locator из установленной
-        .NET SDK (см. DecaEngine.Core.Build.csproj) — это приводит к падению
+        Microsoft.CodeAnalysis.Workspaces.MSBuild transitively pulls in its own version
+        of Microsoft.Build/Microsoft.Build.Framework. Without pinning that version
+        explicitly with ExcludeAssets="runtime", their DLLs are copied to the output
+        folder and clash by version with what Microsoft.Build.Locator resolves from the
+        installed .NET SDK (see DecaEngine.Core.Build.csproj) - which fails with
         "The type initializer for 'Microsoft.Build.Shared.Debugging.DebugUtils'
-        threw an exception." Пиннингом версии и исключением runtime-ассетов здесь
-        гарантируем, что во всём решении используется только одна версия этих
-        пакетов и её бинарники никогда не копируются в output.
+        threw an exception." Pinning the version and excluding the runtime assets here
+        guarantees that the whole solution uses a single version of these packages and
+        that its binaries are never copied to the output.
       -->
       <PackageReference Include="Microsoft.Build" Version="18.6.3" ExcludeAssets="runtime" />
       <PackageReference Include="Microsoft.Build.Framework" Version="18.6.3" ExcludeAssets="runtime" />

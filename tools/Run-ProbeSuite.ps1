@@ -1,35 +1,35 @@
 ﻿<#
 .SYNOPSIS
-	Прогоняет DECA_PROBE_*-гарнессы как регрессионный набор и сверяет их числа с эталоном.
+	Runs the DECA_PROBE_* harnesses as a regression suite and checks their numbers against a baseline.
 
 .DESCRIPTION
-	Тестов на рендер в проекте нет и быть не может: проверять картинку ассертами дороже, чем её
-	рисовать. Зато пробы уже печатают числа, по которым видно ЧТО ИМЕННО сломалось - светимость
-	кадра, число сущностей, совпадение BVH с кэшем. Скрипт превращает эти числа в эталон.
+	There are no render tests in this project and there cannot be: asserting on an image costs more
+	than drawing it. But the probes already print numbers that show EXACTLY what broke - frame
+	luminance, entity counts, BVH/cache agreement. This script turns those numbers into a baseline.
 
-	Смысл именно в рефакторинге: перенос кода между проектами и распил файлов не должны менять
-	НИ ОДНОГО из этих чисел. Если после переезда ProbeGi в свой модуль светимость поля уехала -
-	переезд был не механическим, и это видно сразу, а не через неделю на скриншоте.
+	The point is refactoring: moving code between projects and splitting files must not change a
+	SINGLE one of these numbers. If frame luminance shifted after ProbeGi moved into its own module,
+	the move was not mechanical, and that shows up right away instead of a week later in a screenshot.
 
-	Строки с временем (` ms`) в эталон не попадают: они пляшут от запуска к запуску и утопили бы
-	сигнал. Числа сверяются с допуском, текст - точно.
+	Lines carrying timings (` ms`) never reach the baseline: they jitter from run to run and would
+	drown the signal. Numbers are compared with a tolerance, text exactly.
 
 .PARAMETER Baseline
-	Записать текущие числа как эталон вместо сверки. Делать это можно ТОЛЬКО на заведомо
-	исправном дереве - обычно сразу после коммита, который прошёл сверку.
+	Record the current numbers as the baseline instead of comparing. Do this ONLY on a known-good
+	tree - normally right after a commit that passed the comparison.
 
 .PARAMETER Scenario
-	Прогнать один сценарий вместо всех. Имена - в $Scenarios ниже.
+	Run a single scenario instead of all of them. Names are in $Scenarios below.
 
 .PARAMETER Tolerance
-	Относительный допуск для чисел, по умолчанию 1%. Светимость считается на GPU, и последний
-	знак имеет право гулять.
+	Relative tolerance for numbers, 1% by default. Luminance is computed on the GPU, and the last
+	digit is allowed to wander.
 
 .PARAMETER Backend
-	d3d12 (по умолчанию) или vulkan. Аппаратная трассировка компилируется только на d3d12.
+	d3d12 (default) or vulkan. Hardware ray tracing is only compiled on d3d12.
 
 .PARAMETER SkipBuild
-	Не пересобирать редактор. Для повторного прогона после падения.
+	Do not rebuild the editor. For a re-run after a failure.
 
 .EXAMPLE
 	.\tools\Run-ProbeSuite.ps1 -Baseline
@@ -42,110 +42,116 @@ param(
 	[string]$Scenario,
 	[double]$Tolerance = 0.01,
 	[ValidateSet('d3d12', 'vulkan')][string]$Backend = 'd3d12',
-	[switch]$SkipBuild
+	[switch]$SkipBuild,
+	[string]$BinDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-# ЛОВУШКА ПУТИ: сборка с -p:Platform=x64 кладёт свежие DLL в bin\x64\..., а в bin\Debug\... лежит
-# СТАРЫЙ комплект - там обновляется exe, но не DecaEngine.Graphics.Diligent.dll. Запуск оттуда
-# тихо гоняет вчерашний код. Только bin\x64.
-# Точка входа переехала в DecaEngine.Editor.App: сам редактор теперь библиотека, иначе на него не
-# мог бы сослаться проект пробников (см. DecaEngine.Editor.App.csproj). EditorAssets приезжают сюда
-# транзитивно из редактора - их 345, ровно столько же, сколько в исходниках.
-$BinDir = Join-Path $RepoRoot 'DecaEngine.Editor.App\bin\x64\Debug\net10.0'
+# PATH TRAP: a build with -p:Platform=x64 puts fresh DLLs into bin\x64\..., while bin\Debug\... holds
+# a STALE set - the exe is updated there, but DecaEngine.Graphics.Diligent.dll is not. Running from
+# there silently exercises yesterday's code. Use bin\x64 only.
+# The entry point moved to DecaEngine.Editor.App: the editor itself is now a library, otherwise the
+# probe project could not reference it (see DecaEngine.Editor.App.csproj). EditorAssets arrive here
+# transitively from the editor - 345 of them, exactly as many as in the sources.
+# -BinDir <dir> - run the probes from a DIFFERENT set (a copy of bin with fresh DLLs dropped in):
+# while the editor is open, its exe and DLLs in bin\x64 are locked and cannot be rebuilt there - but
+# a fix still needs checking without closing the scene. Use together with -SkipBuild.
+if (-not $BinDir) {
+	$BinDir = Join-Path $RepoRoot 'DecaEngine.Editor.App\bin\x64\Debug\net10.0'
+}
 $Exe = Join-Path $BinDir 'DecaEngine.Editor.App.exe'
-# Не "probe-baseline": .gitignore выбрасывает probe-*/ на любом уровне (там ~150 каталогов
-# с выводом проб), и эталоны молча не попадали бы в коммит.
+# Not "probe-baseline": .gitignore drops probe-*/ at any level (there are ~150 directories with probe
+# output), and the baselines would silently never make it into a commit.
 $BaselineDir = Join-Path $PSScriptRoot 'baselines'
 $OutRoot = Join-Path $RepoRoot '_probeout\suite'
 
-# Пробы ищут EditorAssets рядом с exe, поэтому пути к моделям - относительные от bin.
+# The probes look for EditorAssets next to the exe, so model paths are relative to bin.
 $Sponza = 'EditorAssets/models/Sponza.gltf'
 $Fox = 'EditorAssets/models/Fox.glb'
 
 $Scenarios = @(
 	@{
 		Name = 'sponza-base'
-		Desc = 'Загрузка модели, материалы, тени, SSAO/SSGI, probe GI - основной путь превью'
+		Desc = 'Model load, materials, shadows, SSAO/SSGI, probe GI - the main preview path'
 		Args = @('--preview-probe', $Sponza, '<OUT>')
 		Env  = @{}
 	},
 	@{
 		Name = 'sponza-interior'
-		Desc = 'Интерьерный кадр с точечным светом: probe GI трассирует лампы'
+		Desc = 'Interior frame with a punctual light: probe GI traces the lamps'
 		Args = @('--preview-probe', $Sponza, '<OUT>')
 		Env  = @{ DECA_PROBE_EYE = '-0.5,3,0.4'; DECA_PROBE_TARGET = '30,4,0.4'; DECA_PROBE_POINT = '1' }
 	},
 	@{
 		Name = 'sponza-gi-gpu'
-		Desc = 'GPU-путь probe GI против CPU-эталона'
+		Desc = 'Probe GI GPU path against the CPU baseline'
 		Args = @('--preview-probe', $Sponza, '<OUT>')
 		Env  = @{ DECA_PROBE_GIGPU = '1'; DECA_PROBE_EYE = '-0.5,3,0.4'; DECA_PROBE_TARGET = '30,4,0.4' }
 	},
 	@{
 		Name = 'fox-animation'
-		Desc = 'Импорт скелета и клипов, скиннинг - численный отчёт по анимации'
+		Desc = 'Skeleton and clip import, skinning - numeric animation report'
 		Args = @('--preview-probe', $Fox, '<OUT>')
 		Env  = @{ DECA_PROBE_ANIMREPORT = '1' }
 	},
 	@{
 		Name = 'fox-humanoid'
-		Desc = 'Автоматическая разметка гуманоидного аватара по топологии скелета'
+		Desc = 'Automatic humanoid avatar mapping from skeleton topology'
 		Args = @('--preview-probe', $Fox, '<OUT>')
 		Env  = @{ DECA_PROBE_HUMANOID = '1' }
 	},
 	@{
 		Name = 'physics'
-		Desc = 'Мир Bepu: гравитация, контакт с полом, фиксированный шаг'
+		Desc = 'Bepu world: gravity, ground contact, fixed step'
 		Args = @('--preview-probe', $Fox, '<OUT>')
 		Env  = @{ DECA_PROBE_PHYSICS = '1' }
 	},
 	@{
 		Name = 'gameplay'
-		Desc = 'Геймплейные системы: движение персонажа по кругу'
+		Desc = 'Gameplay systems: character moving in a circle'
 		Args = @('--preview-probe', $Fox, '<OUT>')
 		Env  = @{ DECA_PROBE_GAMEPLAY = '1' }
 	},
 	@{
 		Name = 'full-loop'
-		Desc = 'Оба рендер-графа в реальном порядке EditorManager + переключение фич на лету'
+		Desc = 'Both render graphs in the real EditorManager order + feature toggling on the fly'
 		Args = @('--full-loop', $Sponza, '300', '<BACKEND>')
 		Env  = @{ DECA_LOOP_TOGGLE = '1' }
 		<#
-			Итоговая строка сценария несёт номера кадров, на которых модель дозагрузилась. Это
-			замер скорости МАШИНЫ, а не поведения движка: между тёплыми прогонами они гуляют на
-			кадр, а на первом прогоне после пересборки - сразу на пять (холодные JIT и кэш
-			шейдеров сдвигают всю асинхронную загрузку). Расширять допуск, пока не позеленеет,
-			значит просто перестать что-либо проверять - поэтому эти поля выброшены поимённо.
+			The scenario's final line carries the frame numbers at which the model finished
+			loading. That measures the MACHINE's speed, not engine behaviour: between warm runs
+			they drift by a frame, and on the first run after a rebuild by five at once (cold JIT
+			and a cold shader cache shift the whole async load). Widening the tolerance until it
+			goes green just means checking nothing at all - so these fields are dropped by name.
 
-			Проверяемое утверждение остаётся: модель загрузилась, без ошибки, за 300 кадров, и
-			стриминг ДОШЁЛ до конца (соседняя строка `still streaming 0/69`).
+			The claim under test remains: the model loaded, without error, within 300 frames, and
+			streaming REACHED the end (the neighbouring `still streaming 0/69` line).
 		#>
 		IgnoreFields = @('finalized', 'texturesReady', 'visible', 'streamingComplete')
 	}
 )
 
 <#
-	Отбор идёт не белым списком строк, а по признакам: любая тегированная строка с числом -
-	метрика, пока не доказано обратное. Белый список пришлось бы дописывать под каждое новое поле
-	в пробе, и он молча терял бы ровно те метрики, которые добавили последними, - то есть самые
-	интересные.
+	Selection is not a whitelist of lines but a set of traits: any tagged line with a number is a
+	metric until proven otherwise. A whitelist would have to be extended for every new field in a
+	probe, and it would silently lose exactly the metrics added last - that is, the most interesting
+	ones.
 
-	Что выбрасывается и почему:
-	  ` ms`   - времена пляшут от загрузки машины; сверять их значит получать красный прогон через
-	            раз, а набор, который врёт, перестают запускать;
-	  `:\`    - абсолютные пути, они привязали бы эталон к конкретной машине;
-	  compile / pso - счётчики компиляций шейдеров зависят от состояния DECA_SHADER_CACHE:
-	            холодный и тёплый кэш дают разные числа, и к рефакторингу это отношения не имеет;
-	  [diligent-*] - лог самого драйвера. --full-loop подписан на ВСЕ уровни, и оттуда сыплются
-	            адреса страниц динамической памяти: они не совпадают даже между двумя подряд
-	            запусками одного и того же кода;
-	  `[...] frame N:` - вехи асинхронного стриминга. Номер кадра, на котором дозагрузилась
-	            текстура, гуляет на кадр-другой от фоновых потоков декодирования. Итоговые строки
-	            (`done:`, `final texture quality:`) остаются - в них лежат сами факты.
+	What is dropped and why:
+	  ` ms`   - timings jitter with machine load; comparing them means a red run every other time,
+	            and a suite that lies stops being run;
+	  `:\`    - absolute paths, they would tie the baseline to one specific machine;
+	  compile / pso - shader compile counters depend on the state of DECA_SHADER_CACHE: a cold and
+	            a warm cache give different numbers, and that has nothing to do with refactoring;
+	  [diligent-*] - the driver's own log. --full-loop subscribes to ALL levels, and dynamic memory
+	            page addresses pour out of it: they do not even match between two back-to-back runs
+	            of the same code;
+	  `[...] frame N:` - async streaming milestones. The frame number at which a texture finished
+	            loading drifts by a frame or two due to background decode threads. The final lines
+	            (`done:`, `final texture quality:`) stay - they hold the actual facts.
 #>
 $MetricNoise = @(
 	' ms\b',
@@ -177,17 +183,17 @@ function Get-Metrics {
 }
 
 <#
-	Сверка строки метрики: числа - с допуском, всё остальное - точно. Разбор по числам, а не по
-	парам ключ=значение, потому что формат вывода у проб разный, и подстраиваться под каждую
-	значит ломать сверку каждый раз, когда в пробу добавили поле.
+	Comparing a metric line: numbers with a tolerance, everything else exactly. Parsing by numbers
+	rather than by key=value pairs, because the probes' output formats differ, and adapting to each
+	one means breaking the comparison every time a field is added to a probe.
 #>
 function Compare-MetricLine {
 	param([string]$Expected, [string]$Actual, [double]$Tolerance, [string[]]$IgnoreFields)
 
 	$numberPattern = '-?\d+(?:[.,]\d+)?'
 
-	# Значения перечисленных полей затираются в ОБЕИХ строках, поэтому из сверки уходит только
-	# число, а само наличие поля по-прежнему проверяется формой строки.
+	# Values of the listed fields are masked in BOTH lines, so only the number drops out of the
+	# comparison, while the presence of the field itself is still checked by the line's shape.
 	foreach ($field in $IgnoreFields) {
 		$mask = "$([regex]::Escape($field))=$numberPattern"
 		$Expected = [regex]::Replace($Expected, $mask, "$field=~")
@@ -197,7 +203,7 @@ function Compare-MetricLine {
 	$actualShape = [regex]::Replace($Actual, $numberPattern, '#')
 
 	if ($expectedShape -ne $actualShape) {
-		return "форма строки изменилась"
+		return "line shape changed"
 	}
 
 	$expectedNumbers = [regex]::Matches($Expected, $numberPattern)
@@ -209,7 +215,7 @@ function Compare-MetricLine {
 		$scale = [Math]::Max([Math]::Abs($e), 1.0)
 
 		if ([Math]::Abs($e - $a) / $scale -gt $Tolerance) {
-			return "число #$($i + 1): эталон $e, получено $a"
+			return "number #$($i + 1): baseline $e, got $a"
 		}
 	}
 
@@ -238,8 +244,8 @@ function Invoke-Scenario {
 			[Environment]::SetEnvironmentVariable($key, $Case.Env[$key])
 		}
 
-		# Бэкенд задаётся сценарию всегда: на vulkan аппаратная трассировка не компилируется,
-		# и эталон, снятый на одном бэкенде, на другом сверять бессмысленно.
+		# The backend is always passed to the scenario: hardware ray tracing is not compiled on
+		# vulkan, and a baseline taken on one backend is meaningless to compare on another.
 		$restore['DECA_PROBE_BACKEND'] = [Environment]::GetEnvironmentVariable('DECA_PROBE_BACKEND')
 		[Environment]::SetEnvironmentVariable('DECA_PROBE_BACKEND', $Backend)
 
@@ -271,30 +277,30 @@ function Invoke-Scenario {
 # ---------------------------------------------------------------------------------------------
 
 if (-not $SkipBuild) {
-	Write-Host "[suite] сборка редактора (x64)..." -ForegroundColor Cyan
+	Write-Host "[suite] building the editor (x64)..." -ForegroundColor Cyan
 	& dotnet build (Join-Path $RepoRoot 'DecaEngine.Editor\DecaEngine.Editor.csproj') `
 		-c Debug -p:Platform=x64 --nologo -v q | Out-Null
 	if ($LASTEXITCODE -ne 0) {
-		Write-Host "[suite] СБОРКА УПАЛА - прогонять нечего" -ForegroundColor Red
+		Write-Host "[suite] BUILD FAILED - nothing to run" -ForegroundColor Red
 		exit 1
 	}
 }
 
 if (-not (Test-Path $Exe)) {
-	Write-Host "[suite] нет $Exe - соберите редактор с -p:Platform=x64" -ForegroundColor Red
+	Write-Host "[suite] no $Exe - build the editor with -p:Platform=x64" -ForegroundColor Red
 	exit 1
 }
 
 New-Item -ItemType Directory -Path $BaselineDir -Force | Out-Null
 New-Item -ItemType Directory -Path $OutRoot -Force | Out-Null
 
-# @() снаружи обязательно: PowerShell разворачивает массив из одного элемента, и $selected стал бы
-# самой хеш-таблицей сценария - а .Count у неё считает КЛЮЧИ, из-за чего один сценарий отчитывался
-# как «1 из 4».
+# The outer @() is mandatory: PowerShell unwraps a single-element array, and $selected would become
+# the scenario hashtable itself - whose .Count counts KEYS, which made a single scenario report as
+# "1 of 4".
 $selected = @(if ($Scenario) {
 	$match = $Scenarios | Where-Object { $_.Name -eq $Scenario }
 	if (-not $match) {
-		Write-Host "[suite] нет сценария '$Scenario'. Есть: $(($Scenarios.Name) -join ', ')" -ForegroundColor Red
+		Write-Host "[suite] no scenario '$Scenario'. Available: $(($Scenarios.Name) -join ', ')" -ForegroundColor Red
 		exit 1
 	}
 	$match
@@ -312,16 +318,16 @@ foreach ($case in $selected) {
 	$run = Invoke-Scenario -Case $case
 
 	if ($run.ExitCode -ne 0) {
-		Write-Host "  УПАЛА (код $($run.ExitCode)), лог: $($run.LogPath)" -ForegroundColor Red
+		Write-Host "  FAILED (code $($run.ExitCode)), log: $($run.LogPath)" -ForegroundColor Red
 		$run.Output | Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-		$failures += "$($case.Name): ненулевой код возврата"
+		$failures += "$($case.Name): non-zero exit code"
 		continue
 	}
 
 	$metrics = Get-Metrics -Lines $run.Output
 	if ($metrics.Count -eq 0) {
-		Write-Host "  проба отработала, но не напечатала НИ ОДНОЙ метрики - сверять нечего" -ForegroundColor Yellow
-		$failures += "$($case.Name): нет метрик в выводе"
+		Write-Host "  the probe ran but printed NOT A SINGLE metric - nothing to compare" -ForegroundColor Yellow
+		$failures += "$($case.Name): no metrics in the output"
 		continue
 	}
 
@@ -329,14 +335,14 @@ foreach ($case in $selected) {
 
 	if ($Baseline) {
 		$metrics | Out-File -FilePath $baselinePath -Encoding utf8
-		Write-Host "  эталон записан: $($metrics.Count) метрик" -ForegroundColor Green
+		Write-Host "  baseline recorded: $($metrics.Count) metrics" -ForegroundColor Green
 		$recorded++
 		continue
 	}
 
 	if (-not (Test-Path $baselinePath)) {
-		Write-Host "  эталона нет - запустите с -Baseline" -ForegroundColor Yellow
-		$failures += "$($case.Name): нет эталона"
+		Write-Host "  no baseline - run with -Baseline" -ForegroundColor Yellow
+		$failures += "$($case.Name): no baseline"
 		continue
 	}
 
@@ -344,7 +350,7 @@ foreach ($case in $selected) {
 	$diffs = @()
 
 	if ($expected.Count -ne $metrics.Count) {
-		$diffs += "метрик было $($expected.Count), стало $($metrics.Count)"
+		$diffs += "metric count was $($expected.Count), now $($metrics.Count)"
 	}
 
 	$caseTolerance = if ($case.ContainsKey('Tolerance')) { [double]$case.Tolerance } else { $Tolerance }
@@ -355,32 +361,32 @@ foreach ($case in $selected) {
 		$problem = Compare-MetricLine -Expected $expected[$i] -Actual $metrics[$i] `
 			-Tolerance $caseTolerance -IgnoreFields $caseIgnored
 		if ($problem) {
-			$diffs += "  эталон: $($expected[$i])"
-			$diffs += "  стало : $($metrics[$i])"
+			$diffs += "  baseline: $($expected[$i])"
+			$diffs += "  actual  : $($metrics[$i])"
 			$diffs += "  -> $problem"
 		}
 	}
 
 	if ($diffs.Count -eq 0) {
-		Write-Host "  совпало: $($metrics.Count) метрик" -ForegroundColor Green
+		Write-Host "  matched: $($metrics.Count) metrics" -ForegroundColor Green
 	} else {
-		Write-Host "  РАСХОЖДЕНИЕ" -ForegroundColor Red
+		Write-Host "  MISMATCH" -ForegroundColor Red
 		$diffs | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
-		$failures += "$($case.Name): метрики разошлись"
+		$failures += "$($case.Name): metrics diverged"
 	}
 }
 
 Write-Host ""
 if ($Baseline) {
-	Write-Host "[suite] эталон записан для $recorded сценариев в $BaselineDir" -ForegroundColor Green
+	Write-Host "[suite] baseline recorded for $recorded scenarios in $BaselineDir" -ForegroundColor Green
 	exit 0
 }
 
 if ($failures.Count -gt 0) {
-	Write-Host "[suite] ПРОВАЛ ($($failures.Count) из $($selected.Count)):" -ForegroundColor Red
+	Write-Host "[suite] FAILED ($($failures.Count) of $($selected.Count)):" -ForegroundColor Red
 	$failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
 	exit 1
 }
 
-Write-Host "[suite] всё сошлось: $($selected.Count) сценариев" -ForegroundColor Green
+Write-Host "[suite] all matched: $($selected.Count) scenarios" -ForegroundColor Green
 exit 0

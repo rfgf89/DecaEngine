@@ -6,25 +6,12 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Debug-only editor window that visualizes a <see cref="IGraphicsPipeline"/>'s render graph:
-/// per-pass CPU timing, draw call / triangle counts, and a resource lifetime matrix (a table with
-/// one row per resource and one column per pass, showing exactly which passes keep it alive).
-/// Never compiled into Release builds.
-///
-/// Конвейер не передаётся снаружи, а ВЫБИРАЕТСЯ в самом окне из <see cref="GraphicsPipelineRegistry"/>:
-/// в редакторе их одновременно живёт несколько (основная сцена на swap chain, превью модели в
-/// инспекторе, вьюпорт префаба, запекание иконок, офскрин-пробы), и каждый регистрируется сам в
-/// своём конструкторе. Список пересобирается, только когда состав реестра изменился, а выбор
-/// запоминается по стабильному Id записи, а не по индексу - иначе пересоздание любого превью
-/// (RecreateEnvironment) молча переключало бы окно на чужой граф.
-/// </summary>
+/// <summary>Debug-only window showing per-pass timings and resource lifetimes of a render graph.</summary>
 public class RenderGraphDebugWindow : ImGuiDockingWindow
 {
 	private readonly List<RenderGraphDebugSnapshot> _historyBuffer = new(256);
 	private readonly List<float> _frameTimesMs = new(256);
 
-	// Живые конвейеры реестра + версия состава, под которую этот список набран.
 	private readonly List<GraphicsPipelineRegistry.Entry> _pipelines = new(8);
 	private int _registryVersion = -1;
 
@@ -32,20 +19,15 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 	private IGraphicsPipeline? _selectedPipeline;
 	private string _selectedName = "";
 
-	/// <summary>Конвейер, который надо выбрать первым, если он есть в реестре (иначе - первый живой).</summary>
 	private readonly IGraphicsPipeline? _preferredPipeline;
 	private bool _preferenceApplied;
 
-	// The underlying render graph refreshes its debug snapshot every single frame, which makes the
-	// per-pass ms numbers flicker too fast to actually read. Instead we only "adopt" a new snapshot
-	// for display every _refreshIntervalSec seconds, so the numbers hold still long enough to read.
+	// Snapshot is adopted only every _refreshIntervalSec: per-frame numbers flicker unreadably.
 	private RenderGraphDebugSnapshot? _displaySnapshot;
 	private float _refreshIntervalSec = 0.5f;
 	private float _timeSinceRefresh;
 	private bool _freeze;
 
-	/// <param name="preferredPipeline">Необязательный конвейер, на котором окно откроется, если он
-	/// зарегистрирован. Null - откроется на первом живом из реестра.</param>
 	public RenderGraphDebugWindow(string name, ImGuiRender imGuiRender, IGraphicsPipeline? preferredPipeline = null)
 		: base(name, imGuiRender)
 	{
@@ -59,9 +41,9 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 
 		if (_selectedPipeline == null)
 		{
-			ImGui.TextDisabled("Ни одного конвейера не зарегистрировано.");
-			ImGui.TextWrapped("Конвейеры встают в реестр сами, в своём конструкторе (см. GraphicsPipelineRegistry) - " +
-			                  "пустой список означает, что ни один ещё не создан.");
+			ImGui.TextDisabled("No pipelines registered.");
+			ImGui.TextWrapped("Pipelines add themselves to the registry in their own constructor (see GraphicsPipelineRegistry) - " +
+			                  "an empty list means none has been created yet.");
 			return;
 		}
 
@@ -76,9 +58,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 
 		_timeSinceRefresh += ImGui.GetIO().DeltaTime;
 
-		// Первый снимок берётся ДАЖЕ при включённом Freeze: показывать нечего, а переключение
-		// конвейера обнуляет показанный снимок (он принадлежал чужому графу). Дальше Freeze работает
-		// как и раньше - удерживает то, что уже на экране.
+		// The first snapshot is taken even while frozen: there is nothing on screen to hold yet.
 		if (_displaySnapshot == null || (!_freeze && _timeSinceRefresh >= _refreshIntervalSec))
 		{
 			_displaySnapshot = liveSnap;
@@ -114,9 +94,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		}
 	}
 
-	/// <summary>Пересобирает список живых конвейеров, только если состав реестра изменился, и следит,
-	/// чтобы выбор остался валидным: выбранный конвейер могли освободить (пересоздание превью-окружения
-	/// освобождает старый и создаёт новый) - тогда падаем на первый живой.</summary>
+	// Selection is tracked by registry Id, not index: previews are freed and recreated at runtime.
 	private void RefreshPipelineList()
 	{
 		var version = GraphicsPipelineRegistry.Version;
@@ -125,8 +103,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 			_registryVersion = GraphicsPipelineRegistry.CollectLive(_pipelines);
 		}
 
-		// Предпочтительный конвейер применяем один раз - и только когда он реально доехал до реестра
-		// (окно могли открыть раньше, чем конвейер создан).
+		// Applied once, and only once it reaches the registry: the window may open before it exists.
 		if (!_preferenceApplied && _preferredPipeline != null)
 		{
 			foreach (var entry in _pipelines)
@@ -144,7 +121,6 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		{
 			if (entry.Id == _selectedId)
 			{
-				// Имя записи могло измениться (реестр разводит одинаковые имена суффиксом).
 				_selectedPipeline = entry.Pipeline;
 				_selectedName = entry.Name;
 				return;
@@ -175,8 +151,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		_selectedPipeline = entry.Pipeline;
 		_selectedName = entry.Name;
 
-		// Снимок и график принадлежат КОНКРЕТНОМУ графу - иначе после переключения кадр чужого
-		// конвейера продолжал бы висеть на экране до следующего обновления.
+		// Snapshot and history belong to one graph: dropped so another pipeline's frame never shows.
 		_displaySnapshot = null;
 		_timeSinceRefresh = _refreshIntervalSec;
 		_frameTimesMs.Clear();
@@ -185,7 +160,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 	private void DrawPipelineSelector()
 	{
 		ImGui.SetNextItemWidth(320 * _scale);
-		if (ImGui.BeginCombo("Pipeline", _pipelines.Count > 0 ? _selectedName : "<нет конвейеров>"))
+		if (ImGui.BeginCombo("Pipeline", _pipelines.Count > 0 ? _selectedName : "<no pipelines>"))
 		{
 			foreach (var entry in _pipelines)
 			{
@@ -206,19 +181,14 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 
 		if (ImGui.IsItemHovered())
 		{
-			ImGui.SetTooltip("Какой конвейер показывать. Список ведёт GraphicsPipelineRegistry:\n" +
-			                 "каждый конвейер регистрируется в нём сам при создании.");
+			ImGui.SetTooltip("Which pipeline to show. The list is kept by GraphicsPipelineRegistry:\n" +
+			                 "every pipeline registers itself there on creation.");
 		}
 
 		ImGui.SameLine();
 		ImGui.TextDisabled($"({_pipelines.Count} live)");
 	}
 
-	/// <summary>
-	/// Top summary block: frame stats, refresh-rate controls and the CPU-time history graph, all
-	/// grouped into a single bordered panel so they read as one "at a glance" unit instead of being
-	/// scattered loose lines above the tabbed tables.
-	/// </summary>
 	private void DrawOverviewPanel(RenderGraphDebugSnapshot snap)
 	{
 		ImGui.BeginChild("OverviewPanel", new Vector2(-1, 150 * _scale), ImGuiChildFlags.Borders);
@@ -233,8 +203,7 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		ImGui.SameLine();
 		ImGui.Text($"Graph VRAM (approx): {snap.TotalResourceMemoryBytes / (1024.0 * 1024.0):F2} MB");
 
-		// Ресурсы выключенных фич конвейер держит наготове, чтобы повторное включение было
-		// бесплатным (см. GraphicsPipelineSimple.SetFeatures) - здесь их можно отдать обратно.
+		// Disabled features keep their resources alive so re-enabling is free; this frees them.
 		if (_selectedPipeline is GraphicsPipelineSimple simple)
 		{
 			ImGui.SameLine();
@@ -247,8 +216,8 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 
 			if (ImGui.IsItemHovered())
 			{
-				ImGui.SetTooltip("Освобождает VRAM выключенных пост-эффектов и пул ресурсов графа.\n" +
-				                 "Следующее включение такой фичи снова создаст её ресурсы и шейдеры.");
+				ImGui.SetTooltip("Frees the VRAM of disabled post effects and the graph's resource pool.\n" +
+				                 "Enabling such a feature again recreates its resources and shaders.");
 			}
 		}
 
@@ -338,11 +307,6 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		ImGui.PopStyleVar();
 	}
 
-	/// <summary>
-	/// Draws a single horizontal stacked bar (a "flame bar") instead of one progress bar per pass:
-	/// every pass eats from the same total CPU record time, so a stack of segments whose widths sum
-	/// to 100% communicates the relative cost far more directly than N separate 0-100% bars.
-	/// </summary>
 	private void DrawPassBars(RenderGraphDebugSnapshot snap)
 	{
 		if (snap.Passes.Length == 0)
@@ -378,7 +342,6 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 			drawList.AddRectFilled(min, max, color);
 			drawList.AddRect(min, max, ImGui.GetColorU32(ImGuiCol.Border));
 
-			// Only draw the label if the segment is wide enough to hold it, otherwise rely on the tooltip.
 			var label = $"{p.Name} {frac * 100f:F0}%";
 			var labelSize = ImGui.CalcTextSize(label);
 			if (labelSize.X < segWidth - 4f)
@@ -406,7 +369,6 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 
 	private static uint PassSegmentColor(int index)
 	{
-		// A small fixed, high-contrast, colorblind-friendlyish palette, cycling per pass index.
 		Span<Vector4> palette =
 		[
 			new Vector4(0.30f, 0.55f, 0.90f, 0.85f),
@@ -421,13 +383,6 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 		return ImGui.GetColorU32(palette[index % palette.Length]);
 	}
 
-	/// <summary>
-	/// Renders resource lifetimes as a single table: one row per resource, one fixed-width column
-	/// per pass. The cell range between a resource's first and last used pass is highlighted, with
-	/// a distinct color/marker for the birth (first use / allocation) and death (last use) cells,
-	/// so the "lifeline" is unambiguous at a glance instead of relying on hand-placed pixel rects.
-	/// All sizes are scaled by the current editor DPI scale so cells stay legible on any monitor.
-	/// </summary>
 	private void DrawResourceLifetimeTable(RenderGraphDebugSnapshot snap)
 	{
 		int passCount = snap.Passes.Length;
@@ -528,7 +483,6 @@ public class RenderGraphDebugWindow : ImGuiDockingWindow
 				uint cellColor = isStart && isEnd ? startEndColor : isStart ? startColor : isEnd ? endColor : aliveColor;
 				ImGui.TableSetBgColor(ImGuiTableBgTarget.CellBg, cellColor);
 
-				// Center the marker glyph within the (now much wider) cell.
 				var cellWidth = ImGui.GetColumnWidth();
 				string glyph = isStart && isEnd ? "\u25C6" : isStart ? "\u25B6" : isEnd ? "\u25A0" : "";
 				if (glyph.Length > 0)

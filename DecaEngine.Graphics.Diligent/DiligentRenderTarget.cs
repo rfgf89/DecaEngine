@@ -20,11 +20,8 @@ namespace DecaEngine.Graphics.Diligent
 		private ITexture _texture;
 		private readonly Dictionary<(TextureViewType, uint), ITextureView> _views = new();
 
-		// Views obtained via ITexture.GetDefaultView() are owned by the texture itself - Diligent
-		// does not add a reference for them, so disposing one here would over-release the native
-		// object and corrupt the heap (surfacing as an unrelated access violation later, e.g. on the
-		// next GetDefaultView() call after a Resize()). Only views created via CreateView() (the
-		// array-slice branch below) are actually owned by us and must be disposed.
+		// Only CreateView() results are ours to dispose: GetDefaultView() adds no reference and
+		// releasing it corrupts the native heap.
 		private readonly HashSet<(TextureViewType, uint)> _ownedViews = new();
 
 		public DiligentRenderTarget(IRenderDevice device, TextureInfo info)
@@ -61,8 +58,7 @@ namespace DecaEngine.Graphics.Diligent
 				Height = _info.height,
 				ArraySizeOrDepth = _info.arraySize,
 				Format = dilFormat,
-				// ShaderResource остаётся и у MSAA-таргетов: депт читается SSAO-пассом через
-				// Texture2DMS.Load (см. SsaoMsaaPS.hlsl).
+				// MSAA targets keep ShaderResource: SSAO reads depth via Texture2DMS.Load.
 				BindFlags = bindFlags,
 				Usage = Usage.Default,
 				MipLevels = 1,
@@ -80,22 +76,20 @@ namespace DecaEngine.Graphics.Diligent
 				return view;
 
 			ITextureView newView;
-			// If we are requesting slice 0 and the texture is not an array, get the default view.
 			if (slice == 0 && _info.arraySize <= 1)
 			{
 				newView = _texture.GetDefaultView(type);
 			}
 			else
 			{
-				// If the texture is an array, we must create a specific view for the slice.
-				// The dimension of the view must match the dimension of the texture.
+				// The view dimension must match the texture dimension.
 				var viewDim = _info.arraySize > 1 ? ResourceDimension.Tex2dArray : ResourceDimension.Tex2d;
 				
 				newView = _texture.CreateView(new TextureViewDesc
 				{
 					Name = $"{Name} View {type} Slice {slice}",
 					ViewType = type,
-					TextureDim = viewDim, // Correctly specify the view dimension
+					TextureDim = viewDim,
 					FirstSlice = slice,
 					NumSlices = 1,
 				});

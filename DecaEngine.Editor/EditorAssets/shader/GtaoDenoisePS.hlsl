@@ -1,20 +1,13 @@
-// Краесохраняющий денойзер GTAO (XeGTAO_Denoise) - третье и последнее звено конвейера
-// (см. GtaoCommon.hlsl). Читает оценку видимости и упакованные «рёбра» из одного RGBA8-таргета,
-// пишет отфильтрованную видимость, уже домноженную обратно на GtaoOcclusionTermScale.
-//
-// Почему не билатеральный блюр по глубине, как у композита SSAO (SsaoCompositeCommon.hlsl):
-// главный пасс УЖЕ посчитал рёбра - меру принадлежности соседа той же поверхности - причём по той
-// же схеме, по которой строил нормаль, с поправкой на склон. Веса из них и точнее (наклонная
-// плоскость не выглядит обрывом), и дешевле: не нужно ни повторно читать глубину, ни
-// реконструировать её допуск.
-//
-// Фильтр несимметричен по построению: у пикселя A правое ребро и у его правого соседа B левое
-// ребро считались независимо и не обязаны совпадать. Умножение центральных рёбер на встречные
-// рёбра соседей делает связь симметричной - иначе AO протекало бы через силуэт в одну сторону.
+// Edge-preserving GTAO denoiser (XeGTAO_Denoise), last stage of the pipeline (GtaoCommon.hlsl).
+// Reads visibility + packed edges from one RGBA8 target and writes filtered visibility scaled
+// back by GtaoOcclusionTermScale. Uses the main pass's edges instead of a depth-bilateral blur:
+// they already encode same-surface membership with slope correction, cheaper and more accurate.
+// Edges are asymmetric by construction, so center edges are multiplied by the neighbors'
+// opposing edges to make the link symmetric (otherwise AO leaks one-way across silhouettes).
 #include "Instancing.hlsl"
 #include "GtaoShared.hlsl"
 
-// Сырой результат главного пасса: .r - видимость / GtaoOcclusionTermScale, .g - упакованные рёбра.
+// Main pass output: .r = visibility / GtaoOcclusionTermScale, .g = packed edges.
 Texture2D _AoTex;
 SamplerState _AoTex_sampler;
 
@@ -23,8 +16,8 @@ cbuffer View
     ViewData viewData;
 }
 
-// Зеркалит AoConstantsData (SsaoPass.cs) - денойзеру нужен только нижний предел видимости:
-// применять его до фильтрации бессмысленно, среднее всё равно ушло бы ниже.
+// Mirrors AoConstantsData (SsaoPass.cs); the denoiser only needs the visibility floor,
+// which must apply after filtering.
 cbuffer AoConstants
 {
     float aoWorldRange;
@@ -33,13 +26,11 @@ cbuffer AoConstants
     float aoConstantsPad2;
 }
 
-// Вес диагональных соседей: половина ортогонального (диагональ вдвое дальше), плюс поправка 0.85
-// из XeGTAO.
+// Diagonal weight: half the orthogonal one, with the 0.85 correction from XeGTAO.
 static const float DiagWeight = 0.85 * 0.5;
 
-// Небольшая «протечка» AO там, где у пикселя закрыты три-четыре стороны: изолированный пиксель
-// (тонкая ветка, у которой все соседи - фон) иначе остался бы один на один со своим шумом, и это
-// видно и как пространственный, и как временной алиасинг.
+// Small AO leak for nearly isolated pixels (3-4 closed sides), otherwise thin geometry is
+// left alone with its noise (spatial and temporal aliasing).
 static const float LeakThreshold = 2.5;
 static const float LeakStrength = 0.5;
 
@@ -76,14 +67,14 @@ PSOutput Main(in VSOutput input)
     float4 edgesT = LoadEdges(pixel + int2(0, -1), viewportSize);
     float4 edgesB = LoadEdges(pixel + int2(0, 1), viewportSize);
 
-    // Симметризация: центральное левое ребро домножается на правое ребро левого соседа и т.д.
+    // Symmetrize: center-left edge times left neighbor's right edge, etc.
     edgesC *= float4(edgesL.y, edgesR.x, edgesT.w, edgesB.z);
 
     float edginess = (saturate(4.0 - LeakThreshold - dot(edgesC, float4(1.0, 1.0, 1.0, 1.0))) / (4.0 - LeakThreshold)) * LeakStrength;
     edgesC = saturate(edgesC + edginess);
 
-    // Диагональ доступна только если к ней ведёт хотя бы один непрерывный путь по ортогоналям -
-    // «обход за угол» через два ребра. Так AO не перепрыгивает диагональный силуэт.
+    // A diagonal is reachable only through a continuous two-edge orthogonal path, so AO
+    // does not jump across a diagonal silhouette.
     float weightTL = DiagWeight * (edgesC.x * edgesL.z + edgesC.z * edgesT.x);
     float weightTR = DiagWeight * (edgesC.z * edgesT.y + edgesC.y * edgesR.z);
     float weightBL = DiagWeight * (edgesC.w * edgesB.x + edgesC.x * edgesL.w);
@@ -106,8 +97,7 @@ PSOutput Main(in VSOutput input)
 
     float ao = saturate(sum / sumWeight * GtaoOcclusionTermScale);
 
-    // Нижний предел - ручка окна Graphics (см. SsaoPassResources.SetStrength); отрицательное
-    // значение означает «дефолт шейдера» (кбуфер вне превью нулевой).
+    // Floor from the Graphics window (SsaoPassResources.SetStrength); negative = shader default.
     ao = max(ao, aoFloor >= 0.0 ? aoFloor : GtaoDefaultFloor);
 
     PSOutput output;

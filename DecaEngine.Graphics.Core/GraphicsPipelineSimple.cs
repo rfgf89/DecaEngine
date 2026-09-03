@@ -5,56 +5,45 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Набор фич конвейера превью, которые можно менять НА ЖИВОМ конвейере - см.
-/// <see cref="GraphicsPipelineSimple.SetFeatures"/>. Всё, что здесь перечислено, переключается без
-/// пересоздания окружения и без перезагрузки сцены: ресурсы фичи создаются лениво при первом
-/// включении и дальше живут в конвейере, а граф пересобирается заново (дёшево - нативные текстуры
-/// переиспользуются из пула графа, см. <see cref="IRenderGraph.ResetPasses"/>).
-///
-/// Авто-экспозиция здесь есть, но она не структурная - см. <see cref="EyeAdaptation"/>.</summary>
+/// <summary>Pipeline features togglable on a LIVE pipeline via <see cref="GraphicsPipelineSimple.SetFeatures"/>:
+/// resources are created lazily on first enable and the graph rebuild is cheap
+/// (native textures are pooled, see <see cref="IRenderGraph.ResetPasses"/>).
+/// Eye adaptation is the one non-structural feature - see <see cref="EyeAdaptation"/>.</summary>
 public struct PipelineFeatures : IEquatable<PipelineFeatures>
 {
-	/// <summary>Тени от мирового ключевого света: <see cref="ShadowPass"/> в графе.</summary>
+	/// <summary>World key-light shadows (<see cref="ShadowPass"/>).</summary>
 	public bool Shadows;
 
-	/// <summary>Энвайронмент фоном кадра (см. <see cref="SkyPassResources"/>) - рисуется инлайн
-	/// внутри <see cref="ForwardPass"/>.</summary>
+	/// <summary>Environment background, drawn inline inside <see cref="ForwardPass"/>.</summary>
 	public bool SkyBackground;
 
-	/// <summary>Экранное контактное затемнение - инлайн внутри <see cref="ForwardPass"/>.</summary>
+	/// <summary>Screen-space contact occlusion, inline inside <see cref="ForwardPass"/>.</summary>
 	public bool Ssao;
 
-	/// <summary>Техника AO при включённом <see cref="Ssao"/>. Смена пересоздаёт материалы AO
-	/// (в них запечён шейдер), но не окружение.</summary>
+	/// <summary>AO technique used when <see cref="Ssao"/> is on; changing it recreates the AO
+	/// materials (the shader is baked into them) but not the environment.</summary>
 	public AmbientOcclusionMode AoMode;
 
 	public bool Ssgi;
 
-	/// <summary>Стохастические экранные отражения (<see cref="SsrPass"/>): GGX-важностный луч на
-	/// пиксель по тонкому G-buffer-у (см. <see cref="PipelineRenderTargets.NormalRoughnessTarget"/>),
-	/// темпоральная аккумуляция по векторам движения, энергетически корректная замена
-	/// env-спекуляра. Требует <see cref="MotionVectors"/> - без них ресурсы молча не создаются.</summary>
+	/// <summary>Stochastic screen-space reflections (<see cref="SsrPass"/>). Requires
+	/// <see cref="MotionVectors"/> - without them the resources are silently not created.</summary>
 	public bool Ssr;
 
-	/// <summary>RT-фолбэк отражений при включённом <see cref="Ssr"/>: лучи, промахнувшиеся мимо
-	/// экрана, добираются inline RayQuery по TLAS сцены (FEATURE_RT_REFLECTIONS, DXC/SM6.5).
-	/// Смена пересоздаёт материалы SSR (в них запечён шейдер), но не окружение - как AoMode.
-	/// Включивший ОБЯЗАН привязать сцену через <see cref="SsrPassResources.SetRayScene"/>.</summary>
+	/// <summary>RT fallback for <see cref="Ssr"/>: off-screen rays continue via inline RayQuery
+	/// over the scene TLAS (SM6.5). Changing it recreates the SSR materials, like AoMode.
+	/// The enabler MUST bind the scene via <see cref="SsrPassResources.SetRayScene"/>.</summary>
 	public bool SsrRayTraced;
 
-	/// <summary>Текстурное альбедо RT-хитов при включённом <see cref="SsrRayTraced"/>: 0 - выкл
-	/// (потриугольное усреднённое альбедо), 1 - атлас даунсемпленных плиток (Texture2DArray,
-	/// дёшево), 2 - «bindless»-массив полноразмерных base color текстур (дороже по памяти
-	/// дескрипторов; на бэкенде без ShaderResourceRuntimeArrays тихо падает до атласа). Смена
-	/// пересоздаёт материалы SSR (в них запечён шейдер), как <see cref="SsrRayTraced"/>.
-	/// Включивший ОБЯЗАН привязать текстуры через <see cref="SsrPassResources.SetHitTextures"/>.</summary>
+	/// <summary>RT-hit albedo mode: 0 = per-triangle averaged, 1 = downsampled atlas,
+	/// 2 = bindless full-size array (silently degrades to atlas without runtime arrays).
+	/// Changing it recreates the SSR materials; the enabler MUST bind textures via
+	/// <see cref="SsrPassResources.SetHitTextures"/>.</summary>
 	public int SsrHitTextures;
 
-	/// <summary>Экспонировать кадр по ЗАМЕРЕННОЙ яркости, а не по ручной экспокоррекции. Не
-	/// структурная фича: цепочка замера в HDR-конвейере есть всегда (она копеечная - пять дроу
-	/// 64x64 и мельче), а тумблер лишь переключает тонемап между измеренной и ручной экспозицией,
-	/// а туман/блум/god rays - между относительными и абсолютными единицами. Поэтому её смена не
-	/// требует даже пересборки графа.</summary>
+	/// <summary>Expose the frame by MEASURED luminance instead of manual exposure. Non-structural:
+	/// the measurement chain always exists in the HDR pipeline, so toggling this never rebuilds
+	/// the graph - it only switches tonemap/fog/bloom/god-rays exposure modes.</summary>
 	public bool EyeAdaptation;
 
 	public bool Fog;
@@ -62,18 +51,15 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 	public bool Bloom;
 	public bool ColorGrade;
 
-	/// <summary>Экранные векторы движения (<see cref="MotionVectorPass"/>) - вход временнЫх техник
-	/// (апскейлеры DLSS/FSR, TAA). Сами по себе кадр не меняют: пасс лишь заполняет свой буфер, и
-	/// пока его никто не читает, фича стоит одного фуллскрин-дроу.
-	///
-	/// Апскейлер сам себе антиалиасинг - никакого мультисемплинга в конвейере нет.</summary>
+	/// <summary>Screen motion vectors (<see cref="MotionVectorPass"/>) - input of temporal
+	/// techniques (DLSS/FSR, TAA). The pass only fills its buffer; no MSAA exists here,
+	/// the upscaler is its own anti-aliasing.</summary>
 	public bool MotionVectors;
 
-	/// <summary>Темпоральный апскейл (<see cref="TemporalUpscalePass"/>): сцена в рендер-разрешении +
-	/// джиттер + векторы движения собираются в display-кадр аккумуляцией истории. Требует
-	/// <see cref="MotionVectors"/> (иначе ресурсы не создаются) и включает джиттер сам - без него
-	/// аккумулировать нечего. Это встроенный управляемый бэкенд слота апскейлера; FSR/DLSS встанут
-	/// на его место тем же контрактом входов (HDR-кадр, векторы, джиттер, пара разрешений).</summary>
+	/// <summary>Temporal upscale (<see cref="TemporalUpscalePass"/>). Requires
+	/// <see cref="MotionVectors"/> (otherwise resources are not created) and enables jitter
+	/// itself. Built-in managed backend of the upscaler slot; FSR/DLSS use the same input
+	/// contract (HDR frame, vectors, jitter, resolution pair).</summary>
 	public bool TemporalUpscale;
 
 	public bool Equals(PipelineFeatures other)
@@ -95,8 +81,8 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 		       TemporalUpscale == other.TemporalUpscale;
 	}
 
-	/// <summary>Отличаются ли наборы чем-то, кроме <see cref="EyeAdaptation"/> - то есть нужна ли
-	/// пересборка графа (см. <see cref="GraphicsPipelineSimple.SetFeatures"/>).</summary>
+	/// <summary>True when the sets differ by anything but <see cref="EyeAdaptation"/>,
+	/// i.e. a graph rebuild is needed (see <see cref="GraphicsPipelineSimple.SetFeatures"/>).</summary>
 	public bool StructurallyEquals(PipelineFeatures other)
 	{
 		var a = this;
@@ -135,14 +121,11 @@ public struct PipelineFeatures : IEquatable<PipelineFeatures>
 /// (see <see cref="DecaEngine.Editor.ModelViewportEnvironment"/>) that only ever draw unlit
 /// geometry through <see cref="SimpleCullingAndRenderSystem"/> and never need shadow-cascade
 /// culling/rendering. The <see cref="DirectionalLightCascadeData"/> passed to
-/// <see cref="SignalGraph"/> is ignored - callers no longer need to feed it an empty
-/// <see cref="DirectionalLightCascadeData"/> just to keep <see cref="ShadowPass"/> a no-op.
+/// <see cref="SignalGraph"/> is ignored.
 ///
-/// В офскрин-режиме конвейер ВСЕГДА HDR: геометрия и вся пост-обработка живут в линейном RGBA16F
-/// (<see cref="PipelineRenderTargets.HdrColorTarget"/>), а отображаемый RGBA8-таргет пишет
-/// <see cref="TonemapPass"/> в самом конце. Раньше это включалось вместе с авто-экспозицией и,
-/// поскольку формат таргета пекётся в PSO геометрии, требовало пересоздания всего окружения; теперь
-/// формат один и тот же при любом наборе фич - см. <see cref="PipelineFeatures"/>.
+/// Off-screen mode is ALWAYS HDR: geometry and post live in linear RGBA16F
+/// (<see cref="PipelineRenderTargets.HdrColorTarget"/>) and <see cref="TonemapPass"/> writes the
+/// display RGBA8 target last, so feature toggles never force a geometry-PSO rebuild.
 /// </summary>
 public class GraphicsPipelineSimple : IGraphicsPipeline
 {
@@ -156,9 +139,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 	private PipelineFeatures _features;
 
-	// Ресурсы фич: создаются ЛЕНИВО при первом включении и переживают выключение - повторное
-	// включение бесплатно (см. EnsureResources). VRAM возвращается только по явному
-	// ReleaseDisabledResources.
+	// Feature resources: created lazily on first enable and kept across disables (re-enable is
+	// free, see EnsureResources). VRAM is returned only by an explicit ReleaseDisabledResources.
 	private SkyPassResources? _skyResources;
 	private SsaoPassResources? _ssaoResources;
 	private SsgiPassResources? _ssgiResources;
@@ -173,62 +155,56 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	private MotionVectorDebugPassResources? _motionVectorDebugResources;
 	private TemporalUpscalePassResources? _temporalUpscaleResources;
 
-	/// <summary>Нативный бэкенд слота апскейлера (FSR) - см. <see cref="SetNativeUpscaler"/>.
-	/// Когда задан и фича включена, встаёт в граф ВМЕСТО встроенного TAAU. Конвейер владеет им
-	/// (Release в обоих релиз-путях).</summary>
+	/// <summary>Native upscaler backend (FSR); replaces the built-in TAAU in the graph when set.
+	/// The pipeline owns it (Release on both release paths). See <see cref="SetNativeUpscaler"/>.</summary>
 	private INativeUpscalerBackend? _nativeUpscaler;
 
-	/// <summary>Техника AO, под которую собраны текущие <see cref="_ssaoResources"/> - в их материалы
-	/// запечён шейдер, так что смена техники требует пересоздания (но не окружения).</summary>
+	// AO technique the current _ssaoResources were built for; changing it requires a rebuild
+	// (the shader is baked into the materials).
 	private AmbientOcclusionMode _ssaoBuiltMode;
 
-	/// <summary>Собраны ли текущие <see cref="_ssrResources"/> с RT-фолбэком - смена варианта
-	/// трейс-шейдера требует пересоздания ресурсов, как смена техники AO.</summary>
+	// Whether the current _ssrResources were built with the RT fallback.
 	private bool _ssrBuiltRayTraced;
 
-	/// <summary>Режим текстур RT-хитов, с которым собраны текущие <see cref="_ssrResources"/>
-	/// (после клампов EnsureResources) - его смена тоже пересоздаёт материалы SSR.</summary>
+	// RT-hit texture mode the current _ssrResources were built with (after EnsureResources clamps).
 	private int _ssrBuiltHitTextures;
 
-	/// <summary>Были ли тени доступны, когда собирались <see cref="_volumetricResources"/> - его
-	/// материал берёт каскадный shadow map через IBatchRenderer.BindShadowResources.</summary>
+	// Whether shadows were available when _volumetricResources were built: its material takes the
+	// cascaded shadow map via IBatchRenderer.BindShadowResources.
 	private bool _volumetricBuiltWithShadows;
 
-	// Последние данные, с которыми собирался граф: SetFeatures пересобирает его сам, не дожидаясь
-	// следующего SignalGraph (тот случается только при смене числа камер).
+	// Last data the graph was built from: SetFeatures rebuilds immediately, not waiting for the
+	// next SignalGraph (which only happens when the camera count changes).
 	private DirectionalLightCascadeData _lastCascadeData;
 	private RenderCamerasData _lastCameras;
 	private bool _hasGraphData;
 
 	private Ref<Vector2> _viewPortRef;
 
-	/// <summary>Вьюпорт СЦЕНЫ - для пассов, рисующих в рендер-разрешение (геометрия, векторы, AO/GI,
-	/// туман, объёмник, блум). При <see cref="_renderScale"/> == 1 это та же нативная память, что у
-	/// <see cref="_viewPortRef"/>; при масштабе - уменьшенный размер. Пассы отображаемого разрешения
-	/// (тонемап, грейд, отладка векторов, оверлеи) остаются на <see cref="_viewPortRef"/>: тонемап и
-	/// есть точка апскейла (см. TonemapPS.hlsl).</summary>
+	/// <summary>SCENE viewport - for passes drawing at render resolution. Display-resolution
+	/// passes (tonemap, grade, vector debug, overlays) stay on <see cref="_viewPortRef"/>:
+	/// tonemap is the upscale point (see TonemapPS.hlsl).</summary>
 	private Ref<Vector2> _renderViewPortRef;
 
-	/// <summary>Доля отображаемого разрешения, в которую рисуется сцена, - см. <see cref="SetRenderScale"/>.</summary>
+	/// <summary>Fraction of display resolution the scene renders at - see <see cref="SetRenderScale"/>.</summary>
 	private float _renderScale = 1f;
 
-	// Темпоральный джиттер - см. SetTemporalJitter. Пара запомненных матриц отличает "Execute без
-	// нового Update" (в viewData всё ещё лежит НАША джиттернутая матрица - её надо сперва откатить,
-	// иначе смещения складывались бы) от "Update переписал viewData" (лежит свежая чистая - откатывать
-	// нечего). Сравнение точное: Update пересчитывает view*proj из тех же чисел бит-в-бит.
+	// Temporal jitter - see SetTemporalJitter. The remembered matrix pair distinguishes "Execute
+	// without a new Update" (viewData still holds OUR jittered matrix - unwind it first or offsets
+	// would accumulate) from "Update rewrote viewData" (fresh clean matrix - nothing to unwind).
+	// Exact compare is safe: Update recomputes view*proj bit-identically from the same numbers.
 	private bool _jitterEnabled;
 	private uint _jitterFrameIndex;
 	private Vector2 _jitterPixels;
 	private Matrix4x4 _jitteredViewProj;
 	private Matrix4x4 _unjitteredViewProj;
 
-	// Выключенные пассы - ПО ИМЕНИ и с жизнью дольше графа: пересборка графа создаёт объекты пассов
-	// заново (каждый со своим Enabled=true по умолчанию), поэтому флаги хранятся здесь и
-	// переприкладываются после сборки. Иначе тумблер сбрасывался бы сам собой при любом изменении сцены.
+	// Disabled passes - BY NAME, outliving the graph: rebuilds recreate pass objects (each with
+	// Enabled=true), so flags are stored here and re-applied after every rebuild.
 	private readonly Dictionary<string, bool> _passEnabled = new();
 
-	// Живёт дольше графа по той же причине, что _passEnabled: ShadowPass пересоздаётся каждой
-	// пересборкой, а расписание каскадов делится с системой сборки видов (см. ShadowCascadeSchedule).
+	// Outlives the graph for the same reason as _passEnabled: ShadowPass is recreated on every
+	// rebuild while the cascade schedule is shared with the view-build system.
 	private readonly ShadowCascadeSchedule _cascadeSchedule = new();
 
 	/// <summary>Non-null only in off-screen mode (<paramref name="colorTargetName"/> given to the
@@ -237,76 +213,70 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	/// resize/bind them through here rather than creating their own.</summary>
 	public PipelineRenderTargets? Targets => _targets;
 
-	/// <summary>Текущий набор фич - см. <see cref="SetFeatures"/>.</summary>
+	/// <summary>Current feature set - see <see cref="SetFeatures"/>.</summary>
 	public PipelineFeatures Features => _features;
 
-	/// <summary>Расписание перерисовки теневых каскадов этого конвейера - его маску кадра пишет
-	/// CullingAndRenderSystem, а читает колбэк <see cref="ShadowPass"/> при реплее. Пока маску
-	/// никто не пишет (превью через SimpleCullingAndRenderSystem), каскады рисуются каждый кадр.</summary>
+	/// <summary>Shadow-cascade redraw schedule: its frame mask is written by
+	/// CullingAndRenderSystem and read by the <see cref="ShadowPass"/> replay callback. While
+	/// nobody writes the mask, cascades are drawn every frame.</summary>
 	public ShadowCascadeSchedule CascadeSchedule => _cascadeSchedule;
 
-	/// <summary>HDR-конвейер (линейный кадр + отдельный тонемап) - всегда в офскрин-режиме и никогда
-	/// на swap chain.</summary>
+	/// <summary>HDR pipeline (linear frame + separate tonemap) - always in off-screen mode,
+	/// never on the swap chain.</summary>
 	public bool HdrPipeline => _targets?.HdrColorTarget is not null;
 
-	/// <summary>Экспонируется ли кадр по замеренной яркости - см. <see cref="PipelineFeatures.EyeAdaptation"/>.</summary>
+	/// <summary>Whether the frame is exposed by measured luminance - see <see cref="PipelineFeatures.EyeAdaptation"/>.</summary>
 	public bool AutoExposure => _features.EyeAdaptation && HdrPipeline;
 
-	/// <summary>Non-null only when a sky background was enabled (see <see cref="SkyPassResources"/>).
-	/// Exposed so the preview viewport can push the environment yaw (light-rotation slider) into the
-	/// sky shader - см. <see cref="SkyPassResources.SetEnvironmentYaw"/>.</summary>
+	/// <summary>Non-null only when a sky background was enabled (see <see cref="SkyPassResources"/>);
+	/// lets the preview viewport push the environment yaw into the sky shader.</summary>
 	public SkyPassResources? SkyResources => _skyResources;
 
-	/// <summary>Non-null once SSAO has been enabled at least once (ресурсы переживают выключение -
-	/// см. <see cref="SetFeatures"/>). Живые ручки можно пушить и в выключенном состоянии: они лягут
-	/// в кбуферы и оживут вместе с пассом.</summary>
+	/// <summary>Non-null once SSAO has been enabled at least once (resources survive disables).
+	/// Live knobs can be pushed even while disabled: they land in cbuffers and revive with the pass.</summary>
 	public SsaoPassResources? SsaoResources => _ssaoResources;
 
-	/// <summary>См. <see cref="SsaoResources"/>.</summary>
+	/// <summary>See <see cref="SsaoResources"/>.</summary>
 	public SsgiPassResources? SsgiResources => _ssgiResources;
 
-	/// <summary>См. <see cref="SsaoResources"/>. Через неё вьюпорт пушит живые ручки SSR, поворот
-	/// env-карты, солнце RT-фолбэка и привязывает TLAS сцены (SetRayScene).</summary>
+	/// <summary>See <see cref="SsaoResources"/>. Also the viewport's route for live SSR knobs,
+	/// env-map yaw, RT-fallback sun and the scene TLAS (SetRayScene).</summary>
 	public SsrPassResources? SsrResources => _ssrResources;
 
-	/// <summary>См. <see cref="SsaoResources"/>. Через неё вьюпорт пушит живые ручки дымки,
-	/// направление солнца и покадровый базис камеры.</summary>
+	/// <summary>See <see cref="SsaoResources"/>.</summary>
 	public FogPassResources? FogResources => _fogResources;
 
-	/// <summary>См. <see cref="SsaoResources"/>. Через неё вьюпорт пушит живые ручки god rays,
-	/// направление солнца и покадровый базис камеры.</summary>
+	/// <summary>See <see cref="SsaoResources"/>.</summary>
 	public VolumetricLightPassResources? VolumetricResources => _volumetricResources;
 
-	/// <summary>См. <see cref="SsaoResources"/>.</summary>
+	/// <summary>See <see cref="SsaoResources"/>.</summary>
 	public BloomPassResources? BloomResources => _bloomResources;
 
-	/// <summary>См. <see cref="SsaoResources"/>. Работает в ОБОИХ конвейерах: ColorTarget всегда
+	/// <summary>See <see cref="SsaoResources"/>. Works in BOTH pipelines: ColorTarget is always
 	/// RGBA8 display-space.</summary>
 	public ColorGradePassResources? ColorGradeResources => _gradeResources;
 
-	/// <summary>Non-null в офскрин-режиме ВСЕГДА: цепочка замера яркости - часть HDR-конвейера, а не
-	/// отдельная фича (см. <see cref="PipelineFeatures.EyeAdaptation"/>).</summary>
+	/// <summary>ALWAYS non-null in off-screen mode: the luminance-measurement chain is part of the
+	/// HDR pipeline, not a feature (see <see cref="PipelineFeatures.EyeAdaptation"/>).</summary>
 	public EyeAdaptationPassResources? EyeAdaptationResources => _eyeAdaptationResources;
 
-	/// <summary>Non-null once motion vectors have been enabled at least once
-	/// (см. <see cref="PipelineFeatures.MotionVectors"/>). Отсюда апскейлер возьмёт свой входной
-	/// буфер, а отладочный вид - картинку векторов.</summary>
+	/// <summary>Non-null once motion vectors have been enabled at least once; source of the
+	/// upscaler's input buffer and the debug vector view.</summary>
 	public MotionVectorPassResources? MotionVectorResources => _motionVectorResources;
 
-	/// <summary>Отладочная заливка кадра векторами движения - создаётся вместе с
-	/// <see cref="MotionVectorResources"/> и потому non-null ровно тогда же. Сам показ включается её
-	/// живой ручкой <see cref="MotionVectorDebugPassResources.SetDebugView"/>, а не набором фич:
-	/// пересобирать граф на дебаг-галку незачем.</summary>
+	/// <summary>Motion-vector debug fill - created together with <see cref="MotionVectorResources"/>.
+	/// Display is toggled via its live knob <see cref="MotionVectorDebugPassResources.SetDebugView"/>,
+	/// not via the feature set: no graph rebuild for a debug checkbox.</summary>
 	public MotionVectorDebugPassResources? MotionVectorDebugResources => _motionVectorDebugResources;
 
-	/// <summary>Non-null после первого включения <see cref="PipelineFeatures.TemporalUpscale"/> -
-	/// и только на конвейере, где есть векторы движения (см. EnsureResources).</summary>
+	/// <summary>Non-null after the first enable of <see cref="PipelineFeatures.TemporalUpscale"/> -
+	/// and only on a pipeline that has motion vectors (see EnsureResources).</summary>
 	public TemporalUpscalePassResources? TemporalUpscaleResources => _temporalUpscaleResources;
 
-	/// <summary>Отдаёт конвейеру нативный бэкенд апскейла (или null - вернуться на TAAU) и
-	/// пересобирает граф. Конвейер забирает владение: Release бэкенда - на нём. Вызывающий обязан
-	/// сперва дождаться GPU, если конвейер уже рисовал (замена входа тонемапа на живом материале -
-	/// см. needsWait в SetFeatures).</summary>
+	/// <summary>Hands the pipeline a native upscaler backend (or null to return to TAAU) and
+	/// rebuilds the graph. The pipeline takes ownership (it calls Release). The caller must wait
+	/// for the GPU first if the pipeline has already drawn - swapping the tonemap input on a live
+	/// material (see needsWait in SetFeatures).</summary>
 	public void SetNativeUpscaler(INativeUpscalerBackend? backend)
 	{
 		if (ReferenceEquals(_nativeUpscaler, backend))
@@ -323,52 +293,44 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>Текущий нативный бэкенд (null = встроенный TAAU).</summary>
+	/// <summary>Current native backend (null = built-in TAAU).</summary>
 	public INativeUpscalerBackend? NativeUpscaler => _nativeUpscaler;
 
-	/// <summary>Non-null ровно тогда же, когда <see cref="EyeAdaptationResources"/>: финальный
-	/// тонемап существует только в HDR-конвейере (на swap chain его делает сам UnlitInstancedPS.hlsl).</summary>
+	/// <summary>Non-null exactly when <see cref="EyeAdaptationResources"/> is: the final tonemap
+	/// exists only in the HDR pipeline (on the swap chain UnlitInstancedPS.hlsl does it itself).</summary>
 	public TonemapPassResources? TonemapResources => _tonemapResources;
 
-	/// <summary>Суб-пиксельный джиттер проекции (подготовка к темпоральному апскейлеру) - живая ручка
-	/// без пересборки графа: смещение вбивается в viewProj нулевой камеры прямо в нативной памяти
-	/// <see cref="RenderCamerasData.viewData"/> перед каждым Execute, а заморожённый SetupViewData
-	/// перечитывает её на каждом реплее (см. <see cref="ApplyTemporalJitter"/>).
-	///
-	/// БЕЗ темпоральной аккумуляции картинка от него дрожит на суб-пиксель - это ожидаемо: ручка
-	/// существует, чтобы отладить сам джиттер и его НЕпротекание в векторы движения до того, как
-	/// появится потребитель (TAA/апскейлер), который это дрожание соберёт в детализацию.</summary>
+	/// <summary>Sub-pixel projection jitter - a live knob without a graph rebuild: the offset is
+	/// written into camera 0's viewProj in native memory before each Execute and the frozen
+	/// SetupViewData re-reads it on every replay (see <see cref="ApplyTemporalJitter"/>).
+	/// Without temporal accumulation the image visibly shakes sub-pixel - expected; the knob
+	/// exists to debug the jitter and its NON-leakage into motion vectors.</summary>
 	public void SetTemporalJitter(bool enabled)
 	{
 		_jitterEnabled = enabled;
 	}
 
-	/// <summary>Смещение текущего кадра в ПИКСЕЛЯХ (y - вниз, как идут строки кадра), диапазон
-	/// [-0.5..0.5). Именно это значение апскейлер обязан получать как jitter offset. Vector2.Zero,
-	/// пока джиттер выключен.</summary>
+	/// <summary>This frame's offset in PIXELS (y down, as frame rows go), range [-0.5..0.5).
+	/// Exactly the value an upscaler must receive as jitter offset. Vector2.Zero while jitter is off.</summary>
 	public Vector2 CurrentJitterPixels => _jitterPixels;
 
-	/// <summary>Инлайн-оверлей поверх геометрии (см. ForwardPass): дебаг-вид проб и подобное.
-	/// Читается при ЗАПИСИ команд графа, так что после смены значения вызывающий обязан позвать
-	/// <see cref="InvalidateGraph"/> - иначе заморожённые команды продолжат играть старое.</summary>
+	/// <summary>Inline overlay on top of geometry (see ForwardPass), e.g. the probe debug view.
+	/// Read at graph-command RECORD time, so after changing it the caller must call
+	/// <see cref="InvalidateGraph"/> - frozen commands keep replaying the old value otherwise.</summary>
 	public Action<ICommandBuffer>? InlineOverlay { get; set; }
 
 	/// <summary>
-	/// ВТОРОЙ инлайн-оверлей, исполняемый сразу за <see cref="InlineOverlay"/>, - дебаг-линии
-	/// анимации и физики (см. DebugLineOverlay в редакторе).
-	///
-	/// Отдельное свойство, а не «пусть вызывающий сам склеит делегаты»: этими двумя хуками владеют
-	/// РАЗНЫЕ подсистемы вьюпорта (дебаг-вид проб ведёт probe-GI, дебаг-линии - окно дебага), и
-	/// каждая снимает свой хук независимо от другой. Общий слот означал бы, что выключение проб
-	/// молча гасит и линии.
+	/// SECOND inline overlay, executed right after <see cref="InlineOverlay"/> - animation/physics
+	/// debug lines (see DebugLineOverlay in the editor). A separate property because the two hooks
+	/// are owned by DIFFERENT viewport subsystems that clear them independently; a shared slot
+	/// would let disabling probes silently kill the lines.
 	/// </summary>
 	public Action<ICommandBuffer>? DebugOverlay { get; set; }
 
-	/// <summary>Оверлей ОТДЕЛЬНЫМ пассом в самом конце кадра - после ForwardPass (включая резолв
-	/// и всей пост-обработки, то есть поверх готового отображаемого ColorTarget: контур
-	/// выделения Scene View и подобное (см. <see cref="PostOverlayPass"/>). Хук сам привязывает свои
-	/// таргеты и вьюпорт. Читается при ЗАПИСИ команд графа - после смены значения вызывающий обязан
-	/// позвать <see cref="InvalidateGraph"/>, как и с <see cref="InlineOverlay"/>.</summary>
+	/// <summary>Overlay as a SEPARATE pass at the very end of the frame, on top of the finished
+	/// display ColorTarget (Scene View selection outline etc., see <see cref="PostOverlayPass"/>).
+	/// The hook binds its own targets/viewport. Read at graph-command RECORD time - after changing
+	/// it the caller must call <see cref="InvalidateGraph"/>, same as <see cref="InlineOverlay"/>.</summary>
 	public Action<ICommandBuffer>? PostOverlay { get; set; }
 
 	public GraphicsPipelineSimple(IGraphicsApi api, IBatchRenderer batchRenderer, string? debugName = null)
@@ -380,8 +342,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	/// its own color/depth/scene-copy targets instead of drawing to the swap chain's back
 	/// buffer (see <see cref="DecaEngine.Editor.ModelViewportEnvironment"/>). Null draws straight to
 	/// the back buffer and every other creation parameter below is ignored.</param>
-	/// <param name="debugName">Имя конвейера в окне отладки рендер-графа (см.
-	/// <see cref="GraphicsPipelineRegistry"/>). Null - имя выводится из <paramref name="colorTargetName"/>.</param>
+	/// <param name="debugName">Pipeline name in the render-graph debug window (see
+	/// <see cref="GraphicsPipelineRegistry"/>). Null derives it from <paramref name="colorTargetName"/>.</param>
 	public GraphicsPipelineSimple(IGraphicsApi api, IBatchRenderer batchRenderer, string? colorTargetName,
 		string? depthTargetName, uint width, uint height, Vector4 clearColor,
 		bool skyBackground = false, IGpuTexture? environmentMap = null, bool ssao = false, bool enableShadowPass = false,
@@ -417,36 +379,35 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 		if (colorTargetName is not null)
 		{
-			// hdr: true БЕЗУСЛОВНО - см. комментарий класса: формат цветового таргета перестал
-			// зависеть от набора фич, и тумблеры больше не тянут за собой пересборку PSO геометрии.
+			// hdr: true unconditionally - see the class comment: the color-target format no longer
+			// depends on the feature set, so toggles never rebuild geometry PSOs.
 			_targets = new PipelineRenderTargets(api, colorTargetName, depthTargetName!, width, height,
 				hdr: true);
 
 			_viewPortRef = new Ref<Vector2>(new Vector2(width, height));
 
-			// Свой экземпляр: масштаб рендера меняет только его, отображаемый вьюпорт не трогая.
+			// Own instance: render scale changes only this one, leaving the display viewport alone.
 			_renderViewPortRef = new Ref<Vector2>(new Vector2(width, height));
 		}
 		else
 		{
 			_viewPortRef = new Ref<Vector2>(_api.WindowHandle.Size);
 
-			// Swap chain масштаба не имеет - оба вьюпорта НАРОЧНО одна и та же нативная память,
-			// OnViewportChange обновляет обе разом.
+			// Swap chain has no render scale - both viewports DELIBERATELY share the same native
+			// memory; OnViewportChange updates both at once.
 			_renderViewPortRef = _viewPortRef;
 			_api.WindowHandle.OnWindowResize += OnViewportChange;
 		}
 
 		EnsureResources();
 
-		// Конвейер сам встаёт в реестр - окно отладки рендер-графа набирает свой список именно так
-		// (см. GraphicsPipelineRegistry). Реестр держит слабую ссылку и жизнь конвейера не продлевает.
+		// Self-register: the render-graph debug window builds its list from the registry, which
+		// holds a weak reference and does not extend the pipeline's lifetime.
 		GraphicsPipelineRegistry.Register(this, debugName ?? DefaultDebugName(colorTargetName));
 	}
 
-	/// <summary>Имя конвейера для окна отладки, когда явного не дали: цветовой таргет офскрин-режима
-	/// (см. <see cref="PipelineRenderTargets"/>) уже назван по потребителю ("Model Preview Color",
-	/// "Prefab Scene Color", ...), так что достаточно отбросить у него хвост " Color".</summary>
+	/// <summary>Debug-window name when none was given: off-screen color targets are already named
+	/// after their consumer ("Model Preview Color", ...), so just drop the " Color" suffix.</summary>
 	private static string DefaultDebugName(string? colorTargetName)
 	{
 		if (string.IsNullOrWhiteSpace(colorTargetName))
@@ -458,12 +419,12 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		return name.EndsWith(" Color", StringComparison.OrdinalIgnoreCase) ? name[..^" Color".Length] : name;
 	}
 
-	/// <summary>Формат таргета, в который рисует геометрия и пост-обработка.</summary>
+	/// <summary>Format of the target geometry and post-processing draw into.</summary>
 	private TextureObjectFormat RenderColorFormat =>
 		_targets?.RenderColorFormat ?? TextureObjectFormat.R8G8B8A8UNorm;
 
-	/// <summary>Текущий размер офскрин-таргетов. Ресурсы фичи, включённой уже после ресайза вьюпорта,
-	/// обязаны создаваться под ФАКТИЧЕСКИЙ размер, а не под тот, что был у конструктора.</summary>
+	/// <summary>Current off-screen target size. Resources of a feature enabled after a viewport
+	/// resize must be created at the ACTUAL size, not the constructor's.</summary>
 	private (uint Width, uint Height) TargetSize
 	{
 		get
@@ -473,9 +434,9 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>Фактический размер СЦЕНОВЫХ таргетов - по депту, а не по формуле от масштаба:
-	/// ресайзит таргеты вызывающий (см. <see cref="SetRenderScale"/>), и между сменой масштаба и
-	/// ресайзом правду знает только сам таргет.</summary>
+	/// <summary>Actual SCENE target size - taken from the depth target, not derived from the scale:
+	/// the caller resizes targets (see <see cref="SetRenderScale"/>), so between a scale change and
+	/// the resize only the target itself knows the truth.</summary>
 	private (uint Width, uint Height) RenderTargetSize
 	{
 		get
@@ -485,9 +446,9 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>Досоздаёт ресурсы, которых требует текущий <see cref="_features"/>, и пересобирает те,
-	/// у которых изменилось что-то запечённое (техника AO, наличие теней у god rays). Уже созданные
-	/// ресурсы выключенных фич НЕ трогает - в этом весь смысл: повторное включение бесплатно.</summary>
+	/// <summary>Creates resources required by the current <see cref="_features"/> and rebuilds those
+	/// whose baked state changed (AO technique, shadow availability for god rays). Existing
+	/// resources of disabled features are left alone: re-enabling is free.</summary>
 	private void EnsureResources()
 	{
 		if (_features.SkyBackground && _skyResources is null && _environmentMap is not null)
@@ -498,21 +459,21 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 		if (_targets is null)
 		{
-			// Swap chain: своих таргетов у конвейера нет, а вся пост-обработка требует хотя бы копии
-			// кадра и депта - остаётся один ForwardPass (плюс небо инлайн).
+			// Swap chain: no owned targets, and all post-processing needs at least frame/depth
+			// copies - only ForwardPass remains (plus inline sky).
 			return;
 		}
 
-		// Сценовые ресурсы (AO/GI/блум/векторы) - в РЕНДЕР-разрешении: они работают по глубине и
-		// HDR-кадру, а те при масштабе меньше отображаемого. Display-размер остаётся только у
-		// грейда и отладки векторов - они живут после точки апскейла (тонемапа).
+		// Scene resources (AO/GI/bloom/vectors) live at RENDER resolution: they work off depth and
+		// the HDR frame, which shrink with the scale. Display size remains only for grading and
+		// vector debug - they live after the upscale point (tonemap).
 		var (width, height) = RenderTargetSize;
 		var (displayWidth, displayHeight) = TargetSize;
 		var renderDepth = _targets.DepthTarget;
 
-		// HDR-хребет конвейера: замер яркости и тонемап есть ВСЕГДА, тумблер авто-экспозиции лишь
-		// переключает тонемап между измеренной и ручной экспозицией (см. PipelineFeatures.EyeAdaptation).
-		// Создаётся ПЕРВЫМ: туман, блум и god rays берут его 1x1-таргет.
+		// HDR backbone: luminance measurement and tonemap ALWAYS exist; the auto-exposure toggle
+		// only switches tonemap between measured and manual exposure. Created FIRST: fog, bloom
+		// and god rays take its 1x1 target.
 		if (_eyeAdaptationResources is null)
 		{
 			_eyeAdaptationResources = new EyeAdaptationPassResources(_api, _batchRenderer, _colorTargetName!,
@@ -523,7 +484,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 		if (_features.Ssao && _ssaoResources is not null && _ssaoBuiltMode != _features.AoMode)
 		{
-			// В материалы AO запечён шейдер техники - сменить её на живых ресурсах нельзя.
+			// The technique's shader is baked into the AO materials - cannot be swapped live.
 			_ssaoResources.Release();
 			_ssaoResources = null;
 		}
@@ -551,7 +512,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		if (_features.Volumetric && _volumetricResources is not null &&
 		    _volumetricBuiltWithShadows != _features.Shadows)
 		{
-			// Материал god rays собран под наличие/отсутствие каскадного shadow map.
+			// The god-rays material is built for the presence/absence of the cascaded shadow map.
 			_volumetricResources.Release();
 			_volumetricResources = null;
 		}
@@ -581,22 +542,22 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			_motionVectorResources = new MotionVectorPassResources(_api, _batchRenderer, _colorTargetName!,
 				_targets.DepthTarget, width, height);
 
-			// Отладочный вид заводится сразу вместе с буфером, а не по своей галке: без него векторы
-			// вообще нечем посмотреть (кадр они не меняют), а стоит он одного материала и одного
-			// кбуфера - дешевле, чем отдельная ветка ленивого создания. Ему нужны ОБА размера: буфер
-			// векторов живёт в рендер-разрешении, а рисует пасс в отображаемый кадр.
+			// The debug view is created together with the buffer, not behind its own flag: without
+			// it vectors cannot be inspected at all (they do not change the frame), and it costs one
+			// material and one cbuffer. It needs BOTH sizes: the vector buffer lives at render
+			// resolution while the pass draws into the display frame.
 			_motionVectorDebugResources = new MotionVectorDebugPassResources(_api, _batchRenderer,
 				_motionVectorResources.MotionTarget, width, height, displayWidth, displayHeight);
 		}
 
-		// SSR - строго ПОСЛЕ блока векторов (резолву нужен их буфер) и только там, где создан
-		// тонкий G-buffer отражений (HDR-режим - см. PipelineRenderTargets) и есть env-карта
-		// (композит вычитает её вклад). Смена RT-фолбэка пересоздаёт ресурсы: в трейс-материал
-		// запечён вариант шейдера, как у техники AO.
+		// SSR - strictly AFTER the vector block (resolve needs their buffer) and only where the
+		// thin reflection G-buffer exists (HDR mode) and an env map is present (the composite
+		// subtracts its contribution). Changing the RT fallback recreates the resources: the shader
+		// variant is baked into the trace material, like the AO technique.
 		var ssrRayTraced = _features.SsrRayTraced && _api.RayTracing >= RayTracingSupport.Inline;
 
-		// Текстуры RT-хитов: без RT-фолбэка режим бессмыслен, а bindless без поддержки
-		// динамической индексации массивов на бэкенде тихо съезжает на атлас.
+		// RT-hit textures: pointless without the RT fallback; bindless silently degrades to the
+		// atlas when the backend lacks dynamic array indexing.
 		var ssrHitTextures = ssrRayTraced ? Math.Clamp(_features.SsrHitTextures, 0, 2) : 0;
 		if (ssrHitTextures == 2 && !_api.SupportsShaderResourceArrays)
 		{
@@ -621,9 +582,9 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			_ssrBuiltHitTextures = ssrHitTextures;
 		}
 
-		// Слот апскейлера - строго ПОСЛЕ блока векторов: без их буфера аккумулятору нечем
-		// репроецировать историю, поэтому без них фича молча не срабатывает -
-		// ровно как сами векторы, и окно Graphics предупреждает об этом тем же способом.
+		// Upscaler slot - strictly AFTER the vector block: without their buffer the accumulator
+		// cannot reproject history, so the feature silently does nothing, exactly like the vectors
+		// themselves; the Graphics window warns the same way.
 		if (_features.TemporalUpscale && _temporalUpscaleResources is null &&
 		    _motionVectorResources is not null)
 		{
@@ -635,9 +596,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		ApplyExposureMode();
 	}
 
-	/// <summary>Раздаёт всем, кто считает яркость, текущий режим экспозиции: измеренная против
-	/// ручной. Единственное, что делает тумблер авто-экспозиции, - см.
-	/// <see cref="PipelineFeatures.EyeAdaptation"/>.</summary>
+	/// <summary>Pushes the current exposure mode (measured vs manual) to every luminance consumer -
+	/// the only thing the auto-exposure toggle does. See <see cref="PipelineFeatures.EyeAdaptation"/>.</summary>
 	private void ApplyExposureMode()
 	{
 		var auto = AutoExposure;
@@ -647,15 +607,15 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_volumetricResources?.SetExposureRelative(auto);
 	}
 
-	/// <summary>Меняет набор фич на ЖИВОМ конвейере: ресурсы новых фич создаются лениво, ресурсы
-	/// выключенных остаются лежать (повторное включение бесплатно), граф пересобирается. Ни
-	/// окружение, ни батч-рендерер, ни сцена при этом не пересоздаются - в этом вся суть.
+	/// <summary>Changes the feature set on a LIVE pipeline: new features' resources are created
+	/// lazily, disabled ones stay allocated (re-enable is free), and the graph is rebuilt. Neither
+	/// the environment, the batch renderer nor the scene are recreated.
 	///
-	/// Смена ОДНОЙ ЛИШЬ авто-экспозиции не пересобирает даже граф: она живая (см.
+	/// Changing ONLY auto-exposure does not even rebuild the graph (it is live, see
 	/// <see cref="PipelineFeatures.EyeAdaptation"/>).
 	///
-	/// Ждёт GPU перед освобождением чего бы то ни было (смена техники AO, наличия теней у god rays),
-	/// так что вызывать можно из любой точки кадра, где нет незакрытой записи команд.</summary>
+	/// Waits for the GPU before releasing anything, so it may be called from any point of the frame
+	/// with no open command recording.</summary>
 	public void SetFeatures(in PipelineFeatures features)
 	{
 		if (_features.Equals(features))
@@ -666,7 +626,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		var structural = !_features.StructurallyEquals(features);
 		var needsWait =
 			(features.Ssao && _ssaoResources is not null && _ssaoBuiltMode != features.AoMode) ||
-			// Пересборка SSR-материалов под другой вариант трейса (см. EnsureResources).
+			// SSR materials rebuilt for a different trace variant (see EnsureResources).
 			(features.Ssr && _ssrResources is not null &&
 			 (_ssrBuiltRayTraced != (features.SsrRayTraced && _api.RayTracing >= RayTracingSupport.Inline) ||
 			  _ssrBuiltHitTextures != ((features.SsrRayTraced && _api.RayTracing >= RayTracingSupport.Inline)
@@ -674,10 +634,10 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				  : 0))) ||
 			(features.Volumetric && _volumetricResources is not null &&
 			 _volumetricBuiltWithShadows != features.Shadows) ||
-			// Смена АКТИВНОСТИ апскейла переключает вход тонемапа (HDR-кадр <-> выход апскейлера)
-			// на живом материале - менять SRB, пока предыдущий кадр в полёте, нельзя (см.
-			// EyeAdaptationPass про ту же Vulkan-валидацию). Активность зависит от ОБЕИХ фич:
-			// тумблер векторов при включённом апскейле тоже её щёлкает.
+			// Toggling upscale ACTIVITY swaps the tonemap input on a live material - changing an
+			// SRB while the previous frame is in flight is invalid (same Vulkan validation as
+			// EyeAdaptationPass). Activity depends on BOTH features: the vectors toggle flips it
+			// too while upscale is on.
 			(features.TemporalUpscale && features.MotionVectors) !=
 			(_features.TemporalUpscale && _features.MotionVectors);
 
@@ -695,9 +655,10 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>Освобождает ресурсы ВЫКЛЮЧЕННЫХ фич и пул ресурсов графа - точка, где реально
-	/// возвращается VRAM. Отдельно от <see cref="SetFeatures"/> намеренно: держать выключенную фичу в
-	/// памяти дёшево по времени и дорого по VRAM, и выбор этого размена - за вызывающим.</summary>
+	/// <summary>Releases resources of DISABLED features and the graph's resource pool - the point
+	/// where VRAM is actually returned. Deliberately separate from <see cref="SetFeatures"/>:
+	/// keeping a disabled feature resident is cheap in time and expensive in VRAM, and that
+	/// trade-off belongs to the caller.</summary>
 	public void ReleaseDisabledResources()
 	{
 		_api.WaitForGpuIdle();
@@ -758,22 +719,21 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			_motionVectorDebugResources = null;
 		}
 
-		// Также при выключенных ВЕКТОРАХ: без их буфера апскейлер держал бы SRB на освобождённую
-		// текстуру (создание гейтится на векторы - см. EnsureResources, симметрично и освобождение).
+		// Also when VECTORS are off: without their buffer the upscaler would hold an SRB on a
+		// released texture (creation gates on vectors in EnsureResources - release symmetrically).
 		if (!_features.TemporalUpscale || !_features.MotionVectors)
 		{
 			_temporalUpscaleResources?.Release();
 			_temporalUpscaleResources = null;
 		}
 
-		// Ресурсы могли быть привязаны в заморожённых командах - граф пересобираем, а его
-		// собственный пул чистим следом.
+		// Resources may be bound in frozen commands - rebuild the graph, then trim its pool.
 		RebuildGraph();
 		_renderGraph.TrimResourcePool();
 	}
 
-	/// <summary>Перепривязывает материалы пост-обработки к текущим depth/scene-copy/HDR таргетам
-	/// ПОСЛЕ их Resize (см. ModelPreviewViewport.ResizeTargets) - no-op для ещё не созданных.</summary>
+	/// <summary>Rebinds post-processing materials to the current depth/scene-copy/HDR targets
+	/// AFTER their Resize (see ModelPreviewViewport.ResizeTargets) - no-op for not-yet-created ones.</summary>
 	public void RebindSsaoTargets()
 	{
 		if (_targets is null)
@@ -781,8 +741,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			return;
 		}
 
-		// Сценовые ресурсы - в рендер-разрешении, display остаётся у грейда и отладки векторов
-		// (см. EnsureResources).
+		// Scene resources at render resolution; display stays with grading and vector debug
+		// (see EnsureResources).
 		var (renderWidth, renderHeight) = RenderTargetSize;
 		var (displayWidth, displayHeight) = TargetSize;
 
@@ -797,7 +757,7 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 		_motionVectorResources?.RebindTargets(_targets.DepthTarget, renderWidth, renderHeight);
 
-		// Строго ПОСЛЕ ребинда векторов (SSR читает их буфер, а RebindTargets выше его пересоздал).
+		// Strictly AFTER the vector rebind (SSR reads their buffer, which was just recreated).
 		if (_motionVectorResources is not null && _targets.NormalRoughnessTarget is not null)
 		{
 			_ssrResources?.RebindTargets(_targets.DepthTarget, _targets.NormalRoughnessTarget,
@@ -805,9 +765,9 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				_motionVectorResources.MotionTarget, renderWidth, renderHeight);
 		}
 
-		// Строго ПОСЛЕ ребинда самих векторов: их RebindTargets ресайзит MotionTarget, пересоздавая
-		// нативную текстуру, и привяжись дебаг (и апскейлер - он тоже читает буфер векторов) раньше -
-		// они держали бы уничтоженную.
+		// Strictly AFTER the vector rebind: their RebindTargets recreates the native MotionTarget,
+		// and binding the debug view or the upscaler earlier would leave them holding a destroyed
+		// texture.
 		if (_motionVectorResources is not null)
 		{
 			_motionVectorDebugResources?.RebindTargets(_motionVectorResources.MotionTarget,
@@ -820,8 +780,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				displayWidth, displayHeight);
 		}
 
-		// Тонемап - ПОСЛЕДНИМ: при включённом апскейле его вход - OutputTarget апскейлера, а тот
-		// только что пересоздан его же Resize выше.
+		// Tonemap LAST: with upscale on, its input is the upscaler's OutputTarget, which was just
+		// recreated by the Resize above.
 		var nativeActive = _features.TemporalUpscale && _features.MotionVectors &&
 			_nativeUpscaler is not null && _motionVectorResources is not null;
 		var upscaleActive = !nativeActive && _features.TemporalUpscale && _features.MotionVectors &&
@@ -838,8 +798,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_viewPortRef.Set(_api.WindowHandle.Size);
 	}
 
-	/// <summary>See <see cref="GraphicsPipeline.SetOffscreenViewportSize"/>. Обновляет ОБА вьюпорта:
-	/// отображаемый - переданным размером, сценовый - им же, умноженным на <see cref="RenderScale"/>.</summary>
+	/// <summary>See <see cref="GraphicsPipeline.SetOffscreenViewportSize"/>. Updates BOTH viewports:
+	/// display with the given size, scene with it multiplied by <see cref="RenderScale"/>.</summary>
 	public void SetOffscreenViewportSize(Vector2 size)
 	{
 		var renderSize = SceneSizeFor(size);
@@ -852,22 +812,21 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>Текущая доля отображаемого разрешения, в которую рисуется сцена (1 = масштаба нет).</summary>
+	/// <summary>Current fraction of display resolution the scene renders at (1 = no scaling).</summary>
 	public float RenderScale => _renderScale;
 
-	/// <summary>Размер, в котором при текущем масштабе живут СЦЕНОВЫЕ таргеты (депт, HDR-кадр,
-	/// scene-copy, векторы, AO/GI) для данного отображаемого размера. Отображаемый ColorTarget
-	/// масштабом не трогается - апскейл делает тонемап (см. TonemapPS.hlsl).</summary>
+	/// <summary>Size the SCENE targets (depth, HDR frame, scene-copy, vectors, AO/GI) live at for
+	/// the given display size. The display ColorTarget is untouched by the scale - tonemap does the
+	/// upscale (see TonemapPS.hlsl).</summary>
 	public Vector2 SceneSizeFor(Vector2 displaySize) => _renderScale >= 1f
 		? displaySize
 		: new Vector2(MathF.Max(1f, MathF.Round(displaySize.X * _renderScale)),
 			MathF.Max(1f, MathF.Round(displaySize.Y * _renderScale)));
 
-	/// <summary>Меняет масштаб рендера сцены (0.25..1). Только запоминает значение и возвращает
-	/// true при смене: РЕСАЙЗ сценовых таргетов - забота вызывающего, у которого есть весь ресайз-путь
-	/// (GPU-барьер, перепривязка _SceneColor к резидентным материалам, ImGui-биндинги - см.
-	/// ModelPreviewViewport.ResizeTargets). Пока вызывающий не отресайзил, конвейер продолжает рисовать
-	/// в старом размере - вьюпорты обновятся вместе с ресайзом через SetOffscreenViewportSize.</summary>
+	/// <summary>Changes the scene render scale (0.25..1). Only records the value and returns true on
+	/// change: RESIZING the scene targets is the caller's job - it owns the whole resize path (GPU
+	/// barrier, rebinding _SceneColor to resident materials, ImGui bindings - see
+	/// ModelPreviewViewport.ResizeTargets). Until then the pipeline keeps rendering at the old size.</summary>
 	public bool SetRenderScale(float scale)
 	{
 		scale = Math.Clamp(scale, 0.25f, 1f);
@@ -880,22 +839,20 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		return true;
 	}
 
-	/// <summary>Имена пассов текущего графа - для отладочного списка в UI.</summary>
+	/// <summary>Pass names of the current graph - for the debug list in the UI.</summary>
 	public IReadOnlyList<string> PassNames => _renderGraph.PassNames;
 
-	/// <summary>Включает/выключает пасс по имени - отладочный тумблер окна графа. Безопасен для
-	/// любого пасса: выключенный исключается из графа целиком, вместе со своими переходами состояний
-	/// (см. IRenderGraphPass.Enabled). Запомненное значение переживает пересборку графа.
-	///
-	/// Для фич конвейера пользуйтесь <see cref="SetFeatures"/>: там выключение ещё и снимает работу
-	/// по подготовке ресурсов, а не только сам пасс.</summary>
+	/// <summary>Enables/disables a pass by name - the graph debug window's toggle. Safe for any
+	/// pass: a disabled pass is excluded from the graph entirely, including its state transitions
+	/// (see IRenderGraphPass.Enabled). The remembered value survives graph rebuilds.
+	/// For pipeline features use <see cref="SetFeatures"/>: it also removes resource-prep work.</summary>
 	public void SetPassEnabled(string name, bool enabled)
 	{
 		_passEnabled[name] = enabled;
 		_renderGraph.SetPassEnabled(name, enabled);
 	}
 
-	/// <summary>Выключен ли пасс (по запомненному флагу, а не по состоянию графа).</summary>
+	/// <summary>Whether a pass is enabled (by the remembered flag, not the graph state).</summary>
 	public bool IsPassEnabled(string name) => !_passEnabled.TryGetValue(name, out var enabled) || enabled;
 
 	/// <summary>See <see cref="GraphicsPipeline.InvalidateGraph"/>.</summary>
@@ -916,9 +873,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		RebuildGraph();
 	}
 
-	/// <summary>Пересобирает СПИСОК пассов под текущий набор фич. Нативные ресурсы при этом
-	/// переиспользуются - см. <see cref="IRenderGraph.ResetPasses"/>, поэтому вызов дешёвый и
-	/// уместен на каждый тумблер.</summary>
+	/// <summary>Rebuilds the PASS LIST for the current feature set. Native resources are reused
+	/// (see <see cref="IRenderGraph.ResetPasses"/>), so this is cheap enough per toggle.</summary>
 	private void RebuildGraph()
 	{
 		if (!_hasGraphData)
@@ -933,43 +889,41 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			_renderGraph.AddPass(new ShadowPass(_batchRenderer, _lastCascadeData, _cascadeSchedule));
 		}
 
-		// AO рисуется инлайн внутри ForwardPass - между opaque- и transmissive-дроу, чтобы стекло
-		// преломляло затенённый фон, но само экранным AO не глушилось (см.
-		// SsaoPassResources.WriteInlineCommands).
-		// В HDR-конвейере вся геометрия и пост-обработка живут в линейном HDR-таргете, а
-		// ColorTarget получает кадр только от TonemapPass в самом конце.
+		// AO draws inline inside ForwardPass, between opaque and transmissive draws: glass refracts
+		// the occluded background but is not dimmed by screen-space AO itself
+		// (see SsaoPassResources.WriteInlineCommands).
 		var renderColor = _targets?.RenderColorTarget;
 
-		// Сценовые пассы (отсюда и до блума включительно) рисуют в РЕНДЕР-вьюпорт: при масштабе
-		// меньше 1 их таргеты уменьшены, а в отображаемое разрешение кадр поднимает тонемап.
+		// Scene passes (from here through bloom) draw into the RENDER viewport; tonemap lifts the
+		// frame to display resolution.
 		_renderGraph.AddPass(new ForwardPass(_batchRenderer, _lastCameras, _renderViewPortRef, renderColor,
 			_targets?.DepthTarget, _clearColor, _targets?.SceneCopyTarget,
 			_features.SkyBackground ? _skyResources : null,
 			_features.Ssao ? _ssaoResources : null,
-			// Склейка двух хуков в один делегат: многоадресный Action исполняет их по очереди, а
-			// null-и Combine отбрасывает сам, так что «оверлея нет» остаётся ровно null.
+			// Multicast Action runs both hooks in order; Delegate.Combine drops nulls itself, so
+			// "no overlay" stays exactly null.
 			() => (Action<ICommandBuffer>?)Delegate.Combine(InlineOverlay, DebugOverlay),
 			_targets?.NormalRoughnessTarget, _targets?.EnvFactorTarget));
 
-		// Векторы движения - сразу за геометрией: пассу нужна только готовая глубина, и до всей
-		// пост-обработки он успевает заполнить буфер, который дальше заберёт апскейлер. Кадр он не
-		// трогает, так что на порядок остальных пассов не влияет.
+		// Motion vectors right after geometry: the pass only needs finished depth, and the buffer
+		// must be ready before the upscaler. It does not touch the frame, so ordering of the
+		// remaining passes is unaffected.
 		if (_features.MotionVectors && _motionVectorResources is not null)
 		{
 			_renderGraph.AddPass(new MotionVectorPass(_motionVectorResources, _targets!.DepthTarget,
 				_renderViewPortRef));
 		}
 
-		// SSGI собирает bounce из уже отрисованного кадра, поэтому идёт последним - после AO
-		// в источнике света уже есть контактные тени, и bounce их корректно учитывает.
+		// SSGI gathers bounce from the already-rendered frame, so it goes after AO: the light
+		// source already contains contact shadows and the bounce accounts for them.
 		if (_features.Ssgi && _ssgiResources is not null)
 		{
 			var renderDepth = _targets!.DepthTarget;
 			_renderGraph.AddPass(new SsgiPass(_ssgiResources, renderColor!, _targets.SceneCopyTarget, renderDepth, _renderViewPortRef));
 		}
 
-		// SSR - после SSGI (в отражения попадает кадр с непрямым светом; свой снимок сцены пасс
-		// переснимает сам) и до замера яркости: отражения входят в экспозицию наравне с остальным.
+		// SSR after SSGI (reflections see the frame with indirect light; the pass re-snapshots the
+		// scene itself) and before luminance measurement: reflections count toward exposure.
 		if (_features.Ssr && _ssrResources is not null && _motionVectorResources is not null &&
 		    _targets!.NormalRoughnessTarget is not null)
 		{
@@ -978,32 +932,23 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				_motionVectorResources.MotionTarget, _renderViewPortRef));
 		}
 
-		// Замер яркости - по ГОТОВОМУ линейному кадру (со всем непрямым светом), тонемап - следом:
-		// экспозиция этого же кадра, кривая и sRGB-энкод в отображаемый ColorTarget.
-		//
-		// Пасс стоит в графе ВСЕГДА, а не только при включённой авто-экспозиции: он копеечный (пять
-		// дроу 64x64 и мельче), зато его отсутствие оставляло бы 1x1-таргеты адаптации ни разу не
-		// записанными - на Vulkan это UNDEFINED-лейаут под SRV тонемапа. См. PipelineFeatures.EyeAdaptation.
+		// Luminance measurement on the FINISHED linear frame, tonemap right after. The pass is
+		// ALWAYS in the graph, not only with auto-exposure: it is cheap (five draws 64x64 and
+		// smaller), and skipping it would leave the 1x1 adaptation targets never written - on
+		// Vulkan that is an UNDEFINED layout under the tonemap SRV. See PipelineFeatures.EyeAdaptation.
 		if (_eyeAdaptationResources is not null)
 		{
 			_renderGraph.AddPass(new EyeAdaptationPass(_eyeAdaptationResources, _targets!.HdrColorTarget!));
 		}
 
-		// Туман - ПОСЛЕ SSGI (дымка обязана лечь и на непрямой свет), но и ПОСЛЕ ЗАМЕРА ЯРКОСТИ,
-		// хотя физически рассеянный средой свет входит в экспозицию наравне с остальным.
-		//
-		// Причина практическая и замеренная: яркость дымки привязана к адаптации (иначе ручка цвета
-		// бессмысленна - см. FogPassResources.SetExposure), и стой пасс ДО замера, туман раздувал бы
-		// ровно ту величину, на которую сам же и множится. На интерьере Sponza эта петля давала
-		// среднюю яркость кадра 104 против 36 без тумана - дымка съедала кадр целиком. Ценой решения
-		// сильный туман больше не заставляет камеру прижиматься; для инструмента предпросмотра
-		// предсказуемость важнее физической честности.
-		//
-		// Тонемап при этом остаётся ПОСЛЕДНИМ: туман кладётся в ЛИНЕЙНЫЙ кадр, до кривой.
-		//
-		// Объёмный свет (god rays) идёт ПЕРЕД туманом: столбы обязаны затуманиваться дальней дымкой
-		// наравне с геометрией, иначе на затуманенном фоне они читаются как наклейка. Причина
-		// «после замера яркости» у него ровно та же, что у тумана, - см. абзац выше.
+		// Fog AFTER SSGI (haze must cover indirect light too) but also AFTER the luminance
+		// measurement, deviating from physics deliberately: fog brightness is tied to adaptation
+		// (see FogPassResources.SetExposure), and placing it before the measurement created a
+		// feedback loop where fog inflated the very value it multiplies by. Predictability beats
+		// physical honesty for a preview tool. Tonemap still comes LAST: fog lands in the linear
+		// frame, before the curve.
+		// God rays go BEFORE fog: light shafts must be hazed by distant fog like geometry, or they
+		// read as a sticker on a fogged background. Their "after measurement" reason matches fog's.
 		if (_features.Volumetric && _volumetricResources is not null)
 		{
 			var volumetricDepth = _targets!.DepthTarget;
@@ -1018,24 +963,22 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				renderDepth, _renderViewPortRef));
 		}
 
-		// Блум - ПОСЛЕ тумана (рассеяние в оптике происходит уже со светом, дошедшим до объектива,
-		// включая свечение самой дымки) и, как и туман, ПОСЛЕ замера яркости: его порог привязан к
-		// адаптации, и стой пасс до замера, ореол раздувал бы ровно ту величину, на которую сам же
-		// и опирается. До тонемапа - складывать свет можно только в линейном пространстве.
+		// Bloom AFTER fog (optical scattering happens to light that reached the lens, including the
+		// haze's own glow) and, like fog, AFTER the measurement: its threshold is tied to
+		// adaptation. Before tonemap - light can only be summed in linear space.
 		if (_features.Bloom && _bloomResources is not null)
 		{
 			_renderGraph.AddPass(new BloomPass(_bloomResources, renderColor!, _targets!.SceneCopyTarget,
 				_renderViewPortRef));
 		}
 
-		// Слот апскейлера - ПОСЛЕДНИМ в рендер-разрешении: туман, god rays и блум уже вложены в
-		// HDR-кадр (апскейлер обязан видеть то же, что увидел бы глаз), а аккумулировать надо
-		// ЛИНЕЙНЫЙ свет - смешивание после кривой тонемапа занижало бы яркие субпиксельные детали.
-		// Тонемап при включённом апскейле читает его выход и работает 1:1.
-		// Нативный бэкенд (FSR) занимает слот вместо встроенного TAAU, когда задан. Гейт и на САМУ
-		// ФИЧУ векторов, не только на ресурсы: ресурсы переживают выключение (ленивая схема), и без
-		// этой проверки снятая галка векторов оставляла бы апскейлер в графе на протухшем буфере -
-		// пасс векторов из графа уже ушёл, буфер замер с последним кадром.
+		// Upscaler slot LAST at render resolution: fog, god rays and bloom are already in the HDR
+		// frame (the upscaler must see what the eye would), and accumulation needs LINEAR light -
+		// blending after the tonemap curve would suppress bright sub-pixel detail. Tonemap reads
+		// its output 1:1 when upscale is on. The native backend (FSR) takes the slot instead of the
+		// built-in TAAU when set. Gate on the vectors FEATURE, not just the resources: resources
+		// survive disables, and without this check an unticked vectors box would leave the upscaler
+		// in the graph on a stale buffer.
 		var nativeUpscaleActive = _features.TemporalUpscale && _features.MotionVectors &&
 			_nativeUpscaler is not null && _motionVectorResources is not null;
 		var upscaleActive = !nativeUpscaleActive &&
@@ -1055,8 +998,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 		if (_tonemapResources is not null && Environment.GetEnvironmentVariable("DECA_NO_EA_PASS") != "1")
 		{
-			// Вход тонемапа зависит от тумблера апскейла - перепривязка здесь же, где строится граф:
-			// SetFeatures при смене тумблера уже дождался GPU (см. needsWait).
+			// The tonemap input depends on the upscale toggle - rebind here where the graph is
+			// built: SetFeatures already waited for the GPU on the toggle (see needsWait).
 			var tonemapSource = nativeUpscaleActive
 				? (IGpuTexture)_nativeUpscaler!.OutputTarget
 				: upscaleActive
@@ -1068,21 +1011,18 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				_targets!.ColorTarget, _viewPortRef));
 		}
 
-		// Грейдинг и виньетка - ПОСЛЕ тонемапа (их шкалы определены в отображаемом пространстве) и
-		// ДО оверлеев: контур выделения и гизмо - интерфейс, художественная коррекция их трогать не
-		// должна. См. ColorGradePass.
+		// Grading and vignette AFTER tonemap (their scales are defined in display space) and BEFORE
+		// overlays: selection outline and gizmos are UI, artistic correction must not touch them.
 		if (_features.ColorGrade && _gradeResources is not null)
 		{
 			_renderGraph.AddPass(new ColorGradePass(_gradeResources, _targets!.ColorTarget, _viewPortRef));
 		}
 
-		// Отладочный вид векторов - ПОСЛЕ тонемапа и грейдинга (он работает по отображаемому кадру, см.
-		// MotionVectorDebugPS.hlsl), но ДО оверлеев: гизмо и контур выделения обязаны остаться видны,
-		// иначе в этом режиме нельзя выбрать объект.
-		//
-		// В графе он стоит ВСЕГДА, когда есть буфер векторов, а показ включается ручкой в его кбуфере:
-		// выключенный пасс дискардит весь экран, зато галка не пересобирает граф (см.
-		// MotionVectorDebugPassResources).
+		// Vector debug view AFTER tonemap and grading (it works on the display frame, see
+		// MotionVectorDebugPS.hlsl) but BEFORE overlays: gizmos and the selection outline must stay
+		// visible or objects cannot be picked in this mode. It is ALWAYS in the graph whenever the
+		// vector buffer exists; display is toggled via its cbuffer knob (a disabled pass discards
+		// the whole screen), so the checkbox never rebuilds the graph.
 		if (_features.MotionVectors && _motionVectorResources is not null &&
 		    _motionVectorDebugResources is not null)
 		{
@@ -1090,11 +1030,11 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 				_motionVectorResources.MotionTarget, _targets!.ColorTarget, _viewPortRef));
 		}
 
-		// Последним - оверлей отдельным пассом поверх готового кадра (см. PostOverlay): пасс
-		// добавляется всегда, при null-хуке он не пишет ни одной команды.
+		// Last - the overlay as its own pass over the finished frame (see PostOverlay): always
+		// added, a null hook writes no commands.
 		_renderGraph.AddPass(new PostOverlayPass(() => PostOverlay));
 
-		// Пассы созданы заново и пришли с Enabled=true - возвращаем запомненные тумблеры.
+		// Passes were recreated with Enabled=true - re-apply the remembered toggles.
 		foreach (var (name, enabled) in _passEnabled)
 		{
 			_renderGraph.SetPassEnabled(name, enabled);
@@ -1103,18 +1043,18 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 
 	public void Execute()
 	{
-		// Порядок жёсткий: сперва ОТКАТИТЬ джиттер прошлого кадра (если Execute идёт без нового
-		// Update, в viewData всё ещё наша матрица), затем защёлкнуть векторы движения по ЧИСТОЙ
-		// матрице - апскейлеры ждут векторы без джиттера, суб-пиксельное дрожание они вычитают сами
-		// по переданному jitter offset, - и только потом вбить смещение нового кадра.
+		// Strict order: first UNDO last frame's jitter (Execute without a new Update leaves our
+		// matrix in viewData), then latch motion vectors from the CLEAN matrix - upscalers expect
+		// unjittered vectors and subtract the sub-pixel shake themselves via the jitter offset -
+		// and only then apply this frame's offset.
 		LatchRenderResolution();
 		UnwindTemporalJitter();
 		LatchMotionVectors();
 		ApplyTemporalJitter();
 
-		// Фаза стохастического шума SSR - раз в кадр (см. SsrPassResources.AdvanceFrame); там же
-		// защёлкивается viewProj прошлого кадра - репроекция ВИРТУАЛЬНОГО образа отражения у
-		// зеркал (см. SsrResolvePS, приём RTG гл.32) - тем же порядком, что у LatchMotionVectors.
+		// SSR stochastic noise phase advances once per frame (see SsrPassResources.AdvanceFrame);
+		// the same call latches last frame's viewProj for virtual-image reprojection of mirrors
+		// (see SsrResolvePS, RTG ch.32) - same ordering as LatchMotionVectors.
 		if (_features.Ssr && _ssrResources is not null)
 		{
 			_ssrResources.AdvanceFrame();
@@ -1124,8 +1064,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			}
 		}
 
-		// Апскейлеру - джиттер ИМЕННО этого кадра (потому после ApplyTemporalJitter): шейдер вычитает
-		// его из выборки текущего кадра, см. TemporalUpscalePS.hlsl.
+		// The upscaler needs THIS frame's jitter (hence after ApplyTemporalJitter): the shader
+		// subtracts it from the current-frame sample, see TemporalUpscalePS.hlsl.
 		if (_features.TemporalUpscale && _features.MotionVectors)
 		{
 			if (_nativeUpscaler is not null)
@@ -1141,11 +1081,10 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_renderGraph.Execute();
 	}
 
-	/// <summary>При масштабе рендера подменяет в viewData нулевой камеры размер вьюпорта на
-	/// РЕНДЕР-разрешение: шейдеры сцены строят экранные UV и пиксельные шаги как viewport.zw из
-	/// View-кбуфера (см. FogCommon/GtaoCommon/SsaoCommon), а камера хранит отображаемый размер.
-	/// Тот же приём живой нативной памяти, что у джиттера, и идемпотентен: Update переписывает
-	/// viewData каждый кадр, повторный Execute перезапишет то же значение.</summary>
+	/// <summary>With render scale active, patches camera 0's viewport in viewData to the RENDER
+	/// resolution: scene shaders build screen UVs and pixel steps from viewport.zw of the View
+	/// cbuffer while the camera stores the display size. Live-native-memory trick like the jitter,
+	/// and idempotent: Update rewrites viewData every frame.</summary>
 	private void LatchRenderResolution()
 	{
 		if (_renderScale >= 1f || _targets is null || !_hasGraphData ||
@@ -1159,8 +1098,8 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		viewData.viewport = new Vector4(viewData.viewport.X, viewData.viewport.Y, size.X, size.Y);
 	}
 
-	/// <summary>Возвращает в viewData нулевой камеры матрицу без джиттера, если там всё ещё лежит
-	/// наша джиттернутая (Execute без Update между ними). См. комментарий у полей джиттера.</summary>
+	/// <summary>Restores the unjittered matrix in camera 0's viewData if our jittered one is still
+	/// there (Execute without an Update in between). See the jitter field comment.</summary>
 	private void UnwindTemporalJitter()
 	{
 		if (!_hasGraphData || !_lastCameras.IsCreated || _lastCameras.Length == 0)
@@ -1175,22 +1114,21 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>Вбивает суб-пиксельное смещение кадра в живую viewProj нулевой камеры. Halton(2,3) -
-	/// стандартная низкорасходящаяся последовательность фаз джиттера; сдвиг - перенос в clip space
-	/// ПОСЛЕ проекции (строчная конвенция: постумножение, x' = x + jx*w), так что деление на w
-	/// раскладывает его ровно в константный суб-пиксельный сдвиг всего кадра.
+	/// <summary>Applies the frame's sub-pixel offset to camera 0's live viewProj. Halton(2,3) is the
+	/// standard low-discrepancy jitter sequence; the shift is added in clip space AFTER projection
+	/// (row-vector convention: post-multiply, x' = x + jx*w), so the w-divide turns it into a
+	/// constant sub-pixel shift of the whole frame.
 	///
-	/// Только нулевая камера - по той же причине, что и в <see cref="LatchMotionVectors"/>. Матрицы
-	/// вида, куллинга и каскадов не трогаются: фрустум от суб-пикселя не меняется, а тени джиттерить
-	/// прямо вредно - шимеринг краёв теней апскейлер собрать не сможет.</summary>
+	/// Camera 0 only, same reason as <see cref="LatchMotionVectors"/>. View/culling/cascade matrices
+	/// are untouched: the frustum does not change by a sub-pixel, and jittering shadows is actively
+	/// harmful - the upscaler cannot resolve shadow-edge shimmer.</summary>
 	private void ApplyTemporalJitter()
 	{
 		_jitterPixels = Vector2.Zero;
 
-		// Активный апскейлер включает джиттер сам: без него аккумулятору нечего собирать -
-		// каждый кадр приносил бы одни и те же сэмплы, и детализация не восстанавливалась бы.
-		// Гейт на фичу векторов - тот же, что у слота в RebuildGraph: без них апскейл неактивен,
-		// и дрожать кадру незачем.
+		// An active upscaler enables jitter itself: without it the accumulator gets identical
+		// samples every frame and recovers no detail. Gate on the vectors feature, matching the
+		// slot gate in RebuildGraph.
 		var jitterActive = _jitterEnabled ||
 			(_features.TemporalUpscale && _features.MotionVectors &&
 			 (_temporalUpscaleResources is not null || _nativeUpscaler is not null));
@@ -1200,19 +1138,19 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			return;
 		}
 
-		// РЕНДЕР-вьюпорт: джиттер - доли пикселя того разрешения, в котором растеризуется сцена.
+		// RENDER viewport: jitter is in fractions of a pixel at the resolution the scene rasterizes at.
 		var size = _renderViewPortRef.Value;
 		if (size.X < 1f || size.Y < 1f)
 		{
 			return;
 		}
 
-		// 16 фаз: хватает и TAA, и апскейлеру до 2x (FSR берёт 8*(scale^2)). Halton начинается с
-		// индекса 1 - нулевой дал бы (0,0) и выпадал бы из равномерности покрытия пикселя.
+		// 16 phases: enough for TAA and upscaling up to 2x (FSR uses 8*(scale^2)). Halton starts at
+		// index 1 - index 0 would yield (0,0) and break the uniform pixel coverage.
 		uint phase = _jitterFrameIndex++ % 16 + 1;
 		_jitterPixels = new Vector2(Halton(phase, 2) - 0.5f, Halton(phase, 3) - 0.5f);
 
-		// Пиксели -> NDC: пиксель по x это 2/width; y в NDC растёт вверх, а строки кадра идут вниз.
+		// Pixels -> NDC: one x pixel is 2/width; NDC y grows up while frame rows go down.
 		var ndc = new Vector2(_jitterPixels.X * 2f / size.X, -_jitterPixels.Y * 2f / size.Y);
 
 		ref var viewData = ref _lastCameras.viewData.GetRef(0, false);
@@ -1235,15 +1173,14 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		return result;
 	}
 
-	/// <summary>Защёлкивает матрицу репроджекции ровно один раз за кадр - ЗДЕСЬ, а не в пассе:
-	/// команды графа замораживаются и проигрываются много кадров подряд, так что посчитанное внутри
-	/// <see cref="MotionVectorPass.WriteCommands"/> застыло бы вместе с ними (см.
+	/// <summary>Latches the reprojection matrix exactly once per frame - HERE, not in the pass:
+	/// graph commands are frozen and replayed across frames, so anything computed inside
+	/// <see cref="MotionVectorPass.WriteCommands"/> would freeze with them (see
 	/// <see cref="MotionVectorPassResources.UpdateFromView"/>).
 	///
-	/// viewProj берётся из той же живой нативной памяти, по которой рисует <see cref="ForwardPass"/>
-	/// (<see cref="RenderCamerasData.viewData"/>), - иначе векторы считались бы по камере, отличной
-	/// от той, которой отрисован кадр, и разъезд был бы ровно в один кадр: самый неприятный вид
-	/// ошибки, потому что на неподвижной камере он невидим.</summary>
+	/// viewProj comes from the same live native memory <see cref="ForwardPass"/> draws with
+	/// (<see cref="RenderCamerasData.viewData"/>) - otherwise vectors would be computed for a camera
+	/// one frame off from the rendered one, invisible on a static camera.</summary>
 	private void LatchMotionVectors()
 	{
 		if (_motionVectorResources is null || !_hasGraphData)
@@ -1251,13 +1188,12 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 			return;
 		}
 
-		// Камера НУЛЕВАЯ: буфер векторов один на кадр, а несколько камер (сплит-скрин) потребовали бы
-		// своего буфера каждой. Ступень 1 этого не покрывает - см. комментарий класса
-		// MotionVectorPassResources.
+		// Camera 0 only: one vector buffer per frame; split-screen would need one per camera
+		// (see the MotionVectorPassResources class comment).
 		if (!_lastCameras.IsCreated || _lastCameras.Length == 0)
 		{
-			// Кадр без камеры (сцена ещё не собрана): историю рвём, иначе следующий живой кадр
-			// репроецировался бы по матрице, от которой его отделяет неизвестно сколько времени.
+			// Frame without a camera (scene not built yet): break history, or the next live frame
+			// would reproject against a matrix of unknown age.
 			_motionVectorResources.ResetHistory();
 			return;
 		}
@@ -1265,13 +1201,12 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 		_motionVectorResources.UpdateFromView(_lastCameras.viewData.GetRef(0, false).viewProj);
 	}
 
-	/// <summary>Освобождает рендер-граф (заморожённые команды и пины ресурсов) - для пересоздания
-	/// превью-окружения на лету (см. ModelPreviewViewport.RecreateEnvironment). Вызывающий обязан
-	/// сперва дождаться GPU (Flush + WaitForIdle).</summary>
+	/// <summary>Releases the render graph (frozen commands and resource pins) - for recreating the
+	/// preview environment on the fly (see ModelPreviewViewport.RecreateEnvironment). The caller
+	/// must wait for the GPU first (Flush + WaitForIdle).</summary>
 	public void Release()
 	{
-		// Первым делом - вон из реестра, чтобы окно отладки не успело выбрать освобождаемый конвейер
-		// (см. GraphicsPipelineRegistry).
+		// Unregister first so the debug window cannot pick the pipeline being released.
 		GraphicsPipelineRegistry.Unregister(this);
 
 		_renderGraph.Release();
@@ -1296,11 +1231,10 @@ public class GraphicsPipelineSimple : IGraphicsPipeline
 	public RenderGraphDebugHistory DebugHistory => _renderGraph.DebugHistory;
 }
 
-/// <summary>Финальный пасс-хук <see cref="GraphicsPipelineSimple.PostOverlay"/>: исполняет
-/// пользовательский оверлей ОТДЕЛЬНЫМ пассом рендер-графа после всей пост-обработки, поверх уже
-/// готового отображаемого кадра (контур выделения Scene View и подобное). Хук читается при записи
-/// команд (тот же паттерн, что у InlineOverlay в ForwardPass) - смена значения требует
-/// <see cref="GraphicsPipelineSimple.InvalidateGraph"/>; null-хук не пишет команд вовсе.</summary>
+/// <summary>Final pass hook <see cref="GraphicsPipelineSimple.PostOverlay"/>: runs the user overlay
+/// as its own render-graph pass after all post-processing, over the finished display frame. The
+/// hook is read at command-record time (same pattern as InlineOverlay in ForwardPass) - changing it
+/// requires <see cref="GraphicsPipelineSimple.InvalidateGraph"/>; a null hook writes no commands.</summary>
 public sealed class PostOverlayPass : RenderGraphPass<PostOverlayPass.PassData>
 {
 	public override string Name => "Post Overlay Pass";

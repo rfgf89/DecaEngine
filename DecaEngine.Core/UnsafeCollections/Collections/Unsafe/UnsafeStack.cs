@@ -53,38 +53,27 @@ namespace UnsafeCollections.Collections.Unsafe
             var stride = sizeof(T);
             UnsafeStack* stack;
 
-            // fixedSize stack means we are allocating the memory
-            // for the stack header and the items in it as one block
+            // Fixed-size: header and items share one allocation, freed together in Free().
             if (fixedSize)
             {
                 var alignment = Memory.GetAlignment(stride);
 
-                // align stack header size to the elements alignment
                 var sizeOfStack = Memory.RoundToAlignment(sizeof(UnsafeStack), alignment);
                 var sizeOfArray = stride * capacity;
 
-                // allocate memory for stack and array with the correct alignment
                 var ptr = Memory.MallocAndZero(sizeOfStack + sizeOfArray, alignment);
 
-                // grab stack ptr
                 stack = (UnsafeStack*)ptr;
 
-                // initialize fixed buffer from same block of memory as the stack
                 UnsafeBuffer.InitFixed(&stack->_items, (byte*)ptr + sizeOfStack, capacity, stride);
             }
-
-            // dynamic sized stack means we're allocating the stack header
-            // and its memory separately
             else
             {
-                // allocate stack separately
                 stack = Memory.MallocAndZero<UnsafeStack>();
 
-                // initialize dynamic buffer with separate memory
                 UnsafeBuffer.InitDynamic(&stack->_items, capacity, stride);
             }
 
-            // just safety, make sure count is 0
             stack->_count = 0;
             stack->_typeHandle = typeof(T).TypeHandle.Value;
 
@@ -96,16 +85,14 @@ namespace UnsafeCollections.Collections.Unsafe
             if (stack == null)
                 return;
 
-            // if this is a dynamic sized stack, we need to free the buffer by hand
+            // Dynamic buffers are freed separately; fixed-size items are freed with the header.
             if (stack->_items.Dynamic == 1)
             {
                 UnsafeBuffer.Free(&stack->_items);
             }
 
-            // clear stack memory just in case
             *stack = default;
 
-            // free stack memory (if this is a fixed size stack, it frees the _items memory also)
             Memory.Free(stack);
         }
 
@@ -311,20 +298,15 @@ namespace UnsafeCollections.Collections.Unsafe
 
         private static void Expand(UnsafeStack* stack)
         {
-            // new buffer for elements
             UnsafeBuffer newItems = default;
 
-            // initialize to double size of existing one
             int newSize = stack->_items.Length == 0 ? DEFAULT_CAPACITY : stack->_items.Length * 2;
             UnsafeBuffer.InitDynamic(&newItems, newSize, stack->_items.Stride);
 
-            // copy memory over from previous items
             UnsafeBuffer.Copy(stack->_items, 0, newItems, 0, stack->_items.Length);
 
-            // free old buffer
             UnsafeBuffer.Free(&stack->_items);
 
-            // replace buffer with new
             stack->_items = newItems;
         }
 

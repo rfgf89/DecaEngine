@@ -1,29 +1,15 @@
 
 namespace DecaEngine.Graphics.Assets;
 
-/// <summary>
-/// Печёт текстуры подготовленной модели в .dtex и проставляет слотам ключи кеша. Работает по
-/// <c>PreparedModel</c>, то есть после того, как фоновая фаза загрузки уже декодировала
-/// картинки, - собственного разбора glTF здесь нет.
-/// </summary>
+/// <summary>Bakes a prepared model's textures into .dtex and fills in their cache keys.</summary>
 internal static class ModelAssetBaker
 {
-	/// <summary>
-	/// Печёт все текстурные слоты модели и заполняет им <c>PreparedTexture.CacheKey</c>.
-	///
-	/// Дедупликация идёт по паре (исходная картинка, настройки импорта), а не по слоту: типовая
-	/// ORM-текстура glTF - это ОДИН image, на который ссылаются и MetallicRoughness, и Occlusion, и
-	/// без дедупликации BC7-кодирование 4K-картинки честно выполнялось бы дважды на каждый такой
-	/// материал. На сценах уровня Sponza это разница между минутами и десятками минут.
-	/// </summary>
+	// Dedupe by (source image, import settings): glTF ORM maps share one image across slots.
 	public static void BakeTextures(PreparedModel prepared, AssetCache cache,
 		ModelLoadOptions options, CancellationToken cancellationToken)
 	{
 		cache.EnsureDirectories();
 
-		// Ключ считается по байтам исходника, поэтому один и тот же image в разных материалах даёт
-		// одну и ту же строку - словарь лишь избавляет от повторного хеширования и от повторной
-		// проверки файла на диске.
 		var bakedByImage = new Dictionary<(SharpGLTF.Schema2.Image, string), string>();
 
 		foreach (var material in prepared.Materials)
@@ -40,14 +26,14 @@ internal static class ModelAssetBaker
 			BakeSlot(material.NormalTexture, TextureSlotKind.Normal);
 			BakeSlot(material.OcclusionTexture, TextureSlotKind.Occlusion);
 			BakeSlot(material.ThicknessTexture, TextureSlotKind.Thickness);
+			BakeSlot(material.EmissiveTexture, TextureSlotKind.Emissive);
 		}
 
 		void BakeSlot(PreparedTexture texture, TextureSlotKind kind)
 		{
 			if (texture?.Pixels == null || texture.SourceImage == null)
 			{
-				// Слот пуст, или пикселей нет (режим стриминга). Печь нечего - слот останется без
-				// ключа, и при загрузке из кеша получит филлер, как и раньше.
+				// Empty slot or streaming mode: no key, so the loader substitutes a filler.
 				return;
 			}
 
@@ -69,53 +55,30 @@ internal static class ModelAssetBaker
 			var key = AssetCache.TextureKey(encoded.Span, settings);
 			var path = cache.TexturePath(key);
 
-			// Файл уже есть - это попадание по СОДЕРЖИМОМУ: ту же картинку с теми же настройками уже
-			// пекла другая модель. Именно ради этого текстуры адресуются контентно (см. AssetCache).
-			// Ключ проставляется слоту ВСЕГДА, а не только на ветке «файл писали сейчас»: cooked-модель
-			// ссылается на текстуру исключительно по нему (CookedModelFile.WriteTexture пишет слот как
-			// пустой, если ключа нет). Без этого .dtex честно печётся и ложится на диск, .dmdl пишется
-			// без единой текстуры, и модель из кеша приезжает целиком на белых филлерах - причём молча:
-			// геометрия и габариты сходятся один в один. Заодно ломался и отбор «дырявых» материалов
-			// (HasBaseColorTexture=false), то есть листва теряла альфа-тест в тенях.
+			// Assign the key on BOTH paths: cooked models reference textures only by it.
 			texture.CacheKey = key;
 			bakedByImage[dedupeKey] = key;
 
 			if (!File.Exists(path))
 			{
-				// Параллелизм отдан кодировщику (он режет картинку на блоки), а картинки идут строго
-				// по одной. Обратная раскладка - поток на картинку - выглядит соблазнительно, но
-				// упирается в память: декод и кодирование держат по полноразмерной копии на поток, и
-				// на 4K-текстурах это гигабайты (ровно тем же ограничен декод в PrepareModel).
+				// One image at a time: a thread per image holds a full-size copy each.
 				var payload = TextureBaker.Bake(texture.Pixels, texture.Width, texture.Height, settings);
 				DtexFile.Write(path, payload);
 
-				// Размеры - от ФАКТИЧЕСКИ запечённого нулевого уровня. Повторять здесь арифметику
-				// клампа нельзя: он ужимает обе стороны пропорционально, и «обрезать каждую по
-				// пределу» разошлось бы с бейком на неквадратных текстурах (4096x2048 при пределе
-				// 2048 - это 2048x1024, а не 2048x2048). Разъехавшиеся размеры потом дают неверный
-				// номер мип-уровня при стриминге, то есть текстуру не того размера.
+				// Size comes from the baked mip 0: the clamp scales both axes proportionally.
 				texture.Width = payload.Width;
 				texture.Height = payload.Height;
 			}
 			else if (DtexFile.TryReadHeader(path, out var header))
 			{
-				// Попадание по содержимому - размеры берём из ЗАГОЛОВКА готового файла, по той же
-				// причине, что и веткой выше: у слота сейчас размеры исходника, а в файле лежит
-				// прикламленный уровень 0. Разойдясь, они дают стримеру неверный номер мипа.
+				// Same reason: the slot still holds source size, the file holds clamped mip 0.
 				texture.Width = header.Width;
 				texture.Height = header.Height;
 			}
 		}
 	}
 
-	/// <summary>
-	/// Проверяет, что все .dtex, на которые ссылается прочитанная cooked-модель, лежат на месте.
-	///
-	/// Без этой проверки частично вычищенный кеш (кто-то удалил папку textures, антивирус съел файл)
-	/// давал бы модель, у которой .dmdl валиден, а половина материалов молча получает белые филлеры.
-	/// Ошибка такого рода не диагностируется вообще - модель просто «выцветает», - поэтому дешевле
-	/// объявить промах и перепечь.
-	/// </summary>
+	/// <summary>Checks every .dtex a cooked model references still exists on disk.</summary>
 	public static bool AllTexturesPresent(PreparedModel prepared, AssetCache cache)
 	{
 		foreach (var material in prepared.Materials)
@@ -129,7 +92,8 @@ internal static class ModelAssetBaker
 				!SlotPresent(material.MetallicRoughnessTexture) ||
 				!SlotPresent(material.NormalTexture) ||
 				!SlotPresent(material.OcclusionTexture) ||
-				!SlotPresent(material.ThicknessTexture))
+				!SlotPresent(material.ThicknessTexture) ||
+				!SlotPresent(material.EmissiveTexture))
 			{
 				return false;
 			}

@@ -27,10 +27,8 @@ struct CascadeAttribs
 #define MAX_CASCADES 8
 struct ShadowMapAttribs
 {
-    // 0
     float4x4 mWorldToLightView;  // Transform from view space to light projection space
 
-    // 16
     CascadeAttribs Cascades[MAX_CASCADES];
 
     float4x4 mWorldToShadowMapUVDepth[MAX_CASCADES];
@@ -43,10 +41,9 @@ struct ShadowMapAttribs
 
     float4 f4ShadowMapDim;    // Width, Height, 1/Width, 1/Height
 
-    // Number of shadow cascades
     int   iNumCascades                  DEFAULT_VALUE(0);
     float fNumCascades                  DEFAULT_VALUE(0);
-    // Do not use bool, because sizeof(bool)==1 !
+    // Do not use bool: sizeof(bool)==1 breaks the C++/HLSL layout match.
 	BOOL  bVisualizeCascades            DEFAULT_VALUE(0);
     BOOL  bVisualizeShadowing           DEFAULT_VALUE(0);
 
@@ -102,21 +99,14 @@ struct CameraAttribs
     float Padding0;
     float Padding1;
 
-    // Distance to the point of focus
     float fFocusDistance DEFAULT_VALUE(10.0f);
-    // Ratio of the aperture (known as f-stop or f-number)
     float fFStop         DEFAULT_VALUE(5.6f);
-    // Distance between the lens and the film in mm
-    float fFocalLength   DEFAULT_VALUE(50.0f);
-    // Sensor width in mm
-    float fSensorWidth   DEFAULT_VALUE(36.0f);
+    float fFocalLength   DEFAULT_VALUE(50.0f); // mm
+    float fSensorWidth   DEFAULT_VALUE(36.0f); // mm
 
-    // Sensor height in mm
-    float  fSensorHeight  DEFAULT_VALUE(24.0f);
-    // 	Exposure adjustment as a log base-2 value.
-    float  fExposure      DEFAULT_VALUE(0.0f);
-    // TAA jitter
-    float2 f2Jitter;
+    float  fSensorHeight  DEFAULT_VALUE(24.0f); // mm
+    float  fExposure      DEFAULT_VALUE(0.0f);  // log2 exposure adjustment
+    float2 f2Jitter; // TAA jitter
 
     float4x4 mView;
     float4x4 mProj;
@@ -125,12 +115,10 @@ struct CameraAttribs
     float4x4 mProjInv;
     float4x4 mViewProjInv;
 
-    float4 f4ExtraData[5]; // Any appliation-specific data
+    float4 f4ExtraData[5]; // Application-specific data
 
 #ifdef __cplusplus
-    // Set the near and far clip planes z and depth values.
-    //
-    // fNearZ > fFarZ means that the depth buffer is reversed.
+    // fNearZ > fFarZ means the depth buffer is reversed.
     void SetClipPlanes(float fNearZ, float fFarZ)
     {
         bool UseReverseDepth = fNearZ > fFarZ;

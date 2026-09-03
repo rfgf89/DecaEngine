@@ -5,59 +5,38 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Animation;
 
-/// <summary>
-/// Цепочка костей вторичного движения: хвост, коса, полы плаща, подвески. Кости идут ОТ КОРНЯ К
-/// КОНЧИКУ, каждая следующая - непосредственный ребёнок предыдущей; солвер проходит цепочку в этом
-/// порядке и пересчитывает модельные матрицы по ходу, поэтому разрыв в родстве тихо испортил бы
-/// всё, что ниже него.
-/// </summary>
+/// <summary>Secondary-motion bone chain, ordered root to tip; each joint must be the direct
+/// child of the previous one.</summary>
 public sealed class SpringBoneChain
 {
 	public int[] Joints = [];
 
-	/// <summary>Насколько сильно кость тянет обратно к позе анимации за шаг, 0..1. Ноль - кость
-	/// живёт только инерцией и никогда не возвращается; единица - вторичного движения нет вовсе.</summary>
+	/// <summary>Pull back towards the animated pose per step, 0..1; 1 disables the effect.</summary>
 	public float Stiffness = 0.08f;
 
-	/// <summary>Потеря скорости за шаг, 0..1. Без неё цепочка колеблется вечно.</summary>
+	/// <summary>Velocity lost per step, 0..1.</summary>
 	public float Drag = 0.2f;
 
-	/// <summary>Внешняя сила в пространстве МОДЕЛИ (обычно гравитация). Задаётся в пространстве
-	/// модели, а не мира, потому что и вся поза считается в нём: переводить силу в мир значило бы
-	/// тащить сюда трансформ сущности ради одного вектора.</summary>
+	/// <summary>External force in MODEL space, usually gravity.</summary>
 	public Vector3 Gravity = Vector3.Zero;
 
-	/// <summary>Длина «хвостовой» кости - у последнего джойнта цепочки нет ребёнка, задающего
-	/// направление и длину. Ноль означает, что последний джойнт не колышется.</summary>
+	/// <summary>Length of the virtual tail bone; zero leaves the last joint rigid.</summary>
 	public float TailLength;
 
-	// Положения кончиков костей в пространстве модели: текущее и прошлого шага. Верле, а не пара
-	// (позиция, скорость): при рывке корня (телепорт персонажа) верле сам гасит вылет, потому что
-	// скорость в нём не хранится отдельно и не переживает подмену позиции.
+	// Verlet rather than position+velocity: a root teleport cannot fling the chain, since no
+	// velocity survives the position swap.
 	internal Vector3[] Tips = [];
 	internal Vector3[] PreviousTips = [];
 	internal bool Initialized;
 
-	/// <summary>Сбрасывает симуляцию к текущей позе. Обязателен при телепорте персонажа: иначе
-	/// цепочка «догоняет» его через полкарты, растягиваясь в струну.</summary>
+	/// <summary>Resets the simulation to the current pose; required after a teleport.</summary>
 	public void Reset() => Initialized = false;
 }
 
-/// <summary>
-/// Солвер вторичного движения. Работает ПОСЛЕ всего остального (анимация, блендинг, IK) и правит
-/// только локальные повороты костей цепочек - именно поэтому он последний: любой шаг, пересчитывающий
-/// позу из клипа, стёр бы его результат.
-/// </summary>
+/// <summary>Secondary-motion solver; must run last, after animation, blending and IK.</summary>
 public static class SpringBones
 {
-	/// <summary>
-	/// Считает шаг симуляции для всех цепочек и правит <paramref name="locals"/>.
-	///
-	/// <paramref name="models"/> ОБЯЗАН быть актуален на входе и пересчитывается по ходу для костей
-	/// цепочек: каждая следующая кость висит на уже поправленной предыдущей, и брать для неё
-	/// доанимационную матрицу родителя значило бы считать колебание вокруг положения, в котором
-	/// кость уже не находится.
-	/// </summary>
+	/// <summary>Steps every chain, editing locals and the chain bones' model matrices in place.</summary>
 	public static void Solve(PreparedSkeleton skeleton, IReadOnlyList<SpringBoneChain> chains,
 		Transform[] locals, Matrix4x4[] models, float deltaSeconds)
 	{
@@ -105,23 +84,19 @@ public static class SpringBones
 			float length = Vector3.Distance(head, animatedTip);
 			if (length < 1e-5f)
 			{
-				// Кость нулевой длины направления не задаёт - крутить вокруг неё нечего. Такое
-				// бывает у служебных узлов, случайно попавших в цепочку.
+				// A zero-length bone defines no direction to rotate around.
 				chain.Tips[i] = animatedTip;
 				chain.PreviousTips[i] = animatedTip;
 				continue;
 			}
 
-			// Верле: инерция + внешняя сила. Шаг в квадрате у силы - не педантизм, а условие того,
-			// что при смене частоты симуляции траектория остаётся той же.
+			// Squaring the step keeps the trajectory identical across simulation rates.
 			var inertia = (chain.Tips[i] - chain.PreviousTips[i]) * (1f - chain.Drag);
 			var next = chain.Tips[i] + inertia + chain.Gravity * (deltaSeconds * deltaSeconds);
 
-			// Возврат к позе анимации.
 			next = Vector3.Lerp(next, animatedTip, Math.Clamp(chain.Stiffness, 0f, 1f));
 
-			// Жёсткая связь: кончик обязан остаться на своём расстоянии от головы кости, иначе
-			// цепочка растягивается и рвётся визуально.
+			// Rigid constraint: the tip must keep its distance from the bone head.
 			var direction = next - head;
 			float distance = direction.Length();
 			next = distance > 1e-5f ? head + direction * (length / distance) : animatedTip;
@@ -131,13 +106,10 @@ public static class SpringBones
 
 			ApplyRotation(skeleton, locals, models, joint, head, animatedTip, next);
 
-			// Модельные матрицы ниже по цепочке пересчитываются от поправленной кости - см. шапку.
 			RefreshDescendants(skeleton, chain, locals, models, i);
 		}
 	}
 
-	/// <summary>Положение кончика кости в позе анимации: голова следующей кости цепочки, а для
-	/// последней - точка на её собственной оси в <see cref="SpringBoneChain.TailLength"/>.</summary>
 	private static Vector3 AnimatedTip(PreparedSkeleton skeleton, SpringBoneChain chain, Matrix4x4[] models, int index)
 	{
 		int joint = chain.Joints[index];
@@ -147,9 +119,7 @@ public static class SpringBones
 			return models[chain.Joints[index + 1]].Translation;
 		}
 
-		// Ось кости - направление, в котором от неё рос бы ребёнок. Берём локальную трансляцию
-		// самой кости как приближение направления роста: у костей цепочки (хвост, коса) она
-		// сонаправлена с самой цепочкой.
+		// The bone's own local translation approximates the direction a child would grow in.
 		var axis = skeleton.BindLocals[joint].position;
 		if (axis.LengthSquared() < 1e-10f)
 		{
@@ -163,9 +133,6 @@ public static class SpringBones
 		return model.Translation + Vector3.Normalize(direction) * chain.TailLength;
 	}
 
-	/// <summary>Доворачивает кость так, чтобы её кончик смотрел из головы в новую точку. Коррекция
-	/// считается в модельном пространстве и переводится в локальное через поворот РОДИТЕЛЯ - иначе
-	/// она применилась бы поверх собственного поворота кости дважды.</summary>
 	private static void ApplyRotation(PreparedSkeleton skeleton, Transform[] locals, Matrix4x4[] models,
 		int joint, Vector3 head, Vector3 animatedTip, Vector3 newTip)
 	{
@@ -182,17 +149,14 @@ public static class SpringBones
 		int parent = skeleton.Parents[joint];
 		var parentRotation = parent >= 0 ? RotationOf(models[parent]) : Quaternion.Identity;
 
-		// Модельный поворот кости = локальный, домноженный на родительский; коррекция накладывается
-		// в модельном пространстве СЛЕВА от него, а обратно в локальное снимается родительским.
+		// Correction applies on the left in model space, then the parent rotation is undone.
 		var modelRotation = correction * (locals[joint].rotation * parentRotation);
 		locals[joint].rotation = Quaternion.Normalize(modelRotation * Quaternion.Inverse(parentRotation));
 
 		models[joint] = Compose(locals[joint], parent >= 0 ? models[parent] : Matrix4x4.Identity);
 	}
 
-	/// <summary>Пересчитывает модельные матрицы костей цепочки НИЖЕ поправленной. Только их, а не
-	/// всего скелета: цепочки вторичного движения - листья, и полный пересчёт был бы работой впустую
-	/// на каждой кости каждой цепочки.</summary>
+	// Only the chain below the edited bone: spring chains are leaves, a full pass would be waste.
 	private static void RefreshDescendants(PreparedSkeleton skeleton, SpringBoneChain chain, Transform[] locals,
 		Matrix4x4[] models, int index)
 	{
@@ -210,8 +174,7 @@ public static class SpringBones
 		* Matrix4x4.CreateTranslation(local.position)
 		* parent;
 
-	/// <summary>Поворот матрицы без масштаба. Строки нормализуются: у костей с масштабом
-	/// CreateFromRotationMatrix на ненормализованной матрице даёт кватернион с мусорной нормой.</summary>
+	// Rows are normalised first: CreateFromRotationMatrix on a scaled basis returns garbage.
 	private static Quaternion RotationOf(in Matrix4x4 matrix)
 	{
 		var normalized = matrix;
@@ -228,9 +191,7 @@ public static class SpringBones
 		return Quaternion.CreateFromRotationMatrix(normalized);
 	}
 
-	/// <summary>Кратчайший поворот из одного единичного вектора в другой. Отдельно обрабатывается
-	/// противоположное направление: ось поворота там вырождается в ноль, и наивная формула даёт
-	/// нулевой кватернион вместо разворота на 180°.</summary>
+	// Anti-parallel inputs are special-cased: the rotation axis degenerates to zero there.
 	private static Quaternion FromToRotation(Vector3 from, Vector3 to)
 	{
 		float dot = Vector3.Dot(from, to);

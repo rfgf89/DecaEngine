@@ -1,15 +1,9 @@
-// Общая кривая тонмапа превью. Раньше жила прямо в UnlitInstancedPS.hlsl и применялась в конце
-// шейдинга; с HDR-конвейером (см. TonemapPass / EyeAdaptationPass) геометрия пишет ЛИНЕЙНЫЙ
-// радианс в RGBA16F-таргет, а кривая применяется один раз фуллскрин-пассом после авто-экспозиции.
-// Файл включают оба (UnlitInstancedPS - для LDR-режима, когда HDR-конвейер выключен, и
-// TonemapPS - для HDR).
+// Shared tone-mapping curves, included by UnlitInstancedPS (LDR path) and TonemapPS (HDR path).
 #ifndef TONEMAP_HLSL
 #define TONEMAP_HLSL
 
-// Khronos PBR Neutral tone mapper (https://github.com/KhronosGroup/ToneMapping) - the reference
-// curve of the glTF Sample Viewer's "PBR Neutral" mode. Unlike Reinhard (which halves every
-// midtone and is a big part of why the preview used to read as unlit), it passes values below
-// ~0.76 through unchanged and only compresses the top of the range, preserving color saturation.
+// Khronos PBR Neutral (github.com/KhronosGroup/ToneMapping): linear below ~0.76, compresses
+// only the top of the range, preserving saturation.
 float3 PbrNeutralToneMap(float3 color)
 {
     const float startCompression = 0.8 - 0.04;
@@ -21,9 +15,8 @@ float3 PbrNeutralToneMap(float3 color)
 
     float peak = max(color.r, max(color.g, color.b));
 
-    // Единственная точка выхода вместо раннего return внутри ветки: на нём FXC выдаёт
-    // X4000 "use of potentially uninitialized variable (PbrNeutralToneMap)", хотя значение
-    // возвращают обе ветки. Кривая та же, деления на ноль нет - в ветке peak >= 0.76.
+    // Single exit point: an early return in the branch trips FXC X4000 (uninitialized variable).
+    // No divide-by-zero: peak >= 0.76 inside the branch.
     float3 result = color;
     if (peak >= startCompression)
     {
@@ -38,14 +31,8 @@ float3 PbrNeutralToneMap(float3 color)
     return result;
 }
 
-// ACES, аппроксимация Narkowicz (2015) одной рациональной дробью. Классическая «киношная» кривая:
-// заметный подъём контраста в средних тонах, глубокий носок и укатанные света. То, чего нарочно НЕ
-// делает PBR Neutral, и то, из-за отсутствия чего кадр читается плоским.
-//
-// Расплата известна и её надо знать: аппроксимация уводит оттенок насыщенных ярких цветов
-// (оранжевый тянет к жёлтому, красный к оранжевому) - она подгонялась по яркости, а не по
-// цветовому тону. Для «покрасивее» это чаще плюс, для оценки материала - минус, поэтому кривая
-// выбирается, а не назначается.
+// ACES, Narkowicz 2015 approximation; known hue shift on bright saturated colors (fit by
+// luminance, not hue), which is why the curve is user-selectable rather than forced.
 float3 AcesToneMap(float3 color)
 {
     const float a = 2.51;
@@ -56,13 +43,8 @@ float3 AcesToneMap(float3 color)
     return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
 }
 
-// AgX (Troy Sobotka), полиномиальная аппроксимация. Современный компромисс: тот же фильмический
-// контраст, что у ACES, но БЕЗ сдвига оттенка - яркие насыщенные цвета уходят в белый через
-// корректную десатурацию, а не через смену тона. Именно это отличает «дорогую» картинку: пересвет
-// выглядит как пересвет, а не как цветное пятно.
-//
-// Три шага: приведение в рабочее пространство AgX, логарифмическая кодировка в диапазон
-// [-12.47, +4.026] стопов, затем сигмоида-полином шестой степени по этому логу.
+// AgX (Troy Sobotka), polynomial approximation: filmic contrast without ACES's hue shift.
+// Steps: AgX working space, log2 encode to [-12.47, +4.026] EV, 6th-degree sigmoid polynomial.
 float3 AgxToneMap(float3 color)
 {
     const float3x3 agxIn = float3x3(
@@ -80,11 +62,11 @@ float3 AgxToneMap(float3 color)
 
     color = mul(agxIn, max(color, 0.0));
 
-    // Лог-кодировка. Пол 1e-10, а не ноль: log2(0) - это -inf, и он проходит сквозь полином в NaN.
+    // Floor 1e-10, not zero: log2(0) is -inf and rides through the polynomial into NaN.
     color = clamp(log2(max(color, 1e-10)), minEv, maxEv);
     color = (color - minEv) / (maxEv - minEv);
 
-    // Сигмоида как полином 6-й степени по схеме Horner - дешевле и точнее, чем возведения в степень.
+    // Horner-form 6th-degree sigmoid - cheaper and more precise than pow.
     float3 x = color;
     float3 x2 = x * x;
     float3 x4 = x2 * x2;
@@ -100,9 +82,8 @@ float3 AgxToneMap(float3 color)
     return saturate(color);
 }
 
-// Режимы кривой - зеркалит EditorSettings.ToneCurveMode. Выбор РАНТАЙМНЫЙ, а не кейвордом: кривая
-// стоит считанные такты, а вариант шейдера на каждую пересобирал бы все PSO превью при движении
-// выпадающего списка.
+// Mirrors EditorSettings.ToneCurveMode. Runtime select, not a keyword: a shader variant per
+// curve would rebuild every preview PSO on a dropdown change.
 #define TONE_CURVE_PBR_NEUTRAL 0
 #define TONE_CURVE_ACES        1
 #define TONE_CURVE_AGX         2
@@ -122,7 +103,7 @@ float3 ApplyToneCurve(float3 color, int mode)
     return PbrNeutralToneMap(color);
 }
 
-// Фотометрическая яркость (Rec. 709) - на ней считается и авто-экспозиция (см. LuminanceInitPS).
+// Rec. 709 luma; auto-exposure metering uses the same weights (see LuminanceInitPS).
 float TonemapLuminance(float3 color)
 {
     return dot(color, float3(0.2126, 0.7152, 0.0722));

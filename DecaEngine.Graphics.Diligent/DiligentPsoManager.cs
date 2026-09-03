@@ -6,17 +6,12 @@ using Diligent;
 namespace DecaEngine.Graphics.Diligent;
 
 /// <summary>
-/// Глобальный менеджер Pipeline State Object (PSO) кэша.
-/// Рекомендуется создавать один экземпляр на приложение (например, внутри DiligentGraphicsPipeline).
+/// Global PSO cache manager; one instance per application.
 ///
-/// Файл кэша обязан быть ПЕР-БЭКЕНДНЫМ (см. DiligentGraphicsApi.Initialize): D3D12 pipeline
-/// library и Vulkan pipeline cache - несовместимые бинарные форматы, а редактор (D3D12) и
-/// CLI-пробы (Vulkan) запускаются из одной рабочей директории. Загрузка чужих байт в лучшем
-/// случае молча отбрасывается драйвером, в худшем - ломает создание PSO.
+/// The cache file must be per-backend: D3D12 pipeline libraries and Vulkan pipeline caches are
+/// incompatible formats, and the editor (D3D12) and CLI probes (Vulkan) share a working dir.
 ///
-/// Переменные окружения:
-///   DECA_PSO_CACHE=0     - полностью отключить кэш (PSO создаются без него);
-///   DECA_PSO_CACHE=clear - удалить файл кэша при старте (одноразовая чистка каждым запуском).
+/// DECA_PSO_CACHE=0 disables the cache; DECA_PSO_CACHE=clear deletes the file at startup.
 /// </summary>
 public class DiligentPsoManager : IDisposable
 {
@@ -73,8 +68,7 @@ public class DiligentPsoManager : IDisposable
 					CacheDataSize = (uint)cacheData.Length
 				};
 
-				// Битый/чужой/устаревший (после апдейта драйвера) файл не должен убивать запуск и
-				// не должен переживать неудачную загрузку - удаляем и стартуем с пустым кэшем.
+				// A corrupt or foreign cache file must not kill startup, and must not survive.
 				try
 				{
 					_psoCache = _device.CreatePipelineStateCache(createInfo);
@@ -93,7 +87,7 @@ public class DiligentPsoManager : IDisposable
 
 		if (_psoCache is null)
 		{
-			// Файла нет (или загрузка не удалась) - создаем кэш только для сохранения.
+			// No file, or the load failed: create a store-only cache.
 			var createInfo = new PipelineStateCacheCreateInfo
 			{
 				Desc = new PipelineStateCacheDesc
@@ -109,40 +103,20 @@ public class DiligentPsoManager : IDisposable
 		}
 	}
 
-	/// <summary>
-	/// Создает Graphics Pipeline State с использованием глобального кэша.
-	/// </summary>
-	/// <summary>Диагностика: сколько графических PSO создано и во что это обошлось. Статика -
-	/// сознательно: счётчик глобальный на процесс, его смысл именно в суммарной цене за запуск.</summary>
+	// Process-wide diagnostics: how many graphics PSOs were created and what they cost.
 	public static long DiagCreateMs;
 	public static int DiagCreateCount;
 
-	/// <summary>Сколько раз каждое ИМЯ PSO прошло через создание, и во что это обошлось. Имя целиком
-	/// описывает конфигурацию (см. DiligentMaterial.RebuildPipelineIfNeeded), поэтому разбивка по нему
-	/// отвечает на два вопроса сразу: сколько РАЗНЫХ конфигураций реально нужно кадру и сколько из
-	/// созданий - пересборка того же самого материала (взведённый _isDirty при доборе переменных).</summary>
+	// Per-name breakdown; the PSO name fully describes the configuration.
 	public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Count, long Ms)> DiagByName = new();
 
-	/// <summary>Имена PSO, уже прошедшие через <see cref="_psoCache"/> В ЭТОМ ПРОЦЕССЕ - см.
-	/// <see cref="CreateGraphicsPipelineState"/>. Не персистентно (в отличие от файла кэша) и живёт
-	/// ровно для того, чтобы поймать ПОВТОРНОЕ создание PSO под уже виденным именем.</summary>
+	// PSO names already served by _psoCache in this process, to catch repeat creations.
 	private readonly HashSet<string> _seenPsoNames = new();
 	private readonly object _seenPsoNamesLock = new();
 
-	/// <summary>Создаёт графический PSO. Имя (см. DiligentMaterial.RebuildPipelineIfNeeded - оно
-	/// целиком описывает конфигурацию: шейдеры, сэмплеры, лейаут переменных) обычным путём идёт
-	/// через дисковый кэш, НО только первый раз за это же имя в рамках процесса - см. комментарий
-	/// у <see cref="CreateComputePipelineState"/> про D3D12 pipeline library: тот же класс дефекта
-	/// (загрузка по имени возвращает невалидный объект без ошибки и без null) бьёт и по графике,
-	/// просто реже - раньше графические материалы под одним именем не пересоздавались В ПРЕДЕЛАХ
-	/// ОДНОГО запуска. Теперь пересоздаются: смена техники AO (SsaoPassResources.Release + новый
-	/// экземпляр под тем же литеральным именем "SSAO Composite Material"/"SSAO Material") или смена
-	/// провайдера/качества нативного апскейлера освобождают материал и заводят новый под тем же
-	/// именем, а библиотека PSO это имя уже зарегистрировала. Симптом идентичен компьютному -
-	/// AV в IDeviceContext.SetPipelineState на СВЕЖЕМ, только что созданном материале (воспроизведено
-	/// DECA_LOOP_TOGGLE=1: переключение AO Ssao/Gtao валит процесс на первой же перерисовке после
-	/// тоггла; DECA_PSO_CACHE=0 - чисто). Первое создание каждого имени за процесс кэш всё ещё
-	/// использует (даёт выигрыш холодного старта из файла), только ПОВТОРЫ идут мимо него.</summary>
+	/// <summary>Creates a graphics PSO. Only the first creation of a given name uses the disk
+	/// cache: a D3D12 pipeline library re-loaded under an already registered name hands back an
+	/// invalid object with no error and no null, and binding it faults.</summary>
 	public IPipelineState CreateGraphicsPipelineState(GraphicsPipelineStateCreateInfo createInfo)
 	{
 		var name = createInfo.PSODesc.Name;
@@ -163,24 +137,17 @@ public class DiligentPsoManager : IDisposable
 		return pso;
 	}
 
-	/// <summary>Готовые графические PSO, разделяемые между материалами, по ключу конфигурации.
-	/// Владелец - менеджер: материалы такой PSO НЕ диспозят (см. DiligentMaterial.Release).</summary>
+	// Owned by the manager: materials must not dispose a shared PSO.
 	private readonly Dictionary<string, IPipelineState> _sharedPsos = new();
 	private readonly object _sharedPsosLock = new();
 
-	/// <summary>Сколько раз общий PSO выдан из кэша вместо создания. Пара к
-	/// <see cref="DiagCreateCount"/>: их сумма - это число запросов PSO у материалов.</summary>
 	public static int DiagSharedHits;
 
-	/// <summary>Стабильные на процесс номера для объектов, участвующих в ключе PSO (нативные шейдеры,
-	/// стейт-объекты). Нужны именно номера, а не хэши: ключ решает, ПЕРЕИСПОЛЬЗОВАТЬ ли чужой PSO,
-	/// и коллизия здесь означала бы отрисовку чужим пайплайном. Таблица слабая - объект в ней не
-	/// удерживается.</summary>
+	// Identity numbers, not hashes: a collision in a PSO key would draw with a foreign pipeline.
 	private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> _objectIds = new();
 	private int _nextObjectId;
 
-	/// <summary>Номер объекта для ключа PSO. Разным объектам - разные номера, одному и тому же
-	/// объекту всегда один и тот же.</summary>
+	/// <summary>Stable per-process identity number for an object taking part in a PSO key.</summary>
 	public int ObjectId(object obj)
 	{
 		lock (_objectIds)
@@ -197,20 +164,10 @@ public class DiligentPsoManager : IDisposable
 	}
 
 	/// <summary>
-	/// Отдаёт графический PSO для КОНФИГУРАЦИИ, а не для материала: одинаково настроенные материалы
-	/// получают один и тот же нативный объект.
+	/// Returns a graphics PSO per CONFIGURATION rather than per material.
 	///
-	/// Раньше PSO создавался на каждый материал, потому что его имя включало имя материала модели
-	/// (<c>"{Name} Material PSO..."</c>), а имя - это ключ дискового кэша. На Sponza-подобной сцене
-	/// это 71 создание с 71 уникальным именем и ~2.9 с при том, что РАЗНЫХ конфигураций там единицы:
-	/// вариантов пиксельного шейдера всего четыре, а стейт-объекты материалы и так делят (см.
-	/// ModelViewportEnvironment - baseMaterialState раздаётся всем). Дублировались, соответственно, и
-	/// записи в дисковой библиотеке PSO.
-	///
-	/// Ключ обязан описывать конфигурацию ПОЛНОСТЬЮ - иначе материал поедет чужим пайплайном, и это
-	/// не поймается ни варнингом, ни null'ом. Собирает его вызывающая сторона
-	/// (DiligentMaterial.RebuildPipelineIfNeeded), потому что только она знает, из чего createInfo
-	/// собран: стейт-объект + нативные шейдеры + immutable-сэмплеры + лейаут переменных.
+	/// The key must describe the configuration in full - state object, native shaders, immutable
+	/// samplers, variable layout - because a partial key silently draws with a foreign pipeline.
 	/// </summary>
 	public IPipelineState? GetOrCreateSharedGraphicsPipelineState(string key,
 		GraphicsPipelineStateCreateInfo createInfo)
@@ -233,24 +190,15 @@ public class DiligentPsoManager : IDisposable
 		}
 	}
 
-	/// <summary>
-	/// Создает Compute Pipeline State БЕЗ дискового кэша - сознательно. D3D12 pipeline library
-	/// для компьют-PSO, сохранённого другим запуском, возвращает НЕвалидный объект без единой
-	/// ошибки и без null - бинд такого PSO падает AV-ом в реплее замороженных команд
-	/// (воспроизводится двумя запусками full-loop подряд: первый пишет кэш, второй падает на
-	/// "Light Cluster CS"; с DECA_PSO_CACHE=0 оба чистые). Графический путь от того же спасает
-	/// null-фолбэк в DiligentMaterial - компьюту Diligent null не возвращает, ловить нечего.
-	/// Выигрыша кэш тут и не давал: компьют-PSO без растровых состояний создаётся за миллисекунды
-	/// из уже скомпилированного байткода.
-	/// </summary>
+	/// <summary>Creates a compute PSO deliberately WITHOUT the disk cache: a D3D12 pipeline
+	/// library returns an invalid compute PSO from a previous run with no error and no null,
+	/// and binding it faults.</summary>
 	public IPipelineState CreateComputePipelineState(ComputePipelineStateCreateInfo createInfo)
 	{
 		return _device.CreateComputePipelineState(createInfo);
 	}
 
-	/// <summary>
-	/// Сохраняет накопленный кэш на диск. Нужно вызывать при выходе из игры или при завершении загрузки уровня.
-	/// </summary>
+	/// <summary>Writes the accumulated cache to disk; call on shutdown or after a level load.</summary>
 	public unsafe void SaveCache()
 	{
 		if (_psoCache == null)
@@ -268,7 +216,7 @@ public class DiligentPsoManager : IDisposable
 			}
 			catch (IOException)
 			{
-				// Некритично: следующий запуск просто скомпилирует PSO заново.
+				// Not fatal: the next run just recompiles the PSOs.
 			}
 			finally
 			{
@@ -277,9 +225,7 @@ public class DiligentPsoManager : IDisposable
 		}
 		else
 		{
-			// Сериализация не удалась ("Failed to serialize D3D12 pipeline library") - файл на
-			// диске, если есть, уже не соответствует накопленному состоянию и при следующем
-			// запуске загрузится протухшим. Лучше без кэша, чем с невалидным.
+			// Serialization failed, so any file on disk is now stale: better no cache than a bad one.
 			TryDeleteCacheFile();
 		}
 	}

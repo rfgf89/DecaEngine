@@ -28,9 +28,7 @@ public static class DiligentResourceFormats
 			TextureObjectFormat.D32Float => TextureFormat.D32_Float,
 			TextureObjectFormat.D24UNormS8UInt => TextureFormat.D24_UNorm_S8_UInt,
 			TextureObjectFormat.D32FloatS8X24UInt => TextureFormat.D32_Float_S8X24_UInt,
-			// Блочно-сжатые форматы ассет-пайплайна. Все *_UNorm, а не *_UNorm_sRGB: шейдер
-			// материалов сам разворачивает базовый цвет в линейное пространство (см. комментарий
-			// у TextureObjectFormat.BC1UNorm).
+			// All *_UNorm, never *_UNorm_sRGB: the material shader decodes base color itself.
 			TextureObjectFormat.BC1UNorm => TextureFormat.BC1_UNorm,
 			TextureObjectFormat.BC3UNorm => TextureFormat.BC3_UNorm,
 			TextureObjectFormat.BC4UNorm => TextureFormat.BC4_UNorm,
@@ -92,9 +90,7 @@ public static class DiligentResourceFormats
 		return (ToNativeFormat(format), bindFlags);
 	}
 
-	/// <summary>Как <see cref="ToRenderTargetFormat"/>, но с UAV-бинд-флагом по
-	/// <see cref="HandleAccess.Compute"/> в <see cref="TextureInfo.access"/>: выход нативного
-	/// апскейлера (FSR) пишется compute-шейдером через UAV (см. DiligentRenderTarget).</summary>
+	/// <summary>As ToRenderTargetFormat, but adds the UAV bind flag for compute access.</summary>
 	public static (TextureFormat Format, BindFlags BindFlags) ToRenderTargetFormat(TextureObjectFormat format,
 		HandleAccess access)
 	{

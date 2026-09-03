@@ -31,13 +31,13 @@ public class AssemblyApp
 
 	public AssemblyAppState State { get; private set; } = AssemblyAppState.NotLoaded;
 
-	/// <summary>Срабатывает сразу после старта потока с точкой входа загруженного проекта, передавая его ManagedThreadId (используется, например, редактором для разметки вывода консоли по источнику).</summary>
+	/// <summary>Fires right after the project's entry-point thread starts, with its ManagedThreadId.</summary>
 	public event Action<int>? ThreadStarted;
 
-	/// <summary>Срабатывает после остановки/выгрузки потока проекта.</summary>
+	/// <summary>Fires after the project thread is stopped/unloaded.</summary>
 	public event Action? ThreadStopped;
 
-	/// <summary>Удобный конструктор для сценария "загрузить уже собранный проект" (<see cref="LoadFromPath"/>).</summary>
+	/// <summary>Convenience constructor for the "load an already built project" path (LoadFromPath).</summary>
 	public AssemblyApp() : this(AppContext.BaseDirectory)
 	{
 	}
@@ -114,14 +114,8 @@ public class AssemblyApp
 		}
 	}
 
-	/// <summary>
-	/// Загружает уже собранную сборку пользовательского проекта (dll, полученную,
-	/// например, из <see cref="DecaEngine.Core.Build.CsprojOutputResolver"/>) в
-	/// отдельный выгружаемый <see cref="AssemblyLoadContext"/> текущего процесса.
-	/// Точка входа ищется через <see cref="System.Reflection.Assembly.EntryPoint"/>,
-	/// поэтому она может быть в любом namespace (шаблон, генерируемый EditorBuilder,
-	/// кладёт класс Program в namespace проекта).
-	/// </summary>
+	/// <summary>Loads a built project assembly into a collectible AssemblyLoadContext; the entry
+	/// point is found via Assembly.EntryPoint, so it may live in any namespace.</summary>
 	public void LoadFromPath(string assemblyPath)
 	{
 		var fullPath = Path.GetFullPath(assemblyPath);
@@ -161,7 +155,7 @@ public class AssemblyApp
 		return File.Exists(candidate) ? context.LoadFromAssemblyPath(candidate) : null;
 	}
 
-	/// <summary>Запускает точку входа загруженного проекта в отдельном потоке текущего процесса.</summary>
+	/// <summary>Runs the loaded project's entry point on a separate thread of this process.</summary>
 	public void Run()
 	{
 		if (_runMethod is null)
@@ -191,7 +185,7 @@ public class AssemblyApp
 
 	public void Play()
 	{
-		_playMethod?.Invoke(_instanceApp, null);
+		InvokeGuarded(_playMethod, "Play");
 		if (State != AssemblyAppState.NotLoaded)
 		{
 			State = AssemblyAppState.Playing;
@@ -200,17 +194,37 @@ public class AssemblyApp
 
 	public void Pause()
 	{
-		_pauseMethod?.Invoke(_instanceApp, null);
+		InvokeGuarded(_pauseMethod, "Pause");
 		if (State != AssemblyAppState.NotLoaded)
 		{
 			State = AssemblyAppState.Paused;
 		}
 	}
 
-	/// <summary>Останавливает выполнение проекта и выгружает его сборку из процесса.</summary>
+	// Calls into project code must never crash the editor: foreign dlls can throw as early as
+	// the cctor (e.g. TypeLoadException from a stale build). Errors are logged and swallowed.
+	private void InvokeGuarded(MethodInfo? method, string name)
+	{
+		if (method is null)
+		{
+			return;
+		}
+
+		try
+		{
+			method.Invoke(_instanceApp, null);
+		}
+		catch (Exception ex)
+		{
+			var inner = ex is TargetInvocationException { InnerException: { } cause } ? cause : ex;
+			Console.Error.WriteLine($"[project] {name} failed: {inner.GetType().Name}: {inner.Message}");
+		}
+	}
+
+	/// <summary>Stops the project and unloads its assembly from the process.</summary>
 	public void Quit()
 	{
-		_quitMethod?.Invoke(_instanceApp, null);
+		InvokeGuarded(_quitMethod, "Quit");
 		_executableThread?.Join(TimeSpan.FromSeconds(2));
 
 		_assemblyLoadContext?.Unload();

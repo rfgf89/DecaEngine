@@ -15,15 +15,11 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Потриугольные атрибуты для probe GI: альбедо из текстур, тайлы, упаковка единичных векторов. Часть <see cref="ModelImporter"/> - CPU-стороны импорта; ФАЗА потребления (GPU-финализация) и
-/// точки входа загрузки живут в <see cref="ModelLoader"/>.</summary>
+/// <summary>Per-triangle attributes for probe GI: albedo from textures, tiles, packed material channels.</summary>
 public static partial class ModelImporter
 {
-	/// <summary>Линейное альбедо КАЖДОГО треугольника меша: base color текстуры в центроиде UV
-	/// (точечная выборка с заворотом) x линейный фактор. Ключ - meshId; меши без текстуры/UV или
-	/// без CPU-пикселей (стриминг, cooked-модель) пропускаются - потребитель падает на средний
-	/// цвет материала (<see cref="MaterialPbrFactors.AverageBaseColor"/>). Стоимость - единицы
-	/// миллисекунд на Sponza (одна выборка на треугольник) на фоне декода текстур.</summary>
+	/// <summary>Per-triangle linear albedo (and metal/rough) sampled at UV centroids, keyed by
+	/// meshId. Meshes without CPU pixels fall back to MaterialPbrFactors.AverageBaseColor.</summary>
 	internal static void ComputeTriangleAlbedoFromTextures(ModelLoader result, PreparedModel prepared)
 	{
 		var materialByLogical = new Dictionary<int, PreparedMaterial>();
@@ -31,7 +27,7 @@ public static partial class ModelImporter
 		{
 			materialByLogical[pm.LogicalIndex] = pm;
 
-			// Плитка альбедо материала - тем же проходом, пока CPU-пиксели живы.
+			// Albedo tile is built in the same pass, while CPU pixels are still alive.
 			var tileSource = pm.BaseColorTexture;
 			if (tileSource?.Pixels != null && tileSource.Width > 0 && tileSource.Height > 0 &&
 				!result.MaterialAlbedoTile.ContainsKey(pm.LogicalIndex))
@@ -40,8 +36,8 @@ public static partial class ModelImporter
 			}
 		}
 
-		// COOKED-путь: пикселей нет, но атрибуты приехали из .dmdl готовыми - распаковываем и
-		// выходим (см. PreparedModel.TriangleAttributes / EnsureTriangleAttributes).
+		// Cooked path: no pixels, attributes arrive prepacked from .dmdl (5 bytes/triangle,
+		// see EnsureTriangleAttributes) - unpack and return.
 		if (prepared.TriangleAttributes.Count > 0)
 		{
 			foreach (var (meshId, packed) in prepared.TriangleAttributes)
@@ -82,9 +78,8 @@ public static partial class ModelImporter
 				continue;
 			}
 
-			// Пикселей base color может не быть (стриминг/cooked) - это НЕ повод пропускать меш
-			// целиком: потриугольная металличность/шероховатость берётся из СВОЕЙ текстуры (ниже),
-			// а альбедо тогда честно падает на средний цвет материала.
+			// Missing base-color pixels must not skip the mesh: metal/rough come from their own
+			// texture below, and albedo falls back to the material average.
 			var texture = pm.BaseColorTexture;
 			bool hasBasePixels = texture?.Pixels != null && texture.Width > 0 && texture.Height > 0;
 
@@ -94,8 +89,7 @@ public static partial class ModelImporter
 				continue;
 			}
 
-			// Средний цвет материала - фолбэк альбедо, когда пикселей нет (тот же источник, что у
-			// потребителя: MaterialPbrFactors.AverageBaseColor).
+			// Fallback matches the consumer's source: MaterialPbrFactors.AverageBaseColor.
 			var factor = hasBasePixels
 				? new Vector3(pm.BaseColorFactor.X, pm.BaseColorFactor.Y, pm.BaseColorFactor.Z)
 				: new Vector3(ComputeAverageBaseColor(pm).X, ComputeAverageBaseColor(pm).Y,
@@ -103,23 +97,18 @@ public static partial class ModelImporter
 			int triCount = mesh.Indices.Length / 3;
 			var albedo = new Vector3[triCount];
 
-			// Буфер выборок - ОДИН на меш: stackalloc внутри цикла по треугольникам копит стек
-			// (кадр метода не освобождается до выхода) и на модели уровня Sponza его срывает.
+			// One tap buffer per mesh: stackalloc inside the triangle loop accumulates stack
+			// (frame is not released until return) and overflows on Sponza-sized models.
 			Span<Vector2> taps = stackalloc Vector2[7];
 
-			// Металличность - тем же проходом (те же центроиды UV), из B-канала MR-текстуры
-			// (glTF: G - roughness, B - metallic; данные ЛИНЕЙНЫЕ, без sRGB-декода).
+			// glTF MR packing: G = roughness, B = metallic; data is linear, no sRGB decode.
 			var mrTexture = pm.MetallicRoughnessTexture;
 
-			// Пикселей MR-текстуры нет (стриминг/cooked), а материал ПОТЕНЦИАЛЬНО металлический
-			// (фактор > 0.5 - у glTF-материалов с MR-текстурой он по умолчанию 1): декодируем её
-			// МЕЛКО, только ради потриугольных метал/шероховатости. Без этого сцена со стримингом
-			// получала фолбэк «фактор = 1» по обоим каналам, то есть «весь материал - шершавый
-			// металл»: цепочка отскоков RT-отражений не запускалась НИКОГДА (диагностика -
-			// отладочный вид «RT bounce chain»: сплошь зелёный). Стоимость ограничена: декод
-			// идёт только у металлических материалов и в 256px.
-			// Пиксели - в ЛОКАЛЬНЫХ переменных, а не в PreparedTexture: тот же экземпляр может уйти
-			// в печку ассетов, и подмена его пикселей мелким декодом запекла бы в .dtex 256px.
+			// If MR pixels are absent (streaming/cooked) but the material may be metallic,
+			// decode a small (256px) copy just for per-triangle metal/rough; otherwise the
+			// factor fallback makes the whole material rough metal and RT bounces never start.
+			// Decoded pixels stay in locals, not PreparedTexture: the same instance may go to
+			// the asset baker, and swapping its pixels would bake 256px into .dtex.
 			var mrPixels = mrTexture?.Pixels;
 			int mrWidth = mrTexture?.Width ?? 0;
 			int mrHeight = mrTexture?.Height ?? 0;
@@ -146,8 +135,7 @@ public static partial class ModelImporter
 				}
 				catch (Exception)
 				{
-					// Декод - оптимизация качества отражений, а не источник правды: не вышло -
-					// молча падаем на факторы материала.
+					// Quality optimization only: on failure fall back to material factors.
 				}
 			}
 
@@ -169,12 +157,8 @@ public static partial class ModelImporter
 					continue;
 				}
 
-				// СЕМЬ точек по треугольнику вместо одного центроида: центр, вершины (поджатые
-				// внутрь) и середины рёбер. Одна выборка ловит шум текстуры - в MR-картах
-				// реальных ассетов канал металличности «крапчатый», и у отдельных треугольников
-				// неметаллической ткани центроид попадал в тексель 0.6+, что в RT-отражениях
-				// читалось выбросами по треугольникам. Усреднение убирает крапинки, не размывая
-				// крупные детали (внутри треугольника цвет всё равно один).
+				// Seven taps per triangle instead of one centroid: real MR maps are speckled,
+				// and a single tap turned lone triangles into metallic outliers in RT reflections.
 				var uvA = mesh.Vertices[i0].TexCoord;
 				var uvB = mesh.Vertices[i1].TexCoord;
 				var uvC = mesh.Vertices[i2].TexCoord;
@@ -193,7 +177,7 @@ public static partial class ModelImporter
 
 				foreach (var tap in taps)
 				{
-					// Заворот UV как у Wrap-сэмплера (отрицательные тоже).
+					// Wrap UV like a Wrap sampler (negative values too).
 					float u = tap.X - MathF.Floor(tap.X);
 					float v = tap.Y - MathF.Floor(tap.Y);
 
@@ -204,7 +188,7 @@ public static partial class ModelImporter
 						int idx = (py * texture.Width + px) * 4;
 						if (idx + 2 < texture.Pixels!.Length)
 						{
-							// sRGB -> linear тем же pow(2.2), что и шейдер (см. UnlitInstancedPS.hlsl).
+							// sRGB -> linear via the same pow(2.2) as UnlitInstancedPS.hlsl.
 							albedoSum += new Vector3(
 								MathF.Pow(texture.Pixels[idx] / 255f, 2.2f),
 								MathF.Pow(texture.Pixels[idx + 1] / 255f, 2.2f),
@@ -220,7 +204,7 @@ public static partial class ModelImporter
 						int mBase = (my * mrWidth + mx) * 4;
 						if (mBase + 2 < mrPixels!.Length)
 						{
-							// glTF-упаковка: G - roughness, B - metallic; данные линейные.
+							// glTF packing: G = roughness, B = metallic; linear data.
 							metalSum += mrPixels[mBase + 2] / 255f;
 							roughSum += mrPixels[mBase + 1] / 255f;
 							mrTaps++;
@@ -246,11 +230,9 @@ public static partial class ModelImporter
 		}
 	}
 
-	/// <summary>Считает <see cref="PreparedModel.TriangleAttributes"/> - упакованные потриугольные
-	/// альбедо/металличность/шероховатость - ПОКА ЖИВЫ ПИКСЕЛИ текстур. Зовётся печкой ассетов
-	/// перед записью .dmdl: у cooked-модели пикселей нет, и без этого блока RT-отражения теряли и
-	/// текстурный цвет хитов, и материал (цепочка отскоков не запускалась - «металла в сцене
-	/// нет»). Побочный эффект осознан: на модель уходит 5 байт на треугольник в кеше.</summary>
+	/// <summary>Packs PreparedModel.TriangleAttributes while texture pixels are still alive;
+	/// called by the asset baker before writing .dmdl, since cooked models have no pixels.
+	/// Costs 5 bytes per triangle in the cache.</summary>
 	internal static void EnsureTriangleAttributes(PreparedModel prepared)
 	{
 		if (prepared.TriangleAttributes.Count > 0)
@@ -258,7 +240,7 @@ public static partial class ModelImporter
 			return;
 		}
 
-		// Считаем тем же кодом, что и на обычной загрузке, - через временный контейнер.
+		// Reuse the regular-load code path via a scratch container.
 		var scratch = new ModelLoader();
 		ComputeTriangleAlbedoFromTextures(scratch, prepared);
 
@@ -288,16 +270,14 @@ public static partial class ModelImporter
 	private static byte EncodeUnitSrgb(float linear) =>
 		EncodeUnit(MathF.Pow(Math.Clamp(linear, 0f, 1f), 1f / 2.2f));
 
-	/// <summary>Бокс-даунсемпл base color текстуры в плитку <see cref="ModelLoader.AlbedoTileSize"/>² (см.
-	/// <see cref="MaterialAlbedoTile"/>). Усреднение в линейном пространстве, но по РАЗРЕЖЕННОЙ
-	/// сетке (до 4x4 сэмплов на тексель плитки, как stride у ComputeAverageBaseColor): полный
-	/// проход по 2К-текстуре стоил бы сотни миллионов выборок на модель, а плитке 128² больше
-	/// точности и не нужно.</summary>
+	// Box-downsamples base color into an AlbedoTileSize^2 tile. Averaged in linear space but on
+	// a sparse grid (<=4x4 samples per tile texel): a full pass over 2K textures would cost
+	// hundreds of millions of samples per model.
 	private static byte[] BuildAlbedoTile(PreparedTexture texture)
 	{
 		const int size = ModelLoader.AlbedoTileSize;
 
-		// sRGB -> linear через таблицу: pow на каждый сэмпл - главная цена всего прохода.
+		// sRGB -> linear via lookup table: per-sample pow dominates the whole pass otherwise.
 		Span<float> toLinear = stackalloc float[256];
 		for (int i = 0; i < 256; i++)
 		{

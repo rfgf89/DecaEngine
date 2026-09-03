@@ -6,18 +6,9 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Animation;
 
-/// <summary>
-/// Чтение и запись аватара рядом с моделью: <c>Fox.glb</c> -> <c>Fox.avatar.json</c>.
-///
-/// Отдельным файлом рядом, а НЕ внутри .dmdl: аватар - авторские данные, их правят руками, смотрят
-/// в диффе и мержат, а .dmdl - производное от модели, которое пересобирается кешем при любом
-/// изменении опций загрузки. Аватар, запечённый в кук, терялся бы на каждой инвалидации кеша, и
-/// разметка рига жила бы ровно до следующей смены версии формата.
-///
-/// Формат - словарь «слот -> имя кости», а не массив: при добавлении нового слота (пальцы, глаза,
-/// челюсть) старые файлы обязаны читаться дальше, а массив с фиксированными позициями это ломает
-/// молча - слоты сдвигаются, и разметка съезжает на соседнюю кость.
-/// </summary>
+/// <summary>Reads and writes the avatar next to the model: <c>Fox.glb</c> -> <c>Fox.avatar.json</c>.
+/// Kept out of the .dmdl cook: authored data must survive cache invalidation. Slot -> bone name map
+/// rather than an array so adding a slot keeps old files readable.</summary>
 public static class HumanoidAvatarAsset
 {
 	private static readonly JsonSerializerOptions Options = new()
@@ -25,16 +16,14 @@ public static class HumanoidAvatarAsset
 		WriteIndented = true,
 	};
 
-	/// <summary>Путь к аватару по пути модели. Расширение целиком, а не суффикс: так файл виден
-	/// рядом с моделью и сортируется вместе с ней.</summary>
+	/// <summary>Avatar path for a model path.</summary>
 	public static string PathFor(string modelPath) =>
 		Path.ChangeExtension(modelPath, ".avatar.json");
 
 	public static bool Exists(string modelPath) =>
 		!string.IsNullOrEmpty(modelPath) && File.Exists(PathFor(modelPath));
 
-	/// <summary>Кость референсной позы на диске. Массивами, а не объектами с полями x/y/z: файл
-	/// правят руками, и строка <c>"p":[0,0.12,0]</c> читается, а три строки на компоненту - нет.</summary>
+	// Arrays rather than x/y/z objects: the file is hand-edited, "p":[0,0.12,0] stays on one line.
 	private sealed class ReferenceBone
 	{
 		public float[]? P { get; set; }
@@ -54,8 +43,7 @@ public static class HumanoidAvatarAsset
 
 		foreach (var info in HumanoidBones.All)
 		{
-			// Пустые слоты в файл не пишутся: файл читается человеком, и два десятка пустых строк в
-			// нём скрывают те несколько, что действительно назначены.
+			// Unassigned slots stay out of the file: it is meant to be read by a human.
 			if (avatar.IsAssigned(info.Bone))
 			{
 				file.Bones[info.Bone.ToString()] = avatar[info.Bone];
@@ -83,9 +71,8 @@ public static class HumanoidAvatarAsset
 		File.WriteAllText(path, JsonSerializer.Serialize(file, Options));
 	}
 
-	/// <summary>Читает аватар модели; null - файла нет или он не читается. Неизвестные слоты
-	/// ПРОПУСКАЮТСЯ, а не роняют чтение: файл, записанный будущей версией редактора, обязан
-	/// открываться в текущей, пусть и не целиком.</summary>
+	/// <summary>Reads a model's avatar; null when missing or unreadable. Unknown slots are skipped so
+	/// files written by a newer editor still load.</summary>
 	public static HumanoidAvatar? Load(string modelPath)
 	{
 		string path = PathFor(modelPath);
@@ -102,9 +89,7 @@ public static class HumanoidAvatarAsset
 
 			var file = JsonSerializer.Deserialize<AvatarFile>(text);
 
-			// СТАРЫЙ формат - плоская карта «слот -> кость», без обёртки. Читается как есть:
-			// аватары, размеченные до появления референсной позы, обязаны открываться дальше, а не
-			// молча превращаться в пустые (это выглядело бы как «разметка слетела сама»).
+			// Legacy format: a flat slot -> bone map with no wrapper object.
 			var bones = file?.Bones;
 			if (bones == null)
 			{
@@ -132,8 +117,7 @@ public static class HumanoidAvatarAsset
 					if (value?.P is not { Length: 3 } p || value.R is not { Length: 4 } r ||
 						value.S is not { Length: 3 } s)
 					{
-						// Обрезанная запись пропускается, а не подставляется нулями: кость с нулевым
-						// масштабом схлопывает всё поддерево, и такая «поза» хуже её отсутствия.
+						// Skip truncated entries: a zero scale would collapse the whole subtree.
 						continue;
 					}
 
@@ -150,8 +134,7 @@ public static class HumanoidAvatarAsset
 		}
 		catch (Exception)
 		{
-			// Битый или чужой json - это «аватара нет», а не падение редактора: модель обязана
-			// открыться и без разметки.
+			// A corrupt or foreign json means "no avatar"; the model must still open.
 			return null;
 		}
 	}

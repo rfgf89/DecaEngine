@@ -8,89 +8,44 @@ using UnsafeCollections.Collections.Unsafe;
 namespace DecaEngine.Graphics.ProbeGi;
 
 
-/// <summary>
-/// DDGI-лайт для превью: сетка irradiance-проб (SH L1) + sky visibility, запечённая CPU-трассировкой
-/// по геометрии загруженной модели. Каждая проба пускает фиксированный веер лучей: промах = небо
-/// (радианс энвайронмента), попадание = один отскок (солнце с теневым лучом + свет от проб прошлой
-/// итерации - дёшёвая мультибаунс-аппроксимация DDGI). Результат пакуется в четыре 2D-атласа
-/// RGBA16F (Z-слайсы столбиком), которые Lighting-режим шейдера сэмплирует вручную трилинейно
-/// (см. UnlitInstancedPS.hlsl, SampleProbeGi) вместо константного ambient-уровня; sky visibility
-/// из альфы SH0 глушит env-спекуляр в закрытых местах. Кеш первичных лучей переживает поворот
-/// света: ребейк перетрассирует только теневые лучи и заново собирает радианс - быстрее полного.
-/// </summary>
+/// <summary>Lightweight DDGI bake: an SH L1 irradiance probe grid + sky visibility, CPU-traced over
+/// the loaded model and packed into four RGBA16F 2D atlases (Z slices stacked vertically) that the
+/// shader samples manually trilinearly (see UnlitInstancedPS.hlsl, SampleProbeGi).</summary>
 public sealed class ProbeGiBakeResult
 {
-	/// <summary>Размер сетки проб. Сетка ПЛОТНАЯ: проба существует в каждом её узле, включая узлы
-	/// внутри стен и в пустом небе.
-	///
-	/// Разреженный пул кирпичей, стоявший здесь раньше, снят по замеру, а не по вкусу. Кирпич хранил
-	/// 4×4×4 = 64 пробы на 3×3×3 = 27 ячеек: граничные пробы дублировались между соседями ради того,
-	/// чтобы все восемь углов трилинейки лежали в одном кирпиче. Дублирование стоит 64/27 ≈ 2.37×,
-	/// то есть разреженность обязана была выигрывать больше чем вдвое только чтобы выйти в ноль.
-	/// Замерено на прогоне ([probe] sparsity в смоуке): базовый объём 19×22×19 - выигрыш 1.29×, уже
-	/// убыток; каскады 16×16×16 - пул тратил 6400 и 8000 проб там, где плотная сетка обходится 4096,
-	/// то есть проигрывал ВДВОЕ. Вместе с пулом ушло всё, что он породил: индирекция, четырёхпробная
-	/// гранулярность свежего слоя, исчерпание слотов, уверенность кирпича со ступенькой на границе.
-	/// </summary>
+	/// <summary>Probe grid size. The grid is DENSE: a probe exists at every node, including
+	/// inside walls and in open sky (measured cheaper than the sparse brick pool it replaced).</summary>
 	public int CountX, CountY, CountZ;
 	public Vector3 Origin;
 	public Vector3 Cell;
 
-	/// <summary>Размер SH-атласов: ширина - ось X сетки, высота - плоскости Z, уложенные столбиком,
-	/// внутри плоскости строки идут по Y. Та же упаковка, что была у карты индирекции.
-	///
-	/// Столбик, а не Texture2DArray со слоем на плоскость (как в эталоне RTXGI): массив дал бы чуть
-	/// лучшую локальность и открыл бы аппаратную фильтрацию, но сменил бы ТИП текстуры во всех
-	/// потребителях - материалы, три вьюпорта, дебаг-оверлей. Практического штрафа у столбика не
-	/// видно: SH-атлас целиком меньше сотни килобайт, а у vis-атласа ширина много больше тайла
-	/// свизла.</summary>
+	/// <summary>SH atlas layout: width = grid X axis, height = Z planes stacked vertically with
+	/// rows running along Y (a column, not Texture2DArray, so consumers keep the texture type).</summary>
 	public int ShWidth => CountX;
 	public int ShHeight => CountZ * CountY;
 
-	/// <summary>Число проб сетки - оно же число текселей SH-атласа.</summary>
+	/// <summary>Probe count of the grid; also the SH atlas texel count.</summary>
 	public int ProbeCount => CountX * CountY * CountZ;
 
-	/// <summary>Атласы RGBA16F, тексель пробы - см. <see cref="ShWidth"/>/<see cref="ShHeight"/> и
-	/// ProbeGiBaker.ProbeTexel. Sh0: rgb = SH L0 (радианс), a = sky visibility. Sh1..3: rgb = SH L1
-	/// x/y/z, a(Sh1) = валидность пробы (0 = внутри геометрии, соседям её не интерполировать).</summary>
+	/// <summary>RGBA16F atlases. Sh0: rgb = SH L0 radiance, a = sky visibility. Sh1..3: rgb = SH L1
+	/// x/y/z, a(Sh1) = probe validity (0 = inside geometry, do not interpolate).</summary>
 	public byte[] Sh0, Sh1, Sh2, Sh3;
 
-	/// <summary>Атлас РЕЛОКАЦИИ, RGBA16F, та же раскладка пула: rgb = смещение пробы от её узла
-	/// сетки в МИРОВЫХ единицах, a = 1 при активной пробе.
-	///
-	/// Смещение обязано доехать до материального шейдера, а не остаться внутри раунда: и
-	/// трилинейные веса, и тест Чебышёва считают расстояние от точки сэмпла ДО ПРОБЫ, и если
-	/// шейдер будет думать, что проба стоит в узле, когда она сдвинута, оба соврут ровно на
-	/// величину смещения - а тест видимости на это и рассчитан, он там точности в доли ячейки.
-	///
-	/// В запечке нули: релокация - режим реального времени (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeRelocation"/>).</summary>
+	/// <summary>Relocation atlas, RGBA16F: rgb = probe offset from its grid node in WORLD units,
+	/// a = 1 for active probes. The shader must see the offset: trilinear weights and the Chebyshev
+	/// test measure distance to the PROBE, not the node. Zeros in baked mode.</summary>
 	public byte[] Offset;
 
-	/// <summary>Окто-разрешение карты видимости на пробу (см. <see cref="Vis"/>).
-	///
-	/// Эталон (Majercik 2021, таблица 2) держит здесь 16 («8x8 irradiance, 16x16 visibility»), и
-	/// 16 ЗАМЕРЕН - на дефолтном бюджете лучей он ХУЖЕ: яркость паразитной подсветки в интерьере
-	/// Sponza 15.9 против 14.1 у восьмёрки (точечная выборка для сравнения - 16.7). Причина в том,
-	/// что число лучей на пробу осталось прежним: вчетверо больше текселей - вчетверо меньше
-	/// сэмплов на каждый, дисперсия оценки глубины растёт, а тест Чебышёва
-	/// variance/(variance+diff²) при большой дисперсии как раз ПЕРЕСТАЁТ гасить вес заслонённой
-	/// пробы. Поэтому это РУЧКА (окно Graphics, «Visibility res»), а не константа: поднимать её
-	/// имеет смысл вместе с числом лучей на пробу.
-	///
-	/// НЕ const: значение читают и раскладка атласов, и оба шейдера (через кбуферы), и меняется оно
-	/// только при пересоздании сессии - смена на живой сессии рассогласовала бы запись с чтением,
-	/// поэтому ручка помечена как ребейк-уровня (см. GraphicsSettingsWindow).</summary>
+	/// <summary>Octahedral resolution of the per-probe visibility map (see <see cref="Vis"/>).
+	/// A knob, not a const: raising it only helps together with more rays per probe, and atlases
+	/// plus both shaders read it, so it may change only when the session is recreated.</summary>
 	public static int VisRes { get; set; } = DefaultVisRes;
 
 	public const int DefaultVisRes = 8;
 	public const int MinVisRes = 8;
 	public const int MaxVisRes = 24;
 
-	/// <summary>DDGI visibility: RGBA16F атлас VisRes×VisRes окто-текселей на пробу (та же раскладка
-	/// сетки, что у SH-атласов, умноженная на VisRes по обеим осям). r = средняя дистанция до
-	/// геометрии по направлению, g = средний квадрат дистанции - тест Чебышёва в SampleProbeGi
-	/// отбрасывает пробы, заслонённые стеной от точки сэмпла (главный источник протечек света у
-	/// стыков тонкой геометрии).</summary>
+	/// <summary>DDGI visibility atlas, RGBA16F, VisRes x VisRes octahedral texels per probe:
+	/// r = mean distance to geometry, g = mean squared distance (Chebyshev leak test).</summary>
 	public byte[] Vis;
 }

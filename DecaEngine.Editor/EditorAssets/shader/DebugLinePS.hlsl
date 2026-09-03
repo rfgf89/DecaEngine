@@ -1,6 +1,4 @@
-// Пиксель дебаг-линии - см. DebugLineVS.hlsl. Ничего, кроме интерполированного цвета: линия должна
-// выглядеть ровно тем цветом, которым её задала система, иначе кодировка (спящее тело серое,
-// невалидная цель красная) перестаёт читаться.
+// Debug lines pass through the color unshaded: it encodes state and must stay exact.
 struct PSInput
 {
     float4 pos : SV_POSITION;

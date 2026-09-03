@@ -3,124 +3,75 @@ using Friflo.Engine.ECS;
 
 namespace DecaEngine.Scene
 {
-	/// <summary>
-	/// Компоненты анимации - ЧИСТО АВТОРСКИЕ ДАННЫЕ: что играть, какие кости считать ногами, с какой
-	/// жёсткостью колышется хвост. Рантайм-состояние (ozz-скелет и поза, палитра скиннинга, инерция
-	/// spring bones, тела рэгдолла) сюда НЕ кладётся и лежит в реестре сбоку (см.
-	/// <see cref="AnimationDriver"/>).
-	///
-	/// Причина не в чистоте, а в устройстве ECS: компонент - blittable-структура, которую хранилище
-	/// свободно копирует при смене архетипа, а поза - это массивы матриц и хендлы нативных объектов.
-	/// Их копирование при добавлении соседнего компонента означало бы либо потерю состояния, либо
-	/// двойное освобождение нативной памяти.
-	///
-	/// Кости везде задаются ИМЕНАМИ, а не индексами: индексы зависят от порядка узлов в glTF и молча
-	/// разъезжаются при переэкспорте модели - анимация после этого продолжает работать, но гнёт не
-	/// те кости.
-	///
-	/// У всех компонентов есть конструктор без параметров с осмысленными значениями по умолчанию:
-	/// редактор создаёт компонент через <c>new T()</c>, и без них свежедобавленный компонент
-	/// приходил бы с нулевыми весами, то есть не делал бы ничего и выглядел сломанным.
-	/// </summary>
+	/// <summary>Authoring data only: runtime state (ozz skeleton and pose, skinning palette, spring
+	/// inertia, ragdoll bodies) lives in a side registry because ECS freely copies components on
+	/// archetype changes. Joints are named, never indexed - glTF node order shifts on re-export.</summary>
 	public struct Animator() : IComponent
 	{
-		/// <summary>Имя клипа из модели (см. вкладку анимаций). Пусто - персонаж стоит в bind-позе.</summary>
+		/// <summary>Clip name from the model; empty leaves the character in bind pose.</summary>
 		public string ClipName = string.Empty;
 
 		public float Speed = 1f;
 		public bool Loop = true;
 		public bool Playing = true;
 
-		/// <summary>Текущее время в секундах. Хранится в компоненте намеренно: так его видно в
-		/// инспекторе, можно скрабить руками, и оно попадает в снимок Play Mode вместе со всем
-		/// остальным - то есть Stop честно возвращает позу на место.</summary>
+		/// <summary>Playback time in seconds; kept in the component so it is scrubbable and
+		/// captured by the Play Mode snapshot.</summary>
 		public float Time = 0f;
 
-		/// <summary>Вести ли сущность ДВИЖЕНИЕМ КОРНЯ из клипа (root motion, как в ozz
-		/// motion_playback): XZ-трансляция корневой кости вычитается из позы и накапливается в
-		/// позицию сущности - тело движется ровно со скоростью, которую задал автор анимации.
-		/// Требует клип с настоящим движением корня (клипы Fox шагают на месте - для них это ноль)
-		/// и НЕ сочетается с Character Body (телом владеет его рулевое). Старые сцены приезжают с
-		/// false - прежнее поведение.</summary>
+		/// <summary>Root motion: the root joint's XZ translation is subtracted from the pose and
+		/// accumulated into the entity position. Does not combine with Character Body.</summary>
 		public bool RootMotion = false;
 	}
 
-	/// <summary>
-	/// Локомоушен-бленд: стойка/шаг/бег смешиваются по ЗАМЕРЕННОЙ скорости сущности, а темп шага
-	/// масштабируется под неё - лапы перестают скользить, когда скрипт (или игрок) меняет скорость.
-	/// Это blend tree по одному параметру - минимальный современный слой между «один клип» и
-	/// стейт-машиной анимации.
-	///
-	/// Скорость именно ЗАМЕРЯЕТСЯ по перемещению сущности, а не берётся из скрипта: персонажа двигают
-	/// разные силы (скрипт, игрок, толчок физики), и клип обязан соответствовать тому, что видно на
-	/// экране, а не тому, что заказано.
-	///
-	/// Компонент сосуществует с <see cref="Animator"/>: пока локомоушен активен, позу ведёт он, а
-	/// <see cref="Animator"/> - фоллбек (нет ozz, не нашлись клипы, Enabled снят). Фаза цикла живёт
-	/// в драйвере, а не здесь: это не авторская настройка, и скрабить её в инспекторе нечего.
-	/// </summary>
+	/// <summary>Idle/walk/run blend driven by the entity's MEASURED speed (not a scripted value, so
+	/// the clip matches what is on screen), with playback rate scaled to stop foot sliding.
+	/// Takes over the pose from <see cref="Animator"/> while active.</summary>
 	public struct LocomotionComponent() : IComponent
 	{
 		public bool Enabled = true;
 
-		/// <summary>Клип стойки. У Khronos Fox это Survey.</summary>
 		public string IdleClip = "Idle";
 
 		public string WalkClip = "Walk";
 		public string RunClip = "Run";
 
-		/// <summary>Скорость, на которой клип шага проигрывается в авторском темпе, м/с. От неё же
-		/// считается масштаб темпа: на половине скорости шаг играет вдвое медленнее.</summary>
+		/// <summary>Speed (m/s) at which the walk clip plays at its authored rate.</summary>
 		public float WalkSpeed = 1f;
 
-		/// <summary>То же для клипа бега, м/с. Шаг и бег - РАЗНЫЕ АЛЛЮРЫ: между ними не вечный вес
-		/// по скорости, а дискретное переключение с гистерезисом и коротким кроссфейдом - персонаж,
-		/// скорость которого застряла посередине, идёт чистым аллюром с масштабированным темпом.</summary>
+		/// <summary>Same for the run clip (m/s). Walk and run are distinct gaits: switched
+		/// discretely with hysteresis and a short crossfade, never blended by speed.</summary>
 		public float RunSpeed = 3f;
 
-		/// <summary>Сглаживание замеренной скорости, 1/с: без него веса дёргаются каждый кадр -
-		/// скорость тела шумит контактами.</summary>
+		/// <summary>Measured-speed smoothing, 1/s; body speed is noisy from contacts.</summary>
 		public float Smoothing = 8f;
 	}
 
-	/// <summary>
-	/// Клип ПОВЕРХ ЧАСТИ СКЕЛЕТА (частичный бленд, как в ozz-семпле partial_blend): поддерево от
-	/// корневой кости играет свой клип, остальной скелет продолжает базовую позу - Animator или
-	/// локомоушен. Типичный случай - «идёт и оглядывается»: ноги в цикле шага, шея с головой в
-	/// клипе осмотра. Идёт ДО look-at и foot IK - те правят уже смешанную позу.
-	/// </summary>
+	/// <summary>Partial blend: the subtree under <see cref="RootJoint"/> plays its own clip while
+	/// the rest of the skeleton keeps the base pose. Applied before look-at and foot IK.</summary>
 	public struct OverlayClipComponent() : IComponent
 	{
 		public bool Enabled = true;
 
 		public string ClipName = string.Empty;
 
-		/// <summary>Корень поддерева. Пусто - слот «грудь» humanoid-разметки. У четвероногого грудь
-		/// несёт ПЕРЕДНИЕ ЛАПЫ (они в arm-слотах), и клип осмотра на груди остановил бы их шаг -
-		/// для «оглядывается» корнем ставят шею.</summary>
+		/// <summary>Subtree root; empty means the humanoid "chest" slot.</summary>
 		public string RootJoint = string.Empty;
 
-		/// <summary>Вес поддерева, 0..1: базовая поза и клип наложения делят сустав в этой
-		/// пропорции. Вне поддерева всегда чистая база.</summary>
+		/// <summary>Subtree weight 0..1; outside the subtree the base pose is untouched.</summary>
 		public float Weight = 1f;
 
 		public float Speed = 1f;
 		public bool Loop = true;
 	}
 
-	/// <summary>
-	/// АДДИТИВНЫЙ слой (ozz additive + AdditiveAnimationBuilder): клип превращается в дельту от
-	/// своего первого кадра и СУММИРУЕТСЯ поверх текущей позы, не стирая её - в отличие от
-	/// <see cref="OverlayClipComponent"/>, который на поддереве ЗАМЕНЯЕТ базу. Типичный случай -
-	/// вторичное движение поверх чего угодно: дыхание, вздрагивание, у лисы - «поводит головой и
-	/// ушами» из Survey поверх ходьбы и бега. Вес масштабирует дельту (0.3 - лёгкое шевеление).
-	/// </summary>
+	/// <summary>Additive layer: the clip becomes a delta from its own first frame and is summed on
+	/// top of the current pose, unlike <see cref="OverlayClipComponent"/> which replaces it.</summary>
 	public struct AdditiveClipComponent() : IComponent
 	{
 		public bool Enabled = true;
 
-		/// <summary>Клип-источник: дельта строится из него автоматически, авторский дельта-клип не
-		/// нужен.</summary>
+		/// <summary>Source clip; the delta is derived from it, no authored delta clip needed.</summary>
 		public string ClipName = string.Empty;
 
 		public float Weight = 1f;
@@ -128,18 +79,13 @@ namespace DecaEngine.Scene
 		public bool Loop = true;
 	}
 
-	/// <summary>
-	/// Привязка стоп к рельефу (см. <see cref="DecaEngine.Graphics.FootIk"/>). Ровно две ноги: это
-	/// покрывает двуногих и задние ноги четвероногих, а произвольное число ног в плоскую структуру
-	/// компонента не укладывается - там нужен список, который ECS-хранилище копировать не умеет.
-	/// Больше двух ног настраивается кодом через FootIkLeg.
-	/// </summary>
+	/// <summary>Foot placement on terrain. Exactly two legs: a variable count would need a list,
+	/// which the ECS store cannot copy. More legs are configured in code via FootIkLeg.</summary>
 	public struct FootIkComponent() : IComponent
 	{
 		public bool Enabled = true;
 
-		/// <summary>Кость таза - её опускание позволяет дотянуться до нижней стопы на ступеньках и
-		/// склонах. Пусто - таз не трогать.</summary>
+		/// <summary>Pelvis joint; dropping it reaches the lower foot on steps. Empty = leave it.</summary>
 		public string PelvisJoint = string.Empty;
 
 		public string LeftUpperJoint = string.Empty;
@@ -150,42 +96,30 @@ namespace DecaEngine.Scene
 		public string RightLowerJoint = string.Empty;
 		public string RightFootJoint = string.Empty;
 
-		/// <summary>Кость точки ОПОРЫ, когда контакт с землёй ниже сустава стопы. У человека стопа
-		/// лежит на полу и носок не нужен, а у дигитиграда (лиса) «стопа» разметки - скакательный
-		/// сустав, и без носка IK обращался с ногой по-человечески: щупал пол под суставом, висящим
-		/// над землёй в стороне от места контакта, и прибивал локингом его, а не прижатый носок.
-		/// Пусто - берётся слот «носок» humanoid-разметки (у двуногих он обычно пуст - прежнее
-		/// поведение).</summary>
+		/// <summary>Contact joint when the ground touch is below the ankle (digitigrade rigs).
+		/// Empty falls back to the humanoid "toe" slot.</summary>
 		public string LeftToeJoint = string.Empty;
 		public string RightToeJoint = string.Empty;
 
-		/// <summary>Высота сустава ОПОРЫ (носка, если он задан, иначе стопы) над подошвой: без неё
-		/// стопа утапливается в пол ровно на толщину ноги (райкаст даёт точку поверхности, а IK
-		/// ставит туда СУСТАВ). Завышать нельзя: канал высоты не опустит опору ниже этой планки, и
-		/// лапы поднимутся над ровным полом на разницу (у лисы носок в стойке - 1 ед. модели).</summary>
+		/// <summary>Height of the contact joint above the sole, in model units: the raycast gives a
+		/// surface point but IK places the JOINT there. Too large lifts the feet off flat ground.</summary>
 		public float AnkleHeight = 0.1f;
 
-		/// <summary>Предел опускания таза. Без него шаг в пропасть утягивает персонажа под землю.</summary>
+		/// <summary>Pelvis drop limit; without it a step into a chasm drags the character under.</summary>
 		public float MaxPelvisDrop = 0.4f;
 
-		/// <summary>Скорость сглаживания, 1/с. Без сглаживания стопа дрожит на каждом стыке
-		/// треугольников: луч перескакивает между гранями.</summary>
+		/// <summary>Smoothing rate, 1/s; the ray jumps between faces at triangle seams.</summary>
 		public float Smoothing = 12f;
 
 		public float Weight = 1f;
 		public bool AlignToNormal = true;
 
-		/// <summary>Прибивать ли опорную стопу к точке мира (foot locking): убирает остаточное
-		/// скольжение, когда темп клипа не совпадает с реальной скоростью (разгон, препятствия).
-		/// В старых сценах поле приезжает false - прежнее поведение.</summary>
+		/// <summary>Pin the planted foot to a world point, removing residual sliding when the clip
+		/// rate does not match the real speed.</summary>
 		public bool LockFeet = true;
 
-		/// <summary>
-		/// ПЕРЕДНИЕ ноги четвероногого: ещё одна пара цепочек IK. Не включается автоматом по
-		/// разметке намеренно: пустые имена берутся из ARM-слотов humanoid-разметки, и у двуногого
-		/// это его руки - персонаж, который встал бы ладонями на пол из-за галочки по умолчанию,
-		/// хуже лисы с висящими у обрыва лапами. В старых сценах false - прежнее поведение.
-		/// </summary>
+		/// <summary>Front legs of a quadruped: a second pair of IK chains. Off by default because
+		/// empty names resolve to the humanoid ARM slots, i.e. a biped's hands.</summary>
 		public bool FrontLegs = false;
 
 		public string FrontLeftUpperJoint = string.Empty;
@@ -196,101 +130,77 @@ namespace DecaEngine.Scene
 		public string FrontRightLowerJoint = string.Empty;
 		public string FrontRightFootJoint = string.Empty;
 
-		/// <summary>Носки передних ног - только авторские: слота «пальцы кисти» в humanoid-разметке
-		/// нет, и пустое поле означает «опора - сама кисть».</summary>
+		/// <summary>Front toes are authored only: there is no humanoid "hand toe" slot, and an
+		/// empty field means the hand itself is the contact.</summary>
 		public string FrontLeftToeJoint = string.Empty;
 		public string FrontRightToeJoint = string.Empty;
 
-		/// <summary>Наклонять ли корпус (таз) по рельефу: стоя на лестнице или склоне, тело
-		/// четвероногого ложится вдоль перепада, а не остаётся горизонтальным при согнутых по
-		/// отдельности ногах. Работает от перепада средних высот опоры под передней и задней
-		/// парами - без передних ног (<see cref="FrontLegs"/>) наклоняться не от чего.</summary>
+		/// <summary>Pitch the pelvis along the slope, from the height difference between the front
+		/// and rear contact pairs. Requires <see cref="FrontLegs"/>.</summary>
 		public bool AlignBodyToSlope = true;
 	}
 
-	/// <summary>
-	/// Цепочка вторичного движения (хвост, коса, полы плаща). Цепочка задаётся КОРНЕВОЙ костью и
-	/// длиной: система сама спускается по первым детям. Перечислять кости поимённо в компоненте
-	/// нельзя по той же причине, что и ноги, - это список.
-	/// </summary>
+	/// <summary>Secondary-motion chain (tail, braid, cloak). Given as a root joint plus a length;
+	/// the system walks first children from there.</summary>
 	public struct SpringBoneComponent() : IComponent
 	{
 		public bool Enabled = true;
 
 		public string RootJoint = string.Empty;
 
-		/// <summary>Сколько костей взять, считая корневую.</summary>
+		/// <summary>Joint count including the root.</summary>
 		public int Length = 3;
 
-		/// <summary>Насколько сильно кость тянет обратно к позе анимации за шаг, 0..1. Ноль - кость
-		/// живёт только инерцией и не возвращается; единица - вторичного движения нет вовсе.</summary>
+		/// <summary>Pull back toward the animated pose per step, 0..1; 1 disables the effect.</summary>
 		public float Stiffness = 0.08f;
 
-		/// <summary>Потеря скорости за шаг, 0..1. Без неё цепочка колеблется вечно.</summary>
+		/// <summary>Velocity loss per step, 0..1; without it the chain oscillates forever.</summary>
 		public float Drag = 0.2f;
 
-		/// <summary>Длина «хвостовой» кости: у последней кости цепочки нет ребёнка, задающего
-		/// направление.</summary>
+		/// <summary>Length of the virtual tip bone: the last joint has no child to aim at.</summary>
 		public float TailLength = 0.1f;
 
-		/// <summary>Внешняя сила в пространстве модели (обычно гравитация).</summary>
+		/// <summary>External force in model space (usually gravity).</summary>
 		public Vector3 Gravity = Vector3.Zero;
 	}
 
-	/// <summary>Доворот кости на цель (голова за игроком, ствол оружия, торс). Одна кость: цепочку
-	/// «голова + шея + торс» набирают несколькими сущностями или кодом.</summary>
+	/// <summary>Aims one joint at a target. Chains are built from several entities or in code.</summary>
 	public struct LookAtComponent() : IComponent
 	{
 		public bool Enabled = true;
 
 		public string Joint = string.Empty;
 
-		/// <summary>Мировая точка, куда смотреть.</summary>
+		/// <summary>World-space point to look at.</summary>
 		public Vector3 Target = Vector3.Zero;
 
-		/// <summary>Ось «взгляда» в локальном пространстве кости и ось «вверх» - зависят от рига, и
-		/// угадать их нельзя: у одних рижеров кость смотрит по Z, у других по Y.</summary>
+		/// <summary>Gaze and up axes in joint-local space; rig-dependent and not guessable.</summary>
 		public Vector3 Forward = Vector3.UnitZ;
 		public Vector3 Up = Vector3.UnitY;
 
 		public float Weight = 1f;
 	}
 
-	/// <summary>
-	/// Рэгдолл персонажа. Тела строятся по цепочкам скелета от <see cref="RootJoint"/>; какие именно
-	/// кости физические, задаёт <see cref="MaxDepth"/> - брать весь риг нельзя, иначе у персонажа с
-	/// пальцами получится рэгдолл из двухсот тел вместо двадцати.
-	/// </summary>
+	/// <summary>Character ragdoll. Bodies follow skeleton chains from <see cref="RootJoint"/>;
+	/// <see cref="MaxDepth"/> bounds them, since a full finger rig would give hundreds of bodies.</summary>
 	public struct RagdollComponent() : IComponent
 	{
-		/// <summary>Собран ли рэгдолл вообще. Выключение УНИЧТОЖАЕТ тела - это не «пауза».</summary>
+		/// <summary>Disabling DESTROYS the bodies - this is not a pause.</summary>
 		public bool Enabled = false;
 
-		/// <summary>false - поза идёт от анимации (тела едут за ней и расталкивают окружение),
-		/// true - поза идёт от физики. Это и есть тумблер «сбить с ног».</summary>
+		/// <summary>false: pose drives physics; true: physics drives pose (the "knock down" switch).</summary>
 		public bool Physical = false;
 
-		/// <summary>Сила угловых сервоприводов, тянущих суставы к позе анимации в физическом режиме.
-		/// Ноль - обычный тряпичный рэгдолл, больше нуля - active ragdoll, персонаж пытается
-		/// держаться.</summary>
+		/// <summary>Angular servo strength pulling joints to the animated pose; 0 = limp ragdoll.</summary>
 		public float ServoStrength = 0f;
 
 		public string RootJoint = string.Empty;
 
-		/// <summary>Глубина обхода скелета от корня.</summary>
+		/// <summary>Skeleton traversal depth from the root.</summary>
 		public int MaxDepth = 4;
 
-		/// <summary>
-		/// ОДИН радиус капсул на весь скелет, в единицах модели. НОЛЬ (по умолчанию) - радиус каждой
-		/// кости берётся ИЗ МЕША, по толщине соответствующей части тела (см.
-		/// AnimationDriver.MeasureBoneRadii).
-		///
-		/// Ноль дефолтом не для краткости. Единый радиус НЕВЕРЕН по построению у любого настоящего
-		/// персонажа: туловище втрое-впятеро толще лапы, и одним числом рэгдолл получается либо
-		/// тонущим в полу (радиус по лапе), либо распирающим конечности (радиус по туловищу).
-		/// Ненулевое значение остаётся как принудительный override - под риги без скин-стрима и под
-		/// намеренную стилизацию, - но выбирать его должен человек, а не дефолт.
-		/// </summary>
+		/// <summary>One capsule radius for the whole skeleton, in model units. ZERO (the default)
+		/// measures each bone's radius from the mesh instead, which any real character needs.</summary>
 		public float BoneRadius = 0f;
 
 		public float TotalMass = 70f;

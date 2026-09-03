@@ -9,13 +9,13 @@ namespace DecaEngine.Graphics.ProbeGi;
 
 public sealed class ProbeGiBaker
 {
-	// --- Сцена: мировые треугольники + BVH ---------------------------------------------------
+	// --- Scene: world triangles + BVH ---------------------------------------------------------
 
 	private struct Tri
 	{
 		public Vector3 A, E1, E2;
 
-		/// <summary>Линейное альбедо для отскока (среднее по base color текстуре × фактор).</summary>
+		// Linear-space albedo (mean of base color texture x factor).
 		public Vector3 Albedo;
 	}
 
@@ -23,16 +23,12 @@ public sealed class ProbeGiBaker
 	{
 		public Vector3 Min, Max;
 
-		/// <summary>Лист (Left &lt; 0): Start/Count - срез в _order. Внутренний узел: Left/Start -
-		/// индексы левого/правого детей (правый НЕ Left+1: между ними всё левое поддерево -
-		/// депth-first нумерация BuildNode).</summary>
+		// Leaf (Left<0): Start/Count slice _order. Else Left/Start = children, not adjacent.
 		public int Left, Start, Count;
 	}
 
 	private Tri[] _tris = Array.Empty<Tri>();
 
-	/// <summary>Объектная геометрия для аппаратного пути - собирается тем же проходом по модели, что
-	/// и мировая похлёбка (см. конструктор).</summary>
 	private ProbeInstancedGeometry _instanced = new()
 	{
 		Triangles = Array.Empty<BvhTriangleGpu>(),
@@ -41,22 +37,17 @@ public sealed class ProbeGiBaker
 		HitTextureKeys = Array.Empty<(int, int)>(),
 	};
 
-	/// <summary>Геометрия сцены в объектном пространстве плюс таблица инстансов - основа BLAS/TLAS
-	/// аппаратного пути (см. <see cref="ProbeInstancedGeometry"/>). Программному пути не нужна: он
-	/// ходит по мировому BVH из <see cref="ExportBvh"/>.</summary>
+	/// <summary>Object-space scene geometry plus instance table; BLAS/TLAS source for the HW path.</summary>
 	public ProbeInstancedGeometry InstancedGeometry => _instanced;
 
-	/// <summary>Нормаль с гардом от нулевой длины (вырожденные/несглаженные вершины импорта):
-	/// нулевая окто-кодируется в мусор, а (0,0,1) хотя бы валидна - шейдер её нормализует.</summary>
+	// Zero-length normals oct-encode to garbage; (0,0,1) is at least valid.
 	private static Vector3 SafeNormalize(Vector3 n)
 	{
 		float lenSq = n.LengthSquared();
 		return lenSq > 1e-12f ? n / MathF.Sqrt(lenSq) : Vector3.UnitZ;
 	}
 
-	/// <summary>Мировая матрица инстанса модели. Публичная и одна на всех нарочно: по ней строится
-	/// и запечённая геометрия, и пересборка TLAS на движение объекта - разъехавшись, эти две
-	/// сдвинули бы лучи относительно самой сцены.</summary>
+	/// <summary>Model instance world matrix; baked geometry and TLAS refits must share this one.</summary>
 	public static Matrix4x4 InstanceMatrix(Transform t) =>
 		Matrix4x4.CreateScale(t.scale.X, t.scale.Y, t.scale.Z) *
 		Matrix4x4.CreateFromQuaternion(t.rotation) *
@@ -69,26 +60,25 @@ public sealed class ProbeGiBaker
 
 	public bool HasGeometry => _tris.Length > 0;
 
-	/// <summary>Число треугольников в BVH - диагностика «бейк ничего не видит» (см. PreviewProbe).</summary>
+	/// <summary>Triangle count in the BVH.</summary>
 	public int TriangleCount => _tris.Length;
 
-	// --- Дисковый кеш BVH (см. ProbeGiBvhCache) ------------------------------------------------
+	// --- BVH disk cache (see ProbeGiBvhCache) --------------------------------------------------
 
-	/// <summary>Треугольник мировой похлёбки в сериализуемом виде (зеркало приватного Tri).</summary>
+	/// <summary>Serializable mirror of the private Tri.</summary>
 	public struct CachedTri
 	{
 		public Vector3 A, E1, E2, Albedo;
 	}
 
-	/// <summary>Узел BVH в сериализуемом виде (зеркало приватного Node).</summary>
+	/// <summary>Serializable mirror of the private Node.</summary>
 	public struct CachedNode
 	{
 		public Vector3 Min, Max;
 		public int Left, Start, Count;
 	}
 
-	/// <summary>Полный слепок построенного BVH - всё, что нужно, чтобы поднять бейкер без обхода
-	/// геометрии модели.</summary>
+	/// <summary>Full snapshot of a built BVH, enough to restore a baker without model geometry.</summary>
 	public sealed class BvhCacheData
 	{
 		public required CachedTri[] Triangles { get; init; }
@@ -103,7 +93,6 @@ public sealed class ProbeGiBaker
 		public required (int Model, int Material)[] HitTextureKeys { get; init; }
 	}
 
-	/// <summary>Восстановление из кеша - конструктор без единого обращения к геометрии модели.</summary>
 	private ProbeGiBaker(BvhCacheData data)
 	{
 		_tris = new Tri[data.Triangles.Length];
@@ -134,7 +123,7 @@ public sealed class ProbeGiBaker
 		};
 	}
 
-	/// <summary>Слепок текущего BVH для записи в кеш.</summary>
+	/// <summary>Snapshot of the current BVH for writing to the cache.</summary>
 	public BvhCacheData ExportCache()
 	{
 		var triangles = new CachedTri[_tris.Length];
@@ -166,11 +155,7 @@ public sealed class ProbeGiBaker
 		};
 	}
 
-	/// <summary>
-	/// Бейкер по одной модели: сперва пробуем кеш &lt;модель&gt;.bhv.bin рядом с ней, и только если
-	/// его нет (или он от другой версии файла) - строим BVH и кладём результат в кеш. Сборка стоит
-	/// десятки секунд на тяжёлом ассете, а геометрия между запусками не меняется.
-	/// </summary>
+	/// <summary>Baker for one model, reusing the &lt;model&gt;.bhv.bin BVH cache when it is current.</summary>
 	public static ProbeGiBaker LoadOrBuild(ModelLoader model, string modelPath, out bool fromCache)
 	{
 		fromCache = false;
@@ -195,9 +180,9 @@ public sealed class ProbeGiBaker
 		return baker;
 	}
 
-	// --- Диагностика BVH -----------------------------------------------------------------------
+	// --- BVH diagnostics -----------------------------------------------------------------------
 
-	/// <summary>Сводка по построенному дереву - для отладочного вывода и оверлея.</summary>
+	/// <summary>Summary of the built tree, for debug output and the overlay.</summary>
 	public readonly record struct BvhStats(int Triangles, int Nodes, int Leaves, int MaxDepth,
 		float AvgLeafTriangles, Vector3 Min, Vector3 Max);
 
@@ -235,11 +220,7 @@ public sealed class ProbeGiBaker
 		CountStats(node.Start, depth + 1, ref leaves, ref maxDepth, ref leafTris);
 	}
 
-	/// <summary>
-	/// Боксы узлов дерева для отладочной отрисовки. <paramref name="maxDepth"/> - до какой глубины
-	/// спускаться (0 = только корень); <paramref name="leavesOnly"/> - брать только листья, то есть
-	/// показывать фактическую гранулярность разбиения, а не вложенные объёмы.
-	/// </summary>
+	/// <summary>Node boxes for debug drawing, down to maxDepth (0 = root only).</summary>
 	public List<(Vector3 Min, Vector3 Max, int Depth)> CollectDebugBoxes(int maxDepth, bool leavesOnly)
 	{
 		var boxes = new List<(Vector3, Vector3, int)>();
@@ -274,51 +255,22 @@ public sealed class ProbeGiBaker
 		CollectBoxes(node.Start, depth + 1, maxDepth, leavesOnly, boxes);
 	}
 
-	/// <summary>Порог луча по дальности, за которым попадание считается промахом - тот же, что
-	/// использует CPU-трассировщик; GPU-обход обязан брать его отсюда, иначе пути разойдутся.</summary>
+	/// <summary>Ray distance cutoff; the GPU traversal must read it from here or the paths diverge.</summary>
 	public float RayTMax => _rayTMax;
 
-	/// <summary>Отступ теневого луча от поверхности - GPU-путь обязан брать его отсюда, иначе
-	/// самозатенение разойдётся с CPU-эталоном.</summary>
+	/// <summary>Shadow ray surface offset; the GPU path must read it from here to match the CPU.</summary>
 	public float SceneEpsilon => _sceneEpsilon;
 
-	/// <summary>Направления лучей конкретного раунда. GPU-путь берёт их отсюда, а не пересчитывает
-	/// у себя: расхождение в последнем бите синуса увело бы луч на соседний треугольник у силуэта,
-	/// и сверка с CPU-эталоном перестала бы что-либо значить (см. ProbeRoundCS.hlsl).</summary>
+	/// <summary>Ray directions for a round; the GPU path reads these instead of recomputing them.</summary>
 	public static Vector3[] RoundRayDirections(int rays, int sequence) =>
 		BuildRotatedFibonacciSphere(rays, sequence);
 
-	/// <summary>Сколько первых лучей веера не вращать (RTXGI-DDGI, RTXGI_DDGI_NUM_FIXED_RAYS).
-	///
-	/// Смысл приёма (ProbeRayCommon.hlsl: «Don't rotate fixed rays so relocation/classification are
-	/// temporally stable»): решения о ПЕРЕЕЗДЕ пробы и о её отключении принимаются по геометрии -
-	/// доле задних граней, ближайшему выходу наружу, запасу свободного места. Считать их по вееру,
-	/// который каждый раунд повёрнут заново, значит мерить дрожащей линейкой: у пробы на кромке
-	/// геометрии доля задних граней гуляет от раунда к раунду просто из-за смены направлений, и
-	/// проба то уезжает, то возвращается, каждый раз сбрасывая накопители. Небольшой набор лучей,
-	/// НЕ зависящий от номера раунда, даёт этим решениям устойчивую опору.
-	///
-	/// Фиксированные лучи не участвуют в оценке радианса и в карте глубин (см. ProbeRoundCS): они
-	/// не вращаются, поэтому их направления представлены в среднем вдвое чаще остальных, и подмешать
-	/// их значило бы внести в оценку постоянное смещение по этим направлениям. Трассируются они не
-	/// впустую - именно они и делают всю геометрическую работу.
-	///
-	/// ТОЛЬКО в реальном времени. В запечке веер вращается по номеру раунда, оба пути (CPU и GPU)
-	/// обязаны совпасть луч в луч ради сверки, и делить веер значило бы зеркалить всю раскладку ещё
-	/// и в CPU-бейкере; выгоды при этом нет - в запечке проба переезжает один раз на инициализации.
-	/// Доля - восьмая часть веера (у эталона 32 из 288, тот же порядок) с полом 16 и потолком 32,
-	/// и только начиная с 64 лучей. Пол не занижен сознательно: по этим лучам ищется БЛИЖАЙШАЯ
-	/// передняя грань, и на слишком редком веере проба рискует не заметить рядом стоящую
-	/// поверхность и решить, что вокруг просторно (ветка возврата к узлу в ProbeRoundCS). Потолок
-	/// держит цену: сверх 32 устойчивость решений уже не растёт, а лучи из оценки радианса
-	/// вычитаются. На коротком веере (меньше 64) деления нет вовсе - отдать четверть выборки ради
-	/// устойчивости релокации невыгодно, шум радианса дороже.</summary>
+	/// <summary>Leading rays kept unrotated so relocation/classification stay temporally stable
+	/// (RTXGI_DDGI_NUM_FIXED_RAYS). Realtime only; they are excluded from the radiance estimate.</summary>
 	public static int FixedRayCount(int rays, bool realtime) =>
 		realtime && rays >= 64 ? Math.Min(32, Math.Max(rays / 8, 16)) : 0;
 
-	/// <summary>Направления раунда с учётом фиксированных лучей: [0, FixedRays) - НЕвращаемый веер
-	/// Фибоначчи, [FixedRays, rays) - обычный, повёрнутый по номеру раунда. Оба - равномерные
-	/// сферические выборки, поэтому каждая часть остаётся корректной сама по себе.</summary>
+	/// <summary>Round directions: [0, FixedRays) unrotated Fibonacci, the rest rotated per round.</summary>
 	public static Vector3[] RoundRayDirections(ProbeGiBakeSession session) =>
 		RoundRayDirections(session.RaysPerRound, session.Sequence, session.FixedRays);
 
@@ -337,21 +289,14 @@ public sealed class ProbeGiBaker
 		return dirs;
 	}
 
-	/// <summary>Вес раунда в бегущем среднем - GPU-путь считает его тем же способом, что и
-	/// <see cref="RunRound"/>, иначе поля разойдутся по яркости.
-	///
-	/// Сессия, а не просто номер раунда: пол веса зависит от режима (см.
-	/// <see cref="ProbeGiBakeSession.MinBlend"/>), и в реальном времени именно он превращает бегущее
-	/// среднее в экспоненциальное - формула та же, разъезжаются только асимптоты.</summary>
+	/// <summary>Round weight in the running average; the GPU path must use the same formula.</summary>
 	public static float RoundBlendWeight(ProbeGiBakeSession session)
 	{
 		int averaged = session.Round - BootstrapRounds;
 		return averaged < 0 ? 1f : MathF.Max(1f / (averaged + 1), session.MinBlend);
 	}
 
-	/// <summary>Трассирует один луч CPU-обходом. Это тот же код, которым идёт бейк, вынесенный
-	/// наружу как ЭТАЛОН для сверки GPU-путей (см. SceneTrace.hlsl и сверочный прогон в
-	/// PreviewProbe): CPU-трассировщик уже рабочий, и расхождение с ним - это баг GPU-обхода.</summary>
+	/// <summary>Traces one ray on the CPU; the reference the GPU traversals are validated against.</summary>
 	public bool TraceRay(Vector3 origin, Vector3 direction, float tMax,
 		out float t, out Vector3 normal, out Vector3 albedo)
 	{
@@ -370,9 +315,7 @@ public sealed class ProbeGiBaker
 		return true;
 	}
 
-	/// <summary>Выгружает BVH в раскладке под StructuredBuffer для compute-обхода на GPU (см.
-	/// SceneTrace.hlsl) - путь для железа без аппаратной трассировки. Структура ровно та же, по
-	/// которой ходит CPU-трассировщик, поэтому compute-путь можно сверять с ним луч в луч.</summary>
+	/// <summary>Exports the BVH in StructuredBuffer layout for the compute traversal fallback.</summary>
 	public (BvhNodeGpu[] Nodes, uint[] Order, BvhTriangleGpu[] Triangles) ExportBvh()
 	{
 		var nodes = new BvhNodeGpu[Math.Max(_nodeCount, 1)];
@@ -411,61 +354,40 @@ public sealed class ProbeGiBaker
 		return (nodes, order, triangles);
 	}
 
-	/// <summary>Число лучей на пробу по умолчанию (сферический Фибоначчи, фиксированный веер -
-	/// при L1-проекции регулярность паттерна не полосит). Реальное берётся из
-	/// <see cref="ProbeGiBakeOptions.RaysPerProbe"/>.</summary>
+	/// <summary>Default rays per probe; the effective value comes from ProbeGiBakeOptions.</summary>
 	public const int DefaultRaysPerProbe = 96;
 
-	/// <summary>Потолок бюджета проб (верхний кламп <see cref="ProbeGiBakeOptions.MaxProbes"/>) -
-	/// им же размечен комбо "Max probes" в окне Graphics. Ограничивает бейк, а не раскладку
-	/// атласов: ячейка укрупняется, пока сетка не влезет в бюджет.</summary>
+	/// <summary>Upper clamp on the probe budget; the cell grows until the grid fits.</summary>
 	public const int MaxProbeBudget = 2097152;
 
-	/// <summary>Нижний кламп бюджета проб: сетка меньше 2x2x2 по осям бессмысленна, а совсем
-	/// мелкий бюджет схлопывает ячейку в габарит сцены.</summary>
+	/// <summary>Lower clamp on the probe budget; below 2x2x2 the grid is meaningless.</summary>
 	public const int MinProbeBudget = 512;
 
-	/// <summary>Потолок числа ПРОБ по одной оси. Это не про стоимость бейка (её держит
-	/// <see cref="MaxProbeBudget"/>), а про размер атласа: высота равна CountZ*CountY, умноженная на
-	/// <see cref="ProbeGiBakeResult.VisRes"/> у карты видимости, и обязана влезть в
-	/// <see cref="MaxAtlasDimension"/>. Сама эта проверка стоит в BeginBake и точнее потолка по оси;
-	/// потолок здесь - грубая страховка от вырожденно вытянутого баунда.</summary>
+	/// <summary>Coarse guard against degenerately elongated bounds; BeginBake checks atlas size.</summary>
 	public const int MaxProbesPerAxis = 512;
 
-	/// <summary>Предел стороны текстуры, в который обязаны влезть атласы проб (гарантия D3D12 и
-	/// Vulkan-реализаций - 16384). Проверяется по САМОМУ большому измерению окто-атласа видимости
-	/// (высота = CountZ*CountY*<see cref="ProbeGiBakeResult.VisRes"/>).</summary>
+	/// <summary>Texture side limit the probe atlases must fit; D3D12/Vulkan guarantee 16384.</summary>
 	public const int MaxAtlasDimension = 16384;
 
-	/// <summary>Читает CPU-копии мешей (<see cref="IMeshObject.VertexData"/>) - вызывать на потоке,
-	/// владеющем моделью (главном); дальше Bake можно уносить в фон.</summary>
+	// Reads CPU mesh copies: call on the thread owning the model; Bake itself may go background.
 	public unsafe ProbeGiBaker(ModelLoader model)
 		: this(new[] { (model, Matrix4x4.Identity) }, trackSourceInstances: true)
 	{
 	}
 
-	/// <summary>Сцена из нескольких моделей с мировыми матрицами (окно Scene View, см.
-	/// PrefabSceneViewport): треугольники каждого инстанса каждой модели попадают в мировой BVH
-	/// через InstanceMatrix(инстанс) * World. При trackSourceInstances=false SourceInstance пишется
-	/// -1 - слежение за движением инстансов по исходной модели (PollProbeAccel превью) для
-	/// мульти-модельной сцены не имеет смысла: её позы задают сущности префаба, и на их изменение
-	/// сцена просто пересоздаёт сессию.</summary>
+	/// <summary>Multi-model scene; each instance enters the world BVH via InstanceMatrix * World.</summary>
 	public unsafe ProbeGiBaker(IReadOnlyList<(ModelLoader Model, Matrix4x4 World)> models,
 		bool trackSourceInstances = false)
 	{
 		var tris = new List<Tri>();
 
-		// Параллельно мировой похлёбке собирается ОБЪЕКТНАЯ геометрия для аппаратной трассировки
-		// (см. ProbeInstancedGeometry): те же меши, но по разу на меш и без матрицы инстанса.
-		// Дедуп - по паре (модель, меш): меш, инстанцированный многими сущностями сцены, получает
-		// один срез треугольников/BLAS.
+		// Object-space geometry for HW tracing, deduped per (model, mesh) so one BLAS is shared.
 		var objectTris = new List<BvhTriangleGpu>();
 		var meshSlots = new List<(int First, int Count)>();
 		var meshSlotByMeshId = new Dictionary<(ModelLoader, int), int>();
 		var geometryInstances = new List<ProbeGeometryInstance>();
 
-		// Уникальные base color текстуры сцены (текстурное альбедо RT-хитов) - ключами
-		// (модель, материал), дедуп по словарю; -1 в словаре - материал не влез в потолок.
+		// Unique scene base color textures keyed by (model, material); -1 means over the cap.
 		var hitTextureKeys = new List<(int Model, int Material)>();
 		var hitTextureIndexByKey = new Dictionary<(int, int), int>();
 
@@ -480,14 +402,8 @@ public sealed class ProbeGiBaker
 				continue;
 			}
 
-			// Стекло свет не блокирует, линии/точки не геометрия. Реально «дырявые» материалы
-			// (листва/трава/решётки: средняя альфа base color текстуры мала) тоже пропускаем
-			// ЦЕЛИКОМ: трассировщик не сэмплирует текстуры, и ажурные квады стали бы сплошными
-			// стенами - крона дерева наглухо гасила бы солнце и небо во всём дворе (пропадал
-			// солнечный баунс от пола - галереи чернели, см. Sponza). Критерий - именно средняя
-			// альфа, а НЕ AlphaCutoff: экспортеры сплошь метят камень/ткань как MASK/BLEND
-			// (альфа ~1), и фильтр по режиму выкидывал из BVH всю сцену. Цена - листва не даёт
-			// GI-тени; экранная тень от неё остаётся за shadow map-ой.
+			// Skip glass, non-triangles, and cutout materials: the tracer samples no textures, so
+			// lacy quads would act as solid walls. Keyed on mean alpha, not AlphaCutoff.
 			Vector3 albedo = new(0.5f);
 			bool pbrFound = model.MaterialPbr.TryGetValue(instance.materialId, out var pbr);
 			if (pbrFound)
@@ -504,7 +420,7 @@ public sealed class ProbeGiBaker
 					: new Vector3(pbr.BaseColorFactor.X, pbr.BaseColorFactor.Y, pbr.BaseColorFactor.Z);
 			}
 
-			// Кламп сверху: альбедо ~1 в замкнутом дворе раскачивает мультибаунс до пересвета.
+			// Clamp: albedo near 1 makes multi-bounce blow out in a closed courtyard.
 			albedo = Vector3.Min(albedo, new Vector3(0.85f));
 
 			var mesh = model.Meshes[instance.meshId];
@@ -515,31 +431,18 @@ public sealed class ProbeGiBaker
 
 			var matrix = InstanceMatrix(instance.transform) * world;
 
-			// Потриугольное альбедо из текстур (см. ModelLoader.TriangleAlbedo): отскок GI и
-			// RT-отражения получают цвет в разрешении треугольников; без него - средний цвет
-			// материала (albedo выше).
 			model.TriangleAlbedo.TryGetValue(instance.meshId, out var triAlbedo);
 			var albedoCap = new Vector3(0.85f);
 
-			// Потриугольные металличность и шероховатость (детект металла у RT-хита и резкость
-			// его продолжения).
-			//
-			// Фолбэк, когда попиксельных данных нет: факторы материала - но ТОЛЬКО если у него
-			// нет MR-текстуры. С текстурой факторы по спецификации glTF всего лишь МНОЖИТЕЛИ и
-			// по умолчанию равны 1: принять их за истину означало объявить весь материал
-			// «шершавым металлом» - диффуз хита обнулялся множителем (1 - metalness), оставалась
-			// одна env-заглушка с шероховатостью 1 (плоский цвет, «roughness улетел в максимум»).
-			// Неизвестная металличность = НЕ металл: диффуз сохраняется, фантомных зеркал нет.
+			// MR factors are only multipliers per glTF, so trust them only without an MR texture;
+			// unknown metalness must mean non-metal or hit diffuse gets zeroed.
 			model.TriangleMetalness.TryGetValue(instance.meshId, out var triMetalness);
 			model.TriangleRoughness.TryGetValue(instance.meshId, out var triRoughness);
 			bool factorsAuthoritative = pbrFound && !pbr.HasMetallicRoughnessTexture;
 			float materialMetalness = factorsAuthoritative ? pbr.MetallicFactor : 0f;
 			float materialRoughness = factorsAuthoritative ? pbr.RoughnessFactor : 1f;
 
-			// Текстурное альбедо хита (RT-отражения): индекс уникальной base color текстуры сцены.
-			// Только материалам с настоящей текстурой на мешах с настоящими UV (синтезированные
-			// нули дали бы одну точку текстуры на весь меш); переполнение потолка честно остаётся
-			// на потриугольном альбедо.
+			// Only meshes with real UVs qualify: synthesized zeros would sample one texel per mesh.
 			int hitTextureIndex = -1;
 			bool meshHasUv = instance.meshId < model.MeshHasUv.Count && model.MeshHasUv[instance.meshId];
 			if (meshHasUv && pbrFound && pbr.HasBaseColorTexture &&
@@ -567,11 +470,10 @@ public sealed class ProbeGiBaker
 			int vertexCount = UnsafeArray.GetLength(mesh.VertexData);
 			var vertices = new ReadOnlySpan<Vertex>(UnsafeArray.GetPtr<Vertex>(mesh.VertexData, 0), vertexCount);
 
-			// ModelLoader всегда строит 32-битные индексы (см. PreparedMesh.Indices: uint[]).
+			// ModelLoader always builds 32-bit indices.
 			var indices = new ReadOnlySpan<uint>(UnsafeArray.GetPtr<uint>(mesh.IndexData, 0), mesh.IndexCount);
 
-			// Объектная копия меша - только для первого встреченного его инстанса: остальные
-			// переиспользуют и срез треугольников, и построенный по нему BLAS.
+			// Object copy built for the first instance only; the rest reuse its slice and BLAS.
 			if (!meshSlotByMeshId.TryGetValue((model, instance.meshId), out int meshSlot))
 			{
 				int firstObjectTri = objectTris.Count;
@@ -591,11 +493,7 @@ public sealed class ProbeGiBaker
 						continue;
 					}
 
-					// UV вершин для текстурного альбедо хита: KHR_texture_transform применяется
-					// ЗДЕСЬ (та же формула, что в UnlitInstancedPS: 2x2-матрица + offset), чтобы
-					// шейдеру трассы не таскать трансформ per-инстанс. Как и у triAlbedo,
-					// трансформ берётся у ПЕРВОГО инстанса меша - у прочих инстансов с другим
-					// материалом UV останутся его.
+					// KHR_texture_transform is baked in here, taken from the mesh's first instance.
 					var uv0 = vertices[(int)j0].TexCoord;
 					var uv1 = vertices[(int)j1].TexCoord;
 					var uv2 = vertices[(int)j2].TexCoord;
@@ -607,17 +505,12 @@ public sealed class ProbeGiBaker
 						uv2 = new Vector2(uv2.X * t.X + uv2.Y * t.Y, uv2.X * t.Z + uv2.Y * t.W) + pbr.UvOffset;
 					}
 
-					// Свернуть заворот к нулю ДО упаковки в half: у half на u=8 шаг сетки уже
-					// 1/128 (пиксели на текстуре 1К), а Wrap-сэмплер общий сдвиг на целое не
-					// заметит. Внутри одного треугольника размах UV мал - точности хватает.
+					// Fold wrap to zero before half packing: half loses UV precision past u=8.
 					var uvShift = new Vector2(
 						MathF.Floor(MathF.Min(uv0.X, MathF.Min(uv1.X, uv2.X))),
 						MathF.Floor(MathF.Min(uv0.Y, MathF.Min(uv1.Y, uv2.Y))));
 
-					// Потриугольное альбедо, фолбэк - материал инстанса. Раньше здесь не писалось
-					// ничего («оно у инстанса»), но HW-путь SceneTrace читает ИМЕННО tri.albedo -
-					// нулевое альбедо делало все RT-хиты чёрными (и включало метал-эвристику
-					// второго отскока на всей геометрии).
+					// The HW SceneTrace path reads tri.albedo, so it must be filled here too.
 					objectTris.Add(new BvhTriangleGpu
 					{
 						A = oa, E1 = oe1, E2 = oe2,
@@ -635,8 +528,7 @@ public sealed class ProbeGiBaker
 					});
 				}
 
-				// Меш целиком выродился (нулевой масштаб в самих вершинах, склеенные точки) -
-				// инстансу не на что ссылаться, BLAS строить не из чего.
+				// Fully degenerate mesh: nothing for an instance to reference, no BLAS to build.
 				meshSlot = objectTris.Count > firstObjectTri ? meshSlots.Count : -1;
 				if (meshSlot >= 0)
 				{
@@ -684,10 +576,7 @@ public sealed class ProbeGiBaker
 
 		_tris = tris.ToArray();
 
-		// Вырожденность проверяется в СВОЁМ пространстве у каждой похлёбки, поэтому счётчики
-		// треугольников могут разойтись на единицы на патологических матрицах (нулевой масштаб
-		// схлопывает мировой треугольник, оставляя объектный живым). Пути от этого не разъезжаются:
-		// каждый читает атрибуты из своего массива, а сверяются они по попаданиям луча.
+		// Degeneracy is tested per space, so world and object triangle counts may differ slightly.
 		_instanced = new ProbeInstancedGeometry
 		{
 			Triangles = objectTris.ToArray(),
@@ -704,7 +593,7 @@ public sealed class ProbeGiBaker
 		BuildBvh();
 	}
 
-	// --- BVH (медианный сплит по крупнейшей оси, лист ≤ 4 треугольников) ----------------------
+	// --- BVH (median split on the largest axis, leaf <= 4 triangles) ---------------------------
 
 	private void BuildBvh()
 	{
@@ -756,7 +645,6 @@ public sealed class ProbeGiBaker
 		var size = max - min;
 		int axis = size.X >= size.Y && size.X >= size.Z ? 0 : size.Y >= size.Z ? 1 : 2;
 
-		// Медиана по центроидам: сортировка среза _order компаратором по оси.
 		Array.Sort(_order, start, count, Comparer<int>.Create((x, y) =>
 			GetAxis(centroids[x], axis).CompareTo(GetAxis(centroids[y], axis))));
 
@@ -772,7 +660,7 @@ public sealed class ProbeGiBaker
 
 	private static float GetAxis(Vector3 v, int axis) => axis == 0 ? v.X : axis == 1 ? v.Y : v.Z;
 
-	// --- Трассировка --------------------------------------------------------------------------
+	// --- Tracing --------------------------------------------------------------------------------
 
 	private static bool RayBox(Vector3 origin, Vector3 invDir, float tMax, in Node node)
 	{
@@ -794,7 +682,7 @@ public sealed class ProbeGiBaker
 		return tmax >= MathF.Max(tmin, 0f) && tmin <= tMax;
 	}
 
-	/// <summary>Möller–Trumbore, двусторонний. Возвращает t или -1.</summary>
+	// Moller-Trumbore, double-sided. Returns t or -1.
 	private static float RayTri(Vector3 origin, Vector3 dir, in Tri tri)
 	{
 		var p = Vector3.Cross(dir, tri.E2);
@@ -908,25 +796,17 @@ public sealed class ProbeGiBaker
 		return false;
 	}
 
-	// --- Плотная сетка проб --------------------------------------------------------------------
+	// --- Dense probe grid ------------------------------------------------------------------------
 
-	/// <summary>Линейный индекс ХРАНЕНИЯ пробы по её координатам в атласе: строки идут по Y внутри
-	/// плоскости Z, плоскости - столбиком. Ровно этим индексом адресуются все CPU-буферы поля
-	/// (L0R/L1XR/Validity/...), и он же делением на ширину даёт тексель атласа - см.
-	/// <see cref="ProbeTexel"/>.</summary>
+	// Storage order: rows along Y within a Z plane, planes stacked. Addresses all CPU field buffers.
 	internal static int StorageIndex(int sx, int sy, int sz, int cx, int cy) =>
 		(sz * cy + sy) * cx + sx;
 
-	/// <summary>Тексель пробы в SH-атласе по её линейному индексу хранения. Ширина атласа равна оси X
-	/// сетки, поэтому деление с остатком и есть вся адресация (см.
-	/// <see cref="ProbeGiBakeResult.ShWidth"/>).</summary>
+	// Atlas width equals the grid X axis, so divmod is the whole addressing.
 	private static (int X, int Y) ProbeTexel(int storageIndex, int cx) =>
 		(storageIndex % cx, storageIndex / cx);
 
-	/// <summary>Захватывает поверхности сцены в разреженную воксельную сетку (см.
-	/// <see cref="SurfaceCache"/>): для каждого вокселя, где есть геометрия, запоминает точку на
-	/// поверхности, нормаль и альбедо - взвешенные площадью средние по попавшим треугольникам.
-	/// Чистая геометрия, считается один раз на сессию.</summary>
+	// Area-weighted surface capture into a sparse voxel grid; built once per session.
 	private SurfaceCache BuildSurfaceCache(Vector3 origin, Vector3 cell, int cx, int cy, int cz)
 	{
 		const int sub = SurfaceCache.Subdivision;
@@ -943,9 +823,7 @@ public sealed class ProbeGiBaker
 		var albedoSum = new Vector3[total];
 		var areaSum = new float[total];
 
-		// Идём по треугольникам, а не по вокселям: сцена - это сотни тысяч треугольников против
-		// миллионов вокселей, и почти все вокселя пустые. Треугольник раскладывается по вокселям
-		// своего AABB (консервативно - AABB, а не точное пересечение).
+		// Iterate triangles, not voxels: most voxels are empty. Scatter is by AABB, conservative.
 		var lockObj = new object();
 		Parallel.For(0, _tris.Length, () => (Voxels: new Dictionary<int, (Vector3 P, Vector3 N, Vector3 A, float W)>(), Dummy: 0),
 			(t, _, local) =>
@@ -971,8 +849,7 @@ public sealed class ProbeGiBaker
 			int y0 = Math.Clamp((int)MathF.Floor(lo.Y), 0, vy - 1), y1 = Math.Clamp((int)MathF.Floor(hi.Y), 0, vy - 1);
 			int z0 = Math.Clamp((int)MathF.Floor(lo.Z), 0, vz - 1), z1 = Math.Clamp((int)MathF.Floor(hi.Z), 0, vz - 1);
 
-			// Крупный треугольник (пол, стена) накрывает много вокселей - в каждый кладём его точку,
-			// зажатую в этот воксель, иначе центроид увёл бы позицию вокселя за его пределы.
+			// Clamp the centroid into each voxel, else a large triangle drags the point outside.
 			for (int z = z0; z <= z1; z++)
 			for (int y = y0; y <= y1; y++)
 			for (int x = x0; x <= x1; x++)
@@ -1021,8 +898,6 @@ public sealed class ProbeGiBaker
 			cache.Position[slot] = posSum[v] * inv;
 			var n = normalSum[v] * inv;
 			float len = n.Length();
-			// Нормали сошлись в ноль (воксель на ребре, где грани смотрят навстречу) - берём любую
-			// осмысленную: такой воксель всё равно почти не виден.
 			cache.Normal[slot] = len > 1e-4f ? n / len : Vector3.UnitY;
 			cache.Albedo[slot] = albedoSum[v] * inv;
 		}
@@ -1030,16 +905,11 @@ public sealed class ProbeGiBaker
 		return cache;
 	}
 
-	/// <summary>Строит захват поверхностей, если он заказан и ещё не построен. Обычно это делает
-	/// первый раунд (захват стоит сотни миллисекунд и не должен вставать на главном потоке), но
-	/// GPU-пути кэш нужен уже при создании буферов - там он вызывается напрямую.</summary>
+	/// <summary>Builds the surface capture if requested and not yet built.</summary>
 	public void EnsureSurfaceCache(ProbeGiBakeSession s)
 	{
-		// Реальному времени кэш не нужен ВООБЩЕ (см. RunRound): его статичная геометрия врёт на
-		// движущейся сцене, отскок идёт из поля. Один гейт здесь закрывает все места вызова и
-		// заодно экономит сотни миллисекунд захвата на главном потоке при создании сессии.
-		// WantsSurfaceCache НЕ сбрасывается: живое переключение в запечку достроит кэш первым же
-		// её раундом.
+		// Realtime never uses the cache: its static geometry lies on a moving scene.
+		// WantsSurfaceCache stays set so switching to a bake builds it on the next round.
 		if (!s.WantsSurfaceCache || s.Realtime)
 		{
 			return;
@@ -1049,12 +919,8 @@ public sealed class ProbeGiBaker
 		s.Surface = BuildSurfaceCache(s.Origin, s.Cell, s.CountX, s.CountY, s.CountZ);
 	}
 
-	/// <summary>Прямой свет punctual-светов сцены в точке поверхности - подход RTXGI (теневой луч к
-	/// свету с tmax до него) с формулами затухания из UnlitInstancedPS (Frostbite-окно + конус
-	/// спота), чтобы отскок сходился с прямым светом шейдинга один в один. Вклад ламп идёт в
-	/// СТАТИЧНУЮ долю освещения (знаменатель SunFraction, не числитель): реалтайм-модуляция
-	/// солнечной тенью света ламп касаться не должна. Дистанция теневого луча укорочена на эпсилон
-	/// с обеих сторон - от самозатенения поверхности и от «попадания» в геометрию источника.</summary>
+	// Punctual direct light at a surface point; attenuation mirrors UnlitInstancedPS so the bounce
+	// matches shading. Lamps go into the static share of lighting, not the sun-modulated one.
 	private Vector3 EvalPunctualLights(PunctualLight[] lights, Vector3 pos, Vector3 normal)
 	{
 		if (lights.Length == 0)
@@ -1083,7 +949,7 @@ public sealed class ProbeGiBaker
 				continue;
 			}
 
-			// Гладкое окно затухания - зеркало кластерного шейдинга UnlitInstancedPS.
+			// Smooth falloff window, mirroring the clustered shading in UnlitInstancedPS.
 			float distRatio = dist / range;
 			float distRatio2 = distRatio * distRatio;
 			float distFactor = Math.Clamp(1f - distRatio2 * distRatio2, 0f, 1f);
@@ -1114,10 +980,8 @@ public sealed class ProbeGiBaker
 		return sum;
 	}
 
-	/// <summary>Пересчитывает исходящий радианс кэша поверхностей. Резкая часть - солнце с теневым
-	/// лучом на каждый воксель (это и даёт отскоку детализацию, недоступную сетке проб); гладкая -
-	/// небо и переотскок, взятые из поля проб, которому такой детализации и не нужно. Один луч на
-	/// воксель за раунд, поэтому кэш идёт в ногу с пробами, а не удваивает стоимость бейка.</summary>
+	// Sharp part (sun) is shadow-traced per voxel; smooth part (sky, re-bounce) comes from the
+	// probe field. One ray per voxel per round keeps the cache in step with the probes.
 	private void UpdateSurfaceCache(ProbeGiBakeSession s)
 	{
 		var cache = s.Surface;
@@ -1149,12 +1013,9 @@ public sealed class ProbeGiBaker
 				sunIrradiance = sunColor * ndotl;
 			}
 
-			// Прямой свет ламп - в «статичную» часть, вместе с небом: солнечная тень реального
-			// времени модулирует только солнечную долю (см. EvalPunctualLights).
+			// Lamps go into the static share; the realtime sun shadow modulates only the sun share.
 			var lampIrradiance = EvalPunctualLights(bakeLights, pos, normal);
 
-			// Небо и переотскок - из поля проб. Оно грубое, но именно эта часть освещения меняется
-			// в пространстве плавно, так что разрешения сетки проб ей хватает.
 			var ambient = Vector3.Zero;
 			float ambientFrac = 0f;
 			if (feedback > 0f)
@@ -1174,61 +1035,27 @@ public sealed class ProbeGiBaker
 		});
 	}
 
-	// --- Бейк ---------------------------------------------------------------------------------
+	// --- Bake -----------------------------------------------------------------------------------
 
-	/// <summary>Вес раунда снизу (см. <see cref="RunRound"/>): бегущее среднее 1/(Round+1) на очень
-	/// длинных сессиях загнало бы вес в ноль и заморозило поле намертво.</summary>
+	// Floor on the round weight: 1/(Round+1) would reach zero and freeze the field.
 	internal const float MinRoundBlend = 0.02f;
 
-	/// <summary>Пол веса раунда в режиме реального времени (см.
-	/// <see cref="ProbeGiBakeOptions.Realtime"/>) - он же альфа экспоненциального среднего, к которой
-	/// сходится вес после первых раундов.
-	///
-	/// Размен прямой: возмущение затухает как (1-alpha)^n, а остаточное дрожание ОТДЕЛЬНОЙ пробы
-	/// идёт как sqrt(alpha/(2-alpha)) от дисперсии одного раунда. Редактор выпускает не больше
-	/// одного раунда за кадр, так что при 60 к/с 0.04 - это установление за ~1.2 секунды.
-	///
-	/// Замерено на Sponza при 64 лучах (см. SceneTraceVerifier.MeasureFlicker; p99 и максимум - по
-	/// относительной смене пробы за раунд, доля - сколько проб дёрнулось больше чем на 10%):
-	///
-	///   alpha 0.15 - p99 6.3%, max 79%, доля 0.6%   (мигание видно отчётливо)
-	///   alpha 0.08 - p99 3.4%, max 48%, доля 0.0%
-	///   alpha 0.04 - p99 1.8%, max 24%, доля 0.0%   (выбрано)
-	///   alpha 0.02 - p99 1.0%, max 12%, доля 0.0%   (отклик уже за 2.5 с)
-	///
-	/// Против ХВОСТА распределения альфа работает много лучше числа лучей: учетверение лучей при
-	/// 0.15 убирает дыхание сцены, но отдельные пробы продолжают дёргаться, потому что их разброс
-	/// делает не шум оценки, а смена того, во что попадает веер.</summary>
+	/// <summary>Realtime round weight floor, i.e. the exponential-average alpha; ~1.2 s to settle
+	/// at 60 fps. Measured on Sponza: 0.15 flickers visibly, 0.02 responds too slowly.</summary>
 	public const float RealtimeBlend = 0.04f;
 
-	/// <summary>Длина окна релокации в раундах - ПЯТЬ, как в Majercik 2021 (§5: «cap the number of
-	/// iterations at five to prevent probes from moving back and forth (infinitely) through tangent
-	/// backfaces»). Длинное окно (пробовали 32) не улучшает позиции, а даёт касательным задним
-	/// граням качать пробу туда-обратно.</summary>
+	// Five, per Majercik 2021 5: longer windows let tangent backfaces oscillate the probe.
 	internal const int RelocationRounds = 5;
 
-	/// <summary>Разгонные раунды, НЕ попадающие в усреднение. Отскок собирается из текущего поля, и
-	/// у самого первого раунда это поле пустое - его радианс занижен ровно на весь мультибаунс.
-	/// Копить такие раунды в общее среднее нельзя: холодный старт остался бы в результате навсегда
-	/// (замерено на Sponza - поле выходило процентов на восемь темнее прежнего бейка). Поэтому
-	/// первые раунды идут с полным весом, только раскачивая отскок (сходится геометрически, трёх
-	/// хватает), а усреднение стартует уже по прогретому полю.</summary>
+	// Warm-up rounds excluded from the average: round one has an empty field and no multi-bounce.
 	private const int BootstrapRounds = 3;
 
-	/// <summary>К какому «возрасту» откатывается сходимость при смене освещения (см.
-	/// <see cref="ProbeGiBakeSession.SetLighting"/>). Разгон заново не нужен - старое поле остаётся
-	/// приличным стартовым приближением для отскока, - но вес первого раунда после смены должен
-	/// быть большим, чтобы новое решение проступило за единицы раундов.</summary>
+	// Convergence age restored on a lighting change; the old field is still a decent start.
 	internal const int RestartRound = BootstrapRounds + 1;
 
-	/// <summary>Минимум УСРЕДНЯЕМЫХ раундов независимо от
-	/// <see cref="ProbeGiBakeOptions.RaysPerProbe"/> - иначе на низком качестве поле остаётся
-	/// откровенно шумным.</summary>
 	private const int MinAveragedRounds = 4;
 
-	/// <summary>Синхронный бейк до сходимости - обёртка над сессией для headless-путей вроде
-	/// PreviewProbe, которым нечего ждать между кадрами. Редактор вместо этого крутит
-	/// <see cref="RunRound"/> из PollProbeBake и показывает поле, не дожидаясь сходимости.</summary>
+	/// <summary>Synchronous bake to convergence; a session wrapper for headless paths.</summary>
 	public ProbeGiBakeResult Bake(Vector3 boundsMin, Vector3 boundsMax, Vector3 sunDirection,
 		Vector3 sunColor, float envYawRadians, Func<Vector3, Vector3> skyRadiance,
 		ProbeGiBakeOptions? options = null, PunctualLight[]? punctualLights = null)
@@ -1236,8 +1063,7 @@ public sealed class ProbeGiBaker
 		var session = BeginBake(boundsMin, boundsMax, sunDirection, sunColor, envYawRadians,
 			skyRadiance, options, punctualLights);
 
-		// Условие явное, а не Converged: синхронный бейк обязан завершиться, даже если в настройках
-		// стоит режим реального времени (там сходимости нет по определению).
+		// Explicit condition, not Converged: realtime sessions never converge by definition.
 		while (!session.NoGeometry && session.Round < session.TargetRounds)
 		{
 			RunRound(session);
@@ -1246,13 +1072,8 @@ public sealed class ProbeGiBaker
 		return Snapshot(session);
 	}
 
-	/// <summary>Раскладывает сетку проб по баундам сцены и заводит аккумуляторы прогрессивного
-	/// бейка - лучей не пускает, так что звать можно и с главного потока. Дальше крутите
-	/// <see cref="RunRound"/> в фоне, пока <see cref="ProbeGiBakeSession.Converged"/> не станет
-	/// true, а <see cref="Snapshot"/> - между раундами: поле пригодно к показу уже после первого.
-	/// skyRadiance - линейный радианс неба по мировому направлению ДО пользовательского поворота
-	/// (envYaw применяется внутри, той же конвенцией, что SampleEnvironment в шейдере).
-	/// sunDirection - НА солнце.</summary>
+	/// <summary>Lays out the probe grid and accumulators; traces nothing, so it is main-thread safe.
+	/// skyRadiance is linear sky radiance before envYaw; sunDirection points TOWARDS the sun.</summary>
 	public ProbeGiBakeSession BeginBake(Vector3 boundsMin, Vector3 boundsMax, Vector3 sunDirection,
 		Vector3 sunColor, float envYawRadians, Func<Vector3, Vector3> skyRadiance,
 		ProbeGiBakeOptions? options = null, PunctualLight[]? punctualLights = null)
@@ -1261,21 +1082,14 @@ public sealed class ProbeGiBaker
 		float density = Math.Clamp(options.GridDensity, 4f, 64f);
 		int maxProbes = Math.Clamp(options.MaxProbes, MinProbeBudget, MaxProbeBudget);
 
-		// Сетка: ячейка ~1/density крупнейшего измерения, не больше maxProbes, минимум 2 по оси.
+		// Cell is ~1/density of the largest extent, capped by maxProbes, min 2 probes per axis.
 		var size = Vector3.Max(boundsMax - boundsMin, new Vector3(1e-3f));
 		float maxDim = MathF.Max(size.X, MathF.Max(size.Y, size.Z));
 		var margin = new Vector3(maxDim * 0.02f);
 		var min = boundsMin - margin;
 		var full = size + margin * 2f;
 
-		// Сетка кирпичей: укрупняем ячейку, пока ЖИВЫЕ кирпичи не влезут в бюджет. Считать бюджет
-		// по живым, а не по всему баунду - и есть весь смысл разреженности: на сцене-уровне пустое
-		// пространство занимает большую часть коробки, и раньше оно съедало бюджет наравне с
-		// геометрией, заставляя грубеть сетку у поверхностей.
-		// Сетка ПЛОТНАЯ, поэтому подбор размера стал арифметикой: осматривать геометрию, чтобы
-		// узнать цену раскладки, больше не нужно - цена есть произведение сторон. Вместе с осмотром
-		// ушли ScrollHeadroom, поиск худшего размещения коробки и весь класс отказов «ran out of
-		// pool slots»: слотов, которых может не хватить, больше нет.
+		// Grow the cell until the grid fits the budget; cost is just the product of the sides.
 		float cellTarget = MathF.Max(maxDim, 1e-3f) / density;
 		int cx, cy, cz;
 		while (true)
@@ -1284,8 +1098,7 @@ public sealed class ProbeGiBaker
 			cy = ProbesPerAxis(full.Y, cellTarget);
 			cz = ProbesPerAxis(full.Z, cellTarget);
 
-			// Атлас видимости крупнее SH-атласа в VisRes раз по обеим осям и в предел упирается
-			// первым (см. MaxAtlasDimension).
+			// The visibility atlas is VisRes times larger on both axes, so it hits the limit first.
 			long probes = (long)cx * cy * cz;
 			bool fitsBudget = probes <= maxProbes;
 			bool fitsAtlas = (long)cx * ProbeGiBakeResult.VisRes <= MaxAtlasDimension
@@ -1300,9 +1113,7 @@ public sealed class ProbeGiBaker
 
 		var cell = new Vector3(full.X / (cx - 1), full.Y / (cy - 1), full.Z / (cz - 1));
 
-		// Усредняемых раундов ровно столько, чтобы набрать заказанные RaysPerProbe лучей; сверху -
-		// разгон. Итоговое качество сошедшегося поля выходит тем же, что у прежнего бейка одним
-		// куском, только приходит оно постепенно.
+		// Enough averaged rounds to accumulate the requested RaysPerProbe, plus the warm-up.
 		int averagedRounds = Math.Max(MinAveragedRounds,
 			(int)MathF.Ceiling(Math.Clamp(options.RaysPerProbe, 16, 512)
 				/ (float)Math.Clamp(options.RaysPerRound, 4, 128)));
@@ -1311,8 +1122,7 @@ public sealed class ProbeGiBaker
 			Vector3.Normalize(sunDirection), sunColor, envYawRadians, skyRadiance,
 			BootstrapRounds + averagedRounds);
 
-		// Захват поверхностей (сотни миллисекунд на сцене-уровне) откладывается до первого раунда:
-		// BeginBake зовётся с ГЛАВНОГО потока, и здесь он встал бы видимым фризом редактора.
+		// Surface capture is deferred to the first round: BeginBake runs on the main thread.
 		session.WantsSurfaceCache = options.SurfaceCache;
 		if (punctualLights is { Length: > 0 })
 		{
@@ -1322,14 +1132,11 @@ public sealed class ProbeGiBaker
 		return session;
 	}
 
-	/// <summary>Число ПРОБ по оси под заданный шаг ячейки: ячеек столько, чтобы накрыть протяжённость,
-	/// проб на одну больше. Минимум два - иначе не из чего интерполировать.</summary>
+	// Probes per axis: one more than cells. Minimum two, or there is nothing to interpolate.
 	private static int ProbesPerAxis(float extent, float cellTarget) =>
 		Math.Clamp((int)MathF.Ceiling(extent / cellTarget) + 1, 2, MaxProbesPerAxis);
 
-	/// <summary>Осматривает коробку: есть ли в ней геометрия и насколько сонаправлены нормали её
-	/// треугольников (см. <see cref="FlatNormalCoherence"/>). Нормали взвешиваются площадью - иначе
-	/// россыпь мелких треугольников декора перевесила бы плиту пола, на которой они лежат.</summary>
+	// Normals are area-weighted, else a scatter of decor triangles outvotes the floor slab.
 	private (bool HasGeometry, float Coherence) InspectBox(Vector3 boxMin, Vector3 boxMax)
 	{
 		if (_nodeCount == 0)
@@ -1370,8 +1177,7 @@ public sealed class ProbeGiBaker
 						continue;
 					}
 
-					// Векторное произведение рёбер - нормаль длиной в две площади: и направление, и
-					// вес в одном значении.
+					// Edge cross product carries direction and twice the area as its length.
 					var cross = Vector3.Cross(tri.E1, tri.E2);
 					normalSum += cross;
 					areaSum += cross.Length();
@@ -1387,33 +1193,24 @@ public sealed class ProbeGiBaker
 		return areaSum > 1e-12f ? (true, normalSum.Length() / areaSum) : (false, 0f);
 	}
 
-	/// <summary>Один раунд прогрессивного бейка: пускает RaysPerRound лучей на пробу повёрнутым
-	/// веером Фибоначчи, вливает радианс в поле бегущим средним и копит геометрические суммы
-	/// (видимость неба, валидность, окто-карта глубин). Это тяжёлая часть - зовите в фоне; внутри
-	/// раунд параллелится по пробам, но сами раунды обязаны идти строго по одному.</summary>
+	/// <summary>One progressive bake round; heavy, run it in the background. Rounds must not
+	/// overlap, though a round parallelises internally over probes.</summary>
 	public void RunRound(ProbeGiBakeSession s)
 	{
 		if (!HasGeometry)
 		{
-			// Печь нечего - помечаем сессию сошедшейся, чтобы вызывающий не крутил пустые раунды.
-			// Номера раунда для этого мало: в реальном времени сходимости нет, и вызывающий гонял бы
-			// пустые раунды вечно.
 			s.NoGeometry = true;
 			s.Round = s.TargetRounds;
 			return;
 		}
 
-		// В реальном времени кэш поверхностей не захватывается, не обновляется и не читается -
-		// зеркало GPU-раунда (см. ProbeRelocation.z в ProbeRoundCS.hlsl): его статичная геометрия
-		// врёт на движущейся сцене, отскок идёт из поля проб в точке попадания.
+		// Realtime skips the surface cache entirely, mirroring the GPU round in ProbeRoundCS.hlsl.
 		SurfaceCache? surface = null;
 		if (!s.Realtime)
 		{
 			EnsureSurfaceCache(s);
 
-			// Кэш обновляется ПЕРЕД лучами раунда: он собирает небо и переотскок из поля прошлого
-			// раунда, а лучи этого раунда уже забирают из него свежий радианс. Так кэш и поле
-			// сходятся вместе, не обгоняя друг друга.
+			// Must update before this round's rays so cache and field converge in step.
 			UpdateSurfaceCache(s);
 			surface = s.Surface;
 		}
@@ -1421,10 +1218,7 @@ public sealed class ProbeGiBaker
 		int rays = s.RaysPerRound;
 		var dirs = BuildRotatedFibonacciSphere(rays, s.Sequence++);
 
-		// Вес нового раунда. Разгонные раунды кладутся целиком (alpha = 1): они не усредняются, а
-		// только раскачивают отскок, из которого будут собирать последующие. Дальше - честное
-		// бегущее среднее по УСРЕДНЯЕМЫМ раундам; пол не даёт весу схлопнуться в ноль на длинных
-		// сессиях, а в реальном времени он же и держит окно усреднения конечным.
+		// Warm-up rounds land at alpha = 1; after that it is a floored running average.
 		float alpha = RoundBlendWeight(s);
 
 		int cx = s.CountX, cy = s.CountY, cz = s.CountZ;
@@ -1444,9 +1238,7 @@ public sealed class ProbeGiBaker
 		float visMax = cell.Length() * 1.5f;
 		float gatherOffset = cell.Length() * 0.05f;
 
-		// Поворот энвайронмента: шейдер сдвигает equirect-U на +yaw (см. SampleEnvironment), т.е.
-		// мировое направление d видит небо в направлении с азимутом φ+yaw. SkyIntensity - ручка
-		// яркости небесного эмбиента (окно Graphics).
+		// Environment yaw: the shader shifts equirect U by +yaw, so direction d sees azimuth phi+yaw.
 		var skyRadiance = s.SkyRadiance;
 		float skyIntensity = s.SkyIntensity;
 		float cosYaw = MathF.Cos(s.EnvYaw), sinYaw = MathF.Sin(s.EnvYaw);
@@ -1460,8 +1252,7 @@ public sealed class ProbeGiBaker
 
 		static float Lum(Vector3 c) => 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
 
-		// Раунд ЧИТАЕТ прошлое поле (мультибаунс собирается по соседним пробам в точках попаданий)
-		// и ПИШЕТ новое - см. двойной буфер в ProbeGiBakeSession.
+		// A round reads the previous field and writes the new one; see the double buffer in the session.
 		var l0R = s.L0R; var l1xR = s.L1XR; var l1yR = s.L1YR; var l1zR = s.L1ZR;
 		var validityR = s.ValidityR; var sunFracR = s.SunFracR;
 		var l0W = s.L0W; var l1xW = s.L1XW; var l1yW = s.L1YW; var l1zW = s.L1ZW;
@@ -1469,23 +1260,17 @@ public sealed class ProbeGiBaker
 
 		int gridX = s.CountX, gridY = s.CountY, gridZ = s.CountZ;
 
-		// Обход идёт по индексу ХРАНЕНИЯ - тому же, которым адресованы все буферы поля и тексель
-		// атласа. Объём неподвижен (прокрутки больше нет), так что координаты хранения и есть
-		// координаты сетки.
+		// Iterated by storage index; the volume is static, so storage coords are grid coords.
 		Parallel.For(0, probeCount, p =>
 		{
 			int px = p % gridX;
 			int py = p / gridX % gridY;
 			int pz = p / (gridX * gridY);
 
-			// Трассируем из АКТУАЛЬНОЙ позиции - с учётом накопленной релокации (зеркало
-			// ProbeRoundCS.hlsl): иначе статистика задних граней описывала бы узел сетки, а не то
-			// место, где проба стоит, и релокация не сошлась бы.
+			// Trace from the relocated position, or backface stats would describe the grid node.
 			var probeOffset = probeOffsets[p];
 			var probePos = origin + new Vector3(px * cell.X, py * cell.Y, pz * cell.Z) + probeOffset;
 
-			// Шаг проб у плотной сетки один на весь объём - уровней подразделения, под которые этот
-			// кламп раньше подстраивался, больше нет.
 			float probeVisMax = visMax;
 
 			var sum0 = Vector3.Zero;
@@ -1496,8 +1281,7 @@ public sealed class ProbeGiBaker
 			int missCount = 0, backCount = 0;
 			int visBase = p * res * res;
 
-			// Для релокации - зеркало ProbeRoundCS.hlsl: ближайшая ЗАДНЯЯ грань есть ближайший
-			// выход наружу, ближайшая передняя - мера свободного места вокруг.
+			// For relocation: nearest backface is the nearest way out, nearest front measures room.
 			float closestBackT = _rayTMax, closestFrontT = _rayTMax;
 			var closestBackDir = Vector3.UnitY;
 
@@ -1521,21 +1305,18 @@ public sealed class ProbeGiBaker
 					var normal = Vector3.Normalize(Vector3.Cross(tri.E1, tri.E2));
 					if (Vector3.Dot(normal, dir) > 0f)
 					{
-						// Задняя грань = луч вышел изнутри геометрии (проба в стене).
+						// Backface = the ray left from inside geometry, i.e. the probe is in a wall.
 						radiance = Vector3.Zero;
 						backCount++;
 
-						// Порядок важен: релокации нужна ПОЛНАЯ дистанция (ближайший выход из
-						// стены), укорачивание - только для записи в глубину.
+						// Order matters: relocation needs the full distance, shortening is for depth.
 						if (t < closestBackT)
 						{
 							closestBackT = t;
 							closestBackDir = dir;
 						}
 
-						// Глубина задней грани укорачивается на 80% - зеркало ProbeRoundCS.hlsl
-						// (Majercik 2021, §4.1): тест Чебышёва должен считать её заслоняющей, иначе
-						// проба заявляет, что видит в эту сторону далеко, и свет течёт сквозь стену.
+						// Backface depth shortened 80% (Majercik 2021 4.1) so Chebyshev occludes it.
 						hitT = t * 0.2f;
 					}
 					else
@@ -1543,10 +1324,7 @@ public sealed class ProbeGiBaker
 						closestFrontT = MathF.Min(closestFrontT, t);
 						var hitPos = probePos + dir * t;
 
-						// Кэш поверхностей (см. SurfaceCache): у точки попадания уже есть готовый
-						// исходящий радианс, посчитанный на СВОЁМ разрешении - вчетверо мельче шага
-						// проб. Это и есть смысл surface GI: отскок берётся с детализацией
-						// геометрии, а не размазывается по ячейке сетки проб.
+						// The hit point already has outgoing radiance at voxel resolution.
 						int voxel = surface?.Lookup(hitPos + normal * gatherOffset) ?? -1;
 						if (voxel >= 0)
 						{
@@ -1555,8 +1333,6 @@ public sealed class ProbeGiBaker
 						}
 						else
 						{
-							// Кэша тут нет (воксель не захвачен) - считаем отскок по-старому, из
-							// поля проб.
 							var sunIrradiance = Vector3.Zero;
 							float ndotl = Vector3.Dot(normal, sunDir);
 							if (ndotl > 0f &&
@@ -1565,7 +1341,6 @@ public sealed class ProbeGiBaker
 								sunIrradiance = sunColor * ndotl;
 							}
 
-							// Лампы - в статичную долю, как в UpdateSurfaceCache.
 							var lampIrradiance = EvalPunctualLights(bakeLights,
 								hitPos + normal * (_sceneEpsilon * 4f), normal);
 
@@ -1579,15 +1354,10 @@ public sealed class ProbeGiBaker
 
 							var irradiance = sunIrradiance + lampIrradiance + prevIrradiance;
 
-							// Хрома-кламп альбедо: тянем цвет к собственной люме, ЯРКОСТЬ не меняем
-							// (lerp к Lum линеен - Lum(результата) == Lum(альбедо)). Поэтому
-							// солнечный баунс от камня/пола по силе прежний, а насыщенная ткань
-							// перестаёт быть цветной лампочкой.
+							// Chroma clamp towards luma; lerp is linear so brightness is preserved.
 							var albedo = Vector3.Lerp(new Vector3(Lum(tri.Albedo)), tri.Albedo, bounceSaturation);
 							radiance = albedo * irradiance * (1f / MathF.PI);
 
-							// Солнечная доля яркости этого луча: прямой вклад солнца + солнечная
-							// часть собранного поля (переотскок наследует долю источника).
 							float lumIrr = Lum(irradiance);
 							sunShare = lumIrr > 1e-6f
 								? (Lum(sunIrradiance) + Lum(prevIrradiance) * prevFrac) / lumIrr
@@ -1596,27 +1366,19 @@ public sealed class ProbeGiBaker
 					}
 				}
 
-				// Подавление выбросов - зеркало GPU-раунда (см. ProbeRoundCS.hlsl): редкий луч в
-				// очень яркое двигает пробу целиком, и числом лучей это не лечится. В запечке
-				// потолок нулевой, кламп не срабатывает вовсе.
+				// Firefly suppression, mirroring ProbeRoundCS.hlsl. Disabled during bakes.
 				if (maxRayLuminance > 0f)
 				{
 					float rayLum = Lum(radiance);
 					if (rayLum > maxRayLuminance)
 					{
-						// Масштаб, а не обрезание по каналам: обрезание увело бы цвет.
+						// Scale, not per-channel clip: clipping would shift hue.
 						radiance *= maxRayLuminance / rayLum;
 					}
 				}
 
-				// Окто-карта глубин (DDGI depth), точные суммы по всем раундам. Кламп по масштабу
-				// ячейки, как в оригинальном DDGI: без него луч-промах вносит в среднюю глубину
-				// октанта дистанцию в несколько габаритов сцены, средняя «видимость» становится
-				// огромной, и тест Чебышёва не срабатывает НИКОГДА - протечки у стыков остаются.
-				// Луч размазывается по КОНУСУ текселей - зеркало ProbeRoundCS.hlsl и §4.4 статьи
-				// Majercik 2019. При укладке в один ближайший тексель большинству из 64 октантов не
-				// достаётся ни одного сэмпла за раунд, и тест Чебышёва работает по карте, которой
-				// почти нет.
+				// DDGI octahedral depth. Clamped to cell scale, else misses make visibility huge
+				// and Chebyshev never occludes. Splatted over a texel cone (Majercik 2019 4.4).
 				float tv = MathF.Min(hitT, probeVisMax);
 				for (int dt = 0; dt < res * res; dt++)
 				{
@@ -1653,17 +1415,14 @@ public sealed class ProbeGiBaker
 			var new2 = Vector3.Lerp(l1yR[p], sumY, alpha);
 			var new3 = Vector3.Lerp(l1zR[p], sumZ, alpha);
 
-			// Перцептивное накопление - зеркало GPU-раунда (см. ProbeRoundCS.hlsl и
-			// ProbeGiBakeOptions.RealtimeGamma): яркость движется по гамма-кривой, направленность
-			// не трогается. В запечке accumGamma = 1 и блок мёртв.
+			// Perceptual accumulation: luma moves on a gamma curve, directionality untouched.
 			if (accumGamma > 1f && alpha < 1f)
 			{
 				float lumOld = Lum(l0R[p]);
 				float lumNew = Lum(sum0);
 				float lumLinear = Lum(new0);
 
-				// Только на потемнение - зеркало ProbeRoundCS.hlsl (симметричная кривая душила
-				// подъём из темноты).
+				// Darkening only: a symmetric curve throttled brightening out of darkness.
 				if (lumNew < lumOld && lumLinear > 1e-6f)
 				{
 					float invGamma = 1f / accumGamma;
@@ -1679,8 +1438,7 @@ public sealed class ProbeGiBaker
 				}
 			}
 
-			// Ограничитель скорости - зеркало GPU-раунда (см. ProbeRoundCS.hlsl): режем производную,
-			// а не величину, поэтому установившееся значение не смещается.
+			// Slew limiter: clamps the derivative, not the value, so the steady state is unbiased.
 			if (maxStep > 0f && alpha < 1f)
 			{
 				var delta = new0 - l0R[p];
@@ -1689,7 +1447,7 @@ public sealed class ProbeGiBaker
 				float limit = maxStep * scale;
 				if (deltaLen > limit)
 				{
-					// Один множитель на все полосы SH: порознь они изменили бы направленность поля.
+					// One factor for all SH bands: scaling separately would rotate the field.
 					float k = limit / deltaLen;
 					new0 = l0R[p] + (new0 - l0R[p]) * k;
 					new1 = l1xR[p] + (new1 - l1xR[p]) * k;
@@ -1703,8 +1461,7 @@ public sealed class ProbeGiBaker
 			l1yW[p] = new2;
 			l1zW[p] = new3;
 
-			// Релокация - зеркало ProbeRoundCS.hlsl: проба, стоящая внутри стены или колонны,
-			// отодвигается наружу через ближайшую заднюю грань.
+			// Relocation: a probe inside a wall is pushed out through the nearest backface.
 			bool relocated = false;
 			if (relocLimit > 0f)
 			{
@@ -1716,8 +1473,7 @@ public sealed class ProbeGiBaker
 				{
 					newOffset = probeOffset + closestBackDir * (closestBackT + gatherOffset);
 				}
-				// Возврата к узлу нет - зеркало ProbeRoundCS.hlsl: у тонкой геометрии он качал пробу
-				// туда-обратно с сбросом накопителей на каждый переезд.
+				// No pull back to the node: on thin geometry it oscillated the probe every round.
 
 				float newLen = newOffset.Length();
 				if (newLen > relocLimit)
@@ -1725,8 +1481,7 @@ public sealed class ProbeGiBaker
 					newOffset *= relocLimit / newLen;
 				}
 
-				// Порог, а не любое движение: возврат к узлу идёт долями (0.75 за раунд), и сброс
-				// на каждый мелкий шаг держал бы пробу в вечном холодном старте.
+				// Thresholded, not any motion: resetting on every small step means a permanent cold start.
 				relocated = (newOffset - probeOffset).Length() > relocLimit * 0.1f;
 				probeOffsets[p] = newOffset;
 			}
@@ -1734,9 +1489,7 @@ public sealed class ProbeGiBaker
 			float roundSunFrac = totalLum > 1e-6f ? Math.Clamp(sunLum / totalLum, 0f, 1f) : 0f;
 			sunFracW[p] = sunFracR[p] + (roundSunFrac - sunFracR[p]) * alpha;
 
-			// Видимость неба и валидность зависят только от геометрии, не от света - копим их
-			// точными долями по ВСЕМ раундам сессии. Поэтому поворот солнца их не обесценивает:
-			// именно тут прогрессивный бейк выигрывает у прежнего полного ребейка.
+			// Sky visibility and validity are pure geometry, so they accumulate over all rounds.
 			int rayTotal = s.RayTotal[p] + rays;
 			int missTotal = s.MissTotal[p] + missCount;
 			int backTotal = s.BackTotal[p] + backCount;
@@ -1745,17 +1498,11 @@ public sealed class ProbeGiBaker
 			s.BackTotal[p] = backTotal;
 			s.SkyVis[p] = missTotal / (float)rayTotal;
 
-			// Проба в стене видит в основном задние грани - гасим её вес в интерполяции.
+			// A probe in a wall mostly sees backfaces; damp its interpolation weight.
 			validityW[p] = Math.Clamp(1f - backTotal / (float)rayTotal * 3f, 0f, 1f);
 
-			// Сброс геометрии переехавшей пробы - ПОСЛЕ того, как она отдала этот раунд (лучи-то
-			// пущены ещё с прежнего места), и обязательно после накопления счётчиков выше, иначе
-			// они тут же затёрли бы обнуление. Копить с нуля начинает следующий раунд.
-			//
-			// Без этого сброса переезд был бы половинчатым: радианс проба считала бы уже с нового
-			// места, а валидность осталась бы заниженной старой статистикой задних граней - то есть
-			// выбравшаяся из стены проба продолжала бы числиться замурованной, - и тест Чебышёва
-			// мерил бы глубины от точки, где пробы больше нет.
+			// Reset a relocated probe's geometry only after this round's counters are accumulated,
+			// else the stale backface stats would keep it marked as walled in.
 			if (relocated)
 			{
 				s.RayTotal[p] = 0;
@@ -1776,9 +1523,8 @@ public sealed class ProbeGiBaker
 		s.ConsumeRelocationRound();
 	}
 
-	/// <summary>Пакует ТЕКУЩЕЕ состояние сессии в атласы. Буферы результата переиспользуются между
-	/// снимками (пересоздавать десятки мегабайт каждый раунд незачем), поэтому звать строго между
-	/// раундами и отдавать результат потребителю до следующего <see cref="RunRound"/>.</summary>
+	/// <summary>Packs the current session state into atlases. Result buffers are reused between
+	/// snapshots, so call only between rounds and consume before the next RunRound.</summary>
 	public ProbeGiBakeResult Snapshot(ProbeGiBakeSession s)
 	{
 		int res = ProbeGiBakeResult.VisRes;
@@ -1788,7 +1534,6 @@ public sealed class ProbeGiBaker
 
 		Parallel.For(0, s.ProbeCount, p =>
 		{
-			// Индекс хранения и есть адрес в атласе: ширина атласа равна оси X сетки.
 			var (px, py) = ProbeTexel(p, shWidth);
 			int texel = (py * shWidth + px) * 8;
 			WriteHalf4(result.Sh0, texel, s.L0R[p], s.SkyVis[p]);
@@ -1797,7 +1542,7 @@ public sealed class ProbeGiBaker
 			WriteHalf4(result.Sh3, texel, s.L1ZR[p], 1f);
 			WriteHalf4(result.Offset, texel, s.ProbeOffset[p], 1f);
 
-			// Среднее по всей пробе - заполнитель октантов, куда за все раунды не попал ни один луч.
+			// Probe-wide mean fills octants that never received a ray.
 			int visBase = p * res * res;
 			float totalT = 0f;
 			float totalWeight = 0f;
@@ -1809,7 +1554,7 @@ public sealed class ProbeGiBaker
 
 			float meanAll = totalWeight > 0f ? totalT / totalWeight : 0f;
 
-			// Окто-блок видимости пробы: res×res текселей начиная с (px*res, py*res).
+			// Probe visibility block: res x res texels starting at (px*res, py*res).
 			for (int ty = 0; ty < res; ty++)
 			{
 				for (int tx = 0; tx < res; tx++)
@@ -1827,12 +1572,7 @@ public sealed class ProbeGiBaker
 		return result;
 	}
 
-	/// <summary>Множитель обратной связи поля под заданную глубину мультибаунса. Прогрессивный бейк
-	/// собирает отскок из ТЕКУЩЕГО поля, то есть переотскок по построению бесконечный: суммарная
-	/// энергия идёт как 1/(1-r*f) при средней отражательной способности сцены r, тогда как прежний
-	/// N-итерационный бейк давал (1-r^N)/(1-r). Приравняв, получаем f = (1-r^(N-1))/(1-r^N). Берём
-	/// r=0.5 (дефолтное альбедо трассировщика) - точность оценки тут не важна, важно, что при
-	/// переходе на прогрессивный бейк сцены не поедут по яркости.</summary>
+	// Feedback factor matching N-bounce energy: f = (1-r^(N-1))/(1-r^N) at assumed albedo r=0.5.
 	internal static float BounceFeedback(int bounces)
 	{
 		if (bounces <= 1)
@@ -1845,14 +1585,11 @@ public sealed class ProbeGiBaker
 		return (1f - rn / r) / (1f - rn);
 	}
 
-	/// <summary>Резкость лобы, которой луч размазывается по окто-карте глубин: степень косинуса
-	/// берётся шестью возведениями в квадрат (то есть 64) - дешевле pow, а порог веса отсекает всё
-	/// дальше 26 градусов от луча. Обязано совпадать с ProbeRoundCS.hlsl.</summary>
+	// Depth splat lobe: cos^64 via six squarings. Must match ProbeRoundCS.hlsl.
 	private const int DepthSharpnessSquarings = 6;
 	private const float DepthWeightEpsilon = 0.001f;
 
-	/// <summary>Обратное окто-преобразование: направление по точке карты (зеркало ProbeOctDecode в
-	/// ProbeRoundCS.hlsl).</summary>
+	// Mirror of ProbeOctDecode in ProbeRoundCS.hlsl.
 	private static Vector3 OctDecode(Vector2 uv)
 	{
 		var p = uv * 2f - Vector2.One;
@@ -1868,8 +1605,7 @@ public sealed class ProbeGiBaker
 		return Vector3.Normalize(d);
 	}
 
-	/// <summary>Окто-кодирование направления в [0,1]² - обязано бит-в-бит совпадать с OctEncode в
-	/// UnlitInstancedPS.hlsl (иначе шейдер читает чужие тексели видимости).</summary>
+	// Must match OctEncode in UnlitInstancedPS.hlsl bit for bit.
 	private static Vector2 OctEncode(Vector3 d)
 	{
 		float sum = MathF.Abs(d.X) + MathF.Abs(d.Y) + MathF.Abs(d.Z);
@@ -1883,9 +1619,7 @@ public sealed class ProbeGiBaker
 		return new Vector2(px * 0.5f + 0.5f, py * 0.5f + 0.5f);
 	}
 
-	/// <summary>CPU-аналог шейдерного SampleProbeGi: трилинейная интерполяция 8 проб с весами
-	/// валидности, затем SH L1 → irradiance по нормали. sunFrac/fracOut - интерполяция доли
-	/// солнечного света теми же весами (см. Bake).</summary>
+	// CPU twin of the shader's SampleProbeGi: validity-weighted trilinear, then SH L1 irradiance.
 	private static Vector3 EvalIrradiance(ProbeGiBakeSession s,
 		Vector3[] l0, Vector3[] l1x, Vector3[] l1y, Vector3[] l1z, float[] validity, float[] sunFrac,
 		Vector3 pos, Vector3 normal, out float fracOut)
@@ -1898,8 +1632,6 @@ public sealed class ProbeGiBaker
 		f = Vector3.Clamp(f, Vector3.Zero,
 			new Vector3(s.CountX - 1, s.CountY - 1, s.CountZ - 1));
 
-		// Базовый узел ячейки - просто пол координат сетки: у плотной сетки проба есть в каждом узле,
-		// искать её больше негде и не через что.
 		int lx = Math.Clamp((int)MathF.Floor(f.X), 0, s.CountX - 2);
 		int ly = Math.Clamp((int)MathF.Floor(f.Y), 0, s.CountY - 2);
 		int lz = Math.Clamp((int)MathF.Floor(f.Z), 0, s.CountZ - 2);
@@ -1919,10 +1651,8 @@ public sealed class ProbeGiBaker
 			float w = (ox == 1 ? t.X : 1f - t.X) * (oy == 1 ? t.Y : 1f - t.Y) * (oz == 1 ? t.Z : 1f - t.Z)
 				* validity[index];
 
-			// Мягкий backface-вес - зеркало wrap shading-а в SampleProbeGi (см. UnlitInstancedPS):
-			// без него мультибаунс за несколько итераций протаскивает свет сквозь стены (проба за
-			// стеной подмешивается в сбор на точке попадания) - поле внутри помещений засорялось
-			// солнечным баунсом наружных стен.
+			// Soft backface weight (wrap shading, as in SampleProbeGi): without it multi-bounce
+			// drags light through walls.
 			var probePos = origin + new Vector3(lx + ox, ly + oy, lz + oz) * cell;
 			var toProbe = probePos - pos;
 			float toProbeLen = toProbe.Length();
@@ -1964,9 +1694,7 @@ public sealed class ProbeGiBaker
 		bytes[offset + 1] = (byte)(bits >> 8);
 	}
 
-	/// <summary>Веер Фибоначчи, повёрнутый детерминированной по номеру раунда ориентацией. Без
-	/// поворота каждый раунд стрелял бы ровно в те же направления, и накопление раундов не давало
-	/// бы ничего сверх первого - вся прогрессивность держится на этом повороте.</summary>
+	// Fibonacci fan rotated per round number; progressive accumulation depends on this rotation.
 	private static Vector3[] BuildRotatedFibonacciSphere(int count, int sequence)
 	{
 		var dirs = BuildFibonacciSphere(count);
@@ -1975,9 +1703,7 @@ public sealed class ProbeGiBaker
 			return dirs;
 		}
 
-		// Равномерная ориентация по Шумейку из низкодискрепансной тройки (аддитивная рекуррента на
-		// иррациональных константах: покрывает пространство ориентаций ровнее, чем ГПСЧ, - на
-		// десятке раундов это заметно меньше пятен в поле).
+		// Shoemake uniform orientation from a low-discrepancy triple; fewer blotches than a PRNG.
 		float u1 = Frac(sequence * 0.7548776662f);
 		float u2 = Frac(sequence * 0.5698402909f);
 		float u3 = Frac(sequence * 0.6180339887f);

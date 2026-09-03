@@ -3,19 +3,8 @@ using Hexa.NET.ImGui;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Окно отладки анимации и физики: галочки слоёв дебаг-вида, ручки симуляции и счётчики состояния.
-///
-/// Всё в одном окне намеренно. Анимация и физика в движке связаны насквозь - foot IK стоит на
-/// райкасте, рэгдолл живёт телами, поза персонажа приезжает то из клипа, то из симуляции, - и
-/// вопрос «почему персонаж стоит не так» почти никогда не относится целиком к одной из двух сторон.
-/// Разведя их по двум окнам, пришлось бы держать оба открытыми всегда.
-///
-/// Окно НЕ владеет ничем: галочки пишутся в <see cref="EditorSettings"/>, а вьюпорт перечитывает их
-/// каждый кадр (см. PrefabSceneViewport.BeginDebugFrame). Поэтому закрытое окно ничего не выключает
-/// - включённый слой продолжает рисоваться, и это правильно: дебаг-вид включают, чтобы смотреть на
-/// сцену, а не на окно.
-/// </summary>
+/// <summary>Animation and physics debug window: debug layer toggles, simulation knobs, counters.
+/// Owns nothing - toggles live in <see cref="EditorSettings"/>, so closing it disables nothing.</summary>
 public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 {
 	private readonly EditorSettings _settings;
@@ -34,67 +23,64 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 	{
 		_changed = false;
 
-		if (ImGui.CollapsingHeader("Анимация", ImGuiTreeNodeFlags.DefaultOpen))
+		if (ImGui.CollapsingHeader("Animation", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawAnimationSection();
 		}
 
-		if (ImGui.CollapsingHeader("Физика", ImGuiTreeNodeFlags.DefaultOpen))
+		if (ImGui.CollapsingHeader("Physics", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawPhysicsSection();
 		}
 
-		if (ImGui.CollapsingHeader("Симуляция", ImGuiTreeNodeFlags.DefaultOpen))
+		if (ImGui.CollapsingHeader("Simulation", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawSimulationSection();
 		}
 
-		if (ImGui.CollapsingHeader("Состояние", ImGuiTreeNodeFlags.DefaultOpen))
+		if (ImGui.CollapsingHeader("State", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawStateSection();
 		}
 
-		if (ImGui.CollapsingHeader("Легенда"))
+		if (ImGui.CollapsingHeader("Legend"))
 		{
 			DrawLegendSection();
 		}
 
-		// Запись на диск - после отпускания контрола, а не на каждый тик драга: то же правило, что в
-		// окне Graphics.
+		// Save once the control is released, not on every drag tick.
 		if (_changed && !ImGui.IsAnyItemActive())
 		{
 			_settings.Save();
 		}
 	}
 
-	// --- Секции ----------------------------------------------------------------------------------
-
 	private void DrawAnimationSection()
 	{
 		var options = _settings.AnimationDebug;
 
-		_changed |= ImGui.Checkbox("Скелет", ref options.Skeleton);
-		Hint("Кости октаэдрами. Оранжевая кость - её позу задаёт физика, голубая - анимация.");
+		_changed |= ImGui.Checkbox("Skeleton", ref options.Skeleton);
+		Hint("Bones as octahedra. Orange bone - its pose is driven by physics, cyan - by animation.");
 
-		_changed |= ImGui.Checkbox("Оси суставов", ref options.JointAxes);
-		Hint("X красная, Y зелёная, Z синяя. Показывают перекрут кости вокруг собственной оси - " +
-			"ошибку, невидимую на «палочках» скелета.");
+		_changed |= ImGui.Checkbox("Joint axes", ref options.JointAxes);
+		Hint("X red, Y green, Z blue. They show a bone twisted around its own axis - " +
+			"an error the skeleton's \"sticks\" cannot reveal.");
 
-		_changed |= ImGui.Checkbox("Имена костей", ref options.JointNames);
-		Hint("Подписи поверх вьюпорта - ими заполняют поля компонентов, где кости задаются строками.");
+		_changed |= ImGui.Checkbox("Bone names", ref options.JointNames);
+		Hint("Labels over the viewport - use them to fill component fields that name bones as strings.");
 
-		_changed |= ImGui.Checkbox("Bind-поза", ref options.BindPose);
-		Hint("Серым поверх текущей позы: отличает «поза не применилась» от «применилась, но не та».");
+		_changed |= ImGui.Checkbox("Bind pose", ref options.BindPose);
+		Hint("Grey over the current pose: tells \"pose was not applied\" from \"applied, but the wrong one\".");
 
 		_changed |= ImGui.Checkbox("Foot IK", ref options.FootIk);
-		Hint("Цепочки ног и подошвы. Красный - солвер в этом кадре НЕ применился " +
-			"(нет нативного ozz, нет физики или не найдены кости).");
+		Hint("Leg chains and soles. Red - the solver did NOT run this frame " +
+			"(no native ozz, no physics, or bones not found).");
 
 		_changed |= ImGui.Checkbox("Spring bones", ref options.SpringChains);
 		_changed |= ImGui.Checkbox("Look-at", ref options.LookAt);
 
-		_changed |= ImGui.Checkbox("Поверх геометрии##anim", ref options.OnTop);
-		Hint("Без депт-теста. Почти всегда нужно именно так: скелет целиком внутри меша.");
+		_changed |= ImGui.Checkbox("On top of geometry##anim", ref options.OnTop);
+		Hint("No depth test. Almost always what you want: the skeleton sits entirely inside the mesh.");
 
 		_settings.AnimationDebug = options;
 	}
@@ -103,39 +89,37 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 	{
 		var options = _settings.PhysicsDebug;
 
-		_changed |= ImGui.Checkbox("Коллайдеры тел", ref options.Colliders);
-		Hint("Каркасы по ФАКТИЧЕСКИМ формам из реестра симуляции, а не по тому, что заказывали.");
+		_changed |= ImGui.Checkbox("Body colliders", ref options.Colliders);
+		Hint("Wireframes of the ACTUAL shapes from the simulation registry, not of what was requested.");
 
-		_changed |= ImGui.Checkbox("Статика сцены", ref options.Statics);
-		Hint("Меш статики рисуется габаритной коробкой: каркас по треугольникам уровня закрасил бы экран.");
+		_changed |= ImGui.Checkbox("Scene statics", ref options.Statics);
+		Hint("A static mesh is drawn as its bounding box: a wireframe over level triangles would fill the screen.");
 
-		_changed |= ImGui.Checkbox("Контакты", ref options.Contacts);
-		Hint("Стоит работы в узкой фазе - включается только этой галочкой. Длина стрелки - глубина проникновения.");
+		_changed |= ImGui.Checkbox("Contacts", ref options.Contacts);
+		Hint("Costs narrow-phase work - only this checkbox enables it. Arrow length is penetration depth.");
 
-		_changed |= ImGui.Checkbox("Райкасты", ref options.Rays);
-		Hint("Лучи кадра, в первую очередь лучи foot IK. Серый луч - промах.");
+		_changed |= ImGui.Checkbox("Raycasts", ref options.Rays);
+		Hint("This frame's rays, foot IK rays above all. A grey ray is a miss.");
 
-		_changed |= ImGui.Checkbox("Скорости", ref options.Velocities);
-		Hint("Зелёная стрелка - линейная скорость, лиловая - угловая. Длина в единицах мира за секунду.");
+		_changed |= ImGui.Checkbox("Velocities", ref options.Velocities);
+		Hint("Green arrow - linear velocity, purple - angular. Length in world units per second.");
 
-		_changed |= ImGui.Checkbox("Суставы рэгдолла", ref options.RagdollJoints);
+		_changed |= ImGui.Checkbox("Ragdoll joints", ref options.RagdollJoints);
 
-		// Галочка положительная, поле - от обратного (см. PhysicsDebugOptions.CollidersDepthTested:
-		// полезное поведение обязано совпадать с нулевым значением, иначе дефолт не переживает
-		// чтения старого файла настроек). Разворот делается здесь, в одном месте.
+		// The stored field is inverted so its default(false) is the useful behaviour.
 		bool collidersOnTop = !options.CollidersDepthTested;
-		if (ImGui.Checkbox("Коллайдеры поверх геометрии##collidersontop", ref collidersOnTop))
+		if (ImGui.Checkbox("Colliders on top of geometry##collidersontop", ref collidersOnTop))
 		{
 			options.CollidersDepthTested = !collidersOnTop;
 			_changed = true;
 		}
 
-		Hint("Без депт-теста, как у скелета. Коллайдер персонажа целиком ВНУТРИ меша - с депт-тестом " +
-			"его не видно вовсе, а вопрос к этой галочке обычно именно про капсулы.");
+		Hint("No depth test, same as the skeleton. A character's collider sits entirely INSIDE the mesh - " +
+			"with depth testing it is invisible, and this checkbox is usually asked about capsules.");
 
-		_changed |= ImGui.Checkbox("Остальное поверх геометрии##phys", ref options.OnTop);
-		Hint("Статика, контакты, лучи, скорости, суставы. Отдельно от коллайдеров: они живут снаружи " +
-			"мешей, и «поверх всего» превращает их в сетку по всему экрану.");
+		_changed |= ImGui.Checkbox("Everything else on top of geometry##phys", ref options.OnTop);
+		Hint("Statics, contacts, rays, velocities, joints. Separate from colliders: these live outside " +
+			"meshes, and \"on top of everything\" turns them into a mesh covering the whole screen.");
 
 		_settings.PhysicsDebug = options;
 	}
@@ -143,55 +127,52 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 	private void DrawSimulationSection()
 	{
 		bool enabled = _settings.ScenePhysicsEnabled;
-		if (ImGui.Checkbox("Физика в сцене", ref enabled))
+		if (ImGui.Checkbox("Physics in scene", ref enabled))
 		{
 			_settings.ScenePhysicsEnabled = enabled;
 			_changed = true;
 		}
 
-		Hint("Мир всё равно заводится лениво - под персонажа с foot IK/рэгдоллом/Character Body или " +
-			"под включённый дебаг физики. Эта галочка выключает его насовсем.");
+		Hint("The world is created lazily anyway - for a character with foot IK/ragdoll/Character Body, or " +
+			"for enabled physics debug. This checkbox disables it for good.");
 
-		// Главное, что нужно знать про физику в редакторе, и по галочкам этого не видно: мир стоит,
-		// пока не нажат Play. Без этой строки «физика не работает» и «игра не запущена» - один и тот
-		// же экран.
 		ImGui.TextDisabled(_viewport.ScriptCharacterStatus.Playing
-			? "Идёт Play: симуляция и анимация работают."
-			: "Play не запущен: мир заведён, но НЕ ШАГАЕТ, и анимация стоит на месте.");
+			? "Play is running: simulation and animation are live."
+			: "Play is not running: the world exists but does NOT STEP, and animation stands still.");
 
 		bool paused = _settings.ScenePhysicsPaused;
-		if (ImGui.Checkbox("Пауза", ref paused))
+		if (ImGui.Checkbox("Pause", ref paused))
 		{
 			_settings.ScenePhysicsPaused = paused;
 			_changed = true;
 		}
 
 		float timeScale = _settings.ScenePhysicsTimeScale;
-		if (ImGui.SliderFloat("Масштаб времени", ref timeScale, 0.01f, 2f))
+		if (ImGui.SliderFloat("Time scale", ref timeScale, 0.01f, 2f))
 		{
 			_settings.ScenePhysicsTimeScale = timeScale;
 			_changed = true;
 		}
 
 		float gravity = _settings.SceneGravity;
-		if (ImGui.SliderFloat("Гравитация (Y)", ref gravity, -200f, 0f))
+		if (ImGui.SliderFloat("Gravity (Y)", ref gravity, -200f, 0f))
 		{
 			_settings.SceneGravity = gravity;
 			_changed = true;
 		}
 
-		Hint("В единицах МИРА, а не в метрах: масштаб моделей произволен, и -9.81 осмысленно ровно " +
-			"для метрового персонажа. Применяется при следующем создании мира.");
+		Hint("In WORLD units, not metres: model scale is arbitrary, and -9.81 is meaningful exactly " +
+			"for a one-metre character. Applied the next time the world is created.");
 
 		float intensity = _settings.DebugLineIntensity;
-		if (ImGui.SliderFloat("Яркость линий", ref intensity, 0.5f, 20f))
+		if (ImGui.SliderFloat("Line brightness", ref intensity, 0.5f, 20f))
 		{
 			_settings.DebugLineIntensity = intensity;
 			_changed = true;
 		}
 
-		Hint("Линии пишутся в HDR-таргет ДО тонемапа, экспозиция которого заранее неизвестна - " +
-			"на очень яркой или очень тёмной сцене яркость правится здесь.");
+		Hint("Lines are written to the HDR target BEFORE tonemapping, whose exposure is not known in advance - " +
+			"on a very bright or very dark scene, adjust brightness here.");
 	}
 
 	private void DrawStateSection()
@@ -200,21 +181,21 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 
 		if (physics == null)
 		{
-			ImGui.TextDisabled("Физики в сцене нет.");
-			ImGui.TextWrapped("Мир заводится, когда в сцене появляется персонаж с компонентом " +
-				"Foot IK, Ragdoll или Character Body, либо когда включён любой слой дебага физики.");
+			ImGui.TextDisabled("No physics in the scene.");
+			ImGui.TextWrapped("The world is created when the scene gets a character with a " +
+				"Foot IK, Ragdoll or Character Body component, or when any physics debug layer is enabled.");
 		}
 		else
 		{
-			ImGui.Text($"Тел: {physics.BodyCount} (спит {physics.SleepingBodyCount})");
-			ImGui.Text($"Треугольников статики: {physics.StaticTriangleCount}");
-			ImGui.Text($"Шагов за кадр: {physics.LastStepCount} за {physics.LastStepMilliseconds:0.00} мс");
-			ImGui.Text($"Райкастов за кадр: {physics.RayCastsThisFrame}");
+			ImGui.Text($"Bodies: {physics.BodyCount} ({physics.SleepingBodyCount} asleep)");
+			ImGui.Text($"Static triangles: {physics.StaticTriangleCount}");
+			ImGui.Text($"Steps per frame: {physics.LastStepCount} in {physics.LastStepMilliseconds:0.00} ms");
+			ImGui.Text($"Raycasts per frame: {physics.RayCastsThisFrame}");
 
 			var contacts = physics.World.Contacts;
 			ImGui.Text(contacts.Enabled
-				? $"Контактов: {contacts.Contacts.Count}" + (contacts.Dropped > 0 ? $" (+{contacts.Dropped} отброшено)" : "")
-				: "Контакты не собираются");
+				? $"Contacts: {contacts.Contacts.Count}" + (contacts.Dropped > 0 ? $" (+{contacts.Dropped} dropped)" : "")
+				: "Contacts are not collected");
 		}
 
 		DrawScriptCharacters();
@@ -222,13 +203,11 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 		ImGui.Separator();
 
 		var stats = _viewport.DebugLineStats;
-		ImGui.Text($"Дебаг-линий (вершин): {stats.Vertices}");
+		ImGui.Text($"Debug lines (vertices): {stats.Vertices}");
 		if (stats.Overflowed)
 		{
-			// Молчать здесь нельзя: обрезанный вид неотличим от полного, и «дальше ничего нет»
-			// выглядит как ответ на вопрос, ради которого дебаг и включали.
 			ImGui.TextColored(new System.Numerics.Vector4(1f, 0.5f, 0.2f, 1f),
-				"Упёрлись в потолок вершин - показано НЕ ВСЁ.");
+				"Hit the vertex ceiling - NOT everything is shown.");
 		}
 
 		ImGui.Separator();
@@ -236,7 +215,7 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 		var characters = _viewport.DebugCharacters;
 		if (characters.Count == 0)
 		{
-			ImGui.TextDisabled("Скиннед-персонажей в сцене нет.");
+			ImGui.TextDisabled("No skinned characters in the scene.");
 			return;
 		}
 
@@ -244,102 +223,93 @@ public class AnimationPhysicsDebugWindow : ImGuiDockingWindow
 		{
 			var character = characters[i];
 
-			if (!ImGui.TreeNodeEx($"Сущность {character.EntityId}##character{i}",
+			if (!ImGui.TreeNodeEx($"Entity {character.EntityId}##character{i}",
 				ImGuiTreeNodeFlags.DefaultOpen))
 			{
 				continue;
 			}
 
-			ImGui.Text($"Клип: {character.Clip}{(character.Playing ? "" : " (не найден)")}");
+			ImGui.Text($"Clip: {character.Clip}{(character.Playing ? "" : " (not found)")}");
 			ImGui.Text(character.Locomotion
-				? $"Локомоушен: {character.LocoSpeed:0.00} м/с - стойка {character.LocoIdleWeight:0.00} / " +
-					$"шаг {character.LocoWalkWeight:0.00} / бег {character.LocoRunWeight:0.00}, " +
-					$"фазы аллюра {character.LocoWalkPhaseOffset:0.00}/{character.LocoRunPhaseOffset:0.00}"
-				: "Локомоушен: нет (позу ведёт Animator)");
-			ImGui.Text($"Время: {character.Time:0.000} с");
-			ImGui.Text($"Суставов: {character.JointCount}");
-			ImGui.Text($"Ног IK: {character.LegCount} - {(character.IkApplied ? "применён" : "не применён")}");
-			ImGui.Text($"Цепочек spring bones: {character.ChainCount}");
+				? $"Locomotion: {character.LocoSpeed:0.00} m/s - idle {character.LocoIdleWeight:0.00} / " +
+					$"walk {character.LocoWalkWeight:0.00} / run {character.LocoRunWeight:0.00}, " +
+					$"gait phases {character.LocoWalkPhaseOffset:0.00}/{character.LocoRunPhaseOffset:0.00}"
+				: "Locomotion: none (pose driven by Animator)");
+			ImGui.Text($"Time: {character.Time:0.000} s");
+			ImGui.Text($"Joints: {character.JointCount}");
+			ImGui.Text($"IK legs: {character.LegCount} - {(character.IkApplied ? "applied" : "not applied")}");
+			ImGui.Text($"Spring bone chains: {character.ChainCount}");
 			ImGui.Text(character.RagdollBones > 0
-				? $"Рэгдолл: {character.RagdollBones} костей, {(character.RagdollPhysical ? "физика" : "анимация")}"
-				: "Рэгдолл: нет");
+				? $"Ragdoll: {character.RagdollBones} bones, {(character.RagdollPhysical ? "physics" : "animation")}"
+				: "Ragdoll: none");
 			if (character.ReactionWeight > 0f)
 			{
-				ImGui.Text($"Хит-реакция: вес {character.ReactionWeight:0.00}, " +
-					$"отклонение {character.ReactionDeviation:0.##} ед. модели");
+				ImGui.Text($"Hit reaction: weight {character.ReactionWeight:0.00}, " +
+					$"deviation {character.ReactionDeviation:0.##} model units");
 			}
 
 			ImGui.TreePop();
 		}
 	}
 
-	/// <summary>
-	/// Персонажи под управлением геймплейных скриптов (Character Body + скрипт движения).
-	///
-	/// Строка нужна ровно потому, что стоящий персонаж выглядит одинаково при ЧЕТЫРЁХ разных
-	/// причинах: игра не запущена, физика выключена галочкой, компонент тела не доехал (например,
-	/// сцена сгенерирована старой версией редактора) или тело есть и просто упёрлось. Разбирать это
-	/// по коду дороже, чем вывести четыре числа.
-	/// </summary>
 	private void DrawScriptCharacters()
 	{
 		ImGui.Separator();
 
 		var status = _viewport.ScriptCharacterStatus;
 
-		ImGui.Text($"Скриптов движения: {status.Scripts}, из них с Character Body: {status.WithBody}");
-		ImGui.Text($"Заведено тел: {status.Bodies}, Play: {(status.Playing ? "идёт" : "не запущен")}");
+		ImGui.Text($"Motion scripts: {status.Scripts}, of them with Character Body: {status.WithBody}");
+		ImGui.Text($"Bodies created: {status.Bodies}, Play: {(status.Playing ? "running" : "not running")}");
+
+		if (status.FloorRescues > 0)
+		{
+			ImGui.TextColored(new System.Numerics.Vector4(1f, 0.75f, 0.35f, 1f),
+				$"Rescues from below the floor: {status.FloorRescues} (see Console)");
+		}
 
 		if (status.Scripts == 0)
 		{
-			ImGui.TextDisabled("В сцене нет сущностей со скриптом движения.");
+			ImGui.TextDisabled("No entities with a motion script in the scene.");
 			return;
 		}
 
 		if (!status.Playing)
 		{
-			ImGui.TextDisabled("Скрипты идут только в Play Mode - жми Play в инспекторе.");
+			ImGui.TextDisabled("Scripts only run in Play Mode - hit Play in the inspector.");
 		}
 		else if (status.WithBody == 0)
 		{
-			ImGui.TextDisabled("Тела нет - персонаж идёт трансформом и проходит сквозь геометрию. " +
-				"Добавь Character Body (или пересоздай сцену, если она старая).");
+			ImGui.TextDisabled("No body - the character moves by transform and passes through geometry. " +
+				"Add a Character Body (or recreate the scene if it is an old one).");
 		}
 		else if (!status.HasPhysics)
 		{
-			ImGui.TextDisabled("Физики в сцене нет - персонаж с телом стоять и будет. " +
-				"Включи «Физика в сцене» выше.");
+			ImGui.TextDisabled("No physics in the scene - a character with a body will just stand there. " +
+				"Enable \"Physics in scene\" above.");
 		}
 		else if (status.Paused)
 		{
-			// Пауза - самая обманчивая из причин: физика включена, тело заведено, скрипт исправно
-			// задаёт ему скорость - и ничего не происходит, потому что мир не шагает.
-			ImGui.TextDisabled("Симуляция НА ПАУЗЕ - скорость телу задаётся, но мир не шагает. " +
-				"Сними галочку «Пауза» выше.");
+			ImGui.TextDisabled("Simulation is PAUSED - velocity is set on the body, but the world does not step. " +
+				"Clear the \"Pause\" checkbox above.");
 		}
 		else if (status.Bodies < status.WithBody)
 		{
-			ImGui.TextDisabled("Тело заведено не на всех: проверь радиус круга (нулевой отключает скрипт).");
+			ImGui.TextDisabled("Not everyone got a body: check the circle radius (zero disables the script).");
 		}
 	}
 
-	/// <summary>Легенда цветов. Не украшение: цвет здесь - единственная кодировка состояния, и без
-	/// расшифровки «серая капсула» читается как «капсула», а не как «тело спит».</summary>
 	private static void DrawLegendSection()
 	{
-		ImGui.BulletText("Оранжевый - динамическое тело (и кость, которой управляет физика)");
-		ImGui.BulletText("Голубой - кинематика; кость, которой управляет анимация; нормаль поверхности");
-		ImGui.BulletText("Серый - тело спит; bind-поза; луч, ничего не задевший");
-		ImGui.BulletText("Синий - статика сцены");
-		ImGui.BulletText("Жёлтый - контакт со статикой; связь рэгдолла; корень скелета");
-		ImGui.BulletText("Красный - контакт двух тел; foot IK не применился");
-		ImGui.BulletText("Зелёный - цепочка spring bones; линейная скорость; попавшая часть луча");
-		ImGui.BulletText("Лиловый - цель look-at; угловая скорость; форма, которую дебаг рисовать не умеет");
+		ImGui.BulletText("Orange - dynamic body (and a bone driven by physics)");
+		ImGui.BulletText("Cyan - kinematic; a bone driven by animation; surface normal");
+		ImGui.BulletText("Grey - body asleep; bind pose; a ray that hit nothing");
+		ImGui.BulletText("Blue - scene statics");
+		ImGui.BulletText("Yellow - contact with statics; ragdoll link; skeleton root");
+		ImGui.BulletText("Red - contact between two bodies; foot IK not applied");
+		ImGui.BulletText("Green - spring bone chain; linear velocity; the hit part of a ray");
+		ImGui.BulletText("Purple - look-at target; angular velocity; a shape the debug draw cannot render");
 	}
 
-	/// <summary>Подсказка мелким серым под контролом. Именно текстом, а не всплывающей: половина
-	/// галочек здесь стоит денег или имеет неочевидную цену, и узнавать об этом наведением мыши
-	/// пришлось бы по одной.</summary>
 	private static void Hint(string text)
 	{
 		ImGui.PushStyleColor(ImGuiCol.Text, new System.Numerics.Vector4(0.6f, 0.6f, 0.62f, 1f));

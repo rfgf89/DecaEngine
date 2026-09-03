@@ -19,36 +19,23 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 	private string _validationMessage = "";
 	private OpenFolderDialog? _saveFileDialog;
 
-	/// <summary>
-	/// Идущее создание проекта. В ФОНЕ, потому что оно запускает dotnet десяток раз и занимает
-	/// секунды: синхронный вызов прямо из отрисовки останавливал не модалку, а ВЕСЬ редактор -
-	/// кадры не шли, окно переставало отвечать, и снаружи это неотличимо от зависания.
-	///
-	/// Фоновый поток здесь безопасен: сборщик не трогает ни ImGui, ни сцену, а журнал редактора
-	/// потокобезопасен (см. EngineLog.AddInternal - запись под замком).
-	/// </summary>
+	// Runs off the render thread: the build shells out to dotnet and takes seconds. Safe because
+	// the builder touches neither ImGui nor the scene, and EngineLog is thread-safe.
 	private Task<string>? _buildTask;
 
-	/// <summary>Имя проекта, который сейчас создаётся, - для сообщения о ходе: поля к этому моменту
-	/// уже могут быть сброшены.</summary>
+	// Kept separately: the form fields may already be reset while the build runs.
 	private string _buildingName = "";
 
-	/// <summary>
-	/// Шаблоны, КОТОРЫЕ ЕСТЬ. Раньше список был декоративным: «2D Game» и «UI Framework» создавали
-	/// ровно тот же пустой проект, что и «Empty», потому что сборщик про выбор не знал вовсе.
-	/// Пункт, который ничего не делает, хуже его отсутствия - он обещает содержимое, которого нет, и
-	/// разбираться, почему проект пустой, идут в ассеты, а не в список шаблонов.
-	/// </summary>
 	private readonly (ProjectTemplate Template, string Title, string Description, string Details)[] _templates =
 	{
 		(ProjectTemplate.Empty, "Empty Project",
-			"Только код: игровой класс и хост. Ассетов нет.",
-			"Пустая сцена"),
+			"Code only: a game class and a host. No assets.",
+			"Empty scene"),
 		(ProjectTemplate.AnimationSample, "Animation Sample",
-			"Демо-сцена анимации и физики: площадка со ступенями и пандусом, четыре персонажа " +
-			"(клип со spring bones и look-at, foot IK на ступенях, тряпичный и active рэгдолл), " +
-			"spot и point со тенями.",
-			"Ground.glb + Fox.glb + префаб сцены"),
+			"Animation and physics demo scene: a ground with steps and a ramp, four characters " +
+			"(a clip with spring bones and look-at, foot IK on steps, a limp and an active ragdoll), " +
+			"a spot and a point light with shadows.",
+			"Ground.glb + Fox.glb + scene prefab"),
 	};
 
 	public ModalNewProjectWindow(string title, ImGuiRender imGuiRender) : base(title, imGuiRender)
@@ -62,33 +49,27 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 
 		PollBuild();
 
-		// Пока идёт создание, форма заблокирована целиком: правка полей на него уже не влияет, а
-		// повторное нажатие «Create Project» запустило бы второй dotnet поверх первого - в тот же
-		// каталог.
+		// The whole form is disabled while building: a second Create would run dotnet over the first.
 		ImGui.BeginDisabled(_saveFileDialog != null || _buildTask != null);
 
 		ImGui.Text("Create a new project by filling in the details below:");
 		ImGui.Separator();
 
-		// Calculate available space for content (excluding buttons at bottom)
 		var availableSpace = ImGui.GetContentRegionAvail();
-		float buttonAreaHeight = 35 * _scale; // Height for buttons and spacing
+		float buttonAreaHeight = 35 * _scale;
 		var contentHeight = (availableSpace.Y - buttonAreaHeight - 5 * _scale);
-		// Left column - main settings
 		var columnWidth = availableSpace.X * 0.4f;
 		ImGui.BeginChild("LeftPanel", new Vector2(columnWidth, contentHeight), ImGuiChildFlags.Borders);
 		{
 			ImGui.TextColored(new Vector4(0.7f, 0.7f, 1.0f, 1.0f), "Project Settings");
 			ImGui.Spacing();
 
-			// Project name
 			ImGui.Text("Project Name:");
 			ImGui.SetNextItemWidth(-1);
 			if (ImGui.InputText("##ProjectName", ref _projectName, 256)) ValidateProjectName();
 
 			ImGui.Spacing();
 
-			// Project description
 			ImGui.Text("Description:");
 			ImGui.SetNextItemWidth(-1);
 			ImGui.InputTextMultiline("##ProjectDescription", ref _projectDescription, 512, new Vector2(-1, 196 * _scale), ImGuiInputTextFlags.WordWrap);
@@ -97,7 +78,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			ImGui.Separator();
 			ImGui.Spacing();
 
-			// Save location
 			ImGui.Text("Save Location:");
 			ImGui.SetNextItemWidth((-1 - 164) * _scale);
 			ImGui.InputText("##ProjectPath", ref _projectPath, 512);
@@ -112,7 +92,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			ImGui.Separator();
 			ImGui.Spacing();
 
-			// Options
 			ImGui.TextColored(EditorSelectionStyle.Accent, "Options");
 			ImGui.Spacing();
 
@@ -128,14 +107,12 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 		}
 		ImGui.EndChild();
 
-		// Right column - template selection
 		ImGui.SameLine();
 		ImGui.BeginChild("RightPanel", new Vector2(0, contentHeight), ImGuiChildFlags.Borders);
 		{
 			ImGui.TextColored(new Vector4(0.7f, 0.7f, 1.0f, 1.0f), "Project Templates");
 			ImGui.Spacing();
 
-			// Template cards layout
 			if (ImGui.BeginListBox("##TemplatesCards", new Vector2(-1, 300 * _scale)))
 			{
 				ImGui.Spacing();
@@ -143,7 +120,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 				{
 					var isSelected = _selectedTemplateIndex == i;
 
-					// Template card
 					ImGui.BeginGroup();
 					{
 						ImGui.PushStyleColor(ImGuiCol.Button, isSelected ? new Vector4(0.3f, 0.5f, 0.9f, 0.8f) : new Vector4(0.2f, 0.2f, 0.2f, 0.6f));
@@ -167,7 +143,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 			ImGui.Separator();
 			ImGui.Spacing();
 
-			// Template preview panel
 			ImGui.TextColored(EditorSelectionStyle.Accent, "Template Details");
 			ImGui.Spacing();
 
@@ -181,7 +156,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 				ImGui.Separator();
 				ImGui.Spacing();
 
-				// Description with better formatting
 				ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "Description:");
 				ImGui.TextWrapped(selected.Description);
 
@@ -189,7 +163,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 				ImGui.Separator();
 				ImGui.Spacing();
 
-				// Template info
 				ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "Details:");
 				ImGui.BulletText($"Assets: {selected.Details}");
 			}
@@ -199,7 +172,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 
 		ImGui.Spacing();
 
-		// Validation message
 		if (!string.IsNullOrEmpty(_validationMessage))
 		{
 			ImGui.TextColored(new Vector4(1.0f, 0.7f, 0.7f, _validationAlpha), _validationMessage);
@@ -207,16 +179,13 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 
 		if (_buildTask != null)
 		{
-			// Явное сообщение о ходе - не украшение: создание идёт секунды, и без него единственный
-			// признак работы - это то, что окно не закрылось, а он читается как «кнопка не нажалась».
 			ImGui.TextColored(EditorSelectionStyle.Accent,
-				$"Создаётся проект '{_buildingName}' - идёт восстановление пакетов и ссылок...");
-			ImGui.TextDisabled("Подробности - в окне Console.");
+				$"Creating project '{_buildingName}' - restoring packages and references...");
+			ImGui.TextDisabled("Details are in the Console window.");
 		}
 
 		ImGui.Spacing();
 
-		// Action buttons
 		var buttonWidth = ((ImGui.GetContentRegionAvail().X - 10) / 3);
 
 		if (ImGui.Button("Create Project", new Vector2(buttonWidth, 0)))
@@ -231,7 +200,6 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 
 		if (ImGui.Button("Load Existing", new Vector2(buttonWidth, 0)))
 		{
-			// Open dialog to load existing project
 		}
 
 		ImGui.SameLine(0, 5 * _scale);
@@ -256,9 +224,7 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 		}
 	}
 
-	/// <summary>Запускает создание проекта в фоне. Значения полей СНИМАЮТСЯ здесь, до старта: форма
-	/// заблокирована, но копировать её состояние в замыкание надёжнее, чем полагаться на
-	/// блокировку.</summary>
+	// Field values are snapshotted here rather than read from the closure while the build runs.
 	private void StartBuild()
 	{
 		string name = _projectName;
@@ -268,18 +234,14 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 		_buildingName = name;
 		_validationMessage = "";
 
-		EngineLog.Add(LogLevel.Info, $"Создание проекта '{name}' в {path} ...");
+		EngineLog.Add(LogLevel.Info, $"Creating project '{name}' in {path} ...");
 
-		// Ход генерации - в консоль РЕДАКТОРА: сборщик умеет сообщать о проблемах («модель не
-		// найдена», «площадка не собралась»), и в редакторе их читают там, а не в стандартном
-		// выводе процесса.
+		// Progress goes to the editor console, not stdout: that is where it gets read.
 		_buildTask = Task.Run(() => _editorBuilder.Build(name, path, template,
 			message => EngineLog.Add(LogLevel.Info, message)));
 	}
 
-	/// <summary>Проверяет, не закончилось ли создание. Результат разбирается ЗДЕСЬ, в потоке
-	/// отрисовки: закрытие модалки и правка полей - работа UI, и делать её из фонового потока
-	/// нельзя.</summary>
+	// The result is handled on the render thread: closing the modal and editing fields is UI work.
 	private void PollBuild()
 	{
 		if (_buildTask is not { IsCompleted: true })
@@ -292,15 +254,14 @@ public class ModalNewProjectWindow : ImGuiModalWindow
 
 		if (task.IsFaulted)
 		{
-			// Модалка НЕ закрывается: пути и имя остаются на месте, чтобы можно было поправить и
-			// повторить, не набирая всё заново.
+			// The modal stays open so the name and path can be fixed and retried.
 			var error = task.Exception?.GetBaseException();
-			_validationMessage = $"Не удалось создать проект: {error?.Message}";
+			_validationMessage = $"Failed to create project: {error?.Message}";
 			EngineLog.Add(LogLevel.Error, error?.ToString() ?? "Project creation failed");
 			return;
 		}
 
-		EngineLog.Add(LogLevel.Info, $"Проект создан: {task.Result}");
+		EngineLog.Add(LogLevel.Info, $"Project created: {task.Result}");
 
 		Close();
 		ResetFields();

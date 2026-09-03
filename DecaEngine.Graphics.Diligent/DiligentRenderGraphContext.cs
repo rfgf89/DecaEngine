@@ -50,9 +50,7 @@ public class DiligentRenderGraphContext : IRenderGraphContext
 		var nativeTexture = _builder.GetTexture(textureResource.Id);
 		var textureInfo = _builder.GetTextureInfo(textureResource.Id);
 
-		// A fresh DiligentGpuTexture wrapper around the graph's native ITexture: it lazily creates its
-		// own SRV/UAV/RTV views on demand (same as any other IGpuTexture), independent of the specific
-		// RTV/DSV/SRV view the graph itself already created for SetRenderTargets/ClearRenderTarget.
+		// Wrapper creates its own lazy views, independent of the views the graph already made.
 		return new DiligentGpuTexture(textureInfo.name, textureInfo, nativeTexture);
 	}
 
@@ -61,8 +59,7 @@ public class DiligentRenderGraphContext : IRenderGraphContext
 		var nativeBuffer = _builder.GetBuffer(bufferResource.Id);
 		var pinnedInfo = _builder.GetBufferInfo(bufferResource.Id);
 
-		// Wraps the graph-owned native buffer without allocating a new one, so it flows through the
-		// same DiligentCommandBuffer/DiligentMaterial code paths as any other IBufferHandle.
+		// Wraps the graph-owned native buffer without allocating a new one.
 		return new DiligentBufferHandle(nativeBuffer, pinnedInfo);
 	}
 

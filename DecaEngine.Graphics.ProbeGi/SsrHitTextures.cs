@@ -6,20 +6,7 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Graphics.ProbeGi;
 
-/// <summary>
-/// Набор base color текстур сцены для текстурного альбедо RT-хитов SSR (см.
-/// SsrPassResources.SetHitTextures). Строится из <see cref="ProbeInstancedGeometry.HitTextureKeys"/>
-/// поверх ЖИВЫХ ModelLoader-ов (ключи переживают дисковый кеш BVH, GPU-объекты - нет) и живёт
-/// рядом с accel-ом: пересоздание accel-а пересоздаёт и набор.
-///
-/// Два режима потребления:
-///   - атлас (<see cref="GetAtlas"/>) - Texture2DArray из плиток 128² на материал
-///     (ModelLoader.MaterialAlbedoTile; без CPU-пикселей - плитка среднего цвета текстуры).
-///     Владение атласом здесь: перед Dispose вызывающий ОБЯЗАН вернуть слоты SSR на плейсхолдер;
-///   - bindless (<see cref="GetFullTextures"/>) - полноразмерные GPU-текстуры материалов КАК ЕСТЬ
-///     (владение у моделей). Под стримингом слот начинается 1x1-филлером и дорастает с апгрейдами -
-///     <see cref="RefreshStreams"/> говорит, когда привязку пора перепушить.
-/// </summary>
+/// <summary>Base color textures for SSR ray-hit albedo, tied to the lifetime of the accel.</summary>
 public sealed class SsrHitTextures : IDisposable
 {
 	private readonly (ModelLoader Model, int MaterialId)[] _keys;
@@ -28,9 +15,7 @@ public sealed class SsrHitTextures : IDisposable
 	private bool _atlasFailed;
 	private long _streamStamp;
 
-	/// <summary>Промежуточные плитки bindless-режима (по одной на ключ, ленивые): пока стриминг
-	/// текстуры не завершён, её слот держит ЭТУ текстуру, а не филлер модели - 1x1 белый филлер
-	/// красил бы отражение в белое. Данные - те же, что у слоя атласа.</summary>
+	// Stand-in while a texture streams: the model's 1x1 white filler would whiten reflections.
 	private IGpuTexture?[]? _tileTextures;
 
 	private SsrHitTextures(IGraphicsApi api, (ModelLoader Model, int MaterialId)[] keys)
@@ -40,9 +25,7 @@ public sealed class SsrHitTextures : IDisposable
 		_streamStamp = ComputeStreamStamp();
 	}
 
-	/// <summary>null - у геометрии нет текстурных ключей (или индексы моделей не сшиваются со
-	/// списком - геометрия из чужого кеша), текстурный режим честно остаётся на потриугольном
-	/// альбедо.</summary>
+	/// <summary>Returns null when the geometry has no usable texture keys.</summary>
 	public static SsrHitTextures? Build(IGraphicsApi api, ProbeInstancedGeometry geometry,
 		IReadOnlyList<ModelLoader> models)
 	{
@@ -66,7 +49,7 @@ public sealed class SsrHitTextures : IDisposable
 		return new SsrHitTextures(api, keys);
 	}
 
-	/// <summary>Атлас плиток (ленивая сборка, кешируется). null - бэкенд без Texture2DArray.</summary>
+	/// <summary>Lazily built tile atlas; null on backends without Texture2DArray.</summary>
 	public IGpuTexture? GetAtlas()
 	{
 		if (_atlas != null || _atlasFailed)
@@ -86,16 +69,9 @@ public sealed class SsrHitTextures : IDisposable
 		return _atlas;
 	}
 
-	/// <summary>Живые полноразмерные текстуры для bindless-массива, в порядке индексов. null-слот
-	/// (материал без привязки - не должно случаться, бейкер проверял) добьёт плейсхолдером сам
-	/// SetHitTextures.
-	///
-	/// Стримовая текстура биндится ТОЛЬКО завершённой (Completed): промежуточные ступени стример
-	/// ЗАМЕНЯЕТ, а старую освобождает через считанные тики (ModelStore._retiredTextures,
-	/// RetireTicks = 8), пере-биндя лишь SRB из СВОЕГО списка stream.Bindings - SRB SSR-трейса в
-	/// нём нет, и его дескриптор протухал («невалидные текстуры» в отражениях). Финальная текстура
-	/// больше не заменяется - её держать безопасно; до неё слот стоит на стабильном 1x1-филлере
-	/// binding.Texture (живёт всё время жизни модели).</summary>
+	/// <summary>Full-size material textures for the bindless array, in key order.</summary>
+	// Only Completed streams may be bound: the streamer retires intermediate stages and rebinds
+	// only its own SRBs, so the SSR trace SRB would keep a stale descriptor.
 	public IReadOnlyList<IGpuTexture?> GetFullTextures()
 	{
 		_tileTextures ??= new IGpuTexture?[_keys.Length];
@@ -111,7 +87,6 @@ public sealed class SsrHitTextures : IDisposable
 
 			if (binding.Stream == null)
 			{
-				// Не стримится - текстура создана целиком и живёт со своей моделью.
 				textures[i] = binding.Texture;
 				continue;
 			}
@@ -122,8 +97,7 @@ public sealed class SsrHitTextures : IDisposable
 				continue;
 			}
 
-			// Стриминг ещё идёт - показываем СВОЮ плитку (правильный средний цвет материала
-			// вместо белого 1x1-филлера модели), она переживёт все ступени апгрейда.
+			// Still streaming: our own tile survives every upgrade stage, the model filler does not.
 			_tileTextures[i] ??= _api.CreateTexture2DWithMips($"SSR HitTex Tile {i}",
 				new[] { TilePixels(model, materialId) },
 				ModelLoader.AlbedoTileSize, ModelLoader.AlbedoTileSize);
@@ -133,8 +107,7 @@ public sealed class SsrHitTextures : IDisposable
 		return textures;
 	}
 
-	/// <summary>true - какой-то из стримов ДОЗРЕЛ с прошлой проверки: bindless-привязку пора
-	/// перепушить (слот переезжает с филлера на финальную текстуру). Атласу безразлично.</summary>
+	/// <summary>True when a stream completed since the last call: rebind the bindless array.</summary>
 	public bool RefreshStreams()
 	{
 		long stamp = ComputeStreamStamp();
@@ -163,8 +136,7 @@ public sealed class SsrHitTextures : IDisposable
 		return stamp;
 	}
 
-	/// <summary>Человекочитаемый дамп ключей набора - диагностика «какой индекс какой текстурой
-	/// красится» (CLI-стенд и консоль редактора).</summary>
+	/// <summary>Human-readable dump of the key table for diagnostics.</summary>
 	public IEnumerable<string> DescribeKeys()
 	{
 		for (int i = 0; i < _keys.Length; i++)
@@ -173,7 +145,7 @@ public sealed class SsrHitTextures : IDisposable
 			string state;
 			if (!model.MaterialBaseColor.TryGetValue(materialId, out var binding))
 			{
-				state = "НЕТ ПРИВЯЗКИ";
+				state = "NO BINDING";
 			}
 			else if (binding.Stream == null)
 			{
@@ -190,14 +162,11 @@ public sealed class SsrHitTextures : IDisposable
 		}
 	}
 
-	/// <summary>Пиксели плитки материала: честный даунсемпл base color текстуры, если CPU-пиксели
-	/// были живы при загрузке, иначе - сплошной средний цвет.</summary>
 	private static byte[] TilePixels(ModelLoader model, int materialId) =>
 		model.MaterialAlbedoTile.TryGetValue(materialId, out var tile) ? tile : SolidTile(model, materialId);
 
-	/// <summary>Плитка сплошного среднего цвета ТЕКСТУРЫ (без фактора - его умножает шейдер):
-	/// путь стриминга/cooked, где CPU-пикселей для честной плитки не было. AverageBaseColor
-	/// хранится уже умноженным на фактор - делим назад с гардом от нуля.</summary>
+	// Texture average without the base color factor: the shader applies that itself, and
+	// AverageBaseColor is stored pre-multiplied by it.
 	private static byte[] SolidTile(ModelLoader model, int materialId)
 	{
 		var linear = new Vector3(0.5f);
@@ -230,8 +199,7 @@ public sealed class SsrHitTextures : IDisposable
 	private static byte EncodeSrgb(float linear) =>
 		(byte)Math.Clamp((int)(MathF.Pow(Math.Max(linear, 0f), 1f / 2.2f) * 255f + 0.5f), 0, 255);
 
-	/// <summary>Отпускает атлас. Вызывающий ОБЯЗАН сперва вернуть слоты SSR-трейса на плейсхолдер
-	/// (SetHitTextures(null, null)) - SRB иначе держал бы мёртвый view.</summary>
+	/// <summary>Caller must first reset the SSR trace slots via SetHitTextures(null, null).</summary>
 	public void Dispose()
 	{
 		_atlas?.Release();

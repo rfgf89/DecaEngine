@@ -54,13 +54,12 @@ namespace UnsafeCollections.Collections.Unsafe
                 throw new ArgumentOutOfRangeException(nameof(size), string.Format(ThrowHelper.ArgumentOutOfRange_MustBeNonNegNum, nameof(size)));
 
             var sizeOfHeader = Memory.RoundToAlignment(sizeof(UnsafeBitSet), WORD_SIZE);
-            // Round to nearest multiple of 64 bits because that is the size of the buffer
+            // Buffer is stored in 64-bit words; round size up to a multiple of 64 bits.
             var sizeOfBuffer = ((size + 63) >> 6) * 8;
 
             var ptr = Memory.MallocAndZero(sizeOfHeader + sizeOfBuffer);
             var set = (UnsafeBitSet*)ptr;
 
-            // set bit capacity
             set->_sizeBits = size;
             set->_sizeBuckets = size / WORD_SIZE_BITS;
             set->_bits = (ulong*)((byte*)ptr + sizeOfHeader);
@@ -73,10 +72,8 @@ namespace UnsafeCollections.Collections.Unsafe
             if (set == null)
                 return;
 
-            // clear memory
             *set = default;
 
-            // free memory
             Memory.Free(set);
         }
 
@@ -207,7 +204,6 @@ namespace UnsafeCollections.Collections.Unsafe
                 var word64 = set->_bits[i];
                 if (word64 == WORD_ZERO)
                 {
-                    // since we're skipping whole word, step up offset 
                     bitOffset += WORD_SIZE_BITS;
                     continue;
                 }
@@ -240,14 +236,12 @@ namespace UnsafeCollections.Collections.Unsafe
                             if ((word8 & (1 << 7)) == 1 << 7) arrayBuffer[setCount++] = (bitOffset + 7);
                         }
 
-                        // always step up bitoffset here
                         bitOffset += (WORD_SIZE_BITS / 8);
 
                         if (word8Count == 0)
                         {
                             ++word8Count;
 
-                            // go back
                             goto NEXT_WORD8;
                         }
                     }
@@ -260,7 +254,6 @@ namespace UnsafeCollections.Collections.Unsafe
                     {
                         ++word16Count;
 
-                        // go back
                         goto NEXT_WORD16;
                     }
                 }
@@ -273,7 +266,6 @@ namespace UnsafeCollections.Collections.Unsafe
                 {
                     ++word32Count;
 
-                    // go back
                     goto NEXT_WORD32;
                 }
             }

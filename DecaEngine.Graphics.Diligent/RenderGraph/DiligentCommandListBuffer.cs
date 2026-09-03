@@ -10,37 +10,10 @@ using ValueType = Diligent.ValueType;
 namespace DecaEngine.Graphics.Diligent.RenderGraph
 {
     /// <summary>
-    /// ICommandBuffer implementation that records directly into a native Diligent
-    /// *deferred* IDeviceContext instead of a managed command-struct array
-    /// (compare with <see cref="DiligentCommandBuffer"/>), then submits the
-    /// resulting native <see cref="ICommandList"/> on <see cref="Execute"/>.
-    ///
-    /// Use this instead of <see cref="DiligentCommandBuffer"/> ONLY when you are
-    /// actually recording from multiple threads into separate deferred contexts
-    /// (e.g. the pattern in MultiThreadSample.cs). For the render graph's
-    /// single-threaded, ImmediateContext-based passes, DiligentCommandBuffer is
-    /// already the right tool - it doesn't need a native command list at all.
-    ///
-    /// IMPORTANT Diligent constraints this type must respect:
-    ///  - Deferred contexts must not use RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-    ///    all state transitions are issued explicitly via TransitionResourceStates
-    ///    through the same ResourceStateTracker DiligentCommandBuffer uses, just
-    ///    flushed immediately since there is no later "replay" step here.
-    ///  - A native ICommandList is a ONE-SHOT object (record once -> execute once
-    ///    -> dispose). Diligent's own samples always Dispose() it right after
-    ///    ExecuteCommandLists and call InvalidateState()/FinishFrame() on the
-    ///    deferred context afterwards. Holding on to a finished list across a
-    ///    further Begin() on the same deferred context, or executing it more than
-    ///    once, is undefined behavior in the native API.
-    ///    => Freeze() is intentionally NOT supported here; it throws. If you need
-    ///       "record once, replay every frame" semantics, use
-    ///       DiligentCommandBuffer.Freeze() instead (it replays on a real
-    ///       IDeviceContext each frame from a managed command list, which IS safe).
-    ///  - Recording (BeginRecording..EndRecording) may happen on a worker thread
-    ///    that owns the deferred context. Execute() calls ExecuteCommandLists on
-    ///    the immediate context and MUST be invoked from whichever thread drives
-    ///    that immediate context (mirrors MultiThreadSample.cs: workers finish
-    ///    their command lists, the main thread executes+disposes them all).
+    /// ICommandBuffer recording into a deferred Diligent context; only for multi-threaded
+    /// recording (single-threaded passes should use DiligentCommandBuffer). Deferred contexts
+    /// forbid TRANSITION mode, so states are flushed explicitly via ResourceStateTracker; a
+    /// finished ICommandList is one-shot, and Execute() must run on the immediate-context thread.
     /// </summary>
     public unsafe class DiligentCommandListBuffer : ICommandBuffer
     {
@@ -68,8 +41,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
 
         public void BeginRecording()
         {
-            // A previous list that was recorded but never Execute()'d cannot be
-            // salvaged (see class docs) - drop it rather than leaking the native handle.
+            // A recorded-but-never-executed list cannot be salvaged; drop it, don't leak it.
             _pendingCommandList?.Dispose();
             _pendingCommandList = null;
 
@@ -78,11 +50,7 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _isRecording = true;
         }
 
-        /// <summary>
-        /// Re-points this buffer's *recording* target at a different deferred
-        /// context. The immediate context used for submission in Execute() is
-        /// fixed at construction and does not change.
-        /// </summary>
+        /// <summary>Re-points recording at another deferred context; the submit context is fixed.</summary>
         public void Retarget(IDeviceContext deferredContext)
         {
             _deferredContext = deferredContext;
@@ -95,16 +63,11 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
 
             _pendingCommandList = _deferredContext.FinishCommandList();
 
-            // Bound PSO/RTVs/etc. do not carry over across FinishCommandList; reset
-            // so the next BeginRecording() on this context starts from a clean slate.
+            // Bound state does not survive FinishCommandList; reset for the next recording.
             _deferredContext.InvalidateState();
         }
 
-        /// <summary>
-        /// NOT SUPPORTED. See class remarks: a finished Diligent ICommandList is a
-        /// one-shot object and cannot be cached/replayed across frames the way
-        /// DiligentCommandBuffer's managed command array can.
-        /// </summary>
+        /// <summary>Not supported: a native ICommandList is one-shot; use DiligentCommandBuffer.Freeze.</summary>
         public void Freeze()
         {
             throw new NotSupportedException(
@@ -125,14 +88,10 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _pendingCommandList.Dispose();
             _pendingCommandList = null;
 
-            // Required after FinishCommandList/ExecuteCommandLists so the deferred
-            // context can release its frame-scoped resources (dynamic allocations,
-            // etc.) - mirrors the pattern used in MultiThreadSample.cs.
+            // Required so the deferred context releases its frame-scoped resources.
             _deferredContext.FinishFrame();
             _stateTracker.ResetTransitions();
         }
-
-        // ---- Resource transitions --------------------------------------------------
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void TransitionAndFlush(IDeviceObject? res, global::Diligent.ResourceState state)
@@ -167,14 +126,11 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             });
         }
 
-        /// <summary>Нативные врезки поддержаны только в заморожённом буфере на immediate-контексте
-        /// (см. DiligentCommandBuffer.Callback): FSR пишет в командный лист именно immediate, а
-        /// этот буфер пишет в deferred.</summary>
+        /// <summary>Not supported: native callbacks need the frozen immediate-context buffer.</summary>
         public void Callback(Action callback) =>
             throw new NotSupportedException("Callback commands are only supported by the frozen immediate-context buffer.");
 
-        /// <summary>Как <see cref="Callback"/>: замороженный реплей на immediate-контексте здесь не
-        /// поддержан - см. class remarks у <see cref="Freeze"/>.</summary>
+        /// <summary>Not supported: frozen immediate-context replay only; see <see cref="Freeze"/>.</summary>
         public void ExecuteNested(ICommandBuffer nested, ShadowCascadeSchedule schedule, int cascadeIndex) =>
             throw new NotSupportedException("ExecuteNested commands are only supported by the frozen immediate-context buffer.");
 
@@ -210,8 +166,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             if (texture is DiligentRenderHandle dilHandle) return dilHandle.GetView(type, slice);
             return null;
         }
-
-        // ---- Render targets ---------------------------------------------------------
 
         public void SetBackBufferTarget(IGraphicsApi api)
         {
@@ -255,7 +209,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _deferredContext.SetRenderTargets(rtvs, dsvView, ResourceStateTransitionMode.None);
         }
 
-        /// <summary>См. <see cref="ICommandBuffer.SetRenderTargets"/>.</summary>
         public void SetRenderTargets(IGpuTexture[] rtvs, IGpuTexture dsv)
         {
             var views = new ITextureView?[rtvs.Length];
@@ -284,8 +237,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _deferredContext.ClearDepthStencil(dsvView, flags.ToNative(), depth, stencil, ResourceStateTransitionMode.None);
         }
 
-        // ---- Vertex/index buffers ----------------------------------------------------
-
         public void SetVertexBuffers(uint startSlot, IBufferHandle[] bufferHandles, ulong[] offsets, DecaEngine.Graphics.SetVertexBuffersFlags flags = DecaEngine.Graphics.SetVertexBuffersFlags.None)
         {
             int count = Math.Min(bufferHandles.Length, MaxVertexBuffers);
@@ -307,8 +258,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _deferredContext.SetIndexBuffer(buffer, byteOffset, ResourceStateTransitionMode.None);
         }
 
-        // ---- Viewport ------------------------------------------------------------------
-
         public void SetViewport(uint width, uint height)
         {
             _viewportHelper[0] = new Viewport { Width = width, Height = height, MaxDepth = 1f };
@@ -321,8 +270,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
             _viewportHelper[0] = new Viewport { Width = (uint)s.X, Height = (uint)s.Y, MaxDepth = 1f };
             _deferredContext.SetViewports(_viewportHelper, (uint)s.X, (uint)s.Y);
         }
-
-        // ---- Pipeline / shader resources -----------------------------------------------
 
         public void SetPipelineState(IMaterialObject material)
         {
@@ -343,8 +290,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
         {
             ((DiligentComputeMaterial)material).CommitShaderResources(_deferredContext);
         }
-
-        // ---- Draw / dispatch -------------------------------------------------------------
 
         public void Draw(uint vertexCount, uint startVertex = 0)
         {
@@ -395,8 +340,6 @@ namespace DecaEngine.Graphics.Diligent.RenderGraph
                 ThreadGroupCountZ = threadGroupCountZ
             });
         }
-
-        // ---- Buffer updates ------------------------------------------------------------
 
         public void UpdateBuffer<T>(IBufferHandle buffer, uint offset, T* data) where T : unmanaged
         {

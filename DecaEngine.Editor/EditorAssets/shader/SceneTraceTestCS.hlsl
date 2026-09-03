@@ -1,24 +1,19 @@
-// Сверочный прогон трассировки: тот же набор лучей, что гоняет CPU-трассировщик из ProbeGiBaker,
-// прогоняется через SceneTrace.hlsl, и результаты сравниваются на CPU (см. PreviewProbe). Смысл в
-// том, что CPU-путь уже рабочий и служит эталоном - без такой сверки расхождение в обходе BVH
-// вылезло бы позже, в виде необъяснимо кривого GI.
+// GPU/CPU parity harness: replays the CPU tracer's rays through SceneTrace.hlsl (see PreviewProbe).
 
 #include "SceneTrace.hlsl"
 
 cbuffer TraceTestParams
 {
-    // x = сколько лучей в буферах (хвост последней группы обязан выйти без записи).
+    // x = ray count; threads past it must exit without writing.
     uint4 TraceTestCount;
 };
 
-// xyz = начало луча, w = предельная дальность.
+// xyz = ray origin, w = max distance.
 StructuredBuffer<float4> _TestRayOrigin;
-// xyz = направление (нормализовано вызывающим).
+// xyz = direction, normalized by the caller.
 StructuredBuffer<float4> _TestRayDirection;
 
-// x = дистанция попадания (< 0 - промах), y = 1 при попадании в заднюю грань, zw - резерв.
-// Нормаль и альбедо тут не сверяются: они однозначно выводятся из попавшего треугольника, так что
-// совпадение дистанции уже означает, что обход нашёл ТОТ ЖЕ треугольник.
+// x = hit distance (< 0 miss), y = 1 on backface hit, zw reserved.
 RWStructuredBuffer<float4> _TestResult;
 
 [numthreads(64, 1, 1)]
@@ -35,8 +30,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
 
     SceneHit hit = SceneTraceClosest(origin.xyz, direction, origin.w);
 
-    // z - маркер «шейдер сюда дошёл», w - число узлов BVH, как их видит шейдер. Вместе они
-    // отличают «диспатч не отработал / буфер не привязан» (нули) от «обход отработал, но неверно».
+    // z = shader-reached marker, w = BVH node count as seen by the shader:
+    // distinguishes "dispatch/bind failed" (zeros) from "traversal ran but wrong".
     uint nodeCount, nodeStride;
     _SceneBvhNodes.GetDimensions(nodeCount, nodeStride);
     _TestResult[index] = float4(hit.hit ? hit.t : -1.0, hit.backface ? 1.0 : 0.0,

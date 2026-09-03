@@ -12,27 +12,17 @@ public struct InstanceData
 	public int materialId;
 }
 
-/// <summary>
-/// То, что meshopt-проходы (<see cref="MeshUtility.OptimizeMeshData{T}"/>,
-/// <see cref="MeshUtility.GenerateLodGroupData{T}"/>) обязаны уметь достать из вершины: позицию для
-/// упрощения и UV как атрибут его метрики. Существует ради скиннед-мешей: их вершина - это
-/// <see cref="Vertex"/> ПЛЮС <see cref="SkinVertex"/>, и прогонять её через meshopt нужно ЦЕЛИКОМ.
-///
-/// Иначе не обойтись: и склейка дублей, и упрощение переставляют, схлопывают и выбрасывают вершины,
-/// возвращая таблицы перестановок не для всех проходов (OptimizeVertexFetch переупорядочивает
-/// буфер, ничего не возвращая). Скин-стрим, лежащий параллельным массивом, после такого прохода
-/// разъезжается с геометрией - веса достаются чужим вершинам, и персонаж рвётся в клочья. Склейка
-/// заодно начинает учитывать веса: две вершины с одинаковыми позицией/нормалью/UV, но разными
-/// костями больше не сливаются в одну.
-/// </summary>
+// Skinned vertices must go through meshopt whole: its passes reorder and drop vertices without
+// always returning a remap, so a parallel skin stream would drift out of sync with the geometry.
+/// <summary>What meshopt passes need from a vertex: position to simplify by and UV as a metric attribute.</summary>
 public interface IMeshVertex
 {
 	Vector3 Position { get; }
 	Vector2 TexCoord { get; }
 }
 
-/// <summary>Геометрия + скиннинг одной вершины единым blittable-блоком - только для прогона через
-/// meshopt (см. <see cref="IMeshVertex"/>). В .dmdl и в GPU едет разложенным на два стрима.</summary>
+/// <summary>Geometry plus skinning as one blittable block, used only for meshopt; .dmdl and the GPU
+/// take it as two separate streams.</summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct SkinnedVertex : IMeshVertex
 {
@@ -52,31 +42,13 @@ public struct Vertex : IMeshVertex
 	readonly Vector3 IMeshVertex.Position => Position;
 	readonly Vector2 IMeshVertex.TexCoord => TexCoord;
 
-	/// <summary>
-	/// Per-vertex tangent, xyz = направление роста U на поверхности (мировое после VS), w = знак
-	/// битангента (±1): B = cross(N, T) * w в шейдере (см. UnlitInstancedPS.hlsl,
-	/// FEATURE_NORMAL_MAPS). Источник - авторский glTF TANGENT, когда он есть (знак w инвертируется
-	/// при зеркалировании Z: зеркало меняет ориентацию базиса), иначе - <see
-	/// cref="MeshUtility.GenerateTangents"/>, вычисляющий и направление, и знак прямо в
-	/// пространстве движка. Без верного w зеркальные UV-развёртки (атласы, симметричные модели)
-	/// получают перевёрнутый Y нормал-мапы - рельеф инвертируется.
-	/// </summary>
+	/// <summary>Tangent: xyz = U direction on the surface, w = bitangent sign (B = cross(N, T) * w).
+	/// The sign flips when Z is mirrored; a wrong w inverts normal-map Y on mirrored UVs.</summary>
 	public Vector4 Tangent;
 
-	/// <summary>glTF COLOR_0 (линейный, по спеке умножается на base color); белый (1,1,1,1) для
-	/// мешей без атрибута - ноль по умолчанию структуры красил бы всё в чёрное.</summary>
+	/// <summary>glTF COLOR_0 (linear, multiplies base color); white for meshes without the attribute.</summary>
 	public Vector4 Color;
 
-	/// <summary>glTF TEXCOORD_1 - второй UV-канал; по спеке им чаще всего пользуется
-	/// occlusionTexture с AO-картой, запечённой под отдельную уникальную развёртку (см.
-	/// <see cref="MaterialPbrFactors.OcclusionUvSet"/>). Ноль для мешей без атрибута.</summary>
+	/// <summary>glTF TEXCOORD_1, the second UV channel, mostly used by occlusionTexture; zero if absent.</summary>
 	public Vector2 TexCoord1;
 }
-
-/// <summary>
-/// glTF PBR metallic-roughness scalars of one material (see <see cref="ModelLoader.MaterialPbr"/>).
-/// Defaults follow the glTF spec (baseColor white, metallic 1, roughness 1) unless the material
-/// explicitly authored other values.
-/// </summary>
-/// <summary>Режим прозрачности материала из glTF (alphaMode). Отдельно от порога отсечения -
-/// см. <see cref="MaterialPbrFactors.AlphaMode"/>.</summary>

@@ -84,16 +84,9 @@ namespace DecaEngine.Editor
                 return;
             }
 
-            // Гейт: эта система читает WASD/RMB НАПРЯМУЮ с устройств DecaEngine.Input.Core, в обход
-            // ImGui - раньше это значило, что WASD двигало камеру Game View ВСЕГДА, независимо от того,
-            // какое окно редактора активно (в т.ч. одновременно с новым fly-режимом Scene View, см.
-            // SceneCamera, который слушает ТЕ ЖЕ клавиши через ImGui).
-            //
-            // Гейт по ФОКУСУ ИМЕННО Game View, а не по io.WantCaptureKeyboard: с
-            // ImGuiConfigFlags.NavEnableKeyboard (см. ImGuiManager) последний становится true, как
-            // только nav-фокус есть у ЛЮБОГО окна - включая саму Game View, - и гасил бы камеру ровно
-            // тогда, когда она и должна слушать. Плюс ввод в текстовое поле (WantTextInput) не должен
-            // улетать в камеру, даже если фокус формально на Game View.
+            // This system reads input directly from the devices, bypassing ImGui, so it must gate
+            // on Game View focus. io.WantCaptureKeyboard cannot be used: NavEnableKeyboard makes
+            // it true for any focused window, including Game View itself.
             if (!GameViewWindow.IsAnyFocused || ImGui.GetIO().WantTextInput)
             {
                 _mouseDelta = Vector2.Zero;
@@ -101,7 +94,6 @@ namespace DecaEngine.Editor
             }
 
             Vector3 moveInput = Vector3.Zero;
-            //if (_isRightMouseDown)
             {
                 moveInput.Z += _moveActionW.Read<float>();
                 moveInput.Z -= _moveActionS.Read<float>();

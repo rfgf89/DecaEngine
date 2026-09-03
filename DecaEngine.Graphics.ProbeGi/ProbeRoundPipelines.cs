@@ -4,33 +4,24 @@ using DecaEngine.Graphics.Diligent;
 
 namespace DecaEngine.Graphics.ProbeGi;
 
-/// <summary>
-/// Скомпилированные конвейеры GPU-раунда probe-GI. Вынесены из <see cref="ProbeRoundGpu"/> и живут
-/// отдельно от сессии, потому что от неё не зависят: от сессии зависят только буферы и привязки.
-///
-/// Зачем отдельный объект: компиляция этих двух шейдеров стоит ~650 мс (в них целиком входит обход
-/// BVH), а сессия пересоздаётся на каждое изменение настроек probe-GI - то есть на каждое движение
-/// ползунка в окне Graphics. Пока компиляция сидела в конструкторе ProbeRoundGpu, каждая такая
-/// правка означала более чем полусекундный стопор ПРЯМО НА ПОТОКЕ РЕНДЕРА между кадрами; кадровый
-/// цикл swap chain этого не переживает - в логе редактора это выглядело как «Timeout elapsed while
-/// waiting for the frame waitable object», а дальше устройство уезжало в отказ.
-/// </summary>
+/// <summary>Compiled compute pipelines for the probe-GI GPU round.</summary>
+// Kept outside the session: these shaders cost ~650 ms to compile, and recompiling them on the
+// render thread every time a probe-GI slider moves stalls the swap chain into device removal.
 public sealed class ProbeRoundPipelines : IDisposable
 {
-	/// <summary>Раунд обновления проб (entry point main).</summary>
+	/// <summary>Probe update round (entry point main).</summary>
 	public IPipelineState Round { get; }
 
-	/// <summary>Обновление кэша поверхностей (entry point mainSurface).</summary>
+	/// <summary>Surface cache update (entry point mainSurface).</summary>
 	public IPipelineState Surface { get; }
 
-	/// <summary>Свёртка изменчивости проб в число на объём (entry point mainVariability).</summary>
+	/// <summary>Probe variability reduction (entry point mainVariability).</summary>
 	public IPipelineState Variability { get; }
 
-	/// <summary>Во что обошлась компиляция, мс - для диагностики.</summary>
+	/// <summary>Compile cost in milliseconds.</summary>
 	public long CompileMs { get; }
 
-	/// <summary>Скомпилированы под аппаратную трассировку (SCENE_TRACE_HARDWARE) - значит нужен
-	/// TLAS, а буферы BVH этим вариантом не читаются.</summary>
+	/// <summary>Built for hardware ray tracing: needs a TLAS, ignores the BVH buffers.</summary>
 	public bool Hardware { get; }
 
 	public ProbeRoundPipelines(DiligentGraphicsApi api, bool hardware)
@@ -44,25 +35,20 @@ public sealed class ProbeRoundPipelines : IDisposable
 		Round = CreatePso(device, factory, "ProbeRoundCS", "main", "ProbeRound", hardware);
 		Surface = CreatePso(device, factory, "ProbeSurfaceCacheCS", "mainSurface", "ProbeSurfaceCache", hardware);
 
-		// Свёртка изменчивости трассировкой не пользуется, поэтому компилируется БЕЗ кейворда
-		// аппаратного пути (hardware: false) - и заодно штатным компилятором, без SM 6.5 и DXC.
-		// Имя PSO своё и с вариантом трассировки не пересекается: дисковый кэш D3D12 ключуется по
-		// имени, и одинаковые имена у разных вариантов травят кэш чужим кодом.
+		// Variability does not trace, so it builds without the hardware keyword. Its PSO name
+		// must stay distinct: the D3D12 disk cache is keyed by name and would poison variants.
 		Variability = CreatePso(device, factory, "ProbeVariabilityCS", "mainVariability",
 			"ProbeVariability", hardware: false, fileName: "ProbeVariabilityCS.hlsl");
 
 		CompileMs = sw.ElapsedMilliseconds;
 	}
 
-	/// <param name="fileName">Файл шейдера. Отдельно от <paramref name="shaderName"/>: раунд проб и
-	/// проход кэша поверхностей - это два входа в ОДНОМ файле, а свёртка изменчивости живёт в
-	/// своём.</param>
 	private static IPipelineState CreatePso(IRenderDevice device, IShaderSourceInputStreamFactory factory,
 		string shaderName, string entryPoint, string psoName, bool hardware,
 		string fileName = "ProbeRoundCS.hlsl")
 	{
-		// Путь трассировки выбирается КЕЙВОРДОМ, а не ветвлением в рантайме: выключенный вариант не
-		// существует в скомпилированном коде вовсе - ни обхода BVH, ни его буферов (см. SceneTrace.hlsl).
+		// Trace path is a compile-time keyword: the unused variant is absent from the bytecode,
+		// including its BVH buffer bindings.
 		var macros = new ShaderMacroArray
 		{
 			Elements = hardware ? [new ShaderMacro("SCENE_TRACE_HARDWARE", "1")] : [],
@@ -80,12 +66,10 @@ public sealed class ProbeRoundPipelines : IDisposable
 			EntryPoint = entryPoint,
 			FilePath = fileName,
 			Macros = macros,
-			// Inline-трассировка (RayQuery) появилась в шейдерной модели 6.5, а её понимает только
-			// DXC - штатный FXC не знает даже идентификатора RaytracingAccelerationStructure.
-			// Программному пути всё это не нужно, поэтому переключаем компилятор только под аппаратный.
+			// RayQuery needs SM 6.5, which only DXC understands; FXC serves the software path.
 			ShaderCompiler = hardware ? ShaderCompiler.Dxc : ShaderCompiler.Default,
-			// global:: обязателен: изнутри DecaEngine.Graphics.ProbeGi имя Diligent сначала
-			// разрешается в соседний DecaEngine.Graphics.Diligent и заслоняет SDK.
+			// global:: is required: inside this namespace "Diligent" resolves to the sibling
+			// DecaEngine.Graphics.Diligent and shadows the SDK.
 			HLSLVersion = hardware ? new global::Diligent.Version(6, 5) : default,
 			ShaderSourceStreamFactory = factory,
 		}, out _);

@@ -1,12 +1,7 @@
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Index of every file bundled in the editor's "EditorAssets" folder, keyed by extension, so editor
-/// UI (e.g. the Graphics Pipeline settings' shader pickers, see <see cref="EditorRefPicker"/>) can
-/// offer a filtered dropdown instead of hand-typing an <see cref="DecaEngine.Core.Assets.EditorRef"/>
-/// path. Built once via <see cref="Rescan"/> (called at editor startup) and lazily re-built on first
-/// use if that never happened.
-/// </summary>
+/// <summary>Extension-keyed index of the "EditorAssets" folder for editor file pickers; built by
+/// <see cref="Rescan"/> at startup or lazily on first use.</summary>
 public static class EditorAssetDatabase
 {
 	private static readonly Dictionary<string, List<string>> ByExtension = new(StringComparer.OrdinalIgnoreCase);

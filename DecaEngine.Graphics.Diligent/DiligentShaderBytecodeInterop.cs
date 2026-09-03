@@ -5,20 +5,15 @@ using SharpGen.Runtime;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>
-/// Создание шейдера из ГОТОВОГО байткода в обход управляемого биндинга: у
-/// DiligentGraphics.DiligentEngine.Core 2.5.6 (включая 2.5.6-api10) сгенерированный
-/// ShaderCreateInfo.__MarshalTo копирует массив ByteCode, но НЕ заполняет ByteCodeSize - нативный
-/// Diligent видит указатель с нулевой длиной и отвергает создание. Поэтому нативная структура
-/// собирается здесь вручную (поле в поле повторяет декомпилированный __Native, размер 152 байта
-/// сверяется с внутренним типом биндинга в рантайме - разъехались после апдейта пакета, значит
-/// путь байткода молча выключается, а вызывающий компилирует из исходника как раньше) и вызывается
-/// тот же слот vtable [5] (IRenderDevice::CreateShader), что использует сам биндинг.
-/// </summary>
+// Creates a shader from precompiled bytecode, bypassing the managed binding: in
+// DiligentGraphics.DiligentEngine.Core 2.5.6 the generated ShaderCreateInfo.__MarshalTo copies the
+// ByteCode array but never fills ByteCodeSize, so native Diligent rejects the call. The native
+// struct is therefore built by hand here and dispatched through vtable slot [5]
+// (IRenderDevice::CreateShader). A size mismatch disables the path instead of corrupting memory.
 internal static class DiligentShaderBytecodeInterop
 {
-	// Зеркало Diligent.ShaderCreateInfo.__Native (x64). Version-поля заменены на ulong: та же
-	// ширина и те же смещения, а значения всё равно нулевые (для байткода версии языка не нужны).
+	// Mirror of Diligent.ShaderCreateInfo.__Native (x64). Version fields widened to ulong: same
+	// width and offsets, and bytecode needs no language version anyway.
 	[StructLayout(LayoutKind.Sequential)]
 	private unsafe struct NativeCreateInfo
 	{
@@ -51,7 +46,7 @@ internal static class DiligentShaderBytecodeInterop
 		public IntPtr WebGPUEmulatedArrayIndexSuffix;
 	}
 
-	/// <summary>null - лейаут биндинга не совпал с ожидаемым (см. класс-док). Считается один раз.</summary>
+	// False when the binding's layout no longer matches NativeCreateInfo. Computed once.
 	private static readonly bool LayoutValidated = ValidateLayout();
 
 	private static bool ValidateLayout()
@@ -68,8 +63,7 @@ internal static class DiligentShaderBytecodeInterop
 		}
 	}
 
-	/// <summary>Создаёт шейдер из байткода. null - лейаут не совпал или нативный Diligent вернул
-	/// null (битый/несовместимый байткод) - вызывающий обязан откатиться на компиляцию исходника.</summary>
+	// null means the caller must fall back to compiling from source.
 	public static unsafe IShader? CreateShader(IRenderDevice device, string name, ShaderType type,
 		string entryPoint, byte[] bytecode)
 	{
@@ -80,9 +74,7 @@ internal static class DiligentShaderBytecodeInterop
 
 		var namePtr = Marshal.StringToHGlobalAnsi(name);
 		var entryPtr = Marshal.StringToHGlobalAnsi(entryPoint);
-		// Тот же суффикс, что ставит ShaderDesc() биндинга - путь компиляции из исходника идёт с
-		// UseCombinedTextureSamplers=true (см. DiligentShader.CompileCore), рефлексия байткода
-		// обязана совпадать.
+		// Must match the source-compile path, which uses UseCombinedTextureSamplers=true.
 		var suffixPtr = Marshal.StringToHGlobalAnsi("_sampler");
 
 		try

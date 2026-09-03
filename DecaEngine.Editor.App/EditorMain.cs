@@ -13,13 +13,13 @@ public static class EditorMain
 
 	private static void Main(string[] args)
 	{
-		// До ЛЮБОЙ ветки: нативные либы апскейлеров нужны и редактору, и CLI-пробам, а P/Invoke
-		// грузит их лениво - на этот момент ничего ещё не загружено и копирование безопасно.
+		// Before ANY branch: upscaler native libs are needed by both the editor and CLI probes,
+		// and P/Invoke loads lazily, so copying is still safe here.
 		NativeLibraryDeployer.Deploy();
 
-		// DirectX Agility SDK - СТРОГО до создания D3D12-устройства (Diligent создаёт его при
-		// инициализации графики). Требует режима разработчика Windows; при неудаче остаёмся на
-		// встроенном рантайме - это штатно. DECA_AGILITY=0 - выключить.
+		// DirectX Agility SDK must be enabled STRICTLY before the D3D12 device is created.
+		// Requires Windows developer mode; falling back to the inbox runtime is normal.
+		// DECA_AGILITY=0 disables.
 		NativeLibraryDeployer.TryEnableAgilitySdk();
 
 		if (args.Length > 0 && args[0] == "--preview-probe")
@@ -37,24 +37,22 @@ public static class EditorMain
 			return;
 		}
 
-		// Генератор демо-префаба: графика не нужна вовсе, только ECS и сериализация.
+		// Sample prefab generator: no graphics needed, only ECS and serialization.
 		if (args.Length > 0 && args[0] == "--make-sample-prefab")
 		{
 			SamplePrefabBuilder.Run(args);
 			return;
 		}
 
-		// То же, но вместе с проектом-обёрткой, который редактор умеет открыть.
+		// Same, but with a wrapper project the editor can open.
 		if (args.Length > 0 && args[0] == "--make-sample-project")
 		{
 			SamplePrefabBuilder.RunProject(args);
 			return;
 		}
 
-		// Прописать ссылки на движок в чужой csproj - ровно то, что редактор делает при ОТКРЫТИИ
-		// проекта (см. ProjectSession). Отдельной командой, потому что операция идемпотентная по
-		// замыслу, и проверить это без GUI иначе нечем: сломанная проверка «что уже есть» видна
-		// только на ВТОРОМ запуске.
+		// Attach engine references to a csproj, same as project open (ProjectSession); a separate
+		// command because idempotence is only observable on a second GUI-less run.
 		if (args.Length > 1 && args[0] == "--attach-references")
 		{
 			if (!MSBuildLocator.IsRegistered)
@@ -63,13 +61,12 @@ public static class EditorMain
 			}
 
 			EditorBuilder.AttachEngineReferences(args[1]);
-			Console.WriteLine($"[refs] обработан {args[1]}");
+			Console.WriteLine($"[refs] processed {args[1]}");
 			return;
 		}
 
-		// Разрешить (и при необходимости собрать) выходные файлы проекта - вторая половина того, что
-		// делает открытие проекта. Отдельной командой по той же причине: именно здесь пряталась
-		// взаимная блокировка на выводе dotnet, и без запуска без GUI её нечем было воспроизвести.
+		// Resolve (and build if needed) project outputs - the other half of project open;
+		// separate command so it can be reproduced without the GUI.
 		if (args.Length > 1 && args[0] == "--resolve-outputs")
 		{
 			if (!MSBuildLocator.IsRegistered)
@@ -78,8 +75,8 @@ public static class EditorMain
 			}
 
 			var outputs = DecaEngine.Core.Build.CsprojOutputResolver.GetBuildOutputs(args[1],
-				buildIfMissing: true, platform: ProjectSession.EditorPlatform);
-			Console.WriteLine($"[outputs] найдено {outputs.Count} файлов для {args[1]}");
+				buildIfMissing: true, platform: ProjectSession.EditorPlatform, rebuild: true);
+			Console.WriteLine($"[outputs] found {outputs.Count} files for {args[1]}");
 			return;
 		}
 

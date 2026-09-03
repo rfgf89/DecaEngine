@@ -12,20 +12,7 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Докуемое окно "Graphics" со ВСЕМИ настройками превью-графики в одном месте - для теххудожника:
-/// свет и тени, эффекты кадра (AO, SSGI, туман, объёмный свет, блум, грейд, экспозиция), материалы
-/// и детальные ручки probe-GI/неба (см. ProbeGi.cs). В отличие от модалки Settings (см.
-/// <see cref="SettingsWindow"/>) применяет всё живьём: каждое изменение пишется в
-/// <see cref="EditorSettings"/> и поднимает <see cref="SettingsWindow.PreviewGraphicsApplied"/> -
-/// вьюпорт сам решает, что это (пуш кбуфера, перестройка конвейера или ребейк проб, см.
-/// ModelPreviewViewport.OnGraphicsSettingsChanged/ApplyGraphicsSettings). Настройки сохраняются
-/// на диск после отпускания контрола, не каждый тик драга слайдера.
-///
-/// Разбивка на секции - ПО СМЫСЛУ, с одним исключением: ручки, которые нельзя переставить на живом
-/// окружении, вынесены в отдельную секцию "Перезагрузка" и применяются кнопкой (см. DrawApplyBar).
-/// Держать их вперемешку с живыми нельзя - снаружи они неотличимы, а стоят на порядки дороже.
-/// </summary>
+/// <summary>Docked "Graphics" window: all preview-graphics knobs, applied live.</summary>
 public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 {
 	private readonly EditorSettings _settings;
@@ -35,28 +22,16 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 	private bool _changed;
 	private bool _savePending;
 
-	// Однократная синхронизация VSync при первом кадре секции Display (см. DrawDisplaySection).
 	private bool _vsyncSynced;
 
-	// --- Буфер отложенных настроек (см. DrawApplyBar) --------------------------------------------
-	//
-	// Всё остальное окно применяется живьём, и это правильно: художник крутит ползунок и видит кадр.
-	// Но четыре ручки запечены НЕ в конвейер, а в вещи, которые нельзя переставить на живом
-	// окружении: HDRI требует пересчёта IBL, анизотропия и потолок
-	// текстур - в сэмплерах и декодере уже залитых текстур. Любая из них пересоздаёт окружение и
-	// перечитывает модель с диска - секунды на ассете уровня Sponza. Применяться на каждый клик по
-	// комбо они не должны: пройтись по трём ручкам стоило трёх полных перезагрузок подряд, причём
-	// две первых - впустую. Поэтому правятся они здесь, в буфере, и уезжают в EditorSettings разом.
+	// Staged: these knobs recreate the environment and reload the model from disk.
 	private bool _pendingAniso;
 	private string _pendingHdr = "";
 	private int _pendingMaxTextureSize;
 
-	// Снимок настроек, из которого буфер набран. Нужен не для дифа (диф считается прямо против
-	// EditorSettings), а чтобы заметить правку ТЕХ ЖЕ полей из модалки Settings: она пишет в
-	// EditorSettings напрямую, и без пересинхронизации буфер молча вернул бы старые значения.
+	// Snapshot the buffer was filled from; detects the Settings modal editing the same fields.
 	private (bool Aniso, string Hdr, int MaxTextureSize) _pendingSource;
 
-	// --- Состояние отладочного вида каскадов теней (см. DrawShadowCascadesDebug) ---
 	private const int ShadowDebugSize = 512;
 	private int _shadowDebugSource;
 	private bool _shadowDebugRaw;
@@ -80,10 +55,6 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		_changed = false;
 		SyncPendingFromSettings(force: false);
 
-		// Каждая секция - СВОЙ раскрывающийся заголовок, а не сплошной свиток: ручек здесь
-		// на несколько экранов, и без сворачивания до нужной приходится крутить колесо мимо всех
-		// остальных. Состояние раскрытия держит сам ImGui (по ID заголовка, в своём ini) - хранить
-		// его в EditorSettings незачем.
 		if (ImGui.CollapsingHeader("Display", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawDisplaySection();
@@ -94,10 +65,6 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 			DrawLightSection();
 		}
 
-		// Секция на ПАСС, а не свалка "Passes" с вложенными заголовками: у тумана, объёмного света,
-		// блума и грейда свои секции с самого начала, а AO и SSGI сидели внутри общей - при том что
-		// ручек у них больше, чем у блума. Вложенный CollapsingHeader внутри CollapsingHeader к тому
-		// же не даёт свернуть соседа, не свернув родителя.
 		if (ImGui.CollapsingHeader("Ambient occlusion", ImGuiTreeNodeFlags.DefaultOpen))
 		{
 			DrawAoSection();
@@ -158,30 +125,21 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 			DrawRenderGraphSection();
 		}
 
-		// Последней и рядом с кнопкой, которая её и применяет: секция собрана не по смыслу ручек, а
-		// по их ЦЕНЕ - это единственное, что их объединяет, и единственное, что о них надо знать.
-		if (ImGui.CollapsingHeader("Перезагрузка (окружение и загрузка)"))
+		// Grouped by cost, not by meaning: everything here needs the Apply button.
+		if (ImGui.CollapsingHeader("Reload (environment and loading)"))
 		{
 			DrawReloadSection();
 		}
 
-		// Панель применения - ВНЕ раскрывающегося заголовка: свою секцию художник почти всегда держит
-		// свёрнутой, и кнопка вместе со списком «что ждёт применения» пропала бы из виду ровно тогда,
-		// когда о ней и надо напомнить.
 		DrawApplyBar();
 
 		if (_changed)
 		{
-			// Вьюпорт диффует сам: кбуферные ручки пушатся сразу, фичи конвейера (AO/SSGI/скай/туман/
-			// объёмник/блум/грейд/экспозиция) перестраивают его на живом окружении, а ручки
-			// перезагрузки (HDRI/анизотропия/потолок текстур) пересоздают окружение и
-			// перечитывают модель - но они сюда попадают только через ApplyPending.
 			SettingsWindow.RaisePreviewGraphicsApplied();
 			_savePending = true;
 		}
 
-		// Сохранение на диск - после отпускания контрола: json-запись каждый тик драга слайдера
-		// молотила бы диск впустую.
+		// Save once the control is released; writing json every drag tick hammers the disk.
 		if (_savePending && !ImGui.IsAnyItemActive())
 		{
 			_savePending = false;
@@ -189,13 +147,7 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		}
 	}
 
-	// --- Секции --------------------------------------------------------------------------------
-
-	/// <summary>Презентация кадра САМОГО ОКНА редактора, а не превью-конвейера: ручка живёт на
-	/// главном <see cref="IGraphicsApi"/> (том, что зовёт Present) - окно достаёт его через
-	/// окружение вьюпорта, это тот же экземпляр (см. EditorManager). Пока окружение не поднято,
-	/// применять не к чему - секция ждёт. Переменная окружения DECA_VSYNC при старте старше
-	/// сохранённой настройки: галка тогда синхронизируется с фактом, а не наоборот.</summary>
+	// DECA_VSYNC at startup outranks the saved setting: the checkbox follows the API, not vice versa.
 	private void DrawDisplaySection()
 	{
 		ImGui.Spacing();
@@ -203,7 +155,7 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		var api = _viewport?.Environment?.GraphicsApi ?? _sceneViewport?.Environment?.GraphicsApi;
 		if (api == null)
 		{
-			ImGui.TextDisabled("Окружение ещё не создано.");
+			ImGui.TextDisabled("Environment not created yet.");
 			return;
 		}
 
@@ -227,23 +179,18 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 			api.PresentInterval = vsync ? 1 : 0;
 			_changed = true;
 		}
-		Tooltip("Вертикальная синхронизация презента (IGraphicsApi.PresentInterval).\n" +
-			"Выключение снимает кап фреймрейта - для замеров производительности;\n" +
-			"кадры в полёте при этом по-прежнему ограничены фенсом (см. Present).\n" +
-			"Применяется живьём; при старте перекрывается переменной DECA_VSYNC (1/0).");
+		Tooltip("Vertical sync on present (IGraphicsApi.PresentInterval).\n" +
+			"Turning it off removes the frame rate cap - useful for performance measurements;\n" +
+			"frames in flight are still limited by the fence (see Present).\n" +
+			"Applied live; at startup it is overridden by DECA_VSYNC (1/0).");
 	}
 
-	/// <summary>Ручки ПЕРЕЗАГРУЗКИ - собраны по цене, а не по смыслу: это единственное, что у них
-	/// общего, и единственное, что о них надо знать. Каждая запечена не в конвейер, а в вещи,
-	/// которые нельзя переставить на живом окружении (PSO геометрии, IBL, сэмплеры и декодер уже
-	/// залитых текстур), поэтому все они правятся в буфер и уезжают разом по кнопке внизу окна
-	/// (см. DrawApplyBar). Метка "*" ставится каждой изменённой: иначе буфер - ловушка, значение в
-	/// контроле уже новое, а кадр остаётся старым.</summary>
+	// Knobs baked into IBL, samplers and the texture decoder: staged, applied by the button below.
 	private void DrawReloadSection()
 	{
 		ImGui.Spacing();
-		ImGui.TextDisabled("Применяются кнопкой внизу окна: пересоздают окружение\n" +
-			"и перечитывают модель с диска.");
+		ImGui.TextDisabled("Applied by the button at the bottom of the window: they recreate\n" +
+			"the environment and reload the model from disk.");
 		ImGui.Spacing();
 
 		var aniso = _pendingAniso;
@@ -260,10 +207,9 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 			_pendingHdr = hdrBuffer;
 		}
 		PendingMark(_pendingHdr != (_settings.PreviewEnvironmentHdr ?? string.Empty));
-		Tooltip("Equirect .hdr: абсолютный путь или относительно EditorAssets/.\nПусто - процедурное небо.\nПрименяется кнопкой внизу окна (пересоздаёт окружение и перепекает пробы).");
+		Tooltip("Equirect .hdr: absolute path, or relative to EditorAssets/.\nEmpty - procedural sky.\nApplied by the button at the bottom of the window (recreates the environment and rebakes probes).");
 
-		// Потолок текстур - к рендеру напрямую не относится, но живёт здесь: он запечён в декодер
-		// загрузчика, то есть меняется ровно тем же перечитыванием модели, что и остальные три.
+		// Not a render knob, but baked into the loader's decoder: same model-reload cost.
 		var sizes = new[] { 512, 1024, 2048, 4096 };
 		var labels = new[] { "512", "1024", "2048", "4096" };
 		int index = Array.IndexOf(sizes, _pendingMaxTextureSize);
@@ -274,61 +220,58 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		}
 
 		ImGui.SetNextItemWidth(120 * _scale);
-		if (ImGui.Combo("Потолок текстур", ref index, labels, labels.Length))
+		if (ImGui.Combo("Texture size limit", ref index, labels, labels.Length))
 		{
 			_pendingMaxTextureSize = sizes[index];
 		}
 		PendingMark(_pendingMaxTextureSize != _settings.PreviewMaxTextureSize);
-		Tooltip("Максимальная сторона текстуры при загрузке модели.\n\n" +
-			"Прямо задаёт ПИКОВУЮ память загрузки: загрузчик декодирует ВСЕ текстуры модели\n" +
-			"разом и только потом заливает их на GPU, поэтому в памяти одновременно лежит\n" +
-			"вся их несжатая RGBA-копия. При 2048 одна текстура - 16 МБ; на ассете уровня\n" +
-			"Intel Sponza с сотнями текстур это гигабайты.\n\n" +
-			"Каждый шаг вниз режет пик ВЧЕТВЕРО. 1024 на превью почти неотличим,\n" +
-			"512 заметно мылит крупные планы.");
+		Tooltip("Maximum texture side when loading a model.\n\n" +
+			"Directly sets PEAK load memory: the loader decodes ALL of the model's textures\n" +
+			"at once and only then uploads them to the GPU, so an uncompressed RGBA copy of\n" +
+			"every texture is resident at the same time. At 2048 one texture is 16 MB; on an\n" +
+			"asset like Intel Sponza with hundreds of textures that is gigabytes.\n\n" +
+			"Each step down cuts the peak FOURFOLD. 1024 is nearly indistinguishable in the\n" +
+			"preview, 512 visibly blurs close-ups.");
 
 		DrawStreamingSettings();
 	}
 
-	/// <summary>
-	/// Стриминг моделей сцены. Ручки ЖИВЫЕ: радиус стример перечитывает на каждом Tick, поэтому
-	/// ни перечитывания моделей, ни пересоздания окружения не требуется - в отличие от потолка
-	/// текстур выше, который печётся при загрузке.
-	/// </summary>
+	// Live knobs: the streamer re-reads the radius every Tick, no reload needed.
 	private void DrawStreamingSettings()
 	{
 		ImGui.Separator();
-		ImGui.TextDisabled("Сцена");
+		ImGui.TextDisabled("Scene");
 
 		bool skinning = _settings.SceneSkinning;
-		if (ImGui.Checkbox("GPU-скиннинг", ref skinning))
+		if (ImGui.Checkbox("GPU skinning", ref skinning))
 		{
 			_settings.SceneSkinning = skinning;
 			_changed = true;
 		}
-		Tooltip("Деформация скиннед-моделей на GPU.\n\n" +
-			"Выключение НЕ убирает модель - она рисуется в bind-позе обычным статическим\n" +
-			"путём: не заводятся ни отдельные инстансы в мега-буфере вершин, ни батчи под\n" +
-			"них, ни compute-проход. Компоненты анимации при этом остаются в инспекторе.\n\n" +
-			"Ручка ИНСТАНЦИРОВАНИЯ: скиннед-инстансы регистрируются при появлении модели\n" +
-			"в сцене, поэтому переключение действует на следующие инстанцирования -\n" +
-			"уже показанную модель нужно переоткрыть.\n\n" +
-			"Переменная окружения DECA_SKINNING=0 сильнее этой галки: она нужна как\n" +
-			"аварийный путь, когда редактор не доживает до этого окна.");
+		Tooltip("Deform skinned models on the GPU.\n\n" +
+			"Turning it off does NOT hide the model - it is drawn in bind pose through the\n" +
+			"regular static path: no per-instance slots in the mega vertex buffer, no batches\n" +
+			"for them, no compute pass. Animation components still show in the inspector.\n\n" +
+			"This is an INSTANTIATION knob: skinned instances are registered when a model\n" +
+			"enters the scene, so toggling only affects later instantiations - reopen a model\n" +
+			"that is already shown.\n\n" +
+			"DECA_SKINNING=0 outranks this checkbox: it exists as an escape hatch for when\n" +
+			"the editor does not survive long enough to reach this window.");
 
 		bool streaming = _settings.SceneStreaming;
-		if (ImGui.Checkbox("Стриминг по расстоянию", ref streaming))
+		if (ImGui.Checkbox("Distance streaming", ref streaming))
 		{
 			_settings.SceneStreaming = streaming;
 			_changed = true;
 		}
-		Tooltip("Модели сцены берутся и отпускаются по расстоянию до камеры.\n\n" +
-			"Выключение НЕ отключает загрузку - оно делает все модели сцены постоянно\n" +
-			"резидентными: радиус уходит в бесконечность, и никто ничего не отпускает.\n" +
-			"Память при этом растёт на всю сцену разом.\n\n" +
-			"Практическая польза выключения: стриминг - единственный путь в редакторе,\n" +
-			"где набор мешей и батчей меняется ПО ХОДУ кадров, а не на первом. Тумблер\n" +
-			"позволяет отделить проблемы сцены от проблем стриминга без пересборки.");
+		Tooltip("Scene models are acquired and released by distance to the camera.\n\n" +
+			"Turning it off does NOT disable loading - it makes every scene model permanently\n" +
+			"resident: the radius goes to infinity and nothing is ever released. Memory then\n" +
+			"grows to the whole scene at once.\n\n" +
+			"Practical use of turning it off: streaming is the only path in the editor where\n" +
+			"the set of meshes and batches changes DURING the frame sequence rather than on\n" +
+			"the first frame. The toggle separates scene bugs from streaming bugs without a\n" +
+			"rebuild.");
 
 		if (!streaming)
 		{
@@ -337,21 +280,18 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 
 		float radius = _settings.SceneStreamingRadius;
 		ImGui.SetNextItemWidth(160 * _scale);
-		if (ImGui.SliderFloat("Радиус стриминга", ref radius, 10f, 5000f, "%.0f"))
+		if (ImGui.SliderFloat("Streaming radius", ref radius, 10f, 5000f, "%.0f"))
 		{
 			_settings.SceneStreamingRadius = MathF.Max(1f, radius);
 			_changed = true;
 		}
-		Tooltip("Мировые единицы. Дальше радиуса модель отпускается, ближе - берётся.\n\n" +
-			"У выгрузки есть запас (гистерезис x1.15): без него модель на самой границе\n" +
-			"грузилась и выгружалась бы на каждом шаге камеры.\n\n" +
-			"Слишком малый радиус даёт видимое подгружение вокруг камеры, слишком\n" +
-			"большой обесценивает стриминг - сцена всё равно окажется в памяти целиком.");
+		Tooltip("World units. Beyond the radius a model is released, inside it is acquired.\n\n" +
+			"Unloading has slack (x1.15 hysteresis): without it a model sitting exactly on the\n" +
+			"boundary would load and unload on every camera step.\n\n" +
+			"Too small a radius shows visible pop-in around the camera; too large makes\n" +
+			"streaming pointless - the whole scene ends up resident anyway.");
 	}
 
-	/// <summary>Метка «отредактировано, но ещё не применено» справа от контрола. Без неё буфер
-	/// отложенных ручек - ловушка: значение в комбо стои́т новое, кадр остаётся старым, и понять,
-	/// это ждёт кнопки или просто не работает, снаружи нельзя.</summary>
 	private static void PendingMark(bool pending)
 	{
 		if (!pending)
@@ -382,15 +322,12 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		}
 	}
 
-	/// <summary>Набирает буфер отложенных ручек из настроек. force - после применения/отмены;
-	/// без него пересинхронизация происходит только когда настройки изменил КТО-ТО ДРУГОЙ (модалка
-	/// Settings пишет в те же поля): иначе каждый кадр затирал бы то, что человек сейчас правит.</summary>
+	// Without force, resync only on external edits; otherwise it overwrites in-progress input.
 	private void SyncPendingFromSettings(bool force)
 	{
 		var current = (_settings.PreviewAnisotropicFiltering,
 			_settings.PreviewEnvironmentHdr ?? string.Empty, _settings.PreviewMaxTextureSize);
 
-		// Первый кадр окна тоже попадает сюда: _pendingSource пустой и с настройками не совпадает.
 		if (!force && current == _pendingSource)
 		{
 			return;
@@ -402,8 +339,6 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		_pendingMaxTextureSize = current.Item3;
 	}
 
-	/// <summary>Что в буфере разошлось с настройками, человеческим текстом «было -> стало». Пустой
-	/// список = применять нечего.</summary>
 	private List<string> CollectPendingChanges()
 	{
 		var changes = new List<string>();
@@ -421,20 +356,16 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 
 		if (_pendingMaxTextureSize != _settings.PreviewMaxTextureSize)
 		{
-			changes.Add($"Потолок текстур: {_settings.PreviewMaxTextureSize} -> {_pendingMaxTextureSize}");
+			changes.Add($"Texture size limit: {_settings.PreviewMaxTextureSize} -> {_pendingMaxTextureSize}");
 		}
 
 		return changes;
 
-		static string OnOff(bool value) => value ? "вкл" : "выкл";
+		static string OnOff(bool value) => value ? "on" : "off";
 		static string HdrLabel(string path) =>
-			string.IsNullOrWhiteSpace(path) ? "процедурное небо" : Path.GetFileName(path.Trim());
+			string.IsNullOrWhiteSpace(path) ? "procedural sky" : Path.GetFileName(path.Trim());
 	}
 
-	/// <summary>Панель применения ручек перезагрузки - единственное место окна, где изменение НЕ
-	/// уходит в кадр немедленно. Показывает не голую кнопку, а список того, что именно уедет:
-	/// операция стоит пересоздания окружения и перечитывания модели с диска, и знать заранее, за
-	/// что платишь, важнее, чем сэкономить три строки.</summary>
 	private void DrawApplyBar()
 	{
 		ImGui.Spacing();
@@ -443,11 +374,11 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		var changes = CollectPendingChanges();
 		if (changes.Count == 0)
 		{
-			ImGui.TextDisabled("Изменений, требующих перезагрузки, нет.");
+			ImGui.TextDisabled("No changes requiring a reload.");
 			return;
 		}
 
-		ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), $"Ждут применения ({changes.Count}):");
+		ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), $"Pending ({changes.Count}):");
 		foreach (var change in changes)
 		{
 			ImGui.BulletText(change);
@@ -455,25 +386,22 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 
 		ImGui.Spacing();
 
-		if (ImGui.Button("Применить", new Vector2(140 * _scale, 0)))
+		if (ImGui.Button("Apply", new Vector2(140 * _scale, 0)))
 		{
 			ApplyPending();
 		}
-		Tooltip("Записывает все накопленные ручки перезагрузки разом и пересоздаёт окружение:\n" +
-			"модель перечитывается с диска, пробы перепекаются. Секунды на тяжёлом ассете -\n" +
-			"поэтому ручки и копятся, а не применяются по одной.");
+		Tooltip("Writes every staged reload knob at once and recreates the environment:\n" +
+			"the model is reread from disk, probes are rebaked. Seconds on a heavy asset -\n" +
+			"which is why the knobs are staged instead of applied one by one.");
 
 		ImGui.SameLine();
-		if (ImGui.Button("Отменить", new Vector2(140 * _scale, 0)))
+		if (ImGui.Button("Revert", new Vector2(140 * _scale, 0)))
 		{
 			SyncPendingFromSettings(force: true);
 		}
-		Tooltip("Вернуть контролы к тому, что сейчас стои́т в движке.");
+		Tooltip("Reset the controls to what the engine is currently using.");
 	}
 
-	/// <summary>Переносит буфер в <see cref="EditorSettings"/> одним куском. Дальше - обычный путь
-	/// окна: _changed поднимает PreviewGraphicsApplied, вьюпорты сами видят диф этих четырёх ручек
-	/// и ставят отложенное пересоздание (см. ModelPreviewViewport.OnGraphicsSettingsChanged).</summary>
 	private void ApplyPending()
 	{
 		_settings.PreviewAnisotropicFiltering = _pendingAniso;
@@ -484,12 +412,7 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		_changed = true;
 	}
 
-	// --- Хелперы -------------------------------------------------------------------------------
-
-	/// <summary>Слайдер стандартной ширины; true при изменении значения (и взводит _changed).
-	/// AlwaysClamp - чтобы ctrl+click-ввод не заводил в json значение вне диапазона: ползунок
-	/// упирался бы в максимум, а движок применял введённое (см. историю с Ambient boost 121 при
-	/// разметке до 12).</summary>
+	// AlwaysClamp: ctrl+click typing otherwise stores out-of-range values in the json.
 	private bool Slider(string label, ref float value, float min, float max, string format,
 		ImGuiSliderFlags flags = ImGuiSliderFlags.AlwaysClamp)
 	{
@@ -503,9 +426,6 @@ public partial class GraphicsSettingsWindow : ImGuiDockingWindow
 		return false;
 	}
 
-	/// <summary>Целочисленный близнец <see cref="Slider"/> - с той же шириной и тем же AlwaysClamp:
-	/// без него ctrl+click-ввод заводил в json значение вне разметки (ползунок упирался бы в
-	/// максимум, а движок применял введённое).</summary>
 	private bool SliderInt(string label, ref int value, int min, int max)
 	{
 		ImGui.SetNextItemWidth(180 * _scale);

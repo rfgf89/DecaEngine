@@ -28,7 +28,6 @@ public class SdlDevicePull : DevicePull, IPerformSdlEvent
 
 		if (SDL3.SDL_HasMouse())
 		{
-			// First let's get the generic mouse ID which is usually 1, or something specific if it's an event
 			uint defaultMouseId = 1;
 			var mice = SDL3.SDL_GetMice();
 			if (mice is { Count: > 0 })
@@ -51,7 +50,7 @@ public class SdlDevicePull : DevicePull, IPerformSdlEvent
 			}
 			if (mouseId == 0)
 			{
-				mouseId = 1; // Super fallback
+				mouseId = 1;
 			}
 
 			TryingDeviceAdded(DeviceType.Mouse, mouseId);
@@ -67,8 +66,7 @@ public class SdlDevicePull : DevicePull, IPerformSdlEvent
 			{
 				if (inputDevice is IPerformSdlEvent performSdlEvent)
 				{
-					// We'll roll back the aggressive ID checking because SDL3 IDs might be somewhat
-					// different for some events or some default states (like text input vs key down).
+					// No per-device ID filtering: SDL3 reports differing IDs across event kinds.
 					performSdlEvent.PerformSdlEvent(sdlEvent);
 				}
 			}

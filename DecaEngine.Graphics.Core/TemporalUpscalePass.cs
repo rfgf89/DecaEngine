@@ -6,28 +6,15 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>Ресурсы встроенного темпорального апскейлера (TAAU, см. TemporalUpscalePS.hlsl) -
-/// первый бэкенд слота апскейлера конвейера. Владеет display-размерными <see cref="OutputTarget"/>
-/// (его читает тонемап вместо HDR-кадра) и <see cref="_historyTarget"/> (копия результата для
-/// следующего кадра). Создаётся лениво <see cref="GraphicsPipelineSimple"/> при включении
-/// <see cref="PipelineFeatures.TemporalUpscale"/> - и только вместе с ресурсами векторов движения:
-/// без них аккумулятору нечем репроецировать историю.
-///
-/// Контракт входов - ровно тот, что у FSR/DLSS: HDR-кадр сцены в рендер-разрешении, буфер векторов,
-/// джиттер текущего кадра и пара разрешений. Когда появится нативный бэкенд, он встанет на это же
-/// место графа с этими же входами, а этот класс останется программным фолбэком.</summary>
+/// <summary>Built-in TAAU resources (see TemporalUpscalePS.hlsl); input contract matches FSR/DLSS so a native backend can take the same graph slot.</summary>
 public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 {
-	/// <summary>Дефолтный вес текущего кадра в экспоненциальном аккумуляторе. 0.1 - классика TAA:
-	/// история сходится за ~2 прохода 16-фазного джиттера, а шлейфы (то, что не отсёк clamp)
-	/// гаснут за ~10 кадров. Живая ручка - см. <see cref="SetBlendAlpha"/>.</summary>
+	/// <summary>Default current-frame weight of the exponential accumulator (classic TAA 0.1).</summary>
 	public const float DefaultBlendAlpha = 0.1f;
 
 	private float _blendAlpha = DefaultBlendAlpha;
 
-	/// <summary>Вес текущего кадра (0.02..0.5): меньше - стабильнее и резче на статике, но дольше
-	/// сходится и заметнее шлейфы; больше - отзывчивее, но дрожание джиттера глушится слабее.
-	/// Живая ручка: значение уезжает в кбуфер очередным SetFrameParams (каждый Execute).</summary>
+	/// <summary>Current-frame weight (0.02..0.5); lower = more stable but slower convergence and longer ghosting.</summary>
 	public void SetBlendAlpha(float alpha)
 	{
 		_blendAlpha = Math.Clamp(alpha, 0.02f, 0.5f);
@@ -35,30 +22,26 @@ public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 
 	internal IMaterialObject Material { get; }
 
-	/// <summary>Display-разрешение, RGBA16F - аккумулированный кадр, вход тонемапа при включённом
-	/// апскейле.</summary>
+	/// <summary>Display-resolution RGBA16F accumulated frame; tonemap input when upscaling is on.</summary>
 	public IRenderTarget OutputTarget { get; }
 
 	private readonly IRenderTarget _historyTarget;
 	internal IRenderTarget HistoryTarget => _historyTarget;
 
-	// Кбуфер со своей unmanaged-памятью + UpdateBuffer из пасса - тот же приём и та же причина,
-	// что у MotionVectorPassResources: джиттер меняется каждый кадр, а SetConstant трогал бы SRB
-	// под кадром в полёте.
+	// Unmanaged cbuffer + UpdateBuffer from the pass: jitter changes per frame, and SetConstant
+	// would touch the SRB under an in-flight frame (same as MotionVectorPassResources).
 	private readonly IBufferHandle _constantBuffer;
 	private readonly TemporalUpscaleConstantsData* _constants;
 
-	/// <summary>Есть ли в <see cref="_historyTarget"/> хоть один осмысленный кадр. До первого -
-	/// шейдер берёт текущий кадр целиком (см. TuFrame.w), иначе аккумулятор смешивал бы с
-	/// неинициализированной памятью.</summary>
+	// Until the first frame the shader takes the current frame whole (see TuFrame.w),
+	// otherwise it would blend with uninitialized memory.
 	private bool _hasHistory;
 
 	public TemporalUpscalePassResources(IGraphicsApi graphicsApi, IBatchRenderer batchRenderer,
 		string colorTargetName, IGpuTexture sceneHdrTarget, IGpuTexture motionTarget,
 		uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight)
 	{
-		// Свой экземпляр VS - см. комментарий в FogPassResources (шареный шейдер освобождался бы
-		// дважды при пересоздании окружения).
+		// Own VS instance: a shared shader would be released twice on environment rebuild.
 		var vs = graphicsApi.CreateShader("Temporal Upscale VS", "EditorAssets/shader",
 			"SkyBackgroundVS.hlsl", ShaderObjectType.Vertex);
 		var ps = graphicsApi.CreateShader("Temporal Upscale PS", "EditorAssets/shader",
@@ -107,7 +90,7 @@ public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 		Material.SetTexture("_HistoryTex", _historyTarget);
 		Material.SetImmutableSampler("_HistoryTex", linearClamp);
 
-		// Векторы - только Load ближайшего пикселя, сэмплер не нужен (см. TemporalUpscalePS.hlsl).
+		// Motion vectors are nearest-Load only, no sampler needed (see TemporalUpscalePS.hlsl).
 		Material.SetTexture("_MotionTex", motionTarget);
 
 		_constantBuffer = graphicsApi.CreateBuffer(new BufferInfo
@@ -127,14 +110,13 @@ public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 		SetFrameParams(Vector2.Zero);
 	}
 
-	/// <summary>Layout кбуфера "TemporalUpscaleConstants" в TemporalUpscalePS.hlsl - два float4.</summary>
+	// Mirrors the "TemporalUpscaleConstants" cbuffer in TemporalUpscalePS.hlsl.
 	private struct TemporalUpscaleConstantsData
 	{
-		/// <summary>xy - рендер-размер, zw - 1/рендер-размер.</summary>
+		// xy = render size, zw = 1/render size.
 		public Vector4 Render;
 
-		/// <summary>xy - джиттер кадра в рендер-пикселях (y вниз), z - alpha смешивания, w - есть
-		/// ли история.</summary>
+		// xy = frame jitter in render pixels (y down), z = blend alpha, w = has history.
 		public Vector4 Frame;
 	}
 
@@ -144,24 +126,20 @@ public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 			1f / Math.Max(1u, renderWidth), 1f / Math.Max(1u, renderHeight));
 	}
 
-	/// <summary>Покадровые параметры - зовётся из <see cref="GraphicsPipelineSimple.Execute"/> ПОСЛЕ
-	/// наложения джиттера: шейдер обязан вычесть смещение ИМЕННО этого кадра. Здесь же взводится
-	/// флаг истории: к следующему Execute в history-таргете уже лежит результат текущего.</summary>
+	/// <summary>Per-frame parameters; must be called after this frame's jitter is applied.</summary>
 	public void SetFrameParams(Vector2 jitterPixels)
 	{
 		_constants->Frame = new Vector4(jitterPixels.X, jitterPixels.Y, _blendAlpha, _hasHistory ? 1f : 0f);
 		_hasHistory = true;
 	}
 
-	/// <summary>Сбрасывает аккумулятор - следующий кадр выйдет без истории. Обязателен там же, где
-	/// рвётся история векторов (ресайз, смена сцены): старый кадр после ресайза - другой вьюпорт,
-	/// и смешивание с ним дало бы мусор на весь период схождения.</summary>
+	/// <summary>Drops the accumulator; required wherever motion vector history breaks.</summary>
 	public void ResetHistory()
 	{
 		_hasHistory = false;
 	}
 
-	/// <summary>Ресайз display-таргетов и новый рендер-размер; история при этом рвётся.</summary>
+	/// <summary>Resizes the display targets and the render size, dropping history.</summary>
 	public void Resize(uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight)
 	{
 		OutputTarget.Resize(new Vector2(displayWidth, displayHeight));
@@ -170,9 +148,8 @@ public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 		ResetHistory();
 	}
 
-	/// <summary>Перепривязка ПОСЛЕ Resize входов - те пересоздают нативные текстуры, и SRB иначе
-	/// держал бы уничтоженные (см. ModelPreviewViewport.ResizeTargets). History перепривязывается
-	/// внутри собственного Resize по той же причине.</summary>
+	/// <summary>Call after the inputs are resized: resizing recreates the native textures and
+	/// the SRB would otherwise hold destroyed ones.</summary>
 	public void RebindTargets(IGpuTexture sceneHdrTarget, IGpuTexture motionTarget,
 		uint renderWidth, uint renderHeight, uint displayWidth, uint displayHeight)
 	{
@@ -195,18 +172,12 @@ public sealed unsafe class TemporalUpscalePassResources : IReleaseObject
 }
 
 /// <summary>
-/// Слот апскейлера рендер-графа: собирает display-кадр из рендер-разрешения по истории (см.
-/// TemporalUpscalePS.hlsl).
+/// Render graph upscaler slot: builds the display frame from render resolution plus history.
 ///
-/// Место в кадре: ПОСЛЕ всей сценовой пост-обработки (туман/god rays/блум уже вложены в HDR-кадр -
-/// апскейлер должен видеть то же, что увидел бы глаз) и ПЕРЕД тонемапом, который при включённом
-/// апскейле читает <see cref="TemporalUpscalePassResources.OutputTarget"/> вместо HDR-кадра и
-/// работает 1:1. Аккумулировать надо ЛИНЕЙНЫЙ свет: смешивание после кривой тонемапа занижало бы
-/// яркие субпиксельные детали.
-///
-/// В конце пасса результат копируется в history-таргет - источник репроджекции следующего кадра.
-/// Копия вместо пинг-понга нарочно: тонемап держит ОДИН фиксированный вход, и пинг-понг требовал
-/// бы либо два его материала (как у адаптации), либо перепривязку SRB каждый кадр.
+/// Must run after all scene post-processing and before tonemap, so accumulation happens on
+/// linear light; blending past the tonemap curve would crush bright sub-pixel detail.
+/// The result is copied into the history target rather than ping-ponged, because tonemap
+/// keeps a single fixed input.
 /// </summary>
 public sealed class TemporalUpscalePass : RenderGraphPass<TemporalUpscalePass.PassData>
 {
@@ -230,8 +201,7 @@ public sealed class TemporalUpscalePass : RenderGraphPass<TemporalUpscalePass.Pa
 		_viewPortRef = viewPortRef;
 	}
 
-	/// <summary>Объявляет графу таргеты пасса - см. <see cref="ForwardPass.Setup"/>. History и
-	/// читается (репроджекция), и пишется (копия результата) - тот же паттерн, что у scene-copy.</summary>
+	// History is both read (reprojection) and written (result copy).
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		builder.ReadTarget(builder.ImportTexture(_sceneHdrTarget));
@@ -254,14 +224,13 @@ public sealed class TemporalUpscalePass : RenderGraphPass<TemporalUpscalePass.Pa
 		cmd.TransitionResource(_motionTarget, ResourceState.ShaderResource);
 		cmd.TransitionResource(_resources.HistoryTarget, ResourceState.ShaderResource);
 
-		// Вьюпорт - ОТОБРАЖАЕМЫЙ: пасс и есть переход рендер-разрешения в display.
+		// Display viewport: this pass is the render-to-display resolution step.
 		cmd.SetRenderTarget(_resources.OutputTarget, null);
 		cmd.SetViewport(_viewPortRef);
 		cmd.SetPipelineState(_resources.Material);
 		cmd.CommitShaderResources(_resources.Material);
 		cmd.Draw(3);
 
-		// Результат - в историю следующего кадра (см. ForwardPass: тот же приём со scene-copy).
 		cmd.SetRenderTarget(null, null);
 		cmd.CopyTexture(_resources.OutputTarget, _resources.HistoryTarget);
 		cmd.TransitionResource(_resources.HistoryTarget, ResourceState.ShaderResource);

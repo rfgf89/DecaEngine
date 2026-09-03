@@ -20,16 +20,11 @@ public enum WindowType
 {
 	GameView, Inspector, Hierarchy, Console, AssetBrowser, Project, SceneView, Settings, Graphics,
 
-	/// <summary>Отладка анимации и физики (см. <see cref="AnimationPhysicsDebugWindow"/>) - слои
-	/// дебаг-вида и счётчики. В отличие от окна отладки рендер-графа доступно и в Release: это
-	/// рабочий инструмент аниматора, а не внутренняя диагностика.</summary>
 	AnimationPhysics,
 
-	/// <summary>Разметка humanoid выделенной модели (см. <see cref="HumanoidWindow"/>).</summary>
 	Humanoid,
 #if DEBUG
-	/// <summary>Окно отладки рендер-графа (см. <see cref="RenderGraphDebugWindow"/>) - только в DEBUG,
-	/// потому что снимки графа в Release не собираются вовсе.</summary>
+	/// <summary>DEBUG only: render-graph snapshots are not captured in Release.</summary>
 	RenderGraph,
 #endif
 }
@@ -60,17 +55,10 @@ public class EditorManager : TimeLoopCore
 	private ModelIconCache _modelIconCache;
 	private ModelIconBaker _modelIconBaker;
 
-	/// <summary>Device-level, refcounted store of loaded models shared by every consumer below - a
-	/// model is loaded and GPU-resident ONCE for the whole editor process, each viewport just builds
-	/// its own material set + instances on top of it (see DecaEngine.Editor.ECS.ModelStore class-doc).
-	/// One instance, ticked once per frame from OnUpdate (below) under the GPU lock - do NOT let any
-	/// consumer tick it a second time.</summary>
+	// One instance per process, ticked exactly once per frame from OnUpdate.
 	private ModelStore _modelStore;
 
-	/// <summary>Device-level container of environment maps + samplers shared by every offscreen
-	/// viewport (Model Preview, Scene View, Icon Baker) - see class-doc SharedViewportResources.
-	/// Same one-instance-for-the-process discipline as <see cref="_modelStore"/> above: created once
-	/// here, handed into each consumer's constructor, released once in <see cref="OnQuit"/>.</summary>
+	// One instance per process, shared by every offscreen viewport.
 	private SharedViewportResources _sharedViewportResources;
 	// --- /ECS ---
 
@@ -133,9 +121,8 @@ public class EditorManager : TimeLoopCore
 
 			_editorSettings = EditorSettings.Load();
 
-			// VSync из настроек применяется сразу на старте: окно Graphics Settings синхронизирует
-			// его только на первом своём кадре, а до открытия окна редактор шёл бы с дефолтом api.
-			// Переменная окружения DECA_VSYNC приоритетнее сохранённой настройки.
+			// DECA_VSYNC overrides the saved setting; applied here since the Graphics window
+			// only syncs it on its first frame.
 			if (Environment.GetEnvironmentVariable("DECA_VSYNC") is null)
 			{
 				_graphicsApi.PresentInterval = _editorSettings.VSync ? 1 : 0;
@@ -180,14 +167,8 @@ public class EditorManager : TimeLoopCore
 		var projectWindow = new ProjectWindow("Project", _projectSession, _imGuiManager.ImGuiRender);
 		new GameViewWindow("Game View", _renderHandle, _projectSession, _imGuiManager.ImGuiRender).Show();
 
-		// Один стол на весь редактор - Model Preview, Scene View и иконки браузера ассетов делят
-		// загрузку/GPU-резидентность моделей через него (см. class-doc ModelStore); каждый потребитель
-		// ниже строит только СВОИ материалы/инстансы поверх общих геометрии/текстур.
 		_modelStore = new ModelStore(_graphicsApi);
 
-		// Один контейнер энвайронментов/сэмплеров на весь редактор - Model Preview, Scene View и
-		// бейкер иконок делят его точно так же, как делят загрузку моделей через _modelStore (см.
-		// class-doc SharedViewportResources).
 		_sharedViewportResources = new SharedViewportResources(_graphicsApi);
 
 		_modelPreviewViewport = new ModelPreviewViewport(_graphicsApi, _editorSettings, _modelStore, _sharedViewportResources);
@@ -197,19 +178,23 @@ public class EditorManager : TimeLoopCore
 		_inspectorWindow = inspectorWindow;
 		inspectorWindow.Show();
 
-		// GPU-вьюпорт окна Scene View (рендер префаба по AssetRef-ам, см. PrefabSceneViewport) -
-		// один на редактор, окна Scene View его разделяют (как Inspector разделяет превью моделей).
+		// The menu bar is built earlier for docking order, so its target is wired up here.
+		_menuBarWindow.Inspector = inspectorWindow;
+
 		_prefabSceneViewport = new PrefabSceneViewport(_graphicsApi, _editorSettings, _projectSession, _modelStore,
 			_sharedViewportResources);
 
-		// ВРЕМЕННО: DECA_AUTOLOAD_MODEL=<путь> грузит модель в превью сразу при старте - для
-		// автоматизированного репро багов загрузки/AO без ручных кликов по Asset Browser-у.
+		// DECA_AUTOLOAD_PREFAB / DECA_AUTOLOAD_MODEL open an asset at startup, for headless runs.
+		var autoLoadPrefab = Environment.GetEnvironmentVariable("DECA_AUTOLOAD_PREFAB");
+		if (!string.IsNullOrEmpty(autoLoadPrefab) && File.Exists(autoLoadPrefab))
+		{
+			inspectorWindow.ShowPrefab(autoLoadPrefab);
+		}
+
 		var autoLoadModel = Environment.GetEnvironmentVariable("DECA_AUTOLOAD_MODEL");
 		if (!string.IsNullOrEmpty(autoLoadModel))
 		{
-			// Через Inspector, а не прямым LoadModel: превью держит модель, только пока Inspector в
-			// режиме Model (см. переключение в OnUpdate), иначе автозагруженная модель тут же
-			// отдавалась бы обратно первым же кадром.
+			// Via the Inspector, not LoadModel: the preview only holds a model in Model mode.
 			inspectorWindow.ShowModel(autoLoadModel);
 		}
 		_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.SceneView, () => new SceneViewWindow("Scene View", inspectorWindow, _prefabSceneViewport, _imGuiManager.ImGuiRender));
@@ -219,16 +204,10 @@ public class EditorManager : TimeLoopCore
 
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Settings,
 				() => new SettingsWindow("Settings", _editorSettings, _imGuiManager.ImGuiRender));
-			// Окно Graphics (все настройки превью-графики + probe-GI, см. GraphicsSettingsWindow) -
-			// открывается из меню Window; ссылка на вьюпорт нужна для статуса/ребейка проб.
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Graphics,
 				() => new GraphicsSettingsWindow("Graphics", _editorSettings, _modelPreviewViewport, _prefabSceneViewport, _imGuiManager.ImGuiRender));
-			// Отладка анимации и физики (см. AnimationPhysicsDebugWindow) - тоже из меню Window:
-			// слои дебаг-вида включают под конкретный вопрос, а не держат открытыми постоянно.
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.AnimationPhysics,
 				() => new AnimationPhysicsDebugWindow("Animation & Physics", _editorSettings, _prefabSceneViewport, _imGuiManager.ImGuiRender));
-			// Разметка humanoid - по ВЫДЕЛЕННОЙ в сцене сущности (см. HumanoidWindow), поэтому окну
-			// хватает ссылки на вьюпорт сцены: выделение он и так знает.
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.Humanoid,
 				() => new HumanoidWindow("Humanoid", _prefabSceneViewport, _imGuiManager.ImGuiRender));
 			new AssetBrowserWindow("Asset Browser", _projectSession, inspectorWindow, _modelIconCache, _modelIconBaker, _imGuiManager.ImGuiRender).Show();
@@ -237,22 +216,13 @@ public class EditorManager : TimeLoopCore
 			//_debugWindow.ForceShow();
 
 #if DEBUG
-			// Окно отладки рендер-графа открывается из меню Window и САМО находит все живые конвейеры
-			// через GraphicsPipelineRegistry - здесь передаётся лишь тот, на котором оно откроется
-			// по умолчанию (основная сцена).
+			// The window finds live pipelines itself; this one is just its default selection.
 			_imGuiManager.ImGuiRender.AddWindowGetter(WindowType.RenderGraph,
 				() => new RenderGraphDebugWindow("Render Graph Debugger", _imGuiManager.ImGuiRender, _pipeline));
 #endif
 		}
 	}
 
-	/// <summary>Солнце главной сцены: направленный свет с каскадными тенями.
-	///
-	/// Раньше это было хвостом CreateTestSceneEntities - функции, которая грузила с диска
-	/// EditorAssets/models/result.gltf (6.8 МБ, с оптимизацией мешей и генерацией LOD-ов) и населяла
-	/// ею сцену на КАЖДОМ запуске редактора, независимо от того, открывают проект или нет. Демо-сцена
-	/// удалена целиком; солнце осталось, потому что оно не тестовое - без него у главной сцены нет ни
-	/// направленного света, ни каскадов теней.</summary>
 	private void CreateSceneSunEntity()
 	{
         _ecsWorld.CreateEntity(
@@ -293,32 +263,20 @@ public class EditorManager : TimeLoopCore
 
 		lock (GameHostBridge.GpuSync)
 		{
-			// Must run before the main scene render below: each offscreen Pipeline.Execute() here
-			// rebinds the device's active render target to its own preview/icon-bake color+depth
-			// texture (see ForwardPass.WriteCommands). _pipeline.Execute() unconditionally rebinds
-			// the swap-chain backbuffer, so it must be the LAST Execute() this frame - otherwise
-			// ImGui (and Present) would draw into whatever offscreen target was bound last instead
-			// of the backbuffer, making the whole editor appear to go blank.
-			// ОДИН раз за кадр на весь процесс - финализация (один ModelLoader за кадр), прогрессивный
-			// стриминг текстур и выселение простаивающих моделей живут в столе теперь (см. class-doc
-			// ModelStore), а не в каждом потребителе по отдельности. Ticked ДО потребителей ниже, чтобы
-			// догрузившаяся в этом кадре модель успела зарегистрироваться (ModelStore.ModelReady - см.
-			// ModelStreamer/ModelIconBaker) до их Update.
+			// Offscreen passes rebind the render target, so _pipeline.Execute() below must be
+			// the LAST Execute() of the frame or ImGui/Present miss the backbuffer.
+			// Tick first: a model that finishes here must register before its consumers update.
 			_modelStore.Tick(deltaTime);
 
-			// Модель редактора загружена РОВНО В ОДНОМ месте: показывает Inspector превью модели -
-			// её держит _modelPreviewViewport, иначе (дерево префаба/ничего не открыто) - сцена
-			// префаба. Второй вьюпорт отдаёт свои модели с GPU: раньше оба держали резидентными свои
-			// копии материалов/инстансов одной и той же модели и оба писали полный кадр.
+			PollInspectorLoop();
+
 			bool modelPreviewMode = _inspectorWindow.IsModelPreviewMode;
 			_modelPreviewViewport.SetActive(modelPreviewMode);
 			_prefabSceneViewport.SetActive(!modelPreviewMode);
 
 			_modelPreviewViewport.Update(deltaTime, time);
 
-			// Play Mode - ДО шага вьюпорта: внутри него физика персонажей заводит и снимает тела по
-			// этому флагу, и узнав о нажатии кнопки кадром позже, она пропустила бы ровно тот кадр, в
-			// котором персонаж обязан стронуться.
+			// Set before the viewport step: character physics spawns bodies off this flag.
 			_prefabSceneViewport.IsPlaying = _inspectorWindow.IsPlaying;
 			_prefabSceneViewport.Update(deltaTime, time, _inspectorWindow.Root, _inspectorWindow.PrefabPath,
 				_inspectorWindow.Selected);
@@ -353,6 +311,87 @@ public class EditorManager : TimeLoopCore
 	private ulong lastNumFramesRendered;
 	private float timeFps;
 	private float time;
+
+	// DECA_LOOP_INSPECTOR=N: headless harness that flips the Inspector every N frames.
+	private static readonly int InspectorLoopInterval =
+		int.TryParse(Environment.GetEnvironmentVariable("DECA_LOOP_INSPECTOR"), out var loopN) && loopN > 0 ? loopN : 0;
+
+	private int _inspectorLoopFrame;
+	private int _inspectorLoopLogCount;
+	private bool _inspectorLoopConfigured;
+
+	private void PollInspectorLoop()
+	{
+		if (InspectorLoopInterval <= 0)
+		{
+			return;
+		}
+
+		// The harness forces the settings the reported bug needs to reproduce.
+		if (!_inspectorLoopConfigured)
+		{
+			_inspectorLoopConfigured = true;
+			_editorSettings.PreviewProbeGi = true;
+			_editorSettings.SceneViewHdr = true;
+
+			_editorSettings.UpscalerBackend = 2;
+			_editorSettings.DlssQuality = 2;
+			Console.WriteLine("[insploop] forced PreviewProbeGi=true, SceneViewHdr=true, DLSS quality 2");
+		}
+
+		var prefabPath = Environment.GetEnvironmentVariable("DECA_AUTOLOAD_PREFAB");
+		var modelPath = Environment.GetEnvironmentVariable("DECA_AUTOLOAD_MODEL");
+		if (string.IsNullOrEmpty(prefabPath) || string.IsNullOrEmpty(modelPath))
+		{
+			return;
+		}
+
+		var log = DecaEngine.Core.Diagnostics.EngineLog.Snapshot();
+		for (; _inspectorLoopLogCount < log.Count; _inspectorLoopLogCount++)
+		{
+			var entry = log[_inspectorLoopLogCount];
+			// Skip our own lines: EngineLog captures Console.Out, so echoing them recurses.
+			if (entry.Level is DecaEngine.Core.Diagnostics.LogLevel.Warning or DecaEngine.Core.Diagnostics.LogLevel.Error &&
+				!entry.Message.StartsWith("[insploop", StringComparison.Ordinal))
+			{
+				Console.WriteLine($"[insploop-log] {entry.Level}: {entry.Message}");
+			}
+		}
+
+		_inspectorLoopFrame++;
+
+		if (!_inspectorWindow.IsModelPreviewMode && _inspectorLoopFrame % (InspectorLoopInterval / 2) == 0 &&
+			_inspectorLoopFrame % InspectorLoopInterval != 0)
+		{
+			_prefabSceneViewport.DumpFrameStats($"mid f{_inspectorLoopFrame}");
+		}
+
+		if (_inspectorLoopFrame % InspectorLoopInterval != 0)
+		{
+			return;
+		}
+
+		if (!_inspectorWindow.IsModelPreviewMode)
+		{
+			// Dump before leaving the prefab, once probes and exposure have settled.
+			_prefabSceneViewport.DumpFrameStats($"cycle {_inspectorLoopFrame / InspectorLoopInterval}");
+			_inspectorWindow.ShowModel(modelPath);
+
+			// DECA_LOOP_INSPECTOR_ICONS=<dir> also queues an icon bake, as a browser click would.
+			var iconDir = Environment.GetEnvironmentVariable("DECA_LOOP_INSPECTOR_ICONS");
+			if (!string.IsNullOrEmpty(iconDir) && !_modelIconBaker.IsBakingOrQueued(modelPath))
+			{
+				_modelIconBaker.Enqueue(modelPath, iconDir);
+			}
+
+			Console.WriteLine($"[insploop] frame {_inspectorLoopFrame}: -> Model");
+		}
+		else
+		{
+			_inspectorWindow.ShowPrefab(prefabPath);
+			Console.WriteLine($"[insploop] frame {_inspectorLoopFrame}: -> Prefab");
+		}
+	}
 
 	protected override void OnQuit()
 	{

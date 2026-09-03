@@ -8,19 +8,8 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor;
 
-/// <summary>
-/// Окно разметки humanoid: соответствие слотов скелета человека костям конкретного рига (см.
-/// <see cref="HumanoidAvatar"/>).
-///
-/// Работает с ВЫДЕЛЕННОЙ в сцене сущностью, а не с отдельно открытой моделью: разметку делают, глядя
-/// на персонажа, и подсветка выбранной кости во вьюпорте - половина смысла этого окна. Отдельный
-/// режим «открыть модель для разметки» означал бы второй вьюпорт и вторую копию сцены ради того же
-/// самого.
-///
-/// Правки живут в РАБОЧЕЙ КОПИИ и уезжают в сцену только по «Сохранить». Это не осторожность:
-/// разметка - свойство рига, её подхватывают все персонажи этой модели разом, и живая правка
-/// перестраивала бы им ноги и рэгдоллы на каждый клик по выпадающему списку.
-/// </summary>
+/// <summary>Binds <see cref="HumanoidAvatar"/> slots to the selected rig's joints.</summary>
+// Edits stay in a working copy until Save: the mapping is shared by every character of the model.
 public class HumanoidWindow : ImGuiDockingWindow
 {
 	private readonly PrefabSceneViewport _viewport;
@@ -43,15 +32,14 @@ public class HumanoidWindow : ImGuiDockingWindow
 	{
 		var (skeleton, modelPath, name) = _viewport.SelectedSkinnedModel;
 
-		// Подсветка гасится в начале кадра и зажигается наведением на слот ниже: иначе она осталась
-		// бы висеть на кости, с которой мышь давно ушла.
+		// Cleared each frame and re-set by hover below, else it sticks to a joint the mouse left.
 		_viewport.HighlightJoint = string.Empty;
 
 		if (skeleton == null || string.IsNullOrEmpty(modelPath))
 		{
 			_skeleton = null;
-			ImGui.TextDisabled("Выделите в сцене сущность со скиннед-моделью.");
-			ImGui.TextWrapped("Разметка делается по конкретному ригу, и без модели размечать нечего.");
+			ImGui.TextDisabled("Select an entity with a skinned model in the scene.");
+			ImGui.TextWrapped("Mapping is done against a specific rig, and without a model there is nothing to map.");
 			return;
 		}
 
@@ -61,23 +49,19 @@ public class HumanoidWindow : ImGuiDockingWindow
 			Load(skeleton, modelPath);
 		}
 
-		ImGui.Text($"Модель: {name}");
-		ImGui.Text($"Костей в риге: {skeleton.JointCount}");
+		ImGui.Text($"Model: {name}");
+		ImGui.Text($"Bones in rig: {skeleton.JointCount}");
 
 		if (_viewport.IsAvatarAuto(modelPath))
 		{
-			// Различать сохранённую разметку и догадку обязательно: по автоматической уже работают
-			// foot IK и рэгдолл, и человек вправе знать, что за них решил автомат.
 			ImGui.TextColored(new Vector4(1f, 0.75f, 0.25f, 1f),
-				"Разметка автоматическая - файл аватара ещё не сохранён.");
+				"Mapping is automatic - the avatar file has not been saved yet.");
 		}
 
-		// Состояние референсной позы - рядом с моделью, а не в подсказке: без неё ретаргетинг
-		// работать не будет вовсе, и это должно быть видно до того, как за него возьмутся.
 		if (!_avatar.HasReferencePose)
 		{
 			ImGui.TextColored(new Vector4(1f, 0.75f, 0.25f, 1f),
-				"Референсная поза не снята - ретаргетинг по этому аватару невозможен.");
+				"Reference pose not captured - retargeting with this avatar is impossible.");
 		}
 		else
 		{
@@ -86,9 +70,9 @@ public class HumanoidWindow : ImGuiDockingWindow
 				? new Vector4(0.4f, 0.9f, 0.45f, 1f)
 				: new Vector4(1f, 0.75f, 0.25f, 1f);
 
-			ImGui.TextColored(color, $"Референсная поза: {_avatar.ReferenceLocals.Count} костей, " +
-				$"отклонение от T до {pose.Worst:0.#}°" +
-				$"{(pose.Complete ? "" : " (цепочки размечены не полностью)")}");
+			ImGui.TextColored(color, $"Reference pose: {_avatar.ReferenceLocals.Count} bones, " +
+				$"deviation from T up to {pose.Worst:0.#}°" +
+				$"{(pose.Complete ? "" : " (chains are not fully mapped)")}");
 		}
 
 		DrawToolbar();
@@ -103,9 +87,7 @@ public class HumanoidWindow : ImGuiDockingWindow
 		_skeleton = skeleton;
 		_modelPath = modelPath;
 
-		// Рабочая копия берётся из файла, а если его нет - из автомата: ровно то же, чем пользуется
-		// сцена (см. PrefabSceneViewport.AvatarFor), иначе окно показывало бы не ту разметку, по
-		// которой персонаж уже двигается.
+		// Same source as PrefabSceneViewport.AvatarFor, so the window shows the live mapping.
 		_avatar = (HumanoidAvatarAsset.Load(modelPath) ?? HumanoidAutoMap.Build(skeleton)).Clone();
 		_dirty = false;
 		_status = string.Empty;
@@ -115,58 +97,53 @@ public class HumanoidWindow : ImGuiDockingWindow
 
 	private void DrawToolbar()
 	{
-		if (ImGui.Button("Разметить автоматически"))
+		if (ImGui.Button("Auto-map"))
 		{
 			_avatar = HumanoidAutoMap.Build(_skeleton!);
 			_dirty = true;
-			_status = "Разметка пересобрана автоматом.";
+			_status = "Mapping rebuilt automatically.";
 			Revalidate();
 		}
 
 		ImGui.SameLine();
 
-		if (ImGui.Button("Поменять стороны"))
+		if (ImGui.Button("Swap sides"))
 		{
 			SwapSides();
 			_dirty = true;
-			_status = "Левая и правая стороны поменяны местами.";
+			_status = "Left and right sides swapped.";
 			Revalidate();
 		}
 
-		// Кнопка не лишняя: сторону автомат берёт из имени кости, а когда имена молчат - из знака X,
-		// то есть из соглашения «персонаж смотрит вдоль +Z». Модель, экспортированная развёрнутой,
-		// этому соглашению не следует, и определить это можно только глазами.
 		ImGui.SameLine();
 
-		// Референсная поза - опора ретаргетинга (см. HumanoidReferencePose). Снимается из bind-позы:
-		// поза, которую редактор показывает на паузе, - это уже результат клипа, и снять её значило
-		// бы записать в референс кадр анимации.
-		if (ImGui.Button("Снять T-позу"))
+		// Captured from the bind pose: the displayed pose is already the result of a clip.
+		if (ImGui.Button("Capture T-pose"))
 		{
 			HumanoidReferencePose.CaptureFromBind(_avatar, _skeleton!);
 			_dirty = true;
 
 			var captured = HumanoidReferencePose.Evaluate(_avatar, _skeleton!);
-			_status = $"Референсная поза снята из bind: отклонение до {captured.Worst:0.#}° " +
-				$"({(captured.LooksLikeTPose ? "похоже на T-позу" : "на T-позу НЕ похоже")}).";
+			_status = $"Reference pose captured from bind: deviation up to {captured.Worst:0.#}° " +
+				$"({(captured.LooksLikeTPose ? "looks like a T-pose" : "does NOT look like a T-pose")}).";
 		}
 
 		ImGui.SameLine();
 
-		if (ImGui.Button("Очистить"))
+		if (ImGui.Button("Clear"))
 		{
 			_avatar.Clear();
 			_dirty = true;
-			_status = "Разметка очищена.";
+			_status = "Mapping cleared.";
 			Revalidate();
 		}
 
 		ImGui.SameLine();
 
-		if (ImGui.Button("Перечитать"))
+		if (ImGui.Button("Reload"))
 		{
 			Load(_skeleton!, _modelPath);
-			_status = "Разметка перечитана с диска.";
+			_status = "Mapping reloaded from disk.";
 		}
 
 		ImGui.SameLine();
@@ -178,16 +155,15 @@ public class HumanoidWindow : ImGuiDockingWindow
 			ImGui.BeginDisabled();
 		}
 
-		if (ImGui.Button("Сохранить"))
+		if (ImGui.Button("Save"))
 		{
 			HumanoidAvatarAsset.Save(_avatar, _modelPath);
 
-			// Сброс кеша сцены - обязателен: без него персонажи продолжат жить по разметке, которую
-			// только что заменили, и правка выглядела бы как «сохранилось, но ничего не изменилось».
+			// Required: otherwise scene characters keep running on the replaced mapping.
 			_viewport.InvalidateAvatar(_modelPath);
 
 			_dirty = false;
-			_status = $"Сохранено: {HumanoidAvatarAsset.PathFor(_modelPath)}";
+			_status = $"Saved: {HumanoidAvatarAsset.PathFor(_modelPath)}";
 		}
 
 		if (fatal)
@@ -195,12 +171,12 @@ public class HumanoidWindow : ImGuiDockingWindow
 			ImGui.EndDisabled();
 
 			ImGui.SameLine();
-			ImGui.TextColored(new Vector4(1f, 0.4f, 0.35f, 1f), "есть ошибки - сохранение запрещено");
+			ImGui.TextColored(new Vector4(1f, 0.4f, 0.35f, 1f), "errors present - saving is blocked");
 		}
 		else if (_dirty)
 		{
 			ImGui.SameLine();
-			ImGui.TextColored(new Vector4(1f, 0.75f, 0.25f, 1f), "есть несохранённые правки");
+			ImGui.TextColored(new Vector4(1f, 0.75f, 0.25f, 1f), "unsaved edits");
 		}
 
 		if (_status.Length > 0)
@@ -260,8 +236,6 @@ public class HumanoidWindow : ImGuiDockingWindow
 						Revalidate();
 					}
 
-					// Наведение на пункт списка подсвечивает кость во вьюпорте - так слот выбирают
-					// глазами, а не сверяя имена по списку.
 					if (ImGui.IsItemHovered())
 					{
 						_viewport.HighlightJoint = jointName;
@@ -285,11 +259,11 @@ public class HumanoidWindow : ImGuiDockingWindow
 	{
 		if (_issues.Count == 0)
 		{
-			ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.45f, 1f), "Проблем нет.");
+			ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.45f, 1f), "No issues.");
 			return;
 		}
 
-		ImGui.Text($"Проблем: {_issues.Count}");
+		ImGui.Text($"Issues: {_issues.Count}");
 
 		foreach (var issue in _issues)
 		{
@@ -301,9 +275,7 @@ public class HumanoidWindow : ImGuiDockingWindow
 	private void Revalidate() =>
 		_issues = _skeleton != null ? HumanoidValidation.Validate(_avatar, _skeleton) : new List<HumanoidIssue>();
 
-	/// <summary>Меняет местами левые и правые слоты. Пары берутся из справочника по ПОРЯДКУ слотов
-	/// (левый блок идёт непосредственно перед правым), а не по разбору имени: имена слотов - это
-	/// удобство чтения, и выводить из них логику значит сломать её первым переименованием.</summary>
+	// Pairs are listed explicitly rather than derived from slot names, which are display-only.
 	private void SwapSides()
 	{
 		(HumanoidBone Left, HumanoidBone Right)[] pairs =

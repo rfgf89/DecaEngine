@@ -5,44 +5,23 @@ using DecaEngine.Graphics.Diligent;
 
 namespace DecaEngine.Graphics.ProbeGi;
 
-/// <summary>
-/// Аппаратные структуры ускорения под трассировку probe-GI: BLAS на МЕШ в объектном пространстве
-/// плюс TLAS из матриц инстансов (см. <see cref="ProbeInstancedGeometry"/>).
-///
-/// Двухуровневая схема - это и есть ответ на «движущийся мир». Прежняя версия строила один BLAS из
-/// мировой треугольной похлёбки бейкера: атрибуты в шейдере брались прямо по
-/// CommittedPrimitiveIndex, без таблиц и без пересчёта нормали, - но любое движение объекта означало
-/// пересборку всей структуры, то есть динамики не было по построению. Теперь геометрия от позы не
-/// зависит: BLAS-ы строятся один раз, а движение стоит <see cref="Rebuild"/> одного TLAS.
-///
-/// Плата за это - индирекция при попадании: шейдеру нужны таблица инстансов
-/// (<see cref="Instances"/>) и общий буфер атрибутов (<see cref="MeshTriangles"/>), а нормаль
-/// приходится переносить в мир матрицей инстанса (см. SceneTrace.hlsl).
-///
-/// BLAS строятся по СВОЕМУ буферу позиций, развёрнутому из тех же треугольников, что читает шейдер,
-/// а не по вершинным буферам мешей: только так CommittedPrimitiveIndex гарантированно индексирует
-/// массив атрибутов: бейкер выбрасывает вырожденные треугольники, и нумерация примитивов после этого
-/// с индексным буфером меша уже не совпадает.
-/// </summary>
+/// <summary>Ray tracing acceleration structures for probe GI: one BLAS per mesh in object space
+/// plus a TLAS of instance transforms, so moving an object only costs a TLAS rebuild.</summary>
 public sealed class ProbeSceneAccel : IDisposable
 {
-    /// <summary>Запись таблицы инстансов - зеркало SceneInstance в SceneTrace.hlsl.</summary>
+    // Mirrors SceneInstance in SceneTrace.hlsl.
     [StructLayout(LayoutKind.Sequential)]
     private struct InstanceGpu
     {
         public Vector3 Albedo;
 
-        /// <summary>Индекс первого треугольника МЕША инстанса в общем буфере атрибутов: к нему
-        /// шейдер прибавляет CommittedPrimitiveIndex.</summary>
+        // Base for the shader's CommittedPrimitiveIndex into the shared attribute buffer.
         public uint FirstTriangle;
 
-        /// <summary>Линейный BaseColorFactor материала - множитель текстурного альбедо хита
-        /// (сама текстура фактора не содержит).</summary>
+        // Linear BaseColorFactor; the texture itself does not include it.
         public Vector3 BaseColorFactor;
 
-        /// <summary>Индекс base color текстуры инстанса в наборе текстур хитов
-        /// (см. ProbeInstancedGeometry.HitTextureKeys); -1 - текстуры нет, хит остаётся на
-        /// потриугольном альбедо.</summary>
+        // Index into the hit texture set; -1 means per-triangle albedo only.
         public int TextureIndex;
     }
 
@@ -59,21 +38,19 @@ public sealed class ProbeSceneAccel : IDisposable
 
     public ITopLevelAS Tlas => _tlas;
 
-    /// <summary>Атрибуты треугольников в объектном пространстве - шейдер читает их по
-    /// InstanceID+PrimitiveIndex (см. SceneTrace.hlsl).</summary>
+    /// <summary>Object-space triangle attributes, indexed by InstanceID plus PrimitiveIndex.</summary>
     public IBuffer MeshTriangles => _triangles;
 
-    /// <summary>Таблица инстансов: альбедо и база нумерации треугольников.</summary>
+    /// <summary>Instance table: albedo and the triangle numbering base.</summary>
     public IBuffer Instances => _instanceTable;
 
     public int InstanceCount => _tlasInstances.Length;
     public int MeshCount => _blas.Length;
 
-    /// <summary>Во что обошлась ПЕРВАЯ сборка (BLAS-ы + TLAS), мс - для диагностики.</summary>
+    /// <summary>Cost of the initial BLAS + TLAS build, in milliseconds.</summary>
     public long BuildMs { get; }
 
-    /// <summary>Во что обошлась последняя пересборка TLAS, мс. Это цена движения объекта - ради
-    /// того, чтобы она была на порядки меньше <see cref="BuildMs"/>, схема и двухуровневая.</summary>
+    /// <summary>Cost of the last TLAS rebuild, in milliseconds.</summary>
     public long RebuildMs { get; private set; }
 
     public unsafe ProbeSceneAccel(DiligentGraphicsApi api, ProbeInstancedGeometry geometry)
@@ -88,9 +65,8 @@ public sealed class ProbeSceneAccel : IDisposable
         var device = api.Device;
         _context = api.ImmediateContext;
 
-        // Позиции для сборки: треугольник хранится как вершина плюс два ребра, трассировке нужны
-        // три точки. Индексного буфера нет - развёртка по три вершины на примитив и делает
-        // PrimitiveIndex прямым индексом в массив атрибутов.
+        // No index buffer: three unshared vertices per primitive keep PrimitiveIndex a direct
+        // index into the attribute array, which the baker's degenerate culling would otherwise break.
         var source = geometry.Triangles;
         var positions = new Vector3[(long)source.Length * 3];
         for (int i = 0; i < source.Length; i++)
@@ -133,8 +109,7 @@ public sealed class ProbeSceneAccel : IDisposable
 
         _instanceTable = CreateStructured(device, "ProbeSceneInstances", table, sizeof(InstanceGpu));
 
-        // BLAS на меш. Одна геометрия в каждом - разбивать меш по материалам незачем: материал
-        // здесь свойство инстанса, а не примитива.
+        // One geometry per BLAS: material is a property of the instance, not of the primitive.
         _blas = new IBottomLevelAS[geometry.Meshes.Length];
         ulong blasScratch = 0;
         for (int slot = 0; slot < geometry.Meshes.Length; slot++)
@@ -155,8 +130,7 @@ public sealed class ProbeSceneAccel : IDisposable
                         IndexType = global::Diligent.ValueType.Undefined,
                     }
                 ],
-                // Строим один раз, трассируем миллионами лучей - берём самый быстрый обход ценой
-                // более долгой сборки.
+                // Built once, traced by millions of rays: pay build time for traversal speed.
                 Flags = RaytracingBuildAsFlags.PreferFastTrace,
             });
 
@@ -167,23 +141,12 @@ public sealed class ProbeSceneAccel : IDisposable
         {
             Name = "ProbeSceneTLAS",
             MaxInstanceCount = (uint)geometry.Instances.Length,
-            // AllowUpdate - покадровое движение стоит REFIT-а (PERFORM_UPDATE поверх прежней
-            // структуры, канон DXR - см. Raytracing spec / DxrTutorials 14-Refit), а не полной
-            // пересборки. Качество обхода после refit-а деградирует при больших смещениях -
-            // страховкой каждый N-й Rebuild собирает TLAS заново (см. RebuildsPerFullBuild).
+            // AllowUpdate lets per-frame motion use a refit instead of a full rebuild.
             Flags = RaytracingBuildAsFlags.PreferFastTrace | RaytracingBuildAsFlags.AllowUpdate,
         });
 
-        // Раздельные scratch-буферы под BLAS и TLAS. Общий буфер - гонка: сборки идут подряд в
-        // одном списке команд, и вторая пишет в память, которую ещё читает первая. Барьер между
-        // ними тоже решил бы, но раздельные буферы дешевле по коду и не зависят от того, какие
-        // барьеры вставит бэкенд.
-        //
-        // Скретч BLAS-ов один на всех и по САМОМУ большому: сборки идут последовательно в одном
-        // списке команд... а значит переиспользование памяти между ними - это та же гонка. Здесь
-        // она безопасна ровно потому, что каждая сборка сама дожидается своей области: BuildBLAS
-        // выставляет барьеры по скретчу (ScratchBufferTransitionMode). Экономия существенна: на
-        // сотне мешей отдельные скретчи - это сотня буферов на десятки мегабайт.
+        // BLAS and TLAS need separate scratch buffers: their builds share one command list and
+        // would race. BLAS builds share one buffer safely, since each barriers its own scratch.
         _blasScratch = device.CreateBuffer(new BufferDesc
         {
             Name = "ProbeSceneScratchBlas",
@@ -192,8 +155,7 @@ public sealed class ProbeSceneAccel : IDisposable
             Size = Math.Max(blasScratch, 1024),
         });
 
-        // Скретч - под ОБА режима сборки: refit (Update) обычно требует меньше полной сборки,
-        // но гарантий на это спецификация не даёт.
+        // Sized for both modes: the spec does not guarantee refit needs less than a full build.
         var tlasScratchSizes = _tlas.GetScratchBufferSizes();
         _tlasScratch = device.CreateBuffer(new BufferDesc
         {
@@ -208,7 +170,7 @@ public sealed class ProbeSceneAccel : IDisposable
             Name = "ProbeSceneInstanceBuffer",
             Usage = Usage.Default,
             BindFlags = BindFlags.RayTracing,
-            // Размер записи инстанса задаёт рантайм: 64 байта и в DXR, и в Vulkan.
+            // Instance record size is fixed by the runtime: 64 bytes on both DXR and Vulkan.
             Size = (ulong)geometry.Instances.Length * 64UL,
         });
 
@@ -224,7 +186,7 @@ public sealed class ProbeSceneAccel : IDisposable
                     {
                         GeometryName = "geometry",
                         VertexBuffer = _vertices,
-                        // Смещение В БАЙТАХ до первой вершины меша: буфер общий на всю сцену.
+                        // Byte offset of the mesh's first vertex; the buffer spans the whole scene.
                         VertexOffset = (uint)((long)first * 3 * sizeof(Vector3)),
                         VertexStride = (uint)sizeof(Vector3),
                         VertexCount = (uint)(count * 3),
@@ -241,8 +203,7 @@ public sealed class ProbeSceneAccel : IDisposable
             });
         }
 
-        // Заготовки записей TLAS: от кадра к кадру в них меняется ТОЛЬКО матрица, поэтому массив
-        // живёт вместе с объектом, а не пересобирается на каждое движение.
+        // Only the transform changes between frames, so the record array is kept alive.
         _tlasInstances = new TLASBuildInstanceData[geometry.Instances.Length];
         for (int i = 0; i < _tlasInstances.Length; i++)
         {
@@ -252,7 +213,7 @@ public sealed class ProbeSceneAccel : IDisposable
                 InstanceName = $"instance{i}",
                 Blas = _blas[instance.MeshSlot],
                 Transform = ToMatrix3x4(instance.Transform),
-                // CustomId уезжает в шейдер как InstanceID() - по нему берётся запись таблицы.
+                // Reaches the shader as InstanceID(), which indexes the instance table.
                 CustomId = (uint)i,
                 Mask = 0xFF,
                 Flags = RaytracingInstanceFlags.None,
@@ -264,19 +225,11 @@ public sealed class ProbeSceneAccel : IDisposable
         RebuildMs = 0;
     }
 
-    /// <summary>Пересобирает TLAS под новые позы инстансов - покадровая операция динамического мира.
-    /// BLAS-ы не трогаются: геометрия в объектном пространстве от позы не зависит.
-    ///
-    /// Порядок матриц - это порядок <see cref="ProbeInstancedGeometry.Instances"/>, он же нумерация
-    /// InstanceID в шейдере. Длина обязана совпадать: инстанс, появившийся или исчезнувший в сцене,
-    /// меняет и таблицу атрибутов, то есть требует пересоздания всего объекта.</summary>
-    /// <summary>Каждый N-й Rebuild - полная пересборка вместо refit-а: качество обхода
-    /// отрефиченной структуры деградирует по мере ухода инстансов от поз последней полной
-    /// сборки (DXR spec, Acceleration structure update constraints). При покадровом драге
-    /// гизмо это ~раз в секунду - незаметно.</summary>
+    // Refit traversal quality decays as instances drift from the last full build's poses.
     private const int RebuildsPerFullBuild = 64;
     private int _rebuildsSinceFullBuild;
 
+    /// <summary>Rebuilds the TLAS for new instance poses, in ProbeInstancedGeometry order.</summary>
     public void Rebuild(ReadOnlySpan<Matrix4x4> transforms)
     {
         if (transforms.Length != _tlasInstances.Length)
@@ -309,11 +262,8 @@ public sealed class ProbeSceneAccel : IDisposable
             Instances = _tlasInstances,
             InstanceBuffer = _instanceBuffer,
             ScratchBuffer = _tlasScratch,
-            // REFIT (PERFORM_UPDATE) поверх прежней структуры - цена покадрового движения;
-            // false - полная сборка (первая и каждая N-я, см. RebuildsPerFullBuild).
             Update = update,
-            // Таблиц привязки шейдеров нет: трассировка inline (RayQuery), hit-группы не участвуют -
-            // луч возвращает попадание прямо в вызывающий шейдер.
+            // Inline tracing (RayQuery): no shader binding table, so no hit groups.
             HitGroupStride = 0,
             BindingMode = HitGroupBindingMode.PerInstance,
             TLASTransitionMode = ResourceStateTransitionMode.Transition,
@@ -322,8 +272,7 @@ public sealed class ProbeSceneAccel : IDisposable
             ScratchBufferTransitionMode = ResourceStateTransitionMode.Transition,
         });
 
-    /// <summary>Матрица движка (строковая, перенос в последней СТРОКЕ) в матрицу инстанса
-    /// трассировки (3x4, перенос в последнем СТОЛБЦЕ).</summary>
+    // Engine matrices are row-major with translation in the last row; instance ones use a column.
     private static Matrix3x4 ToMatrix3x4(Matrix4x4 m) => new(
         m.M11, m.M21, m.M31, m.M41,
         m.M12, m.M22, m.M32, m.M42,

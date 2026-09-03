@@ -19,25 +19,19 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>Физика сцены: ленивый мир Bepu, статики, дебаг-оверлей линий. Часть <see cref="PrefabSceneViewport"/> - файл на тему;
-	/// состояние, конструктор и кадровые Update/Render живут в основном файле.</summary>
+	/// <summary>Scene physics: lazy Bepu world, statics, debug line overlay.</summary>
 	public partial class PrefabSceneViewport
 	{
-		/// <summary>
-		/// Кадровый шаг физики: заводит или убирает мир по надобности, догоняет статику и двигает
-		/// симуляцию. Идёт ДО анимации - и это не вкусовщина: луч foot IK обязан щупать мир в том
-		/// состоянии, в котором он будет нарисован, а рэгдолл в этом же кадре читает позу из тел,
-		/// проинтегрированных ЗДЕСЬ, и тут же задаёт им новую цель.
-		/// </summary>
+		// Must run BEFORE animation: foot IK rays need the world as it will be drawn, and the
+		// ragdoll reads poses from bodies integrated here.
 		private void PollScenePhysics(float deltaSeconds)
 		{
 			if (!ScenePhysicsWanted())
 			{
 				if (_physics != null)
 				{
-					// Драйвер держит рэгдоллы ЭТОГО мира - без их сноса они остались бы хендлами в
-					// уничтоженной симуляции. Отвязка, а не Clear: персонажи со своими палитрами
-					// скиннинга обязаны пережить выключение физики (см. AnimationDriver.DetachPhysics).
+					// Detach, not Clear: ragdoll handles die with the world, but characters and
+					// their skinning palettes must survive physics being switched off.
 					_animation?.DetachPhysics();
 					_motion.Clear(_physics);
 					_physics.Dispose();
@@ -53,13 +47,8 @@ namespace DecaEngine.Editor
 				_physicsStaticsDirty = true;
 			}
 
-			// Симуляция идёт ТОЛЬКО в Play. Мир при этом заводится и статику держит всегда - построение
-		// BVH по всей геометрии сцены в момент нажатия кнопки отдало бы первый кадр игры под
-		// подвисание, - но шагов не делает: в режиме редактирования сцена обязана стоять там, где её
-		// поставил автор. Рэгдолл, разъезжающийся, пока автор двигает объекты, - это не «живая
-		// сцена», а невозможность её собрать.
-		//
-		// Ручная пауза остаётся сверху: она останавливает и то, что идёт по Play.
+			// The world exists outside Play (statics BVH is too slow to build on button press)
+		// but only steps in Play; the manual pause sits on top of that.
 		_physics.Paused = _editorSettings.ScenePhysicsPaused || !IsPlaying;
 			_physics.TimeScale = _editorSettings.ScenePhysicsTimeScale;
 			_physics.RecordRays = _editorSettings.PhysicsDebug.Rays;
@@ -69,8 +58,7 @@ namespace DecaEngine.Editor
 			{
 				_physics.World.Contacts.Enabled = recordContacts;
 
-				// Выключение обязано и ОЧИСТИТЬ: иначе на экране навсегда остался бы снимок шага,
-				// на котором галочка ещё была включена, и он выглядел бы как живые контакты.
+				// Disabling must also clear, or the last recorded step stays on screen forever.
 				if (!recordContacts)
 				{
 					_physics.World.Contacts.Clear();
@@ -83,24 +71,19 @@ namespace DecaEngine.Editor
 				RebuildPhysicsStatics();
 			}
 
-			// Скорость задаётся ДО шага, поза читается ПОСЛЕ. Слить их в один вызов нельзя: скорость,
-			// заданная после шага, применится только к следующему (персонаж отстаёт от собственной
-			// команды на кадр), а поза, прочитанная до шага, - это поза прошлого кадра.
+			// Velocity is set BEFORE the step and the pose read AFTER; merging the two calls
+			// would cost a frame of lag in one direction or the other.
 			_motion.Input = _playerInput;
 			_playerInput = default;
 			_motion.Steer(_lastStore, _physics, IsPlaying, deltaSeconds, _animation);
 
 			_physics.Update(deltaSeconds);
 
-			// Тело сдвинулось - трансформ сущности за ним. SyncScene, который перекладывает трансформы
-			// в инстансы, идёт РАНЬШЕ по кадру, поэтому картинка отстаёт от физики ровно на кадр -
-			// столько же, сколько и Play-Mode-системы, которые EditorManager тикает после вьюпорта.
+			// SyncScene ran earlier this frame, so the picture trails physics by exactly one frame.
 			_motion.Apply(_lastStore, _physics);
 		}
 
-		/// <summary>Нужна ли физика этой сцене вообще. Мир заводится только под конкретного
-		/// потребителя - персонажа с foot IK или рэгдоллом либо явно включённый дебаг физики:
-		/// построение статики - это BVH по всей геометрии сцены.</summary>
+		// The world is created only for a real consumer: building statics is a whole-scene BVH.
 		private bool ScenePhysicsWanted()
 		{
 			if (!_editorSettings.ScenePhysicsEnabled)
@@ -132,19 +115,10 @@ namespace DecaEngine.Editor
 			return false;
 		}
 
-		/// <summary>Ведёт ли этого персонажа физика геймплейного скрипта. Мир заводится по нему СРАЗУ,
-		/// не дожидаясь Play: статика - это BVH по всей геометрии сцены, и строить его в момент
-		/// нажатия кнопки значило бы отдать первый кадр игры под подвисание.</summary>
 		private static bool IsPhysicalCharacter(Entity entity) => entity.HasComponent<CharacterBodyComponent>();
 
-		/// <summary>
-		/// Состояние привода персонажей - для окна дебага. Молчащий персонаж в редакторе выглядит
-		/// одинаково независимо от того, ЧТО именно его не пускает: физика выключена галочкой, игра не
-		/// запущена, компонент тела не доехал из префаба или тело есть, но упёрлось. Разбирать это
-		/// глазами по коду - самое дорогое, что можно тут сделать, поэтому все четыре числа выведены
-		/// наружу разом.
-		/// </summary>
-		public (bool Playing, bool HasPhysics, bool Paused, int Scripts, int WithBody, int Bodies) ScriptCharacterStatus
+		/// <summary>Character driver state for the debug window.</summary>
+		public (bool Playing, bool HasPhysics, bool Paused, int Scripts, int WithBody, int Bodies, int FloorRescues) ScriptCharacterStatus
 		{
 			get
 			{
@@ -154,16 +128,13 @@ namespace DecaEngine.Editor
 
 				if (store != null)
 				{
-					// Скрипты и тела считаются ОТДЕЛЬНО: сцена, сгенерированная до появления
-					// Character Body, приезжает со скриптом и без тела, и «1 и 0» отвечает на вопрос
-					// сразу, а «0 из 0» отправило бы искать поломку в физике.
+					// Scripts and bodies are counted separately: old scenes have scripts but no body.
 					foreach (var entity in store.Query<CircleMoveComponent>().Entities)
 					{
 						scripts++;
 						withBody += entity.HasComponent<CharacterBodyComponent>() ? 1 : 0;
 					}
 
-					// Игрок - тоже скрипт движения, только рулит им клавиатура (см. PlayerMoveComponent).
 					foreach (var entity in store.Query<PlayerMoveComponent>().Entities)
 					{
 						scripts++;
@@ -172,15 +143,12 @@ namespace DecaEngine.Editor
 				}
 
 				return (IsPlaying, _physics != null, _physics?.Paused ?? false, scripts, withBody,
-					_motion.CharacterCount);
+					_motion.CharacterCount, _motion.FloorRescues);
 			}
 		}
 
-		/// <summary>
-		/// Пересобирает статику физики по геометрии сцены. Скиннед-модели в неё НЕ идут: персонаж не
-		/// должен быть полом сам себе - его собственная стопа немедленно нашла бы лучом его же ногу,
-		/// и foot IK поднял бы его на высоту собственного бедра.
-		/// </summary>
+		// Skinned models are excluded: a character must not be its own floor, or foot IK rays
+		// would hit its own leg.
 		private void RebuildPhysicsStatics()
 		{
 			if (_physics == null)
@@ -210,22 +178,17 @@ namespace DecaEngine.Editor
 
 			_physics.EndStatics();
 
-			// Скретч держит мировую копию всей сцены - на большом уровне это десятки мегабайт,
-			// которые до следующей пересборки не нужны никому.
+			// Scratch holds a world copy of the whole scene: tens of MB on a large level.
 			_physicsPositions.Clear();
 			_physicsIndices.Clear();
 			_physicsPositions.TrimExcess();
 			_physicsIndices.TrimExcess();
 		}
 
-		// --- Дебаг-линии (см. DebugDraw / DebugLineOverlay) ---------------------------------------
-
-		/// <summary>Открывает кадр дебага. Звать ДО любой стадии, которая рисует: список линий - это
-		/// кадр целиком, а не накопитель.</summary>
+		// Call before any stage that draws: the line list is one frame, not an accumulator.
 		private void BeginDebugFrame()
 		{
-			// Подсветка кости из окна Humanoid включает дебаг сама по себе: её просят как раз тогда,
-			// когда ни один слой ещё не включён - «покажи, какая это кость».
+			// Joint highlight turns debug on by itself; it is asked for with all layers off.
 			_debugDraw.Enabled = _editorSettings.AnimationDebug.AnyEnabled ||
 				_editorSettings.PhysicsDebug.AnyEnabled ||
 				!string.IsNullOrEmpty(HighlightJoint);
@@ -233,8 +196,7 @@ namespace DecaEngine.Editor
 			_debugDraw.Clear();
 		}
 
-		/// <summary>Закрывает кадр дебага: дорисовывает то, что принадлежит миру (физика), и заливает
-		/// всё на GPU. Звать ПОСЛЕ анимации и до исполнения графа.</summary>
+		// Call after animation and before the graph runs.
 		private void EndDebugFrame()
 		{
 			if (_debugDraw.Enabled && _physics != null)
@@ -252,9 +214,8 @@ namespace DecaEngine.Editor
 			PollDebugLineOverlay();
 		}
 
-		/// <summary>Ведёт GPU-оверлей дебаг-линий за содержимым кадра. Создание/снятие пересобирает
-		/// граф (команды заморожены, см. GraphicsPipelineSimple.DebugOverlay), поэтому проверка
-		/// «есть что рисовать» обязана быть дешёвой - она и есть пара сравнений.</summary>
+		// Creating or dropping the overlay rebuilds the graph (commands are frozen), so the
+		// "anything to draw" test must stay cheap.
 		private void PollDebugLineOverlay()
 		{
 			if (!_debugDraw.Enabled || _debugDraw.TotalCount == 0)
@@ -282,8 +243,7 @@ namespace DecaEngine.Editor
 				}
 				catch (Exception ex)
 				{
-					// Один раз и больше не пробовать: не собравшийся шейдер не соберётся и на
-					// следующем кадре, а поток одинаковых ошибок в консоли скрыл бы настоящие.
+					// Try once: a shader that failed to compile will fail again next frame.
 					_debugOverlayFailed = true;
 					EngineLog.Add(LogLevel.Error, $"Debug draw: overlay unavailable: {ex.Message}");
 					return;
@@ -306,8 +266,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Снимает дебаг-оверлей с конвейера и освобождает его. Звать перед пересозданием
-		/// окружения и на выходе: оверлей держит буферы и PSO этого конкретного конвейера.</summary>
+		// Call before recreating the environment: the overlay holds this pipeline's buffers and PSO.
 		private void ReleaseDebugOverlay()
 		{
 			if (_debugLineOverlay == null)
@@ -327,21 +286,14 @@ namespace DecaEngine.Editor
 		private readonly HashSet<int> _visitedThisSync = new();
 		private readonly List<int> _removeScratch = new();
 
-		// Зеркала punctual-светов (point/spot) префаба в РЕНДЕР-сторе окружения: SimpleCullingAndRender
-		// System собирает света из _env.Store, а сущности префаба живут в своём сторе с ЛОКАЛЬНЫМИ
-		// трансформами - зеркало несёт мировые (ComputeWorldMatrix, как у геометрии). Ключ - id
-		// сущности префаба. Синк покомпонентно каждый кадр: светов единицы, а ручки инспектора
-		// (цвет/интенсивность/углы) обязаны быть живыми - пул светов и так перезаливается за кадр.
+		// Prefab punctual lights mirrored into the env render store, keyed by prefab entity id:
+		// the culling system reads _env.Store, and mirrors carry world transforms, not local.
 		private readonly Dictionary<int, Entity> _lightMirrors = new();
 
-		/// <summary>Скретч сборки punctual-светов для бейка проб (см. PollSceneProbeBake) - чтобы не
-		/// аллоцировать список каждый кадр.</summary>
 		private readonly List<PunctualLight> _probeBakeLightsScratch = new();
 
-		/// <summary>TLAS для RT-теней (режим «Ray-traced» комбо Shadow filtering, см.
-		/// ModelPreviewViewport._rtShadowScene - та же роль). Отдельный от _sceneAccel проб: живёт
-		/// независимо от probe-GI, BLAS-ы кешируются по мешам и переживают движение - на позы
-		/// отвечает пересборка TLAS.</summary>
+		// TLAS for ray-traced shadows, separate from the probe _sceneAccel: BLASes are cached
+		// per mesh and survive movement, poses are handled by rebuilding the TLAS.
 		private DiligentRayTracingScene? _rtShadowScene;
 		private readonly List<DiligentRayTracingScene.Instance> _rtShadowInstances = new();
 		private bool _appliedRtShadows;

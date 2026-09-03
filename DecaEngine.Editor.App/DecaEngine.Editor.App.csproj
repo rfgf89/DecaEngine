@@ -1,16 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<!--
-		Точка входа: разбор аргументов командной строки и запуск - либо редактора, либо одного из
-		headless-пробников.
+		The entry point: command line argument parsing and startup - either the editor or one of the
+		headless probes.
 
-		Существует затем, чтобы DecaEngine.Editor мог быть БИБЛИОТЕКОЙ. Пока редактор сам был exe,
-		пробники были обязаны лежать внутри него: сослаться на редактор снаружи было нельзя, а Main
-		с их диспетчеризацией жил в нём же. Отсюда девять с половиной тысяч строк тестовой оснастки
-		посреди окон ImGui.
+		It exists so that DecaEngine.Editor can be a LIBRARY. While the editor was the exe itself,
+		the probes had to live inside it: nothing outside could reference the editor, and the Main
+		that dispatched them lived there too. Hence nine and a half thousand lines of test harness
+		sitting among the ImGui windows.
 
-		Теперь стрелки развязаны: Probes -> Editor (пробникам нужны вьюпорты), App -> оба (ему нужно
-		уметь запустить и то, и другое). Обратных стрелок нет.
+		The arrows are untangled now: Probes -> Editor (the probes need the viewports), App -> both
+		(it has to be able to launch either). There are no arrows back.
 	-->
 	<PropertyGroup>
 		<OutputType>Exe</OutputType>

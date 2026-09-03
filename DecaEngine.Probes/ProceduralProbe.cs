@@ -8,28 +8,21 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Проверка процедурного слоя (DECA_PROBE_PROC=1): spring bones, foot IK, aim IK. Настраивается по
-/// ИМЕНАМ костей, а не по индексам: индексы зависят от порядка узлов в glTF и молча разъезжаются при
-/// переэкспорте модели, а имена - нет.
-///
-/// Физика здесь не нужна: foot IK принимает райкаст функцией, и подставить плоскость точнее и
-/// воспроизводимее, чем гонять симуляцию, - у проверки IK и проверки физики разные предметы
-/// (последняя живёт в PhysicsProbe).
-/// </summary>
+/// <summary>Procedural layer probe (DECA_PROBE_PROC=1): spring bones, foot IK, aim IK.</summary>
+// Joints are looked up by name: glTF node order shifts silently on re-export.
 public static class ProceduralProbe
 {
 	public static void Run(ModelLoader model)
 	{
 		if (model.Skeleton == null)
 		{
-			Console.WriteLine("[probe] proc: модель без скелета - проверять нечего");
+			Console.WriteLine("[probe] proc: model has no skeleton - nothing to check");
 			return;
 		}
 
 		if (!Ozz.IsAvailable)
 		{
-			Console.WriteLine("[probe] proc: нативный ozz недоступен - IK не проверить (two-bone/aim живут в нём)");
+			Console.WriteLine("[probe] proc: native ozz unavailable - cannot check IK (two-bone/aim live there)");
 			return;
 		}
 
@@ -37,7 +30,7 @@ public static class ProceduralProbe
 		using var pose = OzzPose.Create(skeleton);
 		if (skeleton == null || pose == null)
 		{
-			Console.WriteLine("[probe] proc: скелет ozz не собрался");
+			Console.WriteLine("[probe] proc: ozz skeleton failed to build");
 			return;
 		}
 
@@ -50,8 +43,6 @@ public static class ProceduralProbe
 		ProbeFootLocking(model, model.Skeleton, skeleton, pose, locals, models);
 		ProbeAimIk(model.Skeleton, pose, locals, models);
 
-		// Рэгдолл - единственная часть процедурного слоя, которой физика нужна по существу, поэтому
-		// он живёт отдельным файлом и получает уже готовую позу.
 		RagdollProbe.Run(model.Skeleton, pose, models);
 	}
 
@@ -60,12 +51,7 @@ public static class ProceduralProbe
 
 	// --- Spring bones -----------------------------------------------------------------------------
 
-	/// <summary>
-	/// Три утверждения, и все три обязательны. Цепочка в покое НЕ должна дёргать позу (иначе
-	/// «вторичное движение» превращается в вечную мелкую тряску). При рывке она ОБЯЗАНА отстать -
-	/// иначе никакого вторичного движения нет вовсе, а есть жёстко привязанный хвост. И она обязана
-	/// ВЕРНУТЬСЯ - расходящаяся цепочка выглядит как взорвавшийся персонаж и ловится только так.
-	/// </summary>
+	// Asserts all three: no jitter at rest, lag on a jerk, convergence back afterwards.
 	private static void ProbeSpringBones(PreparedSkeleton skeleton, OzzPose pose, Transform[] locals,
 		Matrix4x4[] models)
 	{
@@ -76,7 +62,7 @@ public static class ProceduralProbe
 
 		if (chainJoints.Length < 2)
 		{
-			Console.WriteLine("[probe] proc: цепочки хвоста в риге нет - spring bones пропущены");
+			Console.WriteLine("[probe] proc: no tail chain in the rig - spring bones skipped");
 			return;
 		}
 
@@ -99,7 +85,6 @@ public static class ProceduralProbe
 		var reference = (Transform[])locals.Clone();
 		int tip = chainJoints[^1];
 
-		// 1. Покой: сто шагов при неподвижной позе.
 		for (int i = 0; i < 100; i++)
 		{
 			reference.CopyTo(locals, 0);
@@ -115,7 +100,6 @@ public static class ProceduralProbe
 		Refresh(pose, locals, models);
 		float restDrift = Vector3.Distance(restTip, models[tip].Translation);
 
-		// 2. Рывок: разворачиваем корень цепочки на 60° и делаем ОДИН шаг.
 		int chainRoot = chainJoints[0];
 		int chainParent = skeleton.Parents[chainRoot] >= 0 ? skeleton.Parents[chainRoot] : chainRoot;
 
@@ -131,7 +115,6 @@ public static class ProceduralProbe
 		SpringBones.Solve(skeleton, chains, locals, models, dt);
 		float lag = Vector3.Distance(models[tip].Translation, animatedTip);
 
-		// 3. Возврат: держим повёрнутую позу и ждём, пока цепочка догонит.
 		for (int i = 0; i < 300; i++)
 		{
 			jerked.CopyTo(locals, 0);
@@ -142,10 +125,10 @@ public static class ProceduralProbe
 
 		float settled = Vector3.Distance(models[tip].Translation, animatedTip);
 
-		Console.WriteLine($"[probe] proc: spring bones - покой {restDrift:0.####} " +
-			$"{(restDrift < 0.01f ? "OK" : "ДРОЖИТ")}, отставание при рывке {lag:0.###} " +
-			$"{(lag > 0.05f ? "OK" : "НЕТ ИНЕРЦИИ")}, возврат {settled:0.####} " +
-			$"{(settled < lag * 0.1f ? "OK" : "НЕ СХОДИТСЯ")}");
+		Console.WriteLine($"[probe] proc: spring bones - rest {restDrift:0.####} " +
+			$"{(restDrift < 0.01f ? "OK" : "JITTERS")}, lag on a jerk {lag:0.###} " +
+			$"{(lag > 0.05f ? "OK" : "NO INERTIA")}, return {settled:0.####} " +
+			$"{(settled < lag * 0.1f ? "OK" : "DOES NOT CONVERGE")}");
 	}
 
 	// --- Foot IK ----------------------------------------------------------------------------------
@@ -158,14 +141,12 @@ public static class ProceduralProbe
 
 		if (legs.Count < 2)
 		{
-			Console.WriteLine("[probe] proc: задних ног в риге не нашлось - foot IK пропущен");
+			Console.WriteLine("[probe] proc: no hind legs found in the rig - foot IK skipped");
 			return;
 		}
 
-		// По НОГЕ отдельно, и пол ставится относительно ЕЁ стопы. Общая плоскость под обе ноги для
-		// этой модели нефизична: у лисы задние стопы в bind-позе разнесены по высоте на 12 единиц
-		// при длине ноги ~15, и требование поставить обе на один уровень упирается не в качество
-		// солвера, а в предел складывания колена. Проверять надо солвер, а не выбор тестовой сцены.
+		// One leg at a time: the fox's bind-pose hind feet differ by 12 units in height,
+		// so a shared ground plane would hit the knee fold limit, not the solver.
 		foreach (var leg in legs)
 		{
 			ProbeSingleLeg(skeleton, pose, leg, locals, models);
@@ -174,10 +155,7 @@ public static class ProceduralProbe
 		ProbePelvisDrop(skeleton, pose, legs, locals, models);
 	}
 
-	/// <summary>Одна нога, пол на единицу выше её стопы: заведомо достижимая цель, на которой
-	/// аналитический two-bone IK обязан попадать ТОЧНО. Таз при этом выключен - его поведение
-	/// проверяется отдельно (см. <see cref="ProbePelvisDrop"/>), и смешивать два эффекта в одной
-	/// проверке значит не знать, который из них сломался.</summary>
+	// Reachable target, pelvis disabled: isolates two-bone IK accuracy from pelvis drop.
 	private static void ProbeSingleLeg(PreparedSkeleton skeleton, OzzPose pose, FootIkLeg leg,
 		Transform[] locals, Matrix4x4[] models)
 	{
@@ -186,8 +164,7 @@ public static class ProceduralProbe
 			PelvisJoint = -1,
 			ProbeUp = 20f,
 			ProbeDown = 40f,
-			// Мгновенное сглаживание: проверка одношаговая, экспоненциальное приближение только
-			// размазало бы ожидаемое значение по кадрам.
+			// Single-step check: smoothing would spread the expected value over frames.
 			Smoothing = 0f,
 			AlignToNormal = false,
 		};
@@ -199,12 +176,7 @@ public static class ProceduralProbe
 
 		float startY = models[leg.FootJoint].Translation.Y;
 
-		// Пол - на единицу выше ПЛОСКОСТИ ОПОРЫ (нуля модели), а не выше стопы: солвер сохраняет
-		// подъём стопы над плоскостью и ограничивает поправку долей длины ноги, и пол «чуть выше
-		// стопы» в абсолюте (y около 36) означал бы рельеф в две длины ноги - клапан насыщается, и
-		// проверялась бы деградация, а не точность. Здесь проверяется не семантика замаха, а
-		// точность two-bone IK, поэтому высота щиколотки берётся равной bind-высоте стопы - замах
-		// тогда нулевой, и цель равна «пол + щиколотка», как и ожидание, а поправка равна единице.
+		// Ground is 1 unit above the model origin: higher saturates the correction clamp.
 		const float groundY = 1f;
 		leg.AnkleHeight = startY;
 
@@ -225,17 +197,14 @@ public static class ProceduralProbe
 		float expected = groundY + leg.AnkleHeight;
 		float error = MathF.Abs(resultY - expected);
 
-		// Пределы цепочки: two-bone IK не может поставить стопу ближе к бедру, чем |L1-L2|, и дальше,
-		// чем L1+L2. Без этих чисел недолёт неотличим от ошибки солвера - а это разные диагнозы.
+		// Chain limits |L1-L2|..L1+L2: without them an unreachable target reads as solver error.
 		var hip = models[leg.UpperJoint].Translation;
 		float upperLength = Vector3.Distance(hip, models[leg.LowerJoint].Translation);
 		float lowerLength = Vector3.Distance(models[leg.LowerJoint].Translation, models[leg.FootJoint].Translation);
 		float maxReach = upperLength + lowerLength;
 		float minReach = MathF.Abs(upperLength - lowerLength);
 
-		// Расстояние от бедра до ЦЕЛИ - именно оно решает, достижима она или нет. Сравнивать надо с
-		// ним, а не с итоговым положением стопы: последнее по определению лежит в пределах цепочки,
-		// и по нему недостижимую цель от ошибки солвера не отличить.
+		// Reach is measured to the target, not the solved foot, which is always in range.
 		var targetPoint = new Vector3(
 			models[leg.FootJoint].Translation.X, expected, models[leg.FootJoint].Translation.Z);
 		float targetReach = Vector3.Distance(hip, targetPoint);
@@ -243,21 +212,17 @@ public static class ProceduralProbe
 		string verdict = error < 0.02f
 			? "OK"
 			: targetReach >= maxReach - 0.02f
-				? "цель ВНЕ ДОСЯГАЕМОСТИ (нога вытянута)"
+				? "target OUT OF REACH (leg fully extended)"
 				: targetReach <= minReach + 0.02f
-					? "цель ближе предела складывания"
-					: "СЛИШКОМ БОЛЬШАЯ";
+					? "target closer than the folding limit"
+					: "TOO LARGE";
 
 		Console.WriteLine($"[probe] proc: foot IK ({skeleton.JointNames[leg.FootJoint]}) - " +
-			$"{(solved ? "решён" : "НЕ РЕШЁН")}, y {startY:0.###} -> {resultY:0.###}, ожидалось {expected:0.###}, " +
-			$"ошибка {error:0.####}; досягаемость {minReach:0.##}..{maxReach:0.##}, до цели {targetReach:0.##} {verdict}");
+			$"{(solved ? "solved" : "NOT SOLVED")}, y {startY:0.###} -> {resultY:0.###}, expected {expected:0.###}, " +
+			$"error {error:0.####}; reach {minReach:0.##}..{maxReach:0.##}, to target {targetReach:0.##} {verdict}");
 	}
 
-	/// <summary>
-	/// Опускание таза. Пол ставится НИЖЕ обеих стоп на заведомо большую величину, и проверяется, что
-	/// таз ушёл вниз ровно на клапан <see cref="FootIkSettings.MaxPelvisDrop"/> - не глубже (иначе
-	/// шаг в пропасть утягивает персонажа под землю) и не мельче (иначе клапан не работает вовсе).
-	/// </summary>
+	// Ground far below both feet: the pelvis must drop exactly MaxPelvisDrop, no more, no less.
 	private static void ProbePelvisDrop(PreparedSkeleton skeleton, OzzPose pose, List<FootIkLeg> legs,
 		Transform[] locals, Matrix4x4[] models)
 	{
@@ -285,12 +250,8 @@ public static class ProceduralProbe
 
 		float pelvisBefore = models[pelvis].Translation.Y;
 
-		// Пол - ниже ПЛОСКОСТИ ОПОРЫ (нуля модели), а не «ниже стопы»: солвер сохраняет подъём
-		// стопы над нулём, и пол, опущенный относительно стопы, но оставшийся ВЫШЕ нуля, в новой
-		// семантике - это возвышение, на которое ногу поднимают, а не пропасть, в которую опускают
-		// таз (ровно на этом тест и сломался после смены семантики: «на 20 ниже стопы» у лисы со
-		// стопами на y=23..35 - это ещё y=+3).
-
+		// Below the model origin, not below the foot: the solver keeps foot lift over origin,
+		// so any plane still above zero reads as a step up, not a drop.
 		const float groundY = -20f;
 
 		GroundSample Ground(Vector3 origin, Vector3 direction, float distance)
@@ -305,31 +266,18 @@ public static class ProceduralProbe
 		{
 			leg.ResetSmoothing();
 
-			// ProbeSingleLeg перед этим подменил щиколотку на bind-высоту стопы (общий список ног) -
-			// вернуть авторскую: здесь пропасть задана ниже нуля модели, подъём стопы её не съедает,
-			// и цель честно недостижима на величину много больше клапана.
+			// Restore the authored ankle height: ProbeSingleLeg overwrote it on the shared legs.
 			leg.AnkleHeight = 0.5f;
 		}
 
 		FootIk.Solve(pose, skeleton, legs, settings, Matrix4x4.Identity, locals, models, Ground, 1f / 60f);
 
 		float drop = pelvisBefore - models[pelvis].Translation.Y;
-		Console.WriteLine($"[probe] proc: таз опустился на {drop:0.###} при клапане {maxDrop} " +
+		Console.WriteLine($"[probe] proc: pelvis dropped by {drop:0.###} with a cap of {maxDrop} " +
 			$"{(MathF.Abs(drop - maxDrop) < 0.02f ? "OK" : "MISMATCH")}");
 	}
 
-	/// <summary>
-	/// Локинг опорной стопы - ПАРОЙ на рассинхроне темпа. Модель едет по миру с постоянной
-	/// скоростью, а клип Walk шагает НА МЕСТЕ: без локинга опорная лапа обязана ехать по полу ровно
-	/// со скоростью модели, с локингом - стоять в точке захвата. Стойка размечается ПО КЛИПУ заранее
-	/// (нижняя четверть размаха высоты стопы), в обеих ветках меряется одно и то же - путь лапы в
-	/// МИРЕ за кадры стойки. Одна ветка не доказывает ничего: «мало скольжения» бывает и без
-	/// локинга, если модель еле ползёт.
-	///
-	/// Высота щиколотки в ветках подставляется равной минимуму стопы в клипе, а пол - в ноль мира:
-	/// вертикальный канал тогда тождественный, и пара мерит ТОЛЬКО локинг, а не его смесь с
-	/// подстройкой высоты.
-	/// </summary>
+	// A/B on tempo mismatch: only the locked-vs-unlocked pair proves locking, one branch cannot.
 	private static void ProbeFootLocking(ModelLoader model, PreparedSkeleton skeleton, OzzSkeleton ozz,
 		OzzPose pose, Transform[] locals, Matrix4x4[] models)
 	{
@@ -340,18 +288,17 @@ public static class ProceduralProbe
 
 		if (walk == null || leftFoot < 0 || rightFoot < 0)
 		{
-			Console.WriteLine("[probe] proc: локинг пропущен - нет клипа Walk или задних лап");
+			Console.WriteLine("[probe] proc: locking skipped - no Walk clip or no hind feet");
 			return;
 		}
 
 		using var clip = OzzClip.Build(ozz, walk);
 		if (clip == null || clip.Duration <= 0f)
 		{
-			Console.WriteLine("[probe] proc: локинг пропущен - клип Walk не собрался в ozz");
+			Console.WriteLine("[probe] proc: locking skipped - the Walk clip failed to build in ozz");
 			return;
 		}
 
-		// Разметка стойки, минимумы высот и ПРИРОДНАЯ скорость шага - одним проходом по циклу.
 		const int cycleSamples = 60;
 		var leftPositions = new Vector3[cycleSamples];
 		float leftMin = float.MaxValue, leftMax = float.MinValue, rightMin = float.MaxValue;
@@ -369,10 +316,7 @@ public static class ProceduralProbe
 			rightMin = MathF.Min(rightMin, models[rightFoot].Translation.Y);
 		}
 
-		// Стойка размечается ЯДРОМ - нижней десятой размаха высоты, а не нижней четвертью: на краях
-		// такта лапа клипа сама разгоняется и тормозит, там рассинхрон мгновенной скорости велик
-		// при любом среднем темпе, и локинг на краях ОТПУСКАЕТ по страховке осознанно. Мерить
-		// удержание можно только там, где лапа клипа стоит, - в ядре.
+		// Stance = lowest tenth of the height span: at the edges locking releases by design.
 		var stance = new bool[cycleSamples];
 		float threshold = leftMin + 0.10f * (leftMax - leftMin);
 		float strideTravel = 0f;
@@ -393,7 +337,7 @@ public static class ProceduralProbe
 
 		if (strideSeconds < 1e-4f || strideTravel < 1e-3f)
 		{
-			Console.WriteLine("[probe] proc: локинг пропущен - у клипа не нашлось такта опоры");
+			Console.WriteLine("[probe] proc: locking skipped - the clip has no stance beat");
 			return;
 		}
 
@@ -432,19 +376,13 @@ public static class ProceduralProbe
 				LockFeet = locking,
 			};
 
-			// Скорость модели - ПРИРОДНАЯ скорость клипа плюс 10% рассинхрона: ровно тот остаток,
-			// который локинг обязан убирать. Модель, ползущая много медленнее клипа, - негодная
-			// сцена дважды: мировой путь стопы тогда доминируется махом самого клипа (метрика
-			// меряет клип, а не скольжение), а огромный рассинхрон срабатывает страховочным
-			// отпуском на 0.35 длины ноги - и пара меряет страховку, а не удержание.
-			// Движение - ВДОЛЬ ХОДА ЛИСЫ (морда в -Z): мах опорной лапы сокращается с движением
-			// модели только по этой оси, движение поперёк хода не сокращает его никаким темпом.
+			// Clip speed +10%: a larger mismatch trips the 0.35-leg-length release safeguard.
+			// Travel is along -Z, the fox's facing axis; any other axis never cancels the swing.
 			float speed = naturalSpeed * 1.1f;
 			const float dt = 1f / 60f;
 			const int frames = 240;
 
-			// Первые полторы секунды не меряются: огибающая локинга выучивает размах ноги за
-			// цикл-другой, и до этого обе ветки честно одинаковы.
+			// Skipped: the locking envelope needs a cycle or two to learn the leg's span.
 			const int warmup = 90;
 
 			float slide = 0f;
@@ -482,15 +420,12 @@ public static class ProceduralProbe
 		float unlocked = Slide(locking: false);
 		float locked = Slide(locking: true);
 
-		// Локинг - ДЕМПФЕР, а не абсолютный пин: захват плавный (полвеса точка ещё следует за
-		// стопой), на краях такта и на пределе увода он отпускает по страховкам - всё это осознанно
-		// куплено против «ноги в теле» и дёрганья. Поэтому планка - «заметно меньше», а не «в разы»:
-		// требовать от демпфера нулевого скольжения значит выключить страховки обратно.
+		// Locking is a damper, not a hard pin, so the bar is "noticeably less", not "near zero".
 		bool ok = unlocked > 5f && locked < unlocked * 0.7f;
 
-		Console.WriteLine($"[probe] proc: локинг опорной лапы - скольжение в стойке без локинга " +
-			$"{unlocked:0.##}, с локингом {locked:0.##} " +
-			$"{(ok ? "OK" : "НЕ ДЕРЖИТ/ПАРА НЕ РАЗОШЛАСЬ")}");
+		Console.WriteLine($"[probe] proc: stance foot locking - stance slide without locking " +
+			$"{unlocked:0.##}, with locking {locked:0.##} " +
+			$"{(ok ? "OK" : "DOES NOT HOLD/PAIR DID NOT DIVERGE")}");
 	}
 
 	private static void AddLeg(PreparedSkeleton skeleton, List<FootIkLeg> legs, string upper, string lower, string foot)
@@ -515,18 +450,13 @@ public static class ProceduralProbe
 
 	// --- Aim IK -----------------------------------------------------------------------------------
 
-	/// <summary>
-	/// Aim IK проверяется УГЛОМ ДО ЦЕЛИ до и после: какая именно ось кости считается «взглядом»,
-	/// зависит от рига, и требовать точного попадания без знания рига нельзя. А вот то, что после
-	/// доворота цель стала БЛИЖЕ к оси взгляда, обязано выполняться на любом риге - и ровно это
-	/// ломается, если перепутаны пространство цели или порядок домножения коррекции.
-	/// </summary>
+	// Compares angle-to-target before/after: the forward axis is rig-specific, exact hits are not.
 	private static void ProbeAimIk(PreparedSkeleton skeleton, OzzPose pose, Transform[] locals, Matrix4x4[] models)
 	{
 		int head = skeleton.FindJoint("b_Head_05");
 		if (head < 0)
 		{
-			Console.WriteLine("[probe] proc: головы в риге нет - aim IK пропущен");
+			Console.WriteLine("[probe] proc: no head in the rig - aim IK skipped");
 			return;
 		}
 
@@ -545,9 +475,9 @@ public static class ProceduralProbe
 		Refresh(pose, locals, models);
 		float after = AngleToTarget(models[head], forward, target);
 
-		Console.WriteLine($"[probe] proc: aim IK - {(solved ? "решён" : "НЕ РЕШЁН")}, " +
-			$"угол до цели {before * 180f / MathF.PI:0.#}° -> {after * 180f / MathF.PI:0.#}° " +
-			$"{(solved && after < before - 0.01f ? "OK" : "НЕ УЛУЧШИЛСЯ")}");
+		Console.WriteLine($"[probe] proc: aim IK - {(solved ? "solved" : "NOT SOLVED")}, " +
+			$"angle to target {before * 180f / MathF.PI:0.#}° -> {after * 180f / MathF.PI:0.#}° " +
+			$"{(solved && after < before - 0.01f ? "OK" : "NO IMPROVEMENT")}");
 	}
 
 	private static float AngleToTarget(in Matrix4x4 joint, Vector3 localForward, Vector3 target)

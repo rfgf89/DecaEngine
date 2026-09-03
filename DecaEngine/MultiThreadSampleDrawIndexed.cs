@@ -6,7 +6,7 @@ using DecaEngine;
 using DecaEngine.Core;
 using Diligent;
 using DiligentEngineNET.Samples.Utils;
-// Сэмпл работает с нативным контекстом напрямую - состояния Diligent-овские, не из ICommandBuffer.
+// Sample drives the native Diligent context directly, so states come from Diligent.
 using ClearDepthStencilFlags = Diligent.ClearDepthStencilFlags;
 using ResourceState = Diligent.ResourceState;
 using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
@@ -412,7 +412,6 @@ public class MultiThreadSampleDrawIndexed(GraphicsBackend backend, uint gridSize
         }
         catch
         {
-            // ignored
         }
 
 
@@ -425,8 +424,6 @@ public class MultiThreadSampleDrawIndexed(GraphicsBackend backend, uint gridSize
 
             context.Begin(0);
 
-            // Signal that this thread is ready and wait for
-            // the next main thread signal
             RenderSubset(context, threadIdx + 1);
 
             _commandLists[threadIdx] = context.FinishCommandList();
@@ -489,9 +486,7 @@ public class MultiThreadSampleDrawIndexed(GraphicsBackend backend, uint gridSize
             1.0f, 0,
             ResourceStateTransitionMode.Transition);
 
-        // let workers free to execute, so all threads(including main thread)
-        // will render a piece of subset at same time
-
+        // Release the workers first so they render their subsets alongside the main thread.
         _synchro?.Signal();
         RenderSubset(ImmediateContext, 0);
         _synchro?.WaitForThreads();
@@ -503,7 +498,7 @@ public class MultiThreadSampleDrawIndexed(GraphicsBackend backend, uint gridSize
 
     protected override void OnSetupEngineCreateInfo(EngineCreateInfo createInfo)
     {
-        var currProcessorCount = Environment.ProcessorCount * 0.8f; // run at 80% of cores
+        var currProcessorCount = Environment.ProcessorCount * 0.8f;
         createInfo.NumDeferredContexts = (uint)Math.Max(Math.Floor(currProcessorCount), 4);
 
         if (createInfo is EngineD3D12CreateInfo d3d12Ci)

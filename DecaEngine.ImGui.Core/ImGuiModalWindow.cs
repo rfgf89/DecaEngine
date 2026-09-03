@@ -24,10 +24,8 @@ public abstract class ImGuiModalWindow : ImGuiWindow
 			return;
 		}
 
-		// Центр ГЛАВНОГО ВЬЮПОРТА (viewport.Pos + половина остатка), а не "позиция окна-хозяина +
-		// полвьюпорта": прежняя формула складывала скрин-координаты менюбара с размером вьюпорта и
-		// уводила модалку за пределы окна редактора (невидимое "открытое" окно настроек - особенно
-		// на сдвинутом окне или мульти-мониторе).
+		// Center on the main viewport, not the host window: mixing window screen coords with
+		// viewport size pushes the modal off-screen on moved/multi-monitor setups.
 		var viewport = ImGui.GetMainViewport();
 		Vector2 size = viewport.Size * 0.75f;
 		ImGui.SetNextWindowPos(viewport.Pos + (viewport.Size - size) * 0.5f);

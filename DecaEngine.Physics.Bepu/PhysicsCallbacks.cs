@@ -9,11 +9,7 @@ using BepuUtilities;
 
 namespace DecaEngine.Physics;
 
-/// <summary>
-/// Материал контакта: трение и параметры пружины, с которыми решатель гасит проникновение. Лежит
-/// отдельной структурой, потому что рэгдоллу и персонажу нужны РАЗНЫЕ настройки: конечности должны
-/// скользить по полу, а капсула персонажа - нет.
-/// </summary>
+/// <summary>Contact material: friction and the spring the solver uses to resolve penetration.</summary>
 public struct PhysicsMaterial
 {
 	public float FrictionCoefficient;
@@ -24,40 +20,25 @@ public struct PhysicsMaterial
 	{
 		FrictionCoefficient = 1f,
 		MaximumRecoveryVelocity = 2f,
-		// 30 Гц и коэффициент затухания 1 - апериодический отклик: контакт гасится без
-		// перерегулирования. Меньшая частота даёт заметно «мягкий» пол, большая - дрожание на
-		// шаге симуляции.
+		// 30 Hz, damping ratio 1: critically damped. Lower feels soft, higher jitters at this step.
 		SpringSettings = new SpringSettings(30f, 1f),
 	};
 }
 
-/// <summary>
-/// Фильтр столкновений по подгруппам - приём из демок самого Bepu (bepuphysics2, Apache-2.0,
-/// <c>Demos/Demos/SubgroupCollisionFilter.cs</c>), перенесённый сюда как есть по смыслу.
-///
-/// Тела одной ГРУППЫ (один рэгдолл - одна группа) сталкиваются между собой по битовым маскам
-/// подгрупп; тела разных групп - всегда. Это ровно та задача, которая здесь и стоит: не
-/// сталкиваться должны только СМЕЖНЫЕ по суставу кости - их капсулы пересекаются по построению
-/// (сустав общий), и решатель, расталкивая их, воюет с собственным шарниром. А несмежные - голова и
-/// хвост, лапа и бок - сталкиваться ОБЯЗАНЫ: тряпичная кукла держит форму не только суставами, но и
-/// собственным объёмом, иначе она сворачивается в невозможный узел.
-///
-/// Своя реализация того же (массивы по значению хендла) здесь была и работала, но у штатной есть то,
-/// чего у неё не было: она лежит в <see cref="CollidableProperty{T}"/>, то есть в структуре, которую
-/// ведёт сама симуляция, и переживает удаление и ПЕРЕИСПОЛЬЗОВАНИЕ хендлов без ручной чистки.
-/// </summary>
+/// <summary>Subgroup collision filter; bodies in different groups always collide.</summary>
+// Ported from the bepuphysics2 demos (Apache-2.0, Demos/Demos/SubgroupCollisionFilter.cs).
 public struct SubgroupCollisionFilter
 {
-	/// <summary>Группа связанных тел. У тел РАЗНЫХ групп столкновение разрешено всегда.</summary>
+	/// <summary>Group of related bodies; different groups always collide.</summary>
 	public int GroupId;
 
-	/// <summary>В каких подгруппах состоит это тело.</summary>
+	/// <summary>Subgroups this body belongs to.</summary>
 	public ulong SubgroupMembership;
 
-	/// <summary>С какими подгруппами своей группы это тело сталкивается.</summary>
+	/// <summary>Subgroups of its own group this body collides with.</summary>
 	public ulong CollidableSubgroups;
 
-	/// <summary>Тело вне какой-либо связки: сталкивается со всем.</summary>
+	/// <summary>A body outside any linkage: collides with everything.</summary>
 	public SubgroupCollisionFilter(int groupId)
 	{
 		GroupId = groupId;
@@ -65,8 +46,7 @@ public struct SubgroupCollisionFilter
 		CollidableSubgroups = ulong.MaxValue;
 	}
 
-	/// <summary>Тело - член подгруппы <paramref name="subgroupId"/> (для рэгдолла - номер кости).
-	/// Подгрупп ровно 64: маска битовая, и кость номер 64 молча попала бы в кость номер 0.</summary>
+	/// <summary>Puts the body in one subgroup; ids outside 0..63 do not fit the bit mask.</summary>
 	public SubgroupCollisionFilter(int groupId, int subgroupId)
 	{
 		GroupId = groupId;
@@ -74,8 +54,7 @@ public struct SubgroupCollisionFilter
 		CollidableSubgroups = ulong.MaxValue;
 	}
 
-	/// <summary>Запрещает столкновение пары. ВЗАИМНО: односторонняя запись была бы тихой ошибкой,
-	/// зависящей от того, в каком порядке узкая фаза подала пару.</summary>
+	/// <summary>Disables collision between a pair; must be mutual, pair order is not defined.</summary>
 	public static void DisableCollision(ref SubgroupCollisionFilter a, ref SubgroupCollisionFilter b)
 	{
 		a.CollidableSubgroups &= ~b.SubgroupMembership;
@@ -87,49 +66,28 @@ public struct SubgroupCollisionFilter
 		a.GroupId != b.GroupId || (a.CollidableSubgroups & b.SubgroupMembership) > 0;
 }
 
-/// <summary>
-/// Всё, что узкая фаза знает про КОНКРЕТНОЕ тело. Одна структура на тело, а не таблица на свойство:
-/// горячий цикл читает их вместе, и второй индексируемый массив стоил бы второго промаха кеша.
-/// </summary>
+/// <summary>Per-body narrow phase data; kept in one struct so the hot loop takes one cache miss.</summary>
 public struct PhysicsBodyProperties
 {
 	public SubgroupCollisionFilter Filter;
 
-	/// <summary>
-	/// Телом управляет КОД, а не решатель: контакты такого тела не имеют трения.
-	///
-	/// Персонаж, чью горизонтальную скорость каждый кадр задаёт скрипт, - именно такое тело. Трение
-	/// для него не полезно, а вредно: оно гасит ровно ту скорость, которую только что задали, и
-	/// делает это на каждом субшаге. Замерено на капсуле лисы: при μ=1 и шаге 1/120 с потеря
-	/// составляет μ·g·dt = 0.082 м/с за субшаг, то есть 12.4% пути за оборот. Персонаж при этом
-	/// выглядит идущим правильно - расходится лишь скорость, а её потом связывают с анимационным
-	/// клипом, и ошибка приезжает скольжением ног.
-	/// </summary>
+	// Friction would eat the velocity just written: mu*g*dt = 0.082 m/s per substep at mu=1, 1/120 s.
+	/// <summary>Body velocity is set by code, not the solver: its contacts get zero friction.</summary>
 	public bool VelocityDriven;
 }
 
-/// <summary>
-/// Колбэки узкой фазы. Держат ОДИН материал на всю сцену: пер-телесные настройки контакта требуют
-/// сайд-таблицы, читаемой из горячего цикла на каждом воркере. Всё, что таблицы всё-таки требует
-/// (фильтр подгрупп и бестрениевые тела), лежит в <see cref="PhysicsBodyProperties"/> - одной
-/// структурой на тело, в штатном <see cref="CollidableProperty{T}"/>.
-/// </summary>
+/// <summary>Narrow phase callbacks; one material per scene, per-body data lives in the properties table.</summary>
 public struct PhysicsNarrowPhaseCallbacks : INarrowPhaseCallbacks
 {
 	public PhysicsMaterial Material;
 
-	/// <summary>Свойства тел. Ссылка в структуре живёт нормально: Bepu копирует колбэки к себе один
-	/// раз, вместе со ссылкой.</summary>
+	/// <summary>Per-body properties; Bepu copies these callbacks once, so the reference is safe.</summary>
 	public CollidableProperty<PhysicsBodyProperties>? Bodies;
 
-	/// <summary>Сборщик точек контакта для дебага (см. <see cref="PhysicsContactRecorder"/>); null -
-	/// контакты не собираются вовсе. Ссылка в структуре живёт нормально: Bepu копирует колбэки к
-	/// себе один раз, вместе со ссылкой.</summary>
+	/// <summary>Debug contact point sink; null means contacts are not collected at all.</summary>
 	public PhysicsContactRecorder? Recorder;
 
-	/// <summary>Симуляция нужна ровно для одного - перевода смещения контакта в мировую точку:
-	/// манифолд отдаёт его ОТНОСИТЕЛЬНО позиции коллайдера A, и без его позы контакт нарисовать
-	/// негде. Приходит в <see cref="Initialize"/>, потому что раньше её просто не существует.</summary>
+	// Needed to turn manifold offsets, which are relative to collidable A, into world positions.
 	private Simulation? _simulation;
 
 	public void Initialize(Simulation simulation)
@@ -142,14 +100,12 @@ public struct PhysicsNarrowPhaseCallbacks : INarrowPhaseCallbacks
 	public bool AllowContactGeneration(int workerIndex, CollidableReference a, CollidableReference b,
 		ref float speculativeMargin)
 	{
-		// Два статика не сталкиваются никогда - пара из них означала бы работу впустую.
 		if (a.Mobility == CollidableMobility.Static && b.Mobility == CollidableMobility.Static)
 		{
 			return false;
 		}
 
-		// Фильтр спрашивается только у пары ТЕЛ: у статики своих свойств нет, и обращение к таблице
-		// по её хендлу читало бы чужую запись - хендлы тел и статиков нумеруются независимо.
+		// Bodies only: static handles are numbered separately and would index a foreign entry.
 		if (Bodies != null && a.Mobility != CollidableMobility.Static &&
 			b.Mobility != CollidableMobility.Static)
 		{
@@ -181,15 +137,12 @@ public struct PhysicsNarrowPhaseCallbacks : INarrowPhaseCallbacks
 		return true;
 	}
 
-	/// <summary>Есть ли в паре тело под управлением кода. Статики пропускаются: своих свойств у них
-	/// нет (см. AllowContactGeneration).</summary>
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	private readonly bool IsVelocityDriven(CollidableReference a, CollidableReference b) =>
 		(a.Mobility != CollidableMobility.Static && Bodies![a.BodyHandle].VelocityDriven) ||
 		(b.Mobility != CollidableMobility.Static && Bodies![b.BodyHandle].VelocityDriven);
 
-	/// <summary>Отдельным НЕ-инлайновым методом: горячий путь узкой фазы обязан оставаться коротким,
-	/// а сбор контактов - выключенная по умолчанию ветка, которой незачем раздувать её тело.</summary>
+	// Kept out of line: this branch is off by default and must not bloat the narrow phase hot path.
 	[MethodImpl(MethodImplOptions.NoInlining)]
 	private readonly void RecordContacts<TManifold>(PhysicsContactRecorder recorder, int workerIndex,
 		CollidablePair pair, ref TManifold manifold) where TManifold : unmanaged, IContactManifold<TManifold>
@@ -226,11 +179,7 @@ public struct PhysicsNarrowPhaseCallbacks : INarrowPhaseCallbacks
 	}
 }
 
-/// <summary>
-/// Колбэки интегратора поз: гравитация и линейное затухание. Затухание задаётся ЗА СЕКУНДУ и
-/// пересчитывается под шаг в <see cref="PrepareForIntegration"/> - иначе тела тормозили бы тем
-/// сильнее, чем мельче шаг симуляции, и поведение зависело бы от частоты кадров.
-/// </summary>
+/// <summary>Pose integrator callbacks: gravity plus damping, where damping is given per second.</summary>
 public struct PhysicsPoseCallbacks : IPoseIntegratorCallbacks
 {
 	public Vector3 Gravity;
@@ -253,12 +202,10 @@ public struct PhysicsPoseCallbacks : IPoseIntegratorCallbacks
 
 	public readonly AngularIntegrationMode AngularIntegrationMode => AngularIntegrationMode.Nonconserving;
 
-	/// <summary>false: тела без ограничений интегрируются один раз на кадр, а не на каждый субшаг.
-	/// Для гравитации и затухания разницы нет, а субшаги стоят денег.</summary>
+	// Gravity and damping do not need substeps, and substeps are not free.
 	public readonly bool AllowSubstepsForUnconstrainedBodies => false;
 
-	/// <summary>Кинематику интегрировать не нужно: её скорость задаёт код снаружи (анимация,
-	/// контроллер персонажа), и гравитация к ней не применяется по определению.</summary>
+	// Kinematic velocity is driven from outside; gravity does not apply to it.
 	public readonly bool IntegrateVelocityForKinematics => false;
 
 	public void Initialize(Simulation simulation)
@@ -267,8 +214,7 @@ public struct PhysicsPoseCallbacks : IPoseIntegratorCallbacks
 
 	public void PrepareForIntegration(float dt)
 	{
-		// Затухание за секунду -> множитель за шаг. pow, а не линейное умножение: только так
-		// результат за секунду не зависит от того, на сколько шагов её порезали.
+		// Per-second damping to per-step: pow, so the result is independent of the step count.
 		_linearDampingDt = new Vector<float>(MathF.Pow(MathHelper.Clamp(1f - LinearDamping, 0f, 1f), dt));
 		_angularDampingDt = new Vector<float>(MathF.Pow(MathHelper.Clamp(1f - AngularDamping, 0f, 1f), dt));
 		Vector3Wide.Broadcast(Gravity * dt, out _gravityWideDt);

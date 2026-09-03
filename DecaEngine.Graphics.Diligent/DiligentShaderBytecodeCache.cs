@@ -9,33 +9,14 @@ using Diligent;
 
 namespace DecaEngine.Graphics.Diligent;
 
-/// <summary>
-/// Дисковый кеш БАЙТКОДА шейдеров (HLSL -> DXBC/DXIL/SPIR-V), по файлу на вариант. Существующий
-/// <see cref="DiligentPsoManager"/> кеширует только драйверную часть PSO - компиляция исходника
-/// компилятором (DXC/FXC) в него не входит и на больших вариантах UnlitInstancedPS стоит секунды
-/// НА КАЖДЫЙ запуск редактора. Этот кеш закрывает именно её: попадание создаёт шейдер из готового
-/// байткода, минуя компилятор совсем.
-///
-/// Ключ - SHA-256 от: версии формата, бэкенда, типа шейдера, точки входа, флагов компиляции,
-/// макросов И СОДЕРЖИМОГО исходника со всеми транзитивными #include-ами. Правка любого инклуда
-/// меняет ключ, так что бампать руками ничего не нужно (в отличие от версий ассет-кеша) - протухшие
-/// записи просто перестают находиться и остаются мусором на диске.
-///
-/// Хеш дерева исходников мемоизируется на процесс по корневому файлу: варианты одного шейдера
-/// (десятки) читают дерево с диска один раз. Следствие то же, что у процессного кеша шейдеров
-/// (<see cref="DecaEngine.DiligentGraphicsApi"/>._shaderCache): правка .hlsl при живом редакторе
-/// новых компиляций этого запуска не затронет - поведение не хуже прежнего.
-///
-/// Переменные окружения (зеркало DECA_PSO_CACHE):
-///   DECA_SHADER_CACHE=0     - кеш выключен полностью;
-///   DECA_SHADER_CACHE=clear - очистить директорию кеша при старте.
-///
-/// Потокобезопасен: и мемоизация, и файловый I/O зовутся из фоновой прекомпиляции
-/// (см. ModelLoader.PrecompileShaderVariants) параллельно с компиляциями главного потока.
-/// </summary>
+/// <summary>Disk cache of compiled shader bytecode (HLSL -> DXBC/DXIL/SPIR-V), one file per variant.
+/// Key is SHA-256 over format version, backend, shader type, entry point, flags, macros and the
+/// source text with all transitive #includes, so no manual version bump is needed. The source tree
+/// hash is memoized per process: editing a .hlsl mid-session does not affect this run's compiles.
+/// DECA_SHADER_CACHE=0 disables it, =clear wipes the directory at startup. Thread-safe.</summary>
 public sealed class DiligentShaderBytecodeCache
 {
-	/// <summary>Бамп при изменении раскладки записи или состава ключа.</summary>
+	// Bump when the entry layout or the key composition changes.
 	private const int FormatVersion = 1;
 
 	private readonly string _cacheDir;
@@ -44,8 +25,6 @@ public sealed class DiligentShaderBytecodeCache
 	private readonly object _lock = new();
 	private readonly Dictionary<string, string> _sourceTreeHashByRoot = new(StringComparer.OrdinalIgnoreCase);
 
-	/// <summary>Диагностика на процесс: попадания/промахи/отказы (ключ не посчитался - исходник
-	/// не прочитался) - чтобы вопрос «работает ли кеш» решался счётчиком, а не гаданием.</summary>
 	public static int DiagHits;
 	public static int DiagMisses;
 	public static int DiagStores;
@@ -56,8 +35,7 @@ public sealed class DiligentShaderBytecodeCache
 		_backendTag = backendTag;
 	}
 
-	/// <summary>null - кеш выключен (DECA_SHADER_CACHE=0). Ошибки создания директории глушатся:
-	/// лучше без кеша, чем упавший запуск.</summary>
+	/// <summary>Returns null when the cache is disabled or its directory cannot be created.</summary>
 	public static DiligentShaderBytecodeCache? Create(string cacheDir, string backendTag)
 	{
 		var mode = Environment.GetEnvironmentVariable("DECA_SHADER_CACHE");
@@ -83,8 +61,7 @@ public sealed class DiligentShaderBytecodeCache
 		return new DiligentShaderBytecodeCache(cacheDir, backendTag);
 	}
 
-	/// <summary>Ключ кеша для варианта, null - исходник не прочитался (кеш для этой компиляции
-	/// молча выключается, компилятор отработает как раньше и сам скажет, что не так).</summary>
+	/// <summary>Cache key for a variant; null when the source could not be read.</summary>
 	public string? ComputeKey(string factoryRoot, string filePath, ShaderObjectType type, string entryPoint,
 		ShaderMacro[] macros, ShaderCompileFlags compileFlags)
 	{
@@ -150,8 +127,7 @@ public sealed class DiligentShaderBytecodeCache
 
 		try
 		{
-			// Через временный файл: два процесса (редактор + CLI-проба) могут писать один ключ
-			// одновременно, и обрезанная запись не должна стать «валидным» попаданием.
+			// Temp file + move: two processes can write the same key, a truncated entry must not hit.
 			var path = EntryPath(key);
 			var tmp = path + "." + Environment.ProcessId + ".tmp";
 			File.WriteAllBytes(tmp, bytecode);
@@ -160,12 +136,10 @@ public sealed class DiligentShaderBytecodeCache
 		}
 		catch (Exception)
 		{
-			// Некритично: следующий запуск просто скомпилирует заново.
 		}
 	}
 
-	/// <summary>Запись протухла или битая (создание из байткода не удалось) - убрать, чтобы не
-	/// спотыкаться о неё каждым запуском.</summary>
+	/// <summary>Drops a stale or corrupt entry so the next run recompiles instead of retrying it.</summary>
 	public void Invalidate(string key)
 	{
 		try
@@ -179,15 +153,11 @@ public sealed class DiligentShaderBytecodeCache
 
 	private string EntryPath(string key) => Path.Combine(_cacheDir, key + ".shbc");
 
-	// #include "x" / #include <x> в начале строки (пробелы допустимы). Закомментированный инклуд
-	// иногда попадёт в хеш лишним файлом - это лишь чуть строже нужного, ключ остаётся корректным.
+	// Commented-out includes also match; that only makes the key stricter, never wrong.
 	private static readonly Regex IncludeRegex = new("^\\s*#\\s*include\\s+[\"<]([^\">]+)[\">]",
 		RegexOptions.Multiline | RegexOptions.Compiled);
 
-	/// <summary>Хеш содержимого файла со всеми транзитивными #include-ами (DFS в порядке
-	/// упоминания). Инклуды резолвятся относительно включающего файла, затем от корня фабрики -
-	/// как у дефолтной стрим-фабрики Diligent. Неразрешившийся инклуд входит в хеш именем:
-	/// компиляция такого исходника всё равно упадёт сама.</summary>
+	// Includes resolve relative to the including file, then to the factory root, as Diligent does.
 	private string GetSourceTreeHash(string rootPath, string factoryRoot)
 	{
 		lock (_lock)

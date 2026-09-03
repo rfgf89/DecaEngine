@@ -1,12 +1,5 @@
-// Общее тело композита AO (см. SsaoCompositePS.hlsl / SsaoCompositeMsaaPS.hlsl - обёртки
-// определяют DEPTH_FETCH под одиночный или мультисемпловый депт, ровно как у GtaoPS/GtaoMsaaPS).
-// Финальный кадр (копия в _SceneTex, см. ForwardPass) умножается на размытое AO (_AoTex).
-// Отдельный пасс вместо блендинга, потому что PSO-абстракция движка блендинг не описывает, а
-// читать и писать один таргет одновременно нельзя.
-//
-// Размытие - БИЛАТЕРАЛЬНОЕ 3x3 по глубине: прежний плоский бокс тащил шум оценки через силуэты
-// (тёмная кайма стены переползала на висящую перед ней штору и наоборот), а на тонкой геометрии
-// вроде листвы усреднял вперемешку крону и фон за ней.
+// Shared AO composite body; wrappers define DEPTH_FETCH for single- or multi-sample depth.
+// A separate pass rather than blending: the engine's PSO abstraction has no blend state.
 #include "Instancing.hlsl"
 
 Texture2D    _SceneTex;
@@ -19,29 +12,23 @@ cbuffer View
     ViewData viewData;
 }
 
-// Отладочный вид AO (чекбокс "AO debug view" в окне Graphics, см. SsaoPassResources.SetDebugView):
-// вместо умножения кадра на видимость композит выводит саму видимость в grayscale. Зеркалит
-// AoCompositeData (SsaoPass.cs).
+// Mirrors AoCompositeData (SsaoPass.cs).
 cbuffer AoComposite
 {
-    // 0 = обычный композит, 1 = grayscale AO поверх кадра.
+    // 0 = normal composite, 1 = grayscale AO over the frame.
     float aoDebugView;
 
-    // Делать ли билатеральное размытие AO прямо здесь. Для SSAO - да, это его единственный
-    // фильтр. Для GTAO - НЕТ: его результат уже прошёл краесохраняющий денойзер по «рёбрам»
-    // (GtaoDenoisePS.hlsl), который и точнее этого блюра, и знает про наклон поверхности;
-    // второй проход поверх него только размазал бы контактное затемнение.
+    // On for SSAO (its only filter); off for GTAO, already denoised by GtaoDenoisePS.
     float aoCompositeBlur;
 
     float aoCompositePad1;
     float aoCompositePad2;
 }
 
-// CameraData near в ModelViewportEnvironment - тот же реверсивный-Z, что и в SsaoCommon/GtaoCommon.
+// Must match CameraData near in ModelViewportEnvironment; reverse-Z, as in SsaoCommon/GtaoCommon.
 static const float CompositeNearPlane = 0.05;
 
-// Допуск билатерального веса в долях глубины пикселя: масштаб-инвариантно (дальние пиксели
-// разнесены по z сильнее), и при этом сэмпл с ДРУГОЙ поверхности отбрасывается.
+// Bilateral tolerance as a fraction of pixel depth, so it stays scale invariant.
 static const float DepthTolerance = 0.02;
 
 struct VSOutput
@@ -59,7 +46,7 @@ float CompositeViewDepth(int2 pixel, float2 viewportSize)
 {
     pixel = clamp(pixel, int2(0, 0), int2(viewportSize) - 1);
     float d = DEPTH_FETCH(pixel);
-    // Фон (реверсивный-Z очищается нулём) - бесконечность: билатеральный вес отбросит его сам.
+    // Background clears to zero under reverse-Z; map it to infinity so the weight rejects it.
     return d < 1e-6 ? 1e9 : CompositeNearPlane / d;
 }
 
@@ -75,8 +62,7 @@ PSOutput Main(in VSOutput input)
     float centerDepth = CompositeViewDepth(pixel, viewportSize);
     float tolerance = max(DepthTolerance * centerDepth, 1e-4);
 
-    // Центр всегда с весом 1 - так фильтр не вырождается в ноль на изолированном пикселе
-    // (тонкая ветка листвы, у которой все восемь соседей - фон).
+    // Center weight is fixed at 1 so the filter cannot collapse on an isolated pixel.
     float ao = _AoTex.Sample(_AoTex_sampler, uv).r;
     float weightSum = 1.0;
 
@@ -108,10 +94,8 @@ PSOutput Main(in VSOutput input)
 
     if (aoDebugView > 0.5)
     {
-        // AO уже в display-пространстве (таргет UNORM, шейдеры оценки пишут видимость как есть),
-        // так что gamma-кодировать нечего - лишний pow только вымыл бы контраст ручек AO strength/floor.
-        // Альфа берётся от сцены: композит рисует поверх кадра, и нулевая альфа выбила бы фон
-        // бейкера иконок.
+        // AO is already in display space (UNORM target), so no gamma encode here.
+        // Alpha comes from the scene: zero alpha would punch a hole in the icon baker's background.
         output.color = float4(ao.xxx, scene.a);
         return output;
     }

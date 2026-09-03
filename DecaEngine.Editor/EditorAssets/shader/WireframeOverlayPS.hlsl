@@ -1,7 +1,5 @@
-// Flat-color pixel shader for the Model Preview "Highlight + Wireframe" overlay pass (see
-// DecaEngine.Editor.ModelPreviewViewport). Paired with UnlitInstancedVS.hlsl and a PSO using
-// RasterizerStateInfo.FillMode = Wireframe, drawn as a second pass on top of the normal
-// Highlight-shaded solid mesh.
+// Pairs with UnlitInstancedVS.hlsl and a FillMode=Wireframe PSO; drawn as a second
+// pass over the Highlight-shaded solid mesh (ModelPreviewViewport).
 struct PSInput
 {
     float4 pos : SV_POSITION;

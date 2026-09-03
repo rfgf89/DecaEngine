@@ -3,23 +3,13 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Animation;
 
-/// <summary>
-/// Скиннинг-атрибуты одной вершины: до четырёх джойнтов с весами. Лежит ОТДЕЛЬНЫМ стримом,
-/// параллельным <see cref="Vertex"/>, а не полями внутри неё - скиннед-мешей в сцене единицы, а
-/// вершин у статики миллионы, и +16 байт на каждую вершину Sponza стоили бы десятки мегабайт
-/// впустую. Стрим существует только у мешей, у которых glTF-примитив нёс JOINTS_0/WEIGHTS_0.
-///
-/// Упаковка (16 байт): индексы - ushort (скелеты за 65535 костей не бывают, а byte упирается в
-/// 256 и ломает крупные персонажные риги), веса - unorm16. Веса НОРМАЛИЗОВАНЫ при импорте: сумма
-/// ровно <see cref="WeightScale"/>, иначе скиннинг тихо масштабирует вершины - экспортёры
-/// регулярно отдают сумму 0.999 или 1.001.
-/// </summary>
+/// <summary>Per-vertex skinning attributes (16 bytes, separate stream parallel to Vertex); weights are normalized at import so they sum to exactly <see cref="WeightScale"/>.</summary>
 public struct SkinVertex
 {
-	/// <summary>Знаменатель весов: вес w во float = W? / <see cref="WeightScale"/>.</summary>
+	/// <summary>Weight denominator: float weight = W? / <see cref="WeightScale"/>.</summary>
 	public const float WeightScale = 65535f;
 
-	/// <summary>Максимум влияний на вершину. Зеркалится в SkinningCS.hlsl - менять только парой.</summary>
+	/// <summary>Max influences per vertex. Mirrored in SkinningCS.hlsl - change both together.</summary>
 	public const int MaxInfluences = 4;
 
 	public ushort J0, J1, J2, J3;
@@ -29,36 +19,28 @@ public struct SkinVertex
 }
 
 /// <summary>
-/// Скелет модели: плоский массив джойнтов, отсортированный ТОПОЛОГИЧЕСКИ (родитель всегда раньше
-/// ребёнка). Порядок - не деталь реализации, а контракт: и расчёт модельных матриц одним проходом
-/// по массиву, и ozz-скелет требуют именно его; без него пришлось бы обходить дерево рекурсивно
-/// каждый кадр.
-///
-/// Пространство - уже ЛЕВОСТОРОННЕЕ движка (см. <see cref="SkinningImport.MirrorZ"/>): и bind-поза,
-/// и обратные bind-матрицы, и все клипы конвертируются на импорте, чтобы в рантайме не осталось ни
-/// одного места, где нужно помнить про исходную правостороннюю систему glTF.
+/// Model skeleton: flat joint array sorted topologically (parent always before child) - a contract
+/// relied on by single-pass model-matrix computation and the ozz skeleton. All data is already in
+/// the engine's left-handed space (see <see cref="SkinningImport.MirrorZ"/>); conversion from
+/// glTF's right-handed space happens entirely at import.
 /// </summary>
 public sealed class PreparedSkeleton
 {
-	/// <summary>Имена джойнтов - по ним ищутся кости для IK, рэгдолла и spring bones.</summary>
+	/// <summary>Joint names; used to find bones for IK, ragdoll and spring bones.</summary>
 	public string[] JointNames = [];
 
-	/// <summary>Индекс родителя каждого джойнта, -1 у корня. Всегда меньше индекса самого джойнта.</summary>
+	/// <summary>Parent index per joint, -1 for the root. Always less than the joint's own index.</summary>
 	public int[] Parents = [];
 
-	/// <summary>Локальная TRS каждого джойнта в bind-позе (она же поза по умолчанию, если клип не
-	/// анимирует канал).</summary>
+	/// <summary>Local TRS of each joint in bind pose (also the default pose when a clip omits a channel).</summary>
 	public Transform[] BindLocals = [];
 
-	/// <summary>Обратная bind-матрица: модельное пространство -> пространство джойнта. Источник -
-	/// glTF inverseBindMatrices скина; для джойнтов, в скин не входящих (они всё равно нужны в
-	/// иерархии как промежуточные узлы), считается из bind-позы.</summary>
+	/// <summary>Inverse bind matrix (model space -> joint space); computed from bind pose for joints not in the skin.</summary>
 	public Matrix4x4[] InverseBind = [];
 
 	public int JointCount => Parents.Length;
 
-	/// <summary>Индекс джойнта по имени, -1 если нет. Линейный поиск осознанно: зовётся на настройке
-	/// (привязка IK-целей, сборка рэгдолла), а не в кадре, и словарь на 50-200 костей не окупается.</summary>
+	/// <summary>Joint index by name, -1 if absent. Linear search on purpose: setup-time only.</summary>
 	public int FindJoint(string name)
 	{
 		for (int i = 0; i < JointNames.Length; i++)
@@ -73,27 +55,19 @@ public sealed class PreparedSkeleton
 	}
 }
 
-/// <summary>
-/// Один анимационный клип: по дорожке на джойнт скелета. Дорожки хранят СЫРЫЕ ключи glTF с их
-/// собственными временами - без ресемплинга в фиксированную частоту. Ресемплинг удобнее для
-/// семплера, но он же необратимо портит редкие ключи (кадр-в-кадр анимация камеры) и раздувает
-/// клипы с длинными статичными участками; ozz на своей стороне всё равно перепакует клип в
-/// собственный сжатый формат, и подавать ему уже испорченные данные незачем.
-/// </summary>
+/// <summary>One animation clip; tracks keep raw glTF keys with their own times - no resampling, ozz repacks on its side anyway.</summary>
 public sealed class PreparedAnimation
 {
 	public string Name = string.Empty;
 
-	/// <summary>Длительность клипа в секундах = максимальное время ключа по всем дорожкам.</summary>
+	/// <summary>Clip duration in seconds = max key time across all tracks.</summary>
 	public float Duration;
 
-	/// <summary>По дорожке на джойнт скелета, индексация совпадает с <see cref="PreparedSkeleton"/>.
-	/// Дорожка джойнта, которого клип не трогает, пустая - семплер берёт bind-позу.</summary>
+	/// <summary>One track per skeleton joint, same indexing as <see cref="PreparedSkeleton"/>; empty track = bind pose.</summary>
 	public JointTrack[] Tracks = [];
 }
 
-/// <summary>Ключи одного джойнта в клипе. Каналы независимы: glTF позволяет анимировать только
-/// поворот, оставив трансляцию и масштаб из bind-позы, и это самый частый случай.</summary>
+/// <summary>Keys of one joint in a clip. Channels are independent: glTF may animate rotation only.</summary>
 public sealed class JointTrack
 {
 	public float[] TranslationTimes = [];

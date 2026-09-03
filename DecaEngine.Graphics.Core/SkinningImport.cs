@@ -7,29 +7,12 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>
-/// Разбор скелета, скин-весов и анимационных клипов glTF (см. <see cref="SkinningData"/>-типы).
-/// Вынесен из <see cref="ModelLoader"/> отдельным файлом сознательно: это единственное место, где
-/// правосторонняя система glTF переводится в левостороннюю для ИЕРАРХИИ, и держать конверсию
-/// кучкой проще, чем искать её среди трёх тысяч строк загрузчика.
-///
-/// SharpGLTF НЕ потокобезопасен, поэтому всё здесь обязано звучать на том же потоке, что и
-/// остальное чтение документа (фоновая фаза PrepareModel до Parallel.For).
-/// </summary>
-/// <remarks>Публичный, а не internal: скелет модели нужен и СНАРУЖИ графического слоя - генератору
-/// демо-сцены, чтобы разметить humanoid-аватар без загрузки модели на GPU (см.
-/// SamplePrefabBuilder.WriteFoxAvatar). Полная загрузка ради одного скелета тянула бы за собой
-/// устройство, которого у генератора нет вовсе.</remarks>
+/// <summary>Parses glTF skeletons, skin weights and animation clips.</summary>
+/// <remarks>SharpGLTF is not thread safe: all of this must run on the thread reading the document.</remarks>
 public static class SkinningImport
 {
-	/// <summary>
-	/// Сопряжение матрицы отражением по Z: M' = S * M * S, где S = diag(1,1,-1,1). Ровно та же
-	/// конверсия правой системы в левую, что <c>Position.Z = -Z</c> для вершин, только для полной
-	/// трансформации - в результате меняют знак ТОЛЬКО элементы, у которых ровно один из индексов
-	/// (строка/столбец) равен Z. Без сопряжения обратные bind-матрицы остаются в правой системе, и
-	/// скиннинг зеркалит персонажа относительно зеркалированной же геометрии - руки и ноги
-	/// меняются местами.
-	/// </summary>
+	/// <summary>Conjugates a matrix by a Z reflection: M' = S * M * S, S = diag(1,1,-1,1),
+	/// the right- to left-handed conversion applied to a full transform.</summary>
 	public static Matrix4x4 MirrorZ(Matrix4x4 m)
 	{
 		m.M13 = -m.M13;
@@ -43,24 +26,13 @@ public static class SkinningImport
 		return m;
 	}
 
-	/// <summary>Та же конверсия для кватерниона: отражение по Z сопрягает поворот в (-x,-y,z,w)
-	/// (зеркалятся компоненты оси, перпендикулярные плоскости отражения). Совпадает с тем, что
-	/// делает ModelLoader с поворотами узлов.</summary>
+	/// <summary>Same conversion for a rotation: a Z reflection conjugates it to (-x,-y,z,w).</summary>
 	public static Quaternion MirrorZ(Quaternion q) => new(-q.X, -q.Y, q.Z, q.W);
 
 	public static Vector3 MirrorZ(Vector3 v) => new(v.X, v.Y, -v.Z);
 
-	/// <summary>
-	/// Собирает ЕДИНЫЙ скелет модели: объединение узлов-джойнтов всех скинов документа плюс все их
-	/// предки до корня сцены. Предки обязательны, даже если сами джойнтами не являются: их локальные
-	/// трансформации входят в модельную матрицу джойнта, и без них скелет разъезжается по сцене.
-	/// Один скелет на модель, а не по скелету на скин, - потому что скины персонажа (тело, одежда,
-	/// волосы) почти всегда сидят на одной иерархии, и разводить их значило бы считать одну и ту же
-	/// позу несколько раз.
-	///
-	/// Возвращает null, если в документе нет ни одного скина - модель статическая.
-	/// </summary>
-	/// <param name="nodeToJoint">Заполняется отображением LogicalIndex узла glTF -> индекс джойнта.</param>
+	/// <summary>Builds one skeleton for the whole model: every skin's joints plus their ancestors
+	/// up to the scene root. Returns null when the document has no skins.</summary>
 	public static PreparedSkeleton BuildSkeleton(ModelRoot model, out Dictionary<int, int> nodeToJoint)
 	{
 		nodeToJoint = new Dictionary<int, int>();
@@ -72,8 +44,7 @@ public static class SkinningImport
 			{
 				for (var node = skin.GetJoint(i).Joint; node != null; node = node.VisualParent)
 				{
-					// Цепочка предков уже собрана - выше по ней идти незачем (типичный риг: 200
-					// джойнтов с общим корнем, без выхода из цикла это 200 полных подъёмов).
+					// Ancestor chain already collected; walking higher would be O(joints * depth).
 					if (!wanted.Add(node))
 					{
 						break;
@@ -87,10 +58,8 @@ public static class SkinningImport
 			return null;
 		}
 
-		// Топологический порядок через глубину: родитель всегда строго мельче ребёнка, поэтому
-		// сортировка по глубине гарантирует контракт PreparedSkeleton.Parents (родитель раньше).
-		// Вторичный ключ - LogicalIndex, чтобы порядок был детерминированным между запусками:
-		// иначе .dmdl-кеш и индексы костей в настройках IK/рэгдолла плыли бы от сборки к сборке.
+		// Sort by depth for the parent-before-child contract; LogicalIndex keeps it deterministic,
+		// since the .dmdl cache and IK/ragdoll settings store bone indices.
 		var ordered = new List<Node>(wanted);
 		var depths = new Dictionary<Node, int>();
 		ordered.Sort((a, b) =>
@@ -121,9 +90,7 @@ public static class SkinningImport
 			skeleton.JointNames[i] = node.Name ?? $"Joint_{node.LogicalIndex}";
 			skeleton.Parents[i] = parent != null && nodeToJoint.TryGetValue(parent.LogicalIndex, out int p) ? p : -1;
 
-			// GetDecomposed обязателен: узел glTF может задавать трансформ МАТРИЦЕЙ, а не TRS
-			// (CesiumMan), и у такого AffineTransform прямое чтение Rotation бросает
-			// InvalidOperationException. Для TRS-узлов разложение тождественно.
+			// GetDecomposed is required: matrix-defined nodes throw on a direct Rotation read.
 			var local = node.LocalTransform.GetDecomposed();
 			skeleton.BindLocals[i] = new Transform
 			{
@@ -149,13 +116,7 @@ public static class SkinningImport
 		return depth;
 	}
 
-	/// <summary>
-	/// Обратные bind-матрицы: для джойнтов, входящих в какой-нибудь скин, берутся АВТОРСКИЕ из glTF
-	/// (mirror-Z-сопряжённые) - они точнее пересчёта из bind-позы и учитывают случаи, когда bind-поза
-	/// узлов и та, под которую пекли веса, различаются. Для промежуточных узлов иерархии, ни в один
-	/// скин не входящих, авторской матрицы нет вовсе, и она честно считается из bind-позы: скиннинг
-	/// их не использует, но процедурный слой (IK, рэгдолл) работает с полным скелетом.
-	/// </summary>
+	// Authored inverse binds win over ones derived from the bind pose: the two can differ.
 	private static void FillInverseBindMatrices(ModelRoot model, PreparedSkeleton skeleton,
 		Dictionary<int, int> nodeToJoint)
 	{
@@ -176,8 +137,7 @@ public static class SkinningImport
 			}
 		}
 
-		// Модельные матрицы bind-позы - одним проходом: массив топологически упорядочен, поэтому
-		// родитель к моменту обработки ребёнка уже посчитан.
+		// Single pass: topological order guarantees the parent is done before the child.
 		var bindModel = new Matrix4x4[skeleton.JointCount];
 		for (int i = 0; i < skeleton.JointCount; i++)
 		{
@@ -198,16 +158,8 @@ public static class SkinningImport
 		}
 	}
 
-	/// <summary>
-	/// Скин-стрим примитива: JOINTS_0/WEIGHTS_0, переведённые из локальных индексов скина в индексы
-	/// джойнтов скелета. Возвращает null, если примитив не скиннится, - это признак того, что меш
-	/// остаётся на статическом пути (см. <see cref="SkinVertex"/> о том, почему стрим отдельный).
-	///
-	/// Второй набор влияний (JOINTS_1/WEIGHTS_1, до восьми костей на вершину) осознанно ОТБРАСЫВАЕТСЯ
-	/// с оставлением четырёх самых весомых и перенормировкой: восьмивлиятельные риги встречаются
-	/// редко, а стоят вдвое дороже и в памяти, и в compute-скиннинге. Вклад отброшенных костей у
-	/// таких вершин почти всегда доли процента.
-	/// </summary>
+	/// <summary>Skin stream of a primitive, remapped to skeleton joint indices; null when unskinned.
+	/// JOINTS_1/WEIGHTS_1 are folded down to the four heaviest influences and renormalized.</summary>
 	public static SkinVertex[] ReadSkinVertices(MeshPrimitive primitive, Skin skin,
 		Dictionary<int, int> nodeToJoint, int vertexCount)
 	{
@@ -219,8 +171,7 @@ public static class SkinningImport
 			return null;
 		}
 
-		// Локальный индекс скина -> индекс джойнта скелета. Своя таблица на скин: у второго скина
-		// той же модели те же локальные индексы означают другие кости.
+		// Per-skin table: the same local index means a different bone in another skin.
 		var skinToSkeleton = new int[skin.JointsCount];
 		for (int i = 0; i < skin.JointsCount; i++)
 		{
@@ -258,9 +209,7 @@ public static class SkinningImport
 		return result;
 	}
 
-	/// <summary>Заносит четвёрку (индекс, вес) в набор четырёх сильнейших влияний, вытесняя самое
-	/// слабое. Нулевые веса игнорируются: glTF заполняет неиспользуемые слоты нулём, а джойнт в них
-	/// оставляет мусорный - без проверки мусор вытеснил бы настоящее влияние.</summary>
+	// Zero weights are skipped: glTF leaves garbage joint indices in unused slots.
 	private static void AccumulateInfluences(Vector4 joints, Vector4 weights, int[] skinToSkeleton,
 		Span<int> bestJoint, Span<float> bestWeight)
 	{
@@ -292,16 +241,8 @@ public static class SkinningImport
 		}
 	}
 
-	/// <summary>
-	/// Нормализует веса и пакует их в <see cref="SkinVertex"/>. Остаток от округления к unorm16
-	/// сбрасывается в самый весомый слот, чтобы сумма была РОВНО <see cref="SkinVertex.WeightScale"/>:
-	/// иначе накопленная ошибка округления масштабирует вершину, и на крупных планах персонаж
-	/// заметно «дышит».
-	///
-	/// Вершина без единого влияния (экспортёр приложил скин не ко всем вершинам) прибивается к
-	/// джойнту 0 с весом 1: нулевые веса в compute-скиннинге схлопнули бы её в начало координат
-	/// длинным лучом через всю сцену.
-	/// </summary>
+	// Rounding remainder goes to the heaviest slot so weights sum to exactly WeightScale;
+	// an influence-less vertex is pinned to joint 0 instead of collapsing to the origin.
 	private static SkinVertex PackInfluences(Span<int> joints, Span<float> weights)
 	{
 		float sum = 0f;
@@ -341,13 +282,8 @@ public static class SkinningImport
 		};
 	}
 
-	/// <summary>
-	/// Клипы документа, разложенные по джойнтам скелета. Ключи берутся СЫРЫМИ (см.
-	/// <see cref="PreparedAnimation"/> о том, почему без ресемплинга); CUBICSPLINE-каналы читаются
-	/// как линейные по значениям в узлах - тангенсы отбрасываются. Это осознанная потеря: честная
-	/// поддержка кубики требует своего пути и в семплере, и в ozz-конвертере, а встречается она
-	/// почти только в физически-точных технических анимациях, не в персонажных.
-	/// </summary>
+	/// <summary>Document clips split per skeleton joint; keys stay raw and CUBICSPLINE channels are
+	/// read as linear over the node values, dropping tangents.</summary>
 	public static List<PreparedAnimation> BuildAnimations(ModelRoot model, PreparedSkeleton skeleton,
 		Dictionary<int, int> nodeToJoint)
 	{
@@ -377,8 +313,7 @@ public static class SkinningImport
 				if (channel.TargetNode == null ||
 					!nodeToJoint.TryGetValue(channel.TargetNode.LogicalIndex, out int joint))
 				{
-					// Канал на узел вне скелета (анимация камеры, света, статического реквизита):
-					// скелетному клипу он не принадлежит и молча пропускается.
+					// Channel targets a node outside the skeleton (camera, light, prop).
 					continue;
 				}
 
@@ -404,8 +339,7 @@ public static class SkinningImport
 				}
 			}
 
-			// Клип, не задевший скелет ни одним каналом (морфы, анимация света), в список не идёт -
-			// иначе в UI аниматора висели бы пустые записи, ничего не делающие при выборе.
+			// Clips that touch no joint (morphs, light animation) would be dead entries in the UI.
 			if (any)
 			{
 				animations.Add(clip);

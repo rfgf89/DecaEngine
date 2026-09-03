@@ -6,16 +6,15 @@ using System.Runtime.InteropServices;
 using DecaEngine.Core;
 using Diligent;
 using UnsafeCollections.Collections.Unsafe;
-// Прямая работа с нативным контекстом - состояния здесь Diligent-овские, не из ICommandBuffer.
+// Native context work: states here are Diligent's, not ICommandBuffer's.
 using ResourceState = Diligent.ResourceState;
 
 namespace DecaEngine.Graphics.Diligent;
 
 public static unsafe class DiligentGraphicsUtility
 {
-	// Временная диагностика (DECA_UPLOAD_DEBUG=1): лог крупных UpdateBuffer-аплоадов - на D3D12
-	// каждый такой вызов берёт staging из динамического хипа контекста, и повторяющийся большой
-	// аплоад каждый кадр раздувает хип (симптом: "Created dynamic memory page" каждый кадр).
+	// DECA_UPLOAD_DEBUG=1 logs large UpdateBuffer uploads: on D3D12 each one takes staging from the
+	// context's dynamic heap, so a big per-frame upload inflates it.
 	private static readonly bool UploadDebugEnabled = Environment.GetEnvironmentVariable("DECA_UPLOAD_DEBUG") == "1";
 	private const uint UploadDebugThreshold = 1u * 1024 * 1024;
 
@@ -65,8 +64,7 @@ public static unsafe class DiligentGraphicsUtility
 			return;
 		}
 
-		// Для буферов (Structured, UAV, SRV), которые не являются чистыми UniformBuffer,
-		// UpdateBuffer работает надежнее и не вызывает проблем с Direct3D12 Map/Unmap ограничениями.
+		// Non-uniform buffers go through UpdateBuffer: D3D12 restricts Map/Unmap on them.
 		if ((buffer.GetDesc().BindFlags & BindFlags.UniformBuffer) == 0 || buffer.GetDesc().Usage != Usage.Dynamic)
 		{
 			uint size = (uint)(UnsafeArray.GetLength(array) * Unsafe.SizeOf<T>());
@@ -93,8 +91,7 @@ public static unsafe class DiligentGraphicsUtility
 			return;
 		}
 
-		// Для буферов (Structured, UAV, SRV), которые не являются чистыми UniformBuffer,
-		// UpdateBuffer работает надежнее и не вызывает проблем с Direct3D12 Map/Unmap ограничениями.
+		// Non-uniform buffers go through UpdateBuffer: D3D12 restricts Map/Unmap on them.
 		if ((buffer.GetDesc().BindFlags & BindFlags.UniformBuffer) == 0 || buffer.GetDesc().Usage != Usage.Dynamic)
 		{
 			uint size = (uint)(UnsafeList.GetCount(list) * Unsafe.SizeOf<T>());
@@ -154,10 +151,7 @@ public static unsafe class DiligentGraphicsUtility
 		}
 	}
 	
-	/// <summary>
-	/// Reads data from a GPU buffer into an UnsafeArray.
-	/// The buffer must have been created with Usage.Staging and CPUAccessFlags.Read.
-	/// </summary>
+	/// <summary>Reads a GPU buffer into an UnsafeArray; requires Usage.Staging and CPUAccessFlags.Read.</summary>
 	public static void ReadBufferExt<T>(this IDeviceContext ctx, IBuffer buffer, UnsafeArray* array, MapFlags flags = MapFlags.DoNotWait) where T : unmanaged
 	{
 		if (buffer == null || array == null)
@@ -180,11 +174,7 @@ public static unsafe class DiligentGraphicsUtility
 		}
 	}
 
-	/// <summary>
-	/// Reads data from a GPU buffer into an UnsafeList.
-	/// The buffer must have been created with Usage.Staging and CPUAccessFlags.Read.
-	/// The list must have enough capacity to hold the data.
-	/// </summary>
+	/// <summary>Reads a GPU buffer into an UnsafeList of sufficient capacity; requires Usage.Staging and CPUAccessFlags.Read.</summary>
 	public static void ReadBufferExt<T>(this IDeviceContext ctx, IBuffer buffer, UnsafeList* list, MapFlags flags = MapFlags.DoNotWait) where T : unmanaged
 	{
 		if (buffer == null || list == null)
@@ -207,10 +197,7 @@ public static unsafe class DiligentGraphicsUtility
 		}
 	}
 
-	/// <summary>
-	/// Reads data from a GPU buffer into a managed array.
-	/// The buffer must have been created with Usage.Staging and CPUAccessFlags.Read.
-	/// </summary>
+	/// <summary>Reads a GPU buffer into a managed array; requires Usage.Staging and CPUAccessFlags.Read.</summary>
 	public static void ReadBufferExt<T>(this IDeviceContext ctx, IBuffer buffer, T[] value, MapFlags flags = MapFlags.DoNotWait) where T : unmanaged
 	{
 		if (buffer == null || value.Length == 0)
@@ -235,10 +222,7 @@ public static unsafe class DiligentGraphicsUtility
 		}
 	}
 
-	/// <summary>
-	/// Reads a single value from a GPU buffer.
-	/// The buffer must have been created with Usage.Staging and CPUAccessFlags.Read.
-	/// </summary>
+	/// <summary>Reads a single value from a GPU buffer; requires Usage.Staging and CPUAccessFlags.Read.</summary>
 	public static void ReadBufferExt<T>(this IDeviceContext ctx, IBuffer buffer, out T value, MapFlags flags = MapFlags.DoNotWait) where T : unmanaged
 	{
 		value = default;

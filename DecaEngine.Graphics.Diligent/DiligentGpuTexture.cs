@@ -14,8 +14,7 @@ namespace DecaEngine.Graphics.Diligent
 
 		private readonly Dictionary<(TextureViewType, uint), ITextureView> _views = new();
 
-		/// <summary>Представления, СОЗДАННЫЕ здесь - только их и освобождаем. Дефолтные принадлежат
-		/// текстуре и освобождаются вместе с ней.</summary>
+		/// <summary>Views created here; default views are owned by the texture itself.</summary>
 		private readonly List<ITextureView> _ownedViews = new();
 
 		public DiligentGpuTexture(string name, TextureInfo info, ITexture texture)
@@ -33,8 +32,7 @@ namespace DecaEngine.Graphics.Diligent
 			ITextureView newView;
 			if (slice == 0 && Info.arraySize <= 1)
 			{
-				// Дефолтным представлением владеет САМА текстура - его нельзя освобождать отдельно
-				// (двойное освобождение роняет драйвер), поэтому в список владения оно не идёт.
+				// Owned by the texture: releasing it separately is a double free and kills the driver.
 				newView = Texture.GetDefaultView(type);
 			}
 			else
@@ -57,7 +55,6 @@ namespace DecaEngine.Graphics.Diligent
 
 		public void Release()
 		{
-			// Только созданные нами представления - см. комментарий в GetView.
 			foreach (var view in _ownedViews)
 				view.Dispose();
 			_ownedViews.Clear();

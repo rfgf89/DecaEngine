@@ -9,22 +9,14 @@ using UnsafeCollections.Collections.Unsafe;
 namespace DecaEngine.Scene;
 
 /// <summary>
-/// Раздаёт кадровый бюджет теневых слайсов (<see cref="LightClusters.MaxShadowSlices"/> в texture
-/// array) punctual-светам с ShadowStrength &gt; 0 и строит данные каждого слайса: спот занимает один
-/// слайс (перспективная проекция по внешнему углу конуса), точечный - шесть (грани куба, fov 90 с
-/// небольшим перехлёстом под PCF на швах). Бюджет уходит ближайшим к камере светам; не влезшие
-/// светят без тени (ShadowParams.x = -1).
-///
-/// Список слайсов ВСЕГДА заполняется до полной ёмкости: замороженный ForwardPass пишет фиксированную
-/// петлю по всем слайсам, и мёртвый слайс обязан несть drawCount = 0 (кулинг никого не пропускает,
-/// indirect-дроу рисуют пусто). Зовётся обеими системами сборки камер - основной
-/// <see cref="CullingAndRenderSystem"/> и превью/Scene View <see cref="SimpleCullingAndRenderSystem"/>.
+/// Distributes the per-frame shadow-slice budget (LightClusters.MaxShadowSlices) to punctual
+/// lights: a spot takes 1 slice, a point light 6 cube faces; nearest lights to the camera win.
+/// The slice list is ALWAYS filled to full capacity: the frozen ForwardPass replays a fixed loop
+/// over all slices, so dead slices must carry drawCount = 0.
 /// </summary>
 public static unsafe class PunctualShadowScheduler
 {
-    // Грани куба точечного света: индексация ОБЯЗАНА совпадать с выбором грани по доминирующей оси
-    // в UnlitInstancedPS.hlsl (+X,-X,+Y,-Y,+Z,-Z). Up-вектора произвольны (лишь бы не коллинеарны
-    // оси) - ориентация внутри слайса запечена в его матрице.
+    // Face order must match the dominant-axis face pick in UnlitInstancedPS.hlsl (+X,-X,+Y,-Y,+Z,-Z).
     private static readonly Vector3[] FaceDirs =
     [
         Vector3.UnitX, -Vector3.UnitX,
@@ -39,33 +31,26 @@ public static unsafe class PunctualShadowScheduler
         Vector3.UnitY, Vector3.UnitY,
     ];
 
-    // Скретчи кадра - рендер-системы работают на главном потоке, статики безопасны.
+    // Frame scratch - render systems run on the main thread, statics are safe.
     private static readonly List<(Entity Entity, LightComponent Light, float DistSq)> Candidates = new();
 
-    // Сколько светов не влезло в бюджет на прошлом отчёте: исчерпание бюджета иначе НЕМОЕ - свет
-    // просто светит сквозь стены (ShadowParams.x = -1), и снаружи это неотличимо от сломанных теней.
-    // Печатаем только при ИЗМЕНЕНИИ числа, иначе строка сыпалась бы каждый кадр.
+    // Budget exhaustion is otherwise silent (light shines through walls); log only on change.
     private static int _lastReportedSkipped;
 
-    /// <summary>DECA_PUNCTUAL_CULL=0 выключает фрустум-кулинг кастеров в теневых слайсах punctual-света
-    /// (слайс рисует ВСЮ сцену). Диагностический тумблер: эти плоскости - единственный потребитель
-    /// GPU-фрустум-кулинга во всём движке (у камер и каскадов cullFrustum = 0), поэтому при жалобе
-    /// "тень неполная/лишняя геометрия пропала" сравнение с выключенным кулингом отделяет ошибку
-    /// отсечения от ошибки самой карты за один запуск.</summary>
+    /// <summary>DECA_PUNCTUAL_CULL=0 disables caster frustum culling in punctual shadow slices
+    /// (diagnostic: these are the only consumers of GPU frustum culling in the engine).</summary>
     private static readonly bool FrustumCullCasters =
         Environment.GetEnvironmentVariable("DECA_PUNCTUAL_CULL") != "0";
 
-    /// <summary>Тот же тумблер, что у <see cref="LightCulling.DumpPunctualLight"/> - две половины
-    /// одной диагностики печатаются вместе или не печатаются вовсе.</summary>
+    // Same toggle as LightCulling.DumpPunctualLight - the two dump halves print together.
     private static readonly bool DumpPunctual =
         Environment.GetEnvironmentVariable("DECA_PUNCTUAL_DUMP") == "1";
 
     private static readonly Dictionary<int, string> LastSchedulerDump = new();
 
-    /// <summary>Заполняет слайсы теней кадра в <paramref name="target"/> (cull/light-данные для
-    /// записи shadow map + матрицы для сэмплинга) и раскладку "id сущности света - первый слайс" в
-    /// <paramref name="assignments"/> (её читает LightCulling.TryBuildPunctualLight, собирая
-    /// ShadowParams). Списки target.punctualShadow* обязаны быть пустыми (после Clear).</summary>
+    /// <summary>Fills the frame's shadow slices in <paramref name="target"/> and the light-entity
+    /// to first-slice map in <paramref name="assignments"/>; target.punctualShadow* lists must be
+    /// empty (cleared) on entry.</summary>
     public static void BuildShadowSlices(ArchetypeQuery<LightComponent> punctualLights, Vector3 cameraPos,
         int drawCount, ref RenderCamerasData target, Dictionary<int, int> assignments)
     {
@@ -81,9 +66,7 @@ public static unsafe class PunctualShadowScheduler
                 return;
             }
 
-            // Мировая позиция, не сырой локальный Position: у света под родителем (вложенная
-            // иерархия) локальный Position - это смещение относительно родителя, а не место в мире
-            // (см. LightCulling.GetWorldPositionRotation).
+            // World position, not raw local Position: nested lights offset from their parent.
             LightCulling.GetWorldPositionRotation(entity, out var worldPos, out _);
             float distSq = Vector3.DistanceSquared(worldPos, cameraPos);
             Candidates.Add((entity, light, distSq));
@@ -98,16 +81,13 @@ public static unsafe class PunctualShadowScheduler
             int sliceCount = light.Type == LightType.Point ? 6 : 1;
             if (nextSlice + sliceCount > LightClusters.MaxShadowSlices)
             {
-                // Точечный не влез - следующий спот ещё может (один слайс), продолжаем перебор.
+                // A point light did not fit - a later spot (1 slice) still might; keep scanning.
                 skipped++;
                 continue;
             }
 
-            // Мировые позиция/поворот (не сырой локальный TRS) - см. комментарий у распределения
-            // кандидатов выше и LightCulling.GetWorldPositionRotation: слайс должен рендериться из
-            // точки/ориентации света В МИРЕ, иначе тень вложенного света рвётся с его же освещением
-            // (то читает мировую позицию, это - локальную) и выглядит "сдвинутой/перекошенной"
-            // относительно каcтующей геометрии.
+            // Slices must render from the light's WORLD pose, or nested lights' shadows detach
+            // from their own lighting (which reads world position).
             LightCulling.GetWorldPositionRotation(entity, out var position, out var rotation);
             float range = light.Range;
             float near = SliceNearPlane(range);
@@ -117,15 +97,13 @@ public static unsafe class PunctualShadowScheduler
                 var dir = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, rotation));
                 var up = MathF.Abs(dir.Y) > 0.95f ? Vector3.UnitX : Vector3.UnitY;
 
-                // Полный внешний угол конуса и есть fov слайса: кромка конуса ложится на край карты,
-                // а там спад по углу уже погасил свет - краевых артефактов не видно.
+                // Slice fov = full outer cone angle: the angular falloff already darkens the rim.
                 float fov = Math.Clamp(light.SpotAngle, 1f, 179f) * (MathF.PI / 180f);
                 AddSlice(ref target, position, position + dir, up, fov, near, range, drawCount);
             }
             else
             {
-                // Перехлёст 2% над 90 градусами: PCF-тапы у кромки грани остаются внутри её карты,
-                // выбор грани по доминирующей оси при этом всегда попадает в её (расширенный) фрустум.
+                // 2% overlap over 90 deg keeps PCF taps at face edges inside that face's map.
                 float fov = MathF.PI * 0.5f * 1.02f;
                 for (int face = 0; face < 6; face++)
                 {
@@ -136,19 +114,11 @@ public static unsafe class PunctualShadowScheduler
 
             assignments[entity.Id] = nextSlice;
 
-            // См. LightCulling.DumpPunctualLight - вторая половина той же диагностики. Планировщик и
-            // сборщик пула читают ОДИН И ТОТ ЖЕ LightComponent, но решения принимают разные (здесь -
-            // сколько слайсов и с какой проекцией, там - тип для шейдера), и разойтись им нельзя:
-            // шесть граней куба при DirType.w = 1 в шейдере означают, что пять из них не будут
-            // прочитаны никогда. Печатаем тип ЗДЕСЬ, чтобы сравнение было прямым.
+            // Second half of the LightCulling.DumpPunctualLight diagnostic: scheduler and pool
+            // builder read the same LightComponent but decide independently and must not diverge.
             if (DumpPunctual)
             {
-                // w-столбец viewProj слайса - это ось грани в мире плюс -dot(eye, ось): именно он
-                // даёт shadowClip.w в шейдере, то есть глубину приёмника вдоль оси грани. Печатается
-                // потому, что единичная/нулевая матрица в буфере НЕОТЛИЧИМА от рабочей по всем
-                // прочим дампам, а в шейдере выглядит как "точка позади ближней плоскости" (w <= 0)
-                // или "UV далеко за квадратом слайса" - то есть как ошибка выбора грани, которой нет.
-                // Ожидание: у грани f ось обязана совпасть с FaceDirs[f].
+                // The viewProj w-column is the face axis in world space; expected to match FaceDirs[f].
                 var axes = new System.Text.StringBuilder();
                 for (int face = 0; face < sliceCount; face++)
                 {
@@ -180,7 +150,7 @@ public static unsafe class PunctualShadowScheduler
             }
         }
 
-        // Добить до полной ёмкости мёртвыми слайсами: drawCount = 0 - кулинг никого не пропускает.
+        // Pad to full capacity with dead slices: drawCount = 0, culling passes nobody.
         while (target.punctualShadowCullData.Count < LightClusters.MaxShadowSlices)
         {
             int slice = target.punctualShadowCullData.Count;
@@ -190,26 +160,10 @@ public static unsafe class PunctualShadowScheduler
         }
     }
 
-    /// <summary>Ближняя плоскость теневого слайса света с дальностью <paramref name="range"/> (far
-    /// слайса = range). ЕДИНСТВЕННЫЙ источник этого числа: его берёт и <see cref="AddSlice"/>,
-    /// строя проекцию слайса, и <see cref="LightCulling.TryBuildPunctualLight"/>, кладя его в
-    /// PunctualLight.ShadowParams.z для шейдера. Раньше шейдер выводил near сам, повторяя формулу
-    /// в HLSL, и та уже разошлась: потолок 0.25 добавили здесь, а в UnlitInstancedPS осталось
-    /// max(0.05, range*0.001), так что на Range = 20000 шейдер считал near = 20 вместо 0.25 и
-    /// ошибался в производной d(ndc)/dz (а значит и в депф-байасе тени) в восемьдесят раз.
-    ///
-    /// near обязан остаться СТРОГО меньше far: CreatePerspectiveFieldOfViewLeftHanded кидает
-    /// ArgumentOutOfRangeException при near >= far. Для Range &lt;= 0.05 (за пределами разумного, но
-    /// встречается - декой-свет, тестовая сцена) прежнее max(0.05, range*0.001) давало near == far
-    /// и роняло ВЕСЬ кадр (сборка слайсов идёт до отрисовки, так что одна такая лампа убивала все
-    /// тени, включая чужие) - отсюда множитель range*0.5 снизу.
-    ///
-    /// Сверху near ограничен абсолютной величиной, а не только долей range: слагаемое range*0.001
-    /// задумано как рост точности глубины вместе с дальностью, но без потолка оно рубит саму тень -
-    /// при Range = 20000 near становится 20 единиц, и КАЖДЫЙ кастер ближе 20 единиц к лампе
-    /// отсекается ближней плоскостью, не попадая в карту вовсе (здание вокруг источника перестаёт
-    /// отбрасывать тень, свет идёт сквозь стены). Потолок 0.25 достигается только на range >= 250;
-    /// до range = 50 формула даёт ровно 0.05, так что обычные лампы ведут себя без изменений.</summary>
+    /// <summary>Near plane of a shadow slice (far = range). SINGLE source of this value: both the
+    /// slice projection and PunctualLight.ShadowParams.z read it - the shader must not re-derive
+    /// it. Must stay strictly below far (perspective ctor throws at near >= far), hence the
+    /// range*0.5 floor; capped at 0.25 so huge ranges do not clip nearby casters.</summary>
     public static float SliceNearPlane(float range) =>
         MathF.Min(Math.Clamp(range * 0.001f, 0.05f, 0.25f), range * 0.5f);
 
@@ -217,19 +171,12 @@ public static unsafe class PunctualShadowScheduler
         float fov, float near, float far, int drawCount)
     {
         var view = Matrix4x4.CreateLookAtLeftHanded(eye, lookAt, up);
-        // System.Numerics мапит глубину near->0, far->1 - та же конвенция ОБЫЧНОГО Z, что у
-        // ортокаскадов солнца (запись Less, сравнение LessEqual, clear 1.0).
+        // System.Numerics maps depth near->0, far->1 - same standard-Z convention as sun cascades.
         var proj = Matrix4x4.CreatePerspectiveFieldOfViewLeftHanded(fov, 1f, near, far);
         var viewProj = view * proj;
 
-        // Компактный фрустум - БУКВАЛЬНО тем же выражением, что CameraComponent.CreateCullData:
-        // плоскость собирается из СТРОК транспонированной проекции. Раньше здесь стояли её СТОЛБЦЫ
-        // (M14+M11, M24+M21, ...) - лишняя транспозиция, из-за которой z-компонента левой плоскости
-        // выходила -n*f/(f-n) вместо 1. На спот-конусе это давало условие "кастер виден, только если
-        // его радиус больше смещения от оси света", то есть из карты теней выбрасывало почти всю
-        // геометрию в пятне света, и карта оставалась пустой. Заметить было негде: у всех камер и
-        // каскадов cullFrustum = 0 (см. CreateCullData), так что эти плоскости читает ТОЛЬКО
-        // пунктуальный слот.
+        // Frustum planes from ROWS of the transposed projection - literally the same expression as
+        // CameraComponent.CreateCullData; only the punctual slot ever reads these planes.
         var projT = Matrix4x4.Transpose(proj);
         var frustumX = projT[3] + projT[0];
         var frustumY = projT[3] + projT[1];
@@ -245,8 +192,7 @@ public static unsafe class PunctualShadowScheduler
             znear = near,
             zfar = far,
             drawCount = drawCount,
-            // Бит 0 - фрустум-кулинг (кастеры вне конуса света в его карту не попадают), без LOD:
-            // тень геометрии обязана совпадать с тем, что нарисовано в основном виде.
+            // Bit 0 = frustum culling only, no LOD: shadows must match main-view geometry.
             cullFrustum = FrustumCullCasters ? 1 : 0,
         };
 

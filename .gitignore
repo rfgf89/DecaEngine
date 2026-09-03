@@ -437,3 +437,6 @@ cache.vulkan.shaders/
 # Editor-generated per-project caches (thumbnails, cooked previews)
 EditorCache/
 *.bhv.bin
+
+# RenderDoc captures and exported frames (local debugging artifacts)
+rdc-captures/

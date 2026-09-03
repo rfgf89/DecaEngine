@@ -1,16 +1,8 @@
-// Цветокоррекция и виньетка - финальный пасс кадра (см. ColorGradePass).
-//
-// Работает в ОТОБРАЖАЕМОМ пространстве, по уже готовому RGBA8-кадру, а не в линейном до тонемапа, и
-// это не небрежность: подъём теней, гамма и насыщенность - это классическая цветокоррекция, её
-// шкалы (0.5 - средний тон, 1.0 - белое) определены именно в гамма-пространстве. Перенеси их в
-// линейное - и «контраст 1.2» перестанет значить что-либо предсказуемое.
-//
-// Единый пасс на оба конвейера ровно поэтому же: ColorTarget всегда RGBA8 display-space - и в HDR
-// (его пишет TonemapPass), и в LDR (его пишет сама геометрия). Отсюда же СВОЯ копия кадра, а не
-// общий SceneCopyTarget: тот в HDR-режиме RGBA16F, и CopyTexture в него не годится по формату.
-//
-// Ставится ПОСЛЕ тонемапа, но ДО оверлеев (см. GraphicsPipelineSimple): контур выделения и гизмо -
-// элементы интерфейса, их художественная коррекция трогать не должна.
+// Color grading + vignette, final pass of the frame (see ColorGradePass).
+// Runs deliberately in display space on the RGBA8 frame, not in linear before tonemap:
+// grading scales (0.5 = midtone, 1.0 = white) are defined in gamma space.
+// Uses its own frame copy, not SceneCopyTarget: that one is RGBA16F in HDR, so CopyTexture
+// would mismatch formats. Ordered after tonemap but before overlays (selection/gizmo are UI).
 #include "Instancing.hlsl"
 
 Texture2D    _SceneTex;
@@ -21,18 +13,18 @@ cbuffer View
     ViewData viewData;
 }
 
-// Зеркалит ColorGradeConstantsData (ColorGradePass.cs).
+// Must match ColorGradeConstantsData (ColorGradePass.cs).
 cbuffer GradeConstants
 {
-    // x - насыщенность, y - контраст, z - гамма, w - температура.
+    // x = saturation, y = contrast, z = gamma, w = temperature.
     float4 gradeParams;
-    // x - оттенок (tint), y - сила виньетки, z - её радиус, w - мягкость её края.
+    // x = tint, y = vignette strength, z = vignette radius, w = edge softness.
     float4 gradeParams2;
-    // xyz - тонировка теней (аддитивная), w - вытянутость виньетки к формату кадра.
+    // xyz = shadow tint (additive), w = vignette aspect stretch.
     float4 gradeShadowTint;
-    // xyz - тонировка светов (мультипликативная), w - резерв.
+    // xyz = highlight tint (multiplicative), w = reserved.
     float4 gradeHighlightTint;
-    // xy - размер таргета, zw - 1/xy.
+    // xy = target size, zw = 1/xy.
     float4 gradeTarget;
 }
 
@@ -49,10 +41,8 @@ struct PSOutput
 
 static const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
 
-// Баланс белого. Приближение, а не пересчёт через цветовые температуры Планка: художнику здесь
-// нужна предсказуемая ручка «теплее/холоднее», а не колориметрия, - и результат всё равно судится
-// глазом. Множитель НОРМИРУЕТСЯ по яркости, иначе ручка меняла бы заодно и экспозицию, и её
-// пришлось бы всё время компенсировать.
+// White balance: a warm/cool approximation, not Planckian colorimetry - judged by eye.
+// Normalized by luma so the knob does not also change exposure.
 float3 GradeWhiteBalance(float temperature, float tint)
 {
     float3 wb = float3(
@@ -71,41 +61,35 @@ PSOutput Main(in VSOutput input)
     float4 scene = _SceneTex.Sample(_SceneTex_sampler, uv);
     float3 c = max(scene.rgb, 0.0);
 
-    // 1. Баланс белого - первым: он правит источник, а не результат коррекции.
+    // 1. White balance first: it corrects the source, not the graded result.
     c *= GradeWhiteBalance(gradeParams.w, gradeParams2.x);
 
-    // 2. Тонировка теней (аддитивно) и светов (мультипликативно) - разделение по способу
-    // применения, а не по маске: аддитив поднимает именно чёрное, не трогая белое, множитель -
-    // наоборот. Это и есть lift/gain, только без промежуточного колеса.
+    // 2. Shadow tint additive, highlight tint multiplicative: lift/gain without the wheel.
     c = c * gradeHighlightTint.rgb + gradeShadowTint.rgb;
 
-    // 3. Гамма - до контраста и насыщенности: она перераспределяет средние тона, и считать
-    // контраст надо уже по ним.
+    // 3. Gamma before contrast/saturation: it redistributes midtones they operate on.
     c = pow(max(c, 0.0), 1.0 / max(gradeParams.z, 1e-3));
 
-    // 4. Контраст вокруг среднего серого. Пивот именно 0.5, а не 0.18: мы в гамма-пространстве,
-    // где средний тон - это половина шкалы.
+    // 4. Contrast pivots at 0.5, not 0.18: midtone is half scale in gamma space.
     c = (c - 0.5) * gradeParams.y + 0.5;
 
-    // 5. Насыщенность - последней из цветовых: она обязана видеть уже финальный тон, иначе
-    // приглушённый ползунком цвет вернул бы себе насыщенность гаммой и контрастом.
+    // 5. Saturation last so it sees the final tone.
     float luma = dot(max(c, 0.0), LumaWeights);
     c = lerp(luma.xxx, c, gradeParams.x);
 
-    // 6. Виньетка. Радиус считается от ЦЕНТРА в координатах, растянутых к формату кадра, - иначе
-    // на широком вьюпорте круг превратился бы в овал по горизонтали.
+    // 6. Vignette radius measured in aspect-stretched coords so it stays circular.
     float2 d = uv - 0.5;
     d.x *= lerp(1.0, gradeTarget.x / max(gradeTarget.y, 1.0), saturate(gradeShadowTint.w));
 
     float radius = max(gradeParams2.z, 1e-3);
     float smoothWidth = max(gradeParams2.w, 1e-3);
 
-    // smoothstep от большего к меньшему: на краю кадра множитель уходит в ноль, в центре - единица.
+    // smoothstep high-to-low: zero at the frame edge, one at the center.
     float v = smoothstep(radius, max(radius - smoothWidth, 0.0), length(d));
     c *= lerp(1.0, v, saturate(gradeParams2.y));
 
-    // Альфа - ОТ СЦЕНЫ: превью очищается прозрачным фоном, и своя альфа выбила бы подложку ImGui и
-    // фон бейкера иконок (та же причина, что в FogCommon.hlsl).
+    // Alpha comes FROM the scene: previews clear to transparent, and writing our own alpha
+    // would break the ImGui backdrop and icon baker (same reason as FogCommon.hlsl).
     output.color = float4(saturate(c), scene.a);
     return output;
 }

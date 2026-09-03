@@ -1,5 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <ProjectReference Include="..\..\..\DecaEngine.Animation\DecaEngine.Animation.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Graphics.ProbeGi\DecaEngine.Graphics.ProbeGi.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Probes\DecaEngine.Probes.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Scene\DecaEngine.Scene.csproj" />
+    <ProjectReference Include="..\..\..\DecaEngine.Tests\DecaEngine.Tests.csproj" />
     <ProjectReference Include="..\AnimationSample\AnimationSample.csproj" />
     <ProjectReference Include="..\..\..\DecaEngine\DecaEngine.csproj" />
     <ProjectReference Include="..\..\..\DecaEngine.ImGui.Core\DecaEngine.ImGui.Core.csproj" />

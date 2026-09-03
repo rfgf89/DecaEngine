@@ -15,8 +15,7 @@ public class DiligentShader : IShaderObject
 	public string FactoryPath { get; }
 	public string EntryPoint { get; }
 
-	/// <summary>Ключевые слова варианта (см. IGraphicsApi.CreateShader с keywords): каждый уходит
-	/// в компиляцию макросом NAME=1. Пусто - базовый вариант.</summary>
+	/// <summary>Variant keywords; each is passed to the compiler as NAME=1.</summary>
 	public IReadOnlyList<string> Keywords { get; }
 
 	public IShader NativeShader => _nativeShader ?? throw new NullReferenceException(
@@ -34,10 +33,7 @@ public class DiligentShader : IShaderObject
 		Keywords = keywords ?? Array.Empty<string>();
 	}
 
-	/// <summary>Макросы компиляции: бэкенд-дефайн + ключевые слова варианта (каждое = 1).
-	/// DECA_VULKAN нужен для бэкенд-специфичных веток (например, [[vk::builtin("PointSize")]] в
-	/// UnlitInstancedPointVS.hlsl обязателен на Vulkan, но для FXC на D3D это синтаксическая
-	/// ошибка X3000 - шейдер оборачивает атрибут в #if DECA_VULKAN).</summary>
+	// DECA_VULKAN gates backend-specific syntax: vk:: attributes are an X3000 error under FXC.
 	private ShaderMacro[] BuildMacros()
 	{
 		var macros = new ShaderMacro[Keywords.Count + 1];
@@ -52,18 +48,13 @@ public class DiligentShader : IShaderObject
 		return macros;
 	}
 
-	/// <summary>Диагностика: сколько раз Compile ВЫЗВАН и сколько раз он реально компилировал
-	/// (то есть ранний возврат не сработал). Расхождение этих чисел и есть ответ на вопрос,
-	/// переиспользуется ли скомпилированный шейдер между материалами.</summary>
+	// Calls vs actual compiles: the gap shows how well shaders are reused between materials.
 	public static long DiagCompileMs;
 	public static int DiagCompileCalls;
 	public static int DiagCompileActual;
 
-	/// <summary>Компиляции зовутся и с фоновых потоков загрузки (см.
-	/// ModelLoader.PrecompileShaderVariants), и с главного (SetShader) - в том числе на ОДНОМ
-	/// экземпляре (шарёный кэш DiligentGraphicsApi): без замка два потока компилировали бы один
-	/// шейдер дважды с гонкой на _nativeShader. Создание ресурсов у IRenderDevice потокобезопасно
-	/// (в отличие от контекстов) - параллельные компиляции РАЗНЫХ экземпляров легальны.</summary>
+	// Compile runs from both loader threads and the main thread on one shared instance.
+	// IRenderDevice resource creation is thread-safe, so distinct instances may compile at once.
 	private readonly object _compileLock = new();
 
 	public void Compile()
@@ -111,12 +102,7 @@ public class DiligentShader : IShaderObject
 			_ => throw new ArgumentOutOfRangeException()
 		};
 
-		// Inline-трассировка (RayQuery) в варианте шейдера требует DXC и SM 6.5 - штатный FXC не
-		// знает даже идентификатора RaytracingAccelerationStructure (тот же выбор, что у
-		// ProbeRoundPipelines для SCENE_TRACE_HARDWARE). Признак - кейворд варианта: компилятор
-		// решается ЗДЕСЬ, потому что общий путь CreateSharedShader ничего не знает о содержимом
-		// шейдера. Ключ дискового кеша байткода различает варианты по макросам, так что DXC- и
-		// FXC-байткод не перепутаются.
+		// Inline ray tracing needs DXC and SM 6.5; FXC does not know RaytracingAccelerationStructure.
 		bool needsRayQuery = Keywords != null &&
 			(Keywords.Contains("FEATURE_RT_SHADOWS") || Keywords.Contains("FEATURE_RT_REFLECTIONS"));
 
@@ -138,20 +124,16 @@ public class DiligentShader : IShaderObject
 			HLSLVersion = needsRayQuery ? new global::Diligent.Version(6, 5) : default,
 		};
 
-		// Файл шейдера резолвится относительно ТЕКУЩЕЙ директории процесса - при запуске с "чужим"
-		// CWD (IDE с рабочей папкой проекта и т.п.) файл не находится, и без этой проверки наружу
-		// уходило только безликое "Shader is not compiled" из NativeShader.
+		// Shader paths resolve against the process CWD, so an unexpected CWD must fail loudly.
 		var expectedPath = Path.Combine(Environment.CurrentDirectory, FactoryPath, FilePath);
 		if (!File.Exists(expectedPath))
 		{
 			throw new FileNotFoundException(
 				$"Shader source not found: '{expectedPath}' (shader '{Name}', CWD '{Environment.CurrentDirectory}'). " +
-				"Проверь, что EditorAssets скопированы в рабочую директорию процесса.", expectedPath);
+				"Check that EditorAssets are copied into the process working directory.", expectedPath);
 		}
 
-		// Дисковый кеш байткода: попадание минует компилятор совсем (большие варианты
-		// UnlitInstancedPS стоят секунды КАЖДЫМ запуском). Ключ включает содержимое исходника со
-		// всеми инклудами, так что правка шейдера инвалидирует запись сама.
+		// Disk bytecode cache; the key hashes the source with all includes, so edits self-invalidate.
 		var bytecodeCache = _api.ShaderBytecodeCache;
 		var cacheKey = bytecodeCache?.ComputeKey(Path.Combine(Environment.CurrentDirectory, FactoryPath),
 			FilePath, Type, EntryPoint, shaderCi.Macros.Elements, shaderCi.CompileFlags);
@@ -167,16 +149,14 @@ public class DiligentShader : IShaderObject
 					return;
 				}
 
-				// Битая/несовместимая запись (например, после апдейта Diligent или драйвера) -
-				// убрать и скомпилировать из исходника обычным путём.
+				// Stale entry, e.g. after a Diligent or driver update: drop it and recompile.
 				bytecodeCache.Invalidate(cacheKey);
 			}
 		}
 
 		_nativeShader = _api.Device.CreateShader(shaderCi, out var compilerOutput);
 
-		// Diligent при ошибке компиляции возвращает null и кладёт лог в compilerOutput - раньше он
-		// молча уничтожался, а наружу уходило только "Shader is not compiled" без причины.
+		// Diligent signals a compile failure with a null shader and the log in compilerOutput.
 		if (_nativeShader == null)
 		{
 			string log = ReadCompilerOutput(compilerOutput);
@@ -211,7 +191,7 @@ public class DiligentShader : IShaderObject
 				return "<empty compiler output>";
 			}
 
-			// Diligent кладёт в blob нуль-терминированный текст лога компилятора.
+			// The blob holds null-terminated compiler log text.
 			return System.Runtime.InteropServices.Marshal.PtrToStringAnsi(blob.GetDataPtr(), size).TrimEnd('\0', '\n', ' ');
 		}
 		catch
@@ -220,10 +200,7 @@ public class DiligentShader : IShaderObject
 		}
 	}
 
-	/// <summary>Шейдер выдан из кэша <see cref="DiligentGraphicsApi"/> и шарится между МОДЕЛЯМИ -
-	/// его <see cref="Release"/> игнорируется: освобождение одной модели иначе убило бы нативный
-	/// объект, которым пользуются живые материалы другой. Освобождается только вместе с api
-	/// (см. ReleaseShared).</summary>
+	/// <summary>Shared cache instance: Release is a no-op, only the owning api may free it.</summary>
 	public bool IsShared { get; init; }
 
 	public void Release()
@@ -237,7 +214,6 @@ public class DiligentShader : IShaderObject
 		_nativeShader = null;
 	}
 
-	/// <summary>Настоящее освобождение шарёного шейдера - только из владельца кэша.</summary>
 	internal void ReleaseShared()
 	{
 		_nativeShader?.Dispose();

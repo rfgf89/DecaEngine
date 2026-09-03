@@ -1,20 +1,13 @@
-// Резолв стохастических отражений (см. SsrPass.cs) - две ступени, архитектура Stachowiak
-// (референс: Xerxes1138/StochasticScreenSpaceReflection):
-//
-// 1. ПЕРЕИСПОЛЬЗОВАНИЕ ЛУЧЕЙ (ratio estimator): соседние пиксели стреляли СВОИ GGX-лучи, и их
-//    хиты - валидные сэмплы нашего интеграла. Хит соседа трактуется как точечный «источник»:
-//    вклад = цвет * BRDF(V, L, N_наш) / PDF_соседа. Веса сами дают физику лоба - у зеркала
-//    чужие направления весят ~0 (резкость), у шероховатого лоб широкий и соседи весят честно
-//    (гладкий glossy без ручного радиуса размытия). BRDF bias трейса (лучи поджаты к зеркалу)
-//    компенсируется этим же весом.
-// 2. ТЕМПОРАЛЬНАЯ аккумуляция: история репроецируется по буферу векторов движения и зажимается
-//    в цветовой AABB окрестности текущего кадра (Playdead neighborhood clamp); вес истории
-//    дополнительно гасится скоростью пикселя - на движении камеры отражение не мажется.
+// Stochastic reflection resolve (see SsrPass.cs), Stachowiak-style two stages:
+// 1. Ray reuse (ratio estimator): neighbor hits weighted by BRDF(ours)/PDF(theirs),
+//    which shapes the glossy lobe without a hand-tuned blur radius.
+// 2. Temporal accumulation: history reprojected via motion vectors, clamped to the
+//    neighborhood color AABB (Playdead), and damped by pixel velocity.
 #include "SsrCommon.hlsl"
 
 Texture2D<float> _DepthTex;
-Texture2D _TraceTex;    // цвет хита + confidence (RT0 трейса)
-Texture2D _RayHitTex;   // hit-буфер: uv/направление + pdf + маска (RT1 трейса)
+Texture2D _TraceTex;    // hit color + confidence (trace RT0)
+Texture2D _RayHitTex;   // hit buffer: uv/direction + pdf + mask (trace RT1)
 Texture2D _NormalRoughTex;
 Texture2D _HistoryTex;
 SamplerState _HistoryTex_sampler;
@@ -25,8 +18,8 @@ struct PSOutput
     float4 color : SV_TARGET;
 };
 
-// Спираль соседей переиспользования (первый - сам пиксель); ssrRaysPerPixel выбирает, сколько
-// пар из неё реально берётся (1..4 -> 2..8 тапов).
+// Reuse spiral (first entry is the pixel itself); ssrRaysPerPixel picks how many
+// pairs are actually used (1..4 -> 2..8 taps).
 static const int SsrMaxReuseTaps = 8;
 static const float2 SsrReuseOffsets[SsrMaxReuseTaps] =
 {
@@ -44,7 +37,7 @@ PSOutput Main(in VSOutput input)
 
     float4 center = _TraceTex.Load(int3(pixel, 0));
 
-    // Фон истории не имеет и не копит.
+    // Background keeps no history.
     float centerRaw = _DepthTex.Load(int3(pixel, 0));
     if (centerRaw < 1e-6)
     {
@@ -63,18 +56,14 @@ PSOutput Main(in VSOutput input)
         float3 N = SsrWorldDirToView(normalize(nWorld));
         float3 V = -normalize(P);
 
-        // Поворот спирали - IGN с покадровой фазой: соседние пиксели и соседние кадры берут
-        // взаимодополняющие наборы соседей.
+        // IGN spiral rotation with per-frame phase: neighboring pixels/frames take
+        // complementary neighbor sets.
         float ang = SsrNoise(float2(pixel), ssrFrameIndex * 0.618) * 2.0 * SsrPI;
         float2x2 rot = float2x2(cos(ang), sin(ang), -sin(ang), cos(ang));
 
-        // АНИЗОТРОПНОЕ ядро (RTG гл.19, "BRDF-based reflection filter kernel"): глянцевое
-        // отражение растягивается по экрану ВДОЛЬ проекции нормали (столбы света на мокром
-        // полу), и там же лежат полезные сэмплы соседей - круглый диск половину тапов тратил
-        // поперёк лоба, где вес BRDF ~ 0. Ось - экранная проекция нормали (view.y -> экранный
-        // -y), вытяжка растёт к скользящим углам (доля нормали в плоскости экрана / NdotV),
-        // общий масштаб - с шероховатостью (у зеркала диск сжимается: чужие направления - уже
-        // другой блик).
+        // Anisotropic kernel (RTG ch.19): glossy lobe stretches along the screen
+        // projection of the normal (view.y maps to screen -y); stretch grows toward
+        // grazing angles, overall scale with roughness.
         float NdotV = saturate(dot(N, V));
         float2 nScreen = float2(N.x, -N.y);
         float nScreenLen = length(nScreen);
@@ -83,10 +72,8 @@ PSOutput Main(in VSOutput input)
         float stretch = min(1.0 + 3.0 * nScreenLen * nScreenLen / max(NdotV, 0.25), 4.0);
         float kernelScale = lerp(0.5, 1.5, smoothstep(0.05, 0.5, roughness));
 
-        // Вытяжка выведена для ПЛОСКОСТЕЙ (пол, доска): на сильно кривой поверхности ось
-        // растяжения вращается от пикселя к пикселю, и эллипс мешает сэмплы разных направлений
-        // лоба - на сферах вблизи выходили «завихрения». Кривизна оценивается по соседним
-        // нормалям G-buffer-а; кривым поверхностям эллипс сжимается обратно к кругу.
+        // Stretch is derived for planes; on curved surfaces the axis rotates per
+        // pixel and mixes lobe directions, so curvature squashes the ellipse to a circle.
         float3 nRight = _NormalRoughTex.Load(int3(clamp(pixel + int2(2, 0), int2(0, 0), int2(viewportSize) - 1), 0)).xyz;
         float3 nDown = _NormalRoughTex.Load(int3(clamp(pixel + int2(0, 2), int2(0, 0), int2(viewportSize) - 1), 0)).xyz;
         float curvature = length(nRight - nWorld) + length(nDown - nWorld);
@@ -107,7 +94,6 @@ PSOutput Main(in VSOutput input)
                 break;
             }
 
-            // Спиральный офсет -> случайный поворот -> эллипс лоба (вытяжка вдоль majorDir).
             float2 spun = mul(rot, SsrReuseOffsets[t]) * kernelScale;
             float2 elliptic = majorDir * (spun.x * stretch) + minorDir * spun.y;
             int2 tap = clamp(pixel + int2(round(elliptic)),
@@ -116,11 +102,11 @@ PSOutput Main(in VSOutput input)
             float4 rayHit = _RayHitTex.Load(int3(tap, 0));
             if (rayHit.w < 0.25)
             {
-                continue; // сосед промахнулся - переиспользовать нечего
+                continue;
             }
 
-            // Направление чужого луча ИЗ НАШЕЙ точки: экранный хит - через view-позицию точки
-            // пересечения (честный параллакс), RT-хит - октаэдрально упакованное направление.
+            // Neighbor's ray direction FROM OUR point: screen hit via the hit's view
+            // position (true parallax), RT hit via octahedrally packed direction.
             float3 L;
             if (rayHit.w > 0.75)
             {
@@ -145,17 +131,15 @@ PSOutput Main(in VSOutput input)
                 L = SsrOctDecode(rayHit.xy);
             }
 
-            // Вес ratio estimator-а: BRDF нашего пикселя по направлению соседа / pdf соседа.
-            // У ЗЕРКАЛЬНОГО соседа rayHit.z несёт длину луча (репроекция виртуального образа,
-            // см. ниже), его pdf детерминирован - считается аналитически по его шероховатости.
+            // Ratio-estimator weight: our BRDF along neighbor's direction / neighbor pdf.
+            // For mirror neighbors rayHit.z carries ray length, so their pdf is analytic.
             float tapRough = _NormalRoughTex.Load(int3(tap, 0)).a;
             float tapPdf = tapRough < SsrMirrorRoughness ? SsrMirrorPdf(tapRough) : rayHit.z;
             float weight = SsrBrdfWeight(V, L, N, roughness) / max(tapPdf, 1e-5);
 
             float4 s = _TraceTex.Load(int3(tap, 0));
 
-            // Против «искр»: яркий тап приглушается при усреднении (/(1+lum)) и разжимается
-            // обратно после - firefly-фильтр референса.
+            // Firefly filter: tonemap by 1/(1+lum) before averaging, invert after.
             float3 c = s.rgb / (1.0 + dot(s.rgb, float3(0.2126, 0.7152, 0.0722)));
 
             colorSum += c * weight;
@@ -171,7 +155,7 @@ PSOutput Main(in VSOutput input)
         }
     }
 
-    // Цветовая AABB окрестности 3x3 сырого трейса - границы правдоподобной истории.
+    // 3x3 raw-trace color AABB bounds plausible history.
     float4 mn = center;
     float4 mx = center;
     [unroll]
@@ -192,20 +176,17 @@ PSOutput Main(in VSOutput input)
         }
     }
 
-    // Резолвнутое значение может законно выходить за AABB сырого трейса - расширяем границы им
-    // самим, иначе кламп истории душил бы то, что резолв только что восстановил.
+    // Resolved value may legitimately exceed the raw-trace AABB; widen the bounds
+    // with it so the history clamp does not undo the resolve.
     mn = min(mn, current);
     mx = max(mx, current);
 
     float2 motion = _MotionTex.Load(int3(pixel, 0));
     float2 prevUv = uv + motion;
 
-    // РЕПРОЕКЦИЯ ВИРТУАЛЬНОГО ОБРАЗА у зеркал (RTG гл.32, Reflection Motion Vectors):
-    // отражение при движении камеры едет не как поверхность зеркала, а как точка ЗА ним -
-    // виртуальный образ хита на глубине |P| + длина луча вдоль луча взгляда (плоское
-    // приближение; кривизна по тонкой линзе - возможное продолжение). Прошлое положение
-    // образа даёт viewProj прошлого кадра. Длина: экранный хит - из глубины по его uv,
-    // RT-хит зеркала - из rayHit.z (трейс кладёт туда длину, pdf зеркала аналитический).
+    // Virtual-image reprojection for mirrors (RTG ch.32, Reflection Motion Vectors):
+    // reflections move like the point BEHIND the mirror at depth |P| + ray length
+    // (planar approximation); previous position via last frame's viewProj.
     float virtualBlend = 1.0 - smoothstep(SsrMirrorRoughness, 0.3, roughness);
     float historyMotionDamp = 8.0;
     if (virtualBlend > 0.0 && dot(nWorld, nWorld) > 0.5)
@@ -241,23 +222,20 @@ PSOutput Main(in VSOutput input)
                     0.5 - prevClip.y / prevClip.w * 0.5);
                 prevUv = lerp(prevUv, prevVirtualUv, virtualBlend);
 
-                // Репроекция теперь честная - скоростное гашение истории зеркалу смягчается
-                // (AABB-кламп прикрывает промахи репроекции).
+                // Reprojection is now correct, so relax velocity damping for mirrors;
+                // the AABB clamp covers reprojection misses.
                 historyMotionDamp = lerp(8.0, 2.0, virtualBlend);
             }
         }
     }
 
-    // Вес истории гасится скоростью (референс: response * (1 - |velocity| * 8)) - на движении
-    // камеры протухшая история не мажет, в статике аккумуляция полная. Зеркалу с виртуальной
-    // репроекцией история снова полезна (раньше гасилась до 0.45: репроекция по движению
-    // ПОВЕРХНОСТИ мазала близкие зеркала шлейфом при орбите - теперь образ репроецируется сам).
+    // History weight damped by velocity so stale history does not smear on camera motion.
     float historyByRoughness = lerp(0.8, 1.0, smoothstep(SsrMirrorRoughness, 0.3, roughness));
     float weight = ssrHistoryWeight * historyByRoughness
         * saturate(1.0 - length(motion) * historyMotionDamp);
     if (any(prevUv < 0.0) || any(prevUv > 1.0))
     {
-        weight = 0.0; // пиксель въехал из-за кадра - истории нет
+        weight = 0.0; // pixel entered from off-screen: no history
     }
 
     float4 history = _HistoryTex.SampleLevel(_HistoryTex_sampler, prevUv, 0.0);

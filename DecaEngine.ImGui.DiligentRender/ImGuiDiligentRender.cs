@@ -5,7 +5,7 @@ using DecaEngine.Core;
 using DecaEngine.Graphics.Diligent;
 using Diligent;
 using Hexa.NET.ImGui;
-// Рендерит через нативный контекст напрямую, а не через ICommandBuffer - флаги Diligent-овские.
+// Renders through the native context rather than ICommandBuffer, so the flags are Diligent's.
 using SetVertexBuffersFlags = Diligent.SetVertexBuffersFlags;
 using TextureFormat = Diligent.TextureFormat;
 using ValueType = Diligent.ValueType;
@@ -81,23 +81,15 @@ public class ImGuiDiligentRender : ImGuiRender
 		isSwapChainOutput = false;
 	}
 
-	/// <summary>
-	/// Disposes the shader-resource binding/variable previously cached for <paramref name="textureId"/>,
-	/// if any. Callers must invoke this BEFORE disposing/recreating the underlying texture (e.g. before
-	/// <see cref="DecaEngine.Graphics.Diligent.DiligentRenderTarget.Resize"/>): the cached SRB is bound
-	/// to a view of that texture, and releasing the SRB after the view is already gone accesses freed
-	/// native memory instead of cleanly releasing it (observed as an access violation inside
-	/// <c>ComObject.Release</c>). The texture itself is NOT disposed here: for this overload it's
-	/// externally owned.
-	/// </summary>
+	/// <summary>Releases the cached SRB for a texture id; the texture itself is not disposed.</summary>
+	// Must be called BEFORE the underlying texture is disposed or resized: releasing an SRB whose
+	// view is already gone touches freed native memory.
 	public override void ReleaseRenderTargetBinding(ImTextureID textureId)
 	{
 		if (_textures.Remove(textureId, out var previous))
 		{
-			// Only the binding itself is disposed - the IShaderResourceVariable (Item3) is not an
-			// independently ref-counted object, it's a query into the SRB's internal variable table
-			// (obtained via GetVariableByName); disposing it separately from/in addition to the SRB
-			// double-releases the same underlying native pointer and crashes inside ComObject.Release.
+			// Only the SRB: the IShaderResourceVariable is a query into its table, not ref-counted,
+			// and disposing it too double-releases the same native pointer.
 			previous.Item2.Dispose();
 		}
 	}
@@ -319,14 +311,8 @@ public class ImGuiDiligentRender : ImGuiRender
 					}
 					else
 					{
-						// Texture not (yet) registered - e.g. an AssetBrowser icon whose GPU texture/SRB is
-						// still being created/rebound this same frame (ModelIconCache.Invalidate can drop an
-						// entry mid-frame while a new icon is baked - see ModelIconBaker). Must NOT fall
-						// through to DrawIndexed below without rebinding: the GPU still has whatever SRB was
-						// last committed (a DIFFERENT, unrelated texture) bound, and drawing this command
-						// against it stamps that unrelated icon into this quad instead of just leaving it
-						// blank - the more distinct icons churn per frame, the more visible this gets ("every
-						// image renders some other image"). Skip the draw instead.
+						// Texture not registered yet. Skip the draw: without a rebind the GPU still has
+						// the previously committed SRB bound and would stamp an unrelated texture here.
 						lastTexId = null;
 						continue;
 					}

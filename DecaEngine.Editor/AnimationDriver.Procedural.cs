@@ -10,24 +10,15 @@ using DecaEngine.Physics;
 using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
-// В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
-// имя разрешается неоднозначно.
+// Friflo ships its own Transform component; the alias resolves the ambiguity.
 using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Процедурные добавки: foot IK по ступеням и пружинные кости. Часть <see cref="AnimationDriver"/> - файл на тему; состояние
-/// персонажа (Character) и кадровый Update живут в основном файле.</summary>
+/// <summary>Procedural animation passes: foot IK and spring bones.</summary>
 public sealed partial class AnimationDriver
 {
-	/// <summary>
-	/// Привязка стоп к полу. Идёт ПОСЛЕ look-at и ДО spring bones: look-at правит верх скелета и с
-	/// ногами не пересекается, а вторичное движение обязано считаться по уже окончательной позе -
-	/// иначе цепочка начинает каждый кадр от позы, которой в кадре не будет.
-	///
-	/// Молча выходит без физики или без нативного ozz: two-bone IK живёт в шиме, а луч - в мире.
-	/// Это штатная деградация, и её видно в окне дебага счётчиком применённых ног.
-	/// </summary>
+	// Must run after look-at and before spring bones: secondary motion needs the final pose.
 	private void ApplyFootIk(Entity entity, Character character, float deltaSeconds)
 	{
 		if (character.Pose == null || Physics == null || !entity.HasComponent<FootIkComponent>())
@@ -55,9 +46,7 @@ public sealed partial class AnimationDriver
 			return;
 		}
 
-		// Числовые ручки обновляются каждый кадр (их крутят ползунками во время проигрывания), а
-		// состав ног - только при пересборке выше: пересборка роняет сглаживание, и стопа поехала бы
-		// к земле заново на каждом кадре.
+		// Numeric knobs refresh per frame; the leg set only on rebuild, which resets smoothing.
 		character.IkSettings.Weight = Math.Clamp(settings.Weight, 0f, 1f);
 		character.IkSettings.MaxPelvisDrop = settings.MaxPelvisDrop;
 		character.IkSettings.Smoothing = settings.Smoothing;
@@ -83,13 +72,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>
-	/// Имя кости: заданное автором, а если оно пусто - из humanoid-разметки модели.
-	///
-	/// Приоритет у АВТОРА, и это не мелочь: разметка автоматическая, и на нестандартном риге она
-	/// может ошибиться. Пустое поле означает «возьми из аватара», непустое - «я знаю лучше», и
-	/// перебивать второе первым значило бы, что ручную настройку нельзя сделать в принципе.
-	/// </summary>
+	// Authored name wins over the avatar mapping, which is auto-generated and can guess wrong.
 	private static string JointOf(Character character, string authored, HumanoidBone slot) =>
 		!string.IsNullOrEmpty(authored) ? authored : character.Avatar?[slot] ?? string.Empty;
 
@@ -103,18 +86,12 @@ public sealed partial class AnimationDriver
 			? -1
 			: character.Skeleton.FindJoint(pelvis);
 
-		// Дальность луча - в масштабе СКЕЛЕТА, а не в метрах: у лисы длина кости ~10 единиц, и луч
-		// «полтора метра вниз» не дотянулся бы до пола, под которым она стоит. Это ровно тот случай,
-		// когда абсолютная константа выглядит как «IK не работает».
-		//
-		// Старт - ВЫСОКО над стопой (3 длины кости; канонический сэмпл ozz берёт полметра): лапа на
-		// ступенях и склонах уходит ВНУТРЬ рельефа, и луч, рождённый под поверхностью, пролетает
-		// односторонний меш насквозь и находит «пол» этажом ниже - IK тянет ногу туда.
+		// Ray length is in skeleton scale, not metres; an absolute constant misses the floor.
+		// Start well above the foot: a ray born inside terrain passes through one-sided meshes.
 		character.IkSettings.ProbeUp = character.Scale * 3f;
 		character.IkSettings.ProbeDown = character.Scale * 2f;
 
-		// Носок - точка ОПОРЫ дигитиграда: у лисы «стопа» разметки - скакательный сустав, и без
-		// носка IK щупал пол под суставом, висящим над землёй в стороне от места контакта.
+		// Toe is the contact point on digitigrade rigs, where the mapped "foot" is the hock.
 		AddLeg(character,
 			JointOf(character, settings.LeftUpperJoint, HumanoidBone.LeftUpperLeg),
 			JointOf(character, settings.LeftLowerJoint, HumanoidBone.LeftLowerLeg),
@@ -128,9 +105,7 @@ public sealed partial class AnimationDriver
 			JointOf(character, settings.RightToeJoint, HumanoidBone.RightToes),
 			right: true);
 
-		// Передние ноги четвероногого - из ARM-слотов разметки (лисе автомаппинг кладёт передние
-		// ноги именно туда). Только по явной галочке: у двуногого те же слоты - его руки. Носок
-		// передней ноги - только авторский: слота «пальцы кисти» в разметке нет.
+		// Quadruped front legs live in the ARM slots; opt-in, since on a biped those are arms.
 		if (settings.FrontLegs)
 		{
 			AddLeg(character,
@@ -149,9 +124,7 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Добавляет ногу, если ВСЕ три кости нашлись. Частично настроенная нога не добавляется
-	/// вовсе: two-bone IK с отсутствующим суставом - это не «чуть хуже», а обращение по индексу -1.
-	/// Носок - ОПЦИОНАЛЬНЫЙ: без него точкой опоры служит сама стопа (двуногие).</summary>
+	// All three joints required: a missing one would index the pose with -1. Toe is optional.
 	private static void AddLeg(Character character, string upper, string lower, string foot,
 		string toe = "", bool front = false, bool right = false)
 	{
@@ -228,9 +201,7 @@ public sealed partial class AnimationDriver
 
 		foreach (var chain in character.Chains)
 		{
-			// Числовые параметры обновляются каждый кадр (их крутят ползунками прямо во время
-			// проигрывания), а вот СОСТАВ цепочки - только при пересборке выше, иначе инерция
-			// сбрасывалась бы на каждом кадре.
+			// Numeric params refresh per frame; the joint list only on rebuild, which drops inertia.
 			chain.Stiffness = settings.Stiffness;
 			chain.Drag = settings.Drag;
 			chain.TailLength = settings.TailLength;
@@ -241,16 +212,11 @@ public sealed partial class AnimationDriver
 		character.Models.CopyTo(character.Managed.ModelMatrices, 0);
 	}
 
-	/// <summary>Совпадает ли СОСТАВ цепочки (корень и длина). Числовые параметры сюда не входят
-	/// намеренно - их правка не должна ронять инерцию.</summary>
+	// Structure only: numeric params are excluded so editing them does not drop inertia.
 	private static bool SameChainSource(in SpringBoneComponent a, in SpringBoneComponent b) =>
 		string.Equals(a.RootJoint, b.RootJoint, StringComparison.Ordinal) && a.Length == b.Length;
 
-	/// <summary>
-	/// Собирает цепочку от корневой кости вниз ПО ПЕРВОМУ РЕБЁНКУ. Первый ребёнок, а не «все дети»:
-	/// цепочка вторичного движения по определению линейна, а у кости с развилкой (основание хвоста,
-	/// от которого отходят ещё и ноги) взять всех детей значило бы утащить в цепочку пол-скелета.
-	/// </summary>
+	// Follows the first child only: a spring chain is linear, forks would drag in half the skeleton.
 	private static int[] BuildChain(PreparedSkeleton skeleton, string rootName, int length)
 	{
 		int root = skeleton.FindJoint(rootName);
@@ -277,8 +243,7 @@ public sealed partial class AnimationDriver
 		return chain.ToArray();
 	}
 
-	/// <summary>Первый ребёнок джойнта, -1 если лист. Джойнты топологически упорядочены, поэтому
-	/// дети лежат ПОСЛЕ родителя, и первый найденный - он и есть первый ребёнок.</summary>
+	// Joints are topologically ordered, so children always follow their parent.
 	private static int FirstChild(PreparedSkeleton skeleton, int joint)
 	{
 		for (int i = joint + 1; i < skeleton.JointCount; i++)
@@ -291,7 +256,4 @@ public sealed partial class AnimationDriver
 
 		return -1;
 	}
-
-	// --- Рэгдолл -----------------------------------------------------------------------------------
-
 }

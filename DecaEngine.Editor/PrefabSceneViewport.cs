@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using DecaEngine.Core;
@@ -19,21 +19,10 @@ using DecaEngine.Animation;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// GPU-вьюпорт окна Scene View: рендерит сущности редактируемого префаба (см.
-	/// <see cref="InspectorWindow"/>) через собственное офскрин-окружение
-	/// <see cref="ModelViewportEnvironment"/> (GraphicsPipelineSimple - тот же конвейер, что у
-	/// превью моделей). Сущности с компонентом <see cref="ModelRenderer"/> грузят свои .gltf/.glb
-	/// по <see cref="AssetRef"/> (пути относительно "Assets" проекта), инстансы моделей следуют за
-	/// TRS-иерархией префаба live, выделенная сущность манипулируется гизмо ImGuizmo поверх кадра.
-	/// Режимы шейдинга (Lighting/Textured/каналы отладки) и вращение мирового света - те же ручки,
-	/// что у превью модели (см. <see cref="ModelPreviewViewport"/>).
-	/// </summary>
+	/// <summary>GPU viewport of the Scene View window: renders the edited prefab's entities through its own offscreen <see cref="ModelViewportEnvironment"/>.</summary>
 	public partial class PrefabSceneViewport
 	{
-		/// <summary>Режим шейдинга кадра - маппится в Mode/Channel кбуфера PreviewSettings
-		/// (см. UnlitInstancedPS.hlsl): Lighting = PBR, Textured = плоские текстуры,
-		/// Normal/Uv/Tangent = отладочные каналы.</summary>
+		/// <summary>Frame shading mode, mapped to the PreviewSettings Mode/Channel cbuffer (see UnlitInstancedPS.hlsl).</summary>
 		public enum ShadingMode
 		{
 			Lighting,
@@ -41,35 +30,24 @@ namespace DecaEngine.Editor
 			Normal,
 			Uv,
 			Tangent,
-			// Mode 3 (Lighting) + Channel 11 - визуализация сэмплинга теней punctual-светов
-			// (см. UnlitInstancedPS.hlsl PreviewChannel == 11 и DECA_PROBE_PUNCTUALDEBUG в
-			// PreviewProbe.cs): магента - ветка сэмплинга не выполнилась (нет назначенного слайса
-			// или точка вне радиуса света), оранжевый - точка приёмника за дальней плоскостью слайса,
-			// голубой - точка приёмника вне квадрата UV слайса, градация серого - реальный
-			// shadowLit сэмплера (чёрный = в тени/окклюдер найден, белый = свет/не найден).
+			// Mode 3 + channel 11: punctual shadow sampling debug (see UnlitInstancedPS.hlsl).
 			PunctualShadowDebug,
 
-			// Кластеризация punctual-светов (LightClusterCS.hlsl) - три вида на ОТДЕЛЬНЫХ пунктах меню,
-			// а не через env-переменную: вопрос "почему свет не светит" начинается именно с них, а
-			// каналы теней выше о кластерах не говорят ничего. Ожидаемый вид каждого - в легенде
-			// ClusterLegend ниже и в комментариях каналов 20/21/14 в UnlitInstancedPS.hlsl.
-			ClusterDepthSlices,  // канал 20 - срез глубины фроксела цветом
-			ClusterScreenTiles,  // канал 21 - тайл фроксела по экрану
-			ClusterLightCount,   // канал 14 - число светов в кластере пикселя
+			// Punctual light clustering debug (LightClusterCS.hlsl); legends in ClusterLegend below.
+			ClusterDepthSlices,  // channel 20: froxel depth slice as color
+			ClusterScreenTiles,  // channel 21: froxel screen tile
+			ClusterLightCount,   // channel 14: lights in the pixel's cluster
 
-			// Проецируемая глубина света на поверхность - обе глубины, которые сравнивает теневой
-			// сэмплер, в мировых единицах вдоль оси слайса (каналы 22..24 в UnlitInstancedPS.hlsl).
-			LightDepthReceiver,  // канал 22 - глубина приёмника (этой поверхности) от света
-			LightDepthOccluder,  // канал 23 - глубина окклюдера, записанная в слайсе по тому же UV
-			LightDepthGap,       // канал 24 - их зазор в единицах применённого байаса
+			// Both depths the shadow sampler compares, world units along the slice axis (ch 22..24).
+			LightDepthReceiver,  // channel 22: receiver depth from the light
+			LightDepthOccluder,  // channel 23: occluder depth stored in the slice at the same UV
+			LightDepthGap,       // channel 24: their gap in units of the applied bias
 
-			// Каскадные тени СОЛНЦА (канал 28) - отдельно от punctual-каналов выше: у них общий
-			// только сэмплер, а вопросы разные. Тон = номер каскада, яркость = множитель тени.
+			// Sun cascaded shadows (channel 28): hue = cascade, brightness = shadow factor.
 			SunShadowCascades,
 		}
 
-		/// <summary>Легенда кластерных режимов для тултипа меню - здесь, а не в SceneViewWindow, чтобы
-		/// текст жил рядом с перечислением каналов, которые он описывает.</summary>
+		/// <summary>Legend text for the debug shading modes' menu tooltips.</summary>
 		public static string ClusterLegend(ShadingMode mode) => mode switch
 		{
 			ShadingMode.ClusterDepthSlices =>
@@ -137,21 +115,9 @@ namespace DecaEngine.Editor
 				"(15 UV excess, 16 slice of cyan pixels, 17 raw UV, 18 toFrag, 19 cube face).",
 		};
 
-		/// <summary>Какой именно диагностический канал UnlitInstancedPS показывает режим
-		/// <see cref="ShadingMode.PunctualShadowDebug"/>. По умолчанию 11 (сводная легенда сэмплинга),
-		/// DECA_PUNCTUAL_CHANNEL=N переключает на любой другой временный канал без правки кода и
-		/// пересборки UI: 15 - величина выхода UV за диапазон, 16 - слайс у циан-пикселей, 17 - сырой
-		/// UV, 18 - toFrag, 19 - ВЫБРАННАЯ ГРАНЬ КУБА своим цветом. Перебирать их через меню незачем -
-		/// они временные и живут ровно до починки punctual-теней.
-		///
-		/// Отдельно от теней - диагностика КЛАСТЕРИЗАЦИИ (LightClusterCS): 20 - срез глубины
-		/// фроксел-сетки цветом (аналог "Display depth Slices" из статьи aortiz, по которой сделан
-		/// компьют), 21 - тайл сетки по экрану шахматкой, 14 - число светов в кластере пикселя.
-		/// Каналы теней о кластерах не говорят ничего, так что вопрос "почему свет не светит"
-		/// начинается с 20/21/14, а не с 11.</summary>
+		// DECA_PUNCTUAL_CHANNEL=N overrides the diagnostic channel shown by PunctualShadowDebug (default 11).
 		private static readonly int PunctualDebugChannel =
-			// System.Environment полным именем: у класса есть собственное свойство Environment
-			// (вьюпортное окружение рендера), и короткое имя разрешается в него.
+			// Full name: the class's own Environment property shadows the short name.
 			int.TryParse(System.Environment.GetEnvironmentVariable("DECA_PUNCTUAL_CHANNEL"), out var ch) && ch > 0
 				? ch
 				: 11;
@@ -162,24 +128,17 @@ namespace DecaEngine.Editor
 		private const float CameraNear = 0.05f;
 		private const float CameraFar = 2000f;
 
-		/// <summary>См. ModelPreviewViewport.ResizeSettleSeconds - ресайз таргетов только после того,
-		/// как пользователь отпустил край окна.</summary>
+		// Resize targets only after the user releases the window edge.
 		private const float ResizeSettleSeconds = 0.3f;
 
-		/// <summary>Кламп высоты солнца - у горизонта/зенита ортокамера каскада теней вырождается
-		/// (см. ModelPreviewViewport.LightElevationMinDegrees).</summary>
+		// Clamp sun elevation: the cascade ortho camera degenerates at horizon/zenith.
 		private const float LightElevationMinDegrees = -85f;
 		private const float LightElevationMaxDegrees = 85f;
 
-		/// <summary>Отображение одной сущности префаба с ModelRenderer: какие env-сущности созданы
-		/// под её инстансы и под какой мировой матрицей они стоят. Resident - ссылка стримера на
-		/// модель файла (см. <see cref="ModelStreamer.Acquire"/>); берётся/отпускается по радиусу
-		/// стриминга от камеры.</summary>
+		// Per prefab-entity render record: env entities, instance slots, streamer residency.
 		private sealed class RenderedModel
 		{
-			/// <summary>Сущность ПРЕФАБА, которой принадлежит запись (ключ <see cref="_rendered"/>).
-			/// Продублирован в саму запись, потому что она передаётся вглубь инстанцирования, где
-			/// ключа словаря уже нет, а компоненты анимации висят именно на этой сущности.</summary>
+			// Owning PREFAB entity id; animation components live on it, not on env entities.
 			public int EntityId;
 
 			public string AssetPath = "";
@@ -198,17 +157,14 @@ namespace DecaEngine.Editor
 		private readonly SharedViewportResources _sharedResources;
 		private ModelViewportEnvironment _env;
 
-		/// <summary>Есть ли у объёмного света каскадные тени - см. одноимённое свойство
-		/// <see cref="ModelPreviewViewport.VolumetricShadowsAvailable"/>.</summary>
+		/// <summary>Whether the volumetric light has cascaded shadows.</summary>
 		public bool VolumetricShadowsAvailable => _env?.VolumetricShadowsAvailable ?? false;
 
-		/// <summary>Текущее окружение сцены - для отладочных инструментов (дамп shadow map каскадов
-		/// в окне Graphics). Пересоздаётся при смене env-level настроек - не кэшировать.</summary>
+		/// <summary>Current scene environment; recreated on env-level settings changes — do not cache.</summary>
 		public ModelViewportEnvironment Environment => _env;
 
-		// Конфигурация, с которой создано ТЕКУЩЕЕ окружение (env-level опции пекутся в его
-		// таргеты/пассы/PSO): диф с настройками в OnGraphicsSettingsChanged решает, нужно ли
-		// пересоздание (см. RecreateEnvironment - та же схема, что у ModelPreviewViewport).
+		// Config the CURRENT environment was created with; diffed in OnGraphicsSettingsChanged
+		// to decide whether recreation is needed (see RecreateEnvironment).
 		private bool _appliedSsao;
 		private AmbientOcclusionMode _appliedAoMode;
 		private bool _appliedSsgi;
@@ -216,130 +172,74 @@ namespace DecaEngine.Editor
 		private string _appliedHdrPath = "";
 		private bool _appliedAniso;
 
-		/// <summary>Потолок стороны текстуры, под которым перечитаны резидентные модели. Как и
-		/// анизотропия, он печётся при ЗАГРУЗКЕ (текстура ужимается до заливки), поэтому его смена
-		/// требует не пересоздания окружения, а перечитывания моделей с диска.</summary>
+		// Baked at load time: changing it re-reads resident models instead of recreating the env.
 		private int _appliedMaxTextureSize;
 
 		private bool _appliedSceneHdr;
 
-		// Туман - опция УРОВНЯ СОЗДАНИЯ окружения: пассу нужны депт и scene-copy, поэтому он
-		// создаётся вместе с конвейером (см. GraphicsPipelineSimple), а галка требует пересоздания.
 		private bool _appliedFog;
 
-		// Объёмный свет - тоже уровня создания окружения: пассу нужны депт, scene-copy и shadow map
-		// (см. VolumetricLightPass), он создаётся вместе с конвейером.
 		private bool _appliedVolumetric;
 
-		// Блум - тоже уровня создания: он владеет своей цепочкой таргетов (см. BloomPassResources).
 		private bool _appliedBloom;
 
-		// Грейдинг - тоже уровня создания: пасс владеет своей копией кадра.
 		private bool _appliedColorGrade;
 
-		// Векторы движения - пасс владеет своим RG16F-буфером (см. MotionVectorPassResources).
 		private bool _appliedMotionVectors;
 		private bool _pendingEnvironmentRecreate;
 
-		/// <summary>Стриминг моделей сцены: резидентный кеш, очередь загрузок с приоритетом по
-		/// расстоянию до камеры и выселение простаивающих (см. <see cref="ModelStreamer"/>). Кадровый
-		/// шаг делает <see cref="ModelStreamingSystem"/> в SystemRoot окружения.</summary>
+		// Distance-prioritized model streaming; the per-frame step runs in ModelStreamingSystem.
 		private readonly ModelStreamer _streamer;
 
-		/// <summary>Резидентный кеш стримера на чтение - прежний словарь _models (материалы, probe-GI
-		/// и прочие обходы загруженных моделей продолжают работать без изменений).</summary>
 		private IReadOnlyDictionary<string, ModelStreamer.Resident> _models => _streamer.Models;
 
-		// --- Активность вьюпорта -------------------------------------------------------------------
-		// Модель редактора грузится РОВНО В ОДНОМ месте: либо здесь (открыт префаб), либо в
-		// ModelPreviewViewport (Inspector в режиме Model), но никогда в обоих сразу - иначе одна и та
-		// же модель держит два набора материалов/инстансов. Переключает EditorManager.OnUpdate по
-		// режиму Inspector-а (см. SetActive). В отличие от превью, кадр здесь пишется и в паузе:
-		// окно Scene View живёт отдельно от Inspector-а и видно всегда, поэтому на паузе оно
-		// показывает пустое небо окружения с подсказкой (см. SceneViewWindow), а не подвисший
-		// последний кадр.
+		// The editor model is loaded in exactly ONE place: here or ModelPreviewViewport, never both,
+		// toggled by EditorManager per Inspector mode (see SetActive). Unlike the preview, this
+		// viewport still renders while paused: it shows the empty environment sky, not a stale frame.
 		private bool _active = true;
 
 		private readonly Dictionary<int, RenderedModel> _rendered = new();
 
-		/// <summary>Анимация скиннед-моделей сцены: держит позы персонажей и читает их компоненты
-		/// (<see cref="ECS.Animator"/> и прочие) каждый кадр. Ключ - сущность ПРЕФАБА: именно на ней
-		/// висят компоненты, а не на env-сущностях инстансов.</summary>
+		// Keyed by PREFAB entity: animation components live there, not on env instance entities.
 		private AnimationDriver? _animation;
 
-		/// <summary>Драйвер создаётся лениво - вместе с первой скиннед-моделью сцены. В сценах без
-		/// персонажей его нет вовсе, и кадровый шаг анимации не стоит ничего.</summary>
 		private AnimationDriver EnsureAnimation() => _animation ??= new AnimationDriver(_env.BatchRenderer.Skinning);
 
-		// --- Физика сцены и дебаг-вид (см. ScenePhysics / DebugDraw / DebugLineOverlay) ----------
-
-		/// <summary>Мир физики сцены. Заводится ЛЕНИВО - только когда в сцене есть персонаж с
-		/// компонентом, которому физика нужна (foot IK или рэгдолл): построение статики - это BVH по
-		/// всем треугольникам сцены, и платить за него в сцене без персонажей незачем.</summary>
+		// Lazy: the static build is a BVH over all scene triangles — skip it in scenes without characters.
 		private ScenePhysics? _physics;
 
-		/// <summary>Тела персонажей, которых ведут геймплейные скрипты. В отличие от рэгдоллов, их
-		/// заводит не анимация, а скрипт, и живут они ровно столько, сколько идёт игра.</summary>
 		private readonly CharacterMotionDriver _motion = new();
 
-		/// <summary>Ввод игрока, собранный в <see cref="Render"/> этого кадра. Поле, а не прямая
-		/// запись в привод: ввод собирается при отрисовке, а потребляется в PollScenePhysics, и
-		/// между ними он должен где-то пережить границу кадра. Потребление ОБНУЛЯЕТ поле - скрытый
-		/// вьюпорт перестаёт слать последнее зажатое направление вечно.</summary>
+		// Collected in Render, consumed (and zeroed) in PollScenePhysics across the frame boundary,
+		// so a hidden viewport stops feeding the last held direction forever.
 		private PlayerInput _playerInput;
 
-		/// <summary>Идёт ли Play Mode (см. <see cref="InspectorWindow.IsPlaying"/>). Ставится
-		/// EditorManager'ом каждый кадр.
-		///
-		/// ВРЕМЕННАЯ ПРОВОДКА. Сейчас сцену ведут двое: вьюпорт (физика, анимация - всегда) и
-		/// Play-Mode-системы инспектора (только по кнопке), и этот флаг - единственное, что их
-		/// связывает. Вопрос «кто ведёт сцену» решается отдельно и целиком; до тех пор флаг нужен,
-		/// чтобы персонаж под физикой не бегал по сцене, которую в этот момент редактируют.</summary>
+		/// <summary>Whether Play Mode is running; set by EditorManager each frame (temporary wiring between the viewport and the Play Mode systems).</summary>
 		public bool IsPlaying { get; set; }
 
-		/// <summary>Шло ли Play в прошлом кадре - чтобы поймать МОМЕНТ остановки. Состояние, которое
-		/// живёт сбоку от ECS, снимком Play Mode не откатывается, и снимать его надо на самом
-		/// переходе.</summary>
+		// Detects the Play->Stop edge; this state lives outside ECS and is not rolled back by the snapshot.
 		private bool _wasPlaying;
 
-		/// <summary>Статику надо пересобрать: сцена изменилась структурно или кто-то поехал. Флаг
-		/// свой, а не общий с обводкой выделения: та потребляет свои флаги в тот же кадр, и деление
-		/// одного на двоих означало бы, что успевший первым гасит его для второго.</summary>
+		// Statics rebuild flag; kept separate from selection-outline flags (those self-consume same frame).
 		private bool _physicsStaticsDirty = true;
 
-		/// <summary>Скретч мировой геометрии под статику физики - тот же приём, что у обводки
-		/// выделения: списки переиспользуются, чтобы пересборка не аллоцировала сцену целиком.</summary>
+		// Scratch reused across static rebuilds to avoid re-allocating the whole scene.
 		private readonly List<Vector3> _physicsPositions = new();
 		private readonly List<uint> _physicsIndices = new();
 
-		/// <summary>Приёмник дебаг-линий кадра. Живёт всегда (он ничего не стоит выключенным), а
-		/// GPU-оверлей под ним - только пока дебаг включён.</summary>
 		private readonly DebugDraw _debugDraw = new();
 		private DebugLineOverlay? _debugLineOverlay;
 
-		/// <summary>Создание оверлея провалилось (не собрались шейдеры) - больше не пробовать.
-		/// Тот же приём, что у дебаг-вида проб: попытка на каждом кадре означала бы поток одинаковых
-		/// ошибок в консоли и компиляцию шейдера в каждом кадре.</summary>
+		// Overlay creation failed once — don't retry every frame (log spam + shader recompiles).
 		private bool _debugOverlayFailed;
 
-		/// <summary>Кадр сцены упал с исключением - вьюпорт остановлен до перезагрузки префаба.
-		/// Иначе устойчивая ошибка означает снос и пересборку сцены на КАЖДОМ кадре: поток
-		/// одинаковых сообщений в консоли и мигающий мусор во вьюпорте вместо диагноза.</summary>
+		// A frame threw; the viewport stays stopped until the prefab reloads (avoids per-frame rebuild).
 		private bool _renderFailed;
 
-		/// <summary>Подробности падения уже напечатаны. Флаг НЕ сбрасывается перезагрузкой префаба:
-		/// повторять один и тот же стек по кругу незачем, а перезагрузка при устойчивой ошибке -
-		/// самое частое действие пользователя.</summary>
+		// Not reset by prefab reload: no point repeating the same stack.
 		private bool _renderFailureLogged;
 
-		/// <summary>
-		/// Печатает падение кадра сцены ПОСТРОЧНО.
-		///
-		/// Именно построчно: консоль редактора показывает запись одной строкой без переноса, и
-		/// многострочный <c>ex.ToString()</c> обрезается на первом же кадре стека - то есть ровно на
-		/// том месте, ради которого его и печатают. Кадры стека уходят отдельными записями и видны
-		/// целиком.
-		/// </summary>
+		// Line by line: the editor console shows one line per record; a multi-line ToString loses the stack.
 		private void LogRenderFailure(Exception ex)
 		{
 			if (_renderFailureLogged)
@@ -360,8 +260,7 @@ namespace DecaEngine.Editor
 						$"  ---> {inner.GetType().Name}: {inner.Message}");
 				}
 
-				// Потолок в 20 кадров: интересна вершина стека, а хвост - это цикл редактора, один
-				// и тот же у любого падения.
+				// Cap at 20 frames: the tail is the editor loop, identical for every failure.
 				var frames = (inner.StackTrace ?? string.Empty)
 					.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
@@ -374,28 +273,18 @@ namespace DecaEngine.Editor
 
 		private readonly List<AnimationDriver.CharacterInfo> _debugCharacters = new();
 
-		/// <summary>Сводка для окна дебага. Читается ИЗ окна каждый кадр - поэтому это снимок
-		/// прошлого кадра, а не живые ссылки на состояние вьюпорта.</summary>
+		/// <summary>Snapshot of last frame's character info for the debug window.</summary>
 		public IReadOnlyList<AnimationDriver.CharacterInfo> DebugCharacters => _debugCharacters;
 
-		/// <summary>Мир физики сцены для окна дебага; null - физики в сцене нет (см. <see cref="_physics"/>).</summary>
+		/// <summary>Scene physics world for the debug window; null when the scene has no physics.</summary>
 		public ScenePhysics? DebugPhysics => _physics;
 
-		/// <summary>Сколько вершин дебаг-линий ушло на GPU в последнем кадре и уперлись ли в потолок -
-		/// окно дебага показывает это честно, чтобы «показано не всё» не выглядело как «больше
-		/// ничего нет».</summary>
+		/// <summary>Debug-line vertices uploaded last frame and whether the cap was hit.</summary>
 		public (int Vertices, bool Overflowed) DebugLineStats => (_debugDraw.TotalCount, _debugDraw.Overflowed);
 
-		/// <summary>
-		/// Кадровый шаг анимации: читает компоненты сущностей префаба, считает позы и диспетчеризует
-		/// GPU-скиннинг. Зовётся ДО исполнения графа - и тени, и forward, и трассировка читают уже
-		/// деформированную геометрию.
-		/// </summary>
-		// Счётчик кадров для покадровой диагностики (DECA_ANIM_DIAG=1).
+		// Frame counter for per-frame diagnostics (DECA_ANIM_DIAG=1).
 		private int _animDiagFrame;
 
-		/// <summary>Режим RT-теней запрошен и устройство умеет inline-трассировку (см.
-		/// ModelLoadOptions.RtShadows - тумблер уровня загрузки).</summary>
 		private bool RtShadowsEnabled() =>
 			_editorSettings.ShadowFilterMode == 4 && _graphicsApi.RayTracing >= RayTracingSupport.Inline;
 		private readonly HashSet<int> _visitedLightsThisSync = new();
@@ -403,18 +292,14 @@ namespace DecaEngine.Editor
 		private EntityStore? _lastStore;
 		private string? _currentPrefabPath;
 
-		// Сущности двигались в этом кадре - после Root.Update (он перепишет CPU-массивы инстансов)
-		// их нужно перезалить на GPU (см. Update).
+		// Entities moved this frame; instance buffers must be re-uploaded to GPU after Root.Update.
 		private bool _transformsDirty;
 
-		// --- Probe GI сцены (упрощённый CPU-путь превью, см. ProbeGi.cs / ModelPreviewViewport) --
-		// Прогрессивный бейк сетки irradiance-проб по ВСЕЙ сцене (мульти-модельный ProbeGiBaker):
-		// включается той же галочкой HDR+GI, что и экспозиция. Изменение сцены (структура/позы)
-		// пересоздаёт сессию с дебаунсом; поворот солнца подтягивается в живую сессию без ребейка.
+		// Progressive irradiance-probe bake over the whole scene (see ProbeGi.cs); scene edits
+		// recreate the session debounced, sun rotation feeds the live session without a rebake.
 		private ProbeGiBaker? _probeBaker;
 
-		/// <summary>Фоновая сборка BVH сцены (см. BeginProbeSession): десятки секунд чистого CPU на
-		/// тяжёлой сцене - на потоке рендера это был полный стопор редактора.</summary>
+		// Scene BVH build takes tens of seconds of CPU — must run off the render thread.
 		private Task<ProbeGiBaker>? _probeBakerTask;
 
 		public PrefabSceneViewport(IGraphicsApi graphicsApi, EditorSettings editorSettings, ProjectSession projectSession,
@@ -438,17 +323,11 @@ namespace DecaEngine.Editor
 
 			ApplyGraphicsSettings();
 
-			// "OK" окна Settings: live-биты применяются сразу, изменившиеся env-level опции
-			// (скай/HDR-карта/анизотропия) - пересозданием окружения в начале следующего
-			// Update (см. OnGraphicsSettingsChanged). Вьюпорт один и живёт всю сессию редактора -
-			// отписка не требуется.
+			// Env-level option changes recreate the environment at the start of the next Update.
+			// The viewport lives for the whole editor session, so no unsubscribe is needed.
 			SettingsWindow.PreviewGraphicsApplied += OnGraphicsSettingsChanged;
 		}
 
-		/// <summary>Создаёт окружение сцены по текущим настройкам и запоминает применённую env-level
-		/// конфигурацию (для дифа в <see cref="OnGraphicsSettingsChanged"/>). HDR-конвейер
-		/// (авто-экспозиция + тонемап) - по отдельной галочке тулбара Scene View
-		/// (<see cref="EditorSettings.SceneViewHdr"/>).</summary>
 		private ModelViewportEnvironment CreateEnvironment()
 		{
 			_appliedSsao = _editorSettings.PreviewSsao;
@@ -466,9 +345,8 @@ namespace DecaEngine.Editor
 			_appliedColorGrade = _editorSettings.PreviewColorGrade;
 			_appliedMotionVectors = _editorSettings.PreviewMotionVectors;
 
-			// mainCascades: каскады строит ОСНОВНОЙ CullingAndRenderSystem (тот же точный камерный
-			// CSM, что в GameView) через солнце-сущность в сторе окружения - Update синхронизирует
-			// её с ShadowSettings и пушит дистанции каскадов (см. SyncSunEntity).
+			// mainCascades: the main CullingAndRenderSystem builds the same camera CSM as GameView,
+			// via the sun entity in the environment store (see SyncSunEntity).
 			return new ModelViewportEnvironment(_graphicsApi, InitialWidth, InitialHeight,
 				"Prefab Scene Color", "Prefab Scene Depth", _sharedResources,
 				skyBackground: _appliedSky,
@@ -483,25 +361,20 @@ namespace DecaEngine.Editor
 				bloom: _appliedBloom,
 				colorGrade: _appliedColorGrade,
 				volumetric: _appliedVolumetric,
-				// SSR требует буфера векторов (репроекция истории) - включённые отражения тянут
-				// векторы за собой, как TemporalUpscale.
+				// SSR reprojects history, so it pulls motion vectors in like TemporalUpscale.
 				motionVectors: _appliedMotionVectors || _editorSettings.PreviewSsr,
 				temporalUpscale: _appliedMotionVectors && _editorSettings.TemporalUpscale,
 				ssr: _editorSettings.PreviewSsr,
-				// RT-фолбэк догоняет ApplyPipelineFeatures: TLAS сцены (ProbeSceneAccel) в момент
-				// создания окружения ещё не существует, а трейс-материал RT-варианта без него
-				// коммитился бы с пустым дескриптором.
+				// RT fallback is applied later (ApplyPipelineFeatures): the scene TLAS doesn't exist
+				// yet at environment creation and the RT material would commit an empty descriptor.
 				ssrRayTraced: false,
 				upscalerBackend: _appliedMotionVectors && _editorSettings.TemporalUpscale
 					? Math.Clamp(_editorSettings.UpscalerBackend, 0, 2)
 					: 0);
 		}
 
-		/// <summary>Синхронизирует солнце-сущность окружения с <see cref="PreviewShadowSettings"/>
-		/// (единый источник правды для слайдеров света, неба/IBL и probe-GI): поворот сущности -
-		/// чтобы +Z смотрел по направлению света, дистанции каскадов - по диапазону, где реально
-		/// лежит геометрия (орбитальная камера может стоять и вплотную, и очень далеко - абсолютные
-		/// метры основного пайплайна тут не работают). Звать каждый кадр ДО Root.Update.</summary>
+		// Syncs the sun entity with PreviewShadowSettings: rotation so +Z looks along the light,
+		// cascade distances fit where the geometry actually lies. Call each frame BEFORE Root.Update.
 		private void SyncSunEntity()
 		{
 			var shadowSettings = _env.ShadowSettings;
@@ -516,9 +389,7 @@ namespace DecaEngine.Editor
 			var view = Matrix4x4.CreateLookAtLeftHanded(Vector3.Zero, travel, up);
 			sun.Rotation = new Rotation { value = Quaternion.CreateFromRotationMatrix(Matrix4x4.Transpose(view)) };
 
-			// Угловой размер диска - ширина полутени PCSS (ползунок «Sun angular size» окна Graphics):
-			// сущность солнца заводит окружение с нулём, а ноль в шейдере значит «дефолт», и ручка
-			// без этой строки не делала бы ничего.
+			// PCSS penumbra width; 0 in the shader means "default", so the slider must be pushed here.
 			sun.GetComponent<LightComponent>().SunAngularSize =
 				Math.Clamp(_editorSettings.SunAngularSize, 0.05f, 15f);
 
@@ -532,7 +403,7 @@ namespace DecaEngine.Editor
 			float rangeStart = MathF.Max(distanceToScene - sceneRadius, 0.01f);
 			float rangeSpan = MathF.Max(distanceToScene + sceneRadius - rangeStart, sceneRadius * 0.1f);
 
-			// Прогрессия ~2.6x (0.38^k) внутри диапазона - ближний к геометрии срез самый плотный.
+			// ~2.6x progression (0.38^k): the slice nearest the geometry is the densest.
 			ref var cascaded = ref sun.GetComponent<CascadedShadowComponent>();
 			var distances = cascaded.CascadeDistances;
 			distances[0] = rangeStart;
@@ -542,13 +413,10 @@ namespace DecaEngine.Editor
 			distances[4] = rangeStart + rangeSpan;
 		}
 
-		/// <summary>Текущее состояние галочки HDR тулбара Scene View.</summary>
+		/// <summary>Current state of the Scene View toolbar HDR toggle.</summary>
 		public bool HdrEnabled => _editorSettings.SceneViewHdr;
 
-		/// <summary>Галочка HDR тулбара Scene View: включает авто-экспозицию. Живая - HDR-конвейер в
-		/// офскрин-окружении есть всегда, галочка лишь выбирает, экспонировать кадр по замеренной
-		/// яркости или по ручной экспокоррекции (см. PipelineFeatures.EyeAdaptation). Раньше требовала
-		/// пересоздания окружения: под неё менялся формат цветового таргета, а с ним - PSO геометрии.</summary>
+		/// <summary>Scene View HDR toggle: live — picks auto vs manual exposure without recreating the environment.</summary>
 		public void SetHdrEnabled(bool enabled)
 		{
 			if (_editorSettings.SceneViewHdr == enabled)
@@ -560,8 +428,7 @@ namespace DecaEngine.Editor
 			ApplyPipelineFeatures();
 		}
 
-		/// <summary>Переключает режим шейдинга - пушится в кбуферы материалов всех загруженных
-		/// моделей немедленно (см. ApplyMaterialSettings).</summary>
+		/// <summary>Switches the shading mode; pushed to all loaded models' material cbuffers immediately.</summary>
 		public void SetShading(ShadingMode shading)
 		{
 			if (_shading == shading)
@@ -573,9 +440,7 @@ namespace DecaEngine.Editor
 			ApplyMaterialSettings();
 		}
 
-		/// <summary>Поворачивает мировой ключевой свет: яв вокруг Y + высота над горизонтом,
-		/// смещения от базового положения солнца энвайронмента - зеркало
-		/// <see cref="ModelPreviewViewport.SetLightRotation"/>.</summary>
+		/// <summary>Rotates the world key light: yaw around Y plus elevation, as offsets from the environment's base sun.</summary>
 		public void SetLightRotation(float yawOffsetDegrees, float elevationOffsetDegrees)
 		{
 			_lightYawOffsetDegrees = yawOffsetDegrees;
@@ -583,8 +448,7 @@ namespace DecaEngine.Editor
 			ApplyLightRotation();
 		}
 
-		/// <summary>Кадрирует камеру по баундам текущей сцены; если моделей ещё нет (грузятся) -
-		/// откладывает кадрирование до первого появления геометрии.</summary>
+		/// <summary>Frames the camera on the scene bounds; defers if models are still loading.</summary>
 		public void FrameAll()
 		{
 			if (!TryComputeSceneBounds(out var min, out var max))
@@ -601,10 +465,7 @@ namespace DecaEngine.Editor
 			RequestMotionVectorHistoryReset();
 		}
 
-		/// <summary>Кадрирует камеру на сущность (её баунды + баунды детей): F в Scene View. Направление
-		/// взгляда СОХРАНЯЕТСЯ (resetAngle: false) - в отличие от Frame All, это не «дай мне красивый
-		/// обзорный ракурс», а «подъедь поближе к тому, на что я уже смотрю». Пусто выделение - тот же
-		/// Frame All по всей сцене (см. задачу).</summary>
+		/// <summary>Frames the camera on an entity (F key), keeping the view direction; empty selection frames the whole scene.</summary>
 		public void FrameSelection(Entity? selected)
 		{
 			if (!selected.HasValue || selected.Value.IsNull)
@@ -625,75 +486,55 @@ namespace DecaEngine.Editor
 			RequestMotionVectorHistoryReset();
 		}
 
-		/// <summary>Сбрасывает историю векторов движения - камера телепортировалась (F-фокус/Frame All),
-		/// и без сброса TAA/апскейлер поймал бы один кадр огромного смещения и размазал бы его (см.
-		/// MotionVectorPassResources.ResetHistory). No-op, если векторы движения выключены.</summary>
+		// Camera teleports must reset TAA/upscaler history or one huge-motion frame smears.
 		private void RequestMotionVectorHistoryReset()
 		{
 			_env.Pipeline.MotionVectorResources?.ResetHistory();
 		}
 
-		/// <summary>Рисует ли вьюпорт сцену прямо сейчас. На паузе (Inspector показывает превью
-		/// модели) префаб снят со сцены и в кадре только небо окружения - см. <see cref="SetActive"/>.</summary>
+		/// <summary>Whether the viewport is rendering the scene right now (see <see cref="SetActive"/>).</summary>
 		public bool IsActive => _active;
 
-		/// <summary>
-		/// Включает/ставит на паузу сцену префаба. Зовёт EditorManager.OnUpdate по режиму Inspector-а,
-		/// чтобы модель редактора была загружена ровно в одном месте - здесь ИЛИ в
-		/// <see cref="ModelPreviewViewport"/>. Само снятие сцены с GPU делает ближайший
-		/// <see cref="Update"/> (там мы под GPU-локом редактора), ровно тем же путём, что и закрытие
-		/// префаба.
-		/// </summary>
+		/// <summary>Activates/pauses the prefab scene; the next <see cref="Update"/> detaches the scene under the editor GPU lock.</summary>
 		public void SetActive(bool active)
 		{
 			_active = active;
 		}
 
-		/// <summary>
-		/// Покадровый привод: синхронизирует env-сцену с префабом (загрузки по AssetRef, трансформы,
-		/// удаления), двигает камеру и исполняет офскрин-конвейер. Звать из EditorManager.OnUpdate
-		/// ДО рендера основной сцены, под тем же GPU-локом (см. порядок у ModelPreviewViewport).
-		/// </summary>
+		/// <summary>Per-frame drive: syncs the env scene with the prefab, moves the camera and executes the offscreen pipeline. Call from EditorManager.OnUpdate BEFORE the main scene renders, under the same GPU lock.</summary>
 		public void Update(float deltaTime, float time, Entity? root, string? prefabPath, Entity? selected = null)
 		{
 			_currentPrefabPath = prefabPath;
 
-			// Пауза (Inspector показывает превью модели) неотличима здесь от закрытого префаба: сцена
-			// и её резидентные модели снимаются тем же ClearScene ниже, кадр пишется пустым. При
-			// возврате в активное состояние _lastStore уже сброшен - SyncScene инстанцирует сцену
-			// заново и стример перезапросит модели.
+			// Pause is indistinguishable from a closed prefab: the scene is torn down and
+			// re-instanced by SyncScene when the viewport becomes active again.
 
-			// Заявка на пересоздание окружения (смена env-level настроек графики/галочки HDR) -
-			// исполняется здесь, до записи кадра: старые биндинги ещё нигде не задействованы.
+			// Recreate the environment before writing the frame: old bindings are not yet referenced.
 			if (_pendingEnvironmentRecreate)
 			{
 				_pendingEnvironmentRecreate = false;
 				RecreateEnvironment();
 			}
 
-			// После возможного пересоздания окружения и ДО записи кадра - безопасная точка для
-			// смены бэкенда апскейлера (GPU-барьер + init-команды NGX), см. ModelPreviewViewport.
+			// Safe point for switching the upscaler backend (GPU barrier + NGX init commands).
 			ApplyPendingUpscalerSettings();
 
 			bool hasRoot = _active && root.HasValue && !root.Value.IsNull;
 			if (!hasRoot)
 			{
-				// Префаб закрыт: снимаем сцену И резидентные модели с загрузками - стримеру без
-				// Root.Update некому шагать, брошенные фоновые задачи иначе повисли бы навсегда.
+				// Prefab closed: drop the scene AND resident models — without Root.Update nothing
+				// steps the streamer, so abandoned background loads would hang forever.
 				if (_rendered.Count > 0 || _models.Count > 0)
 				{
 					ClearScene();
 				}
 				_lastStore = null;
 
-				// Кадр НЕ прерывается здесь (в отличие от прежней версии): вьюпорт обязан показывать
-				// лит-небо окружения ДО того, как открыт хоть один префаб (см. задачу про мгновенный
-				// пустой вьюпорт) - см. общий Execute ниже, тот же приём, что и с открытым, но пустым
-				// префабом.
+				// The frame still executes below: an empty scene shows the lit environment sky.
 			}
 			else
 			{
-				// Reload/смена префаба пересоздаёт EntityStore - все закешированные entity id мертвы.
+				// Reload/prefab switch recreates the EntityStore — every cached entity id is dead.
 				var store = root.Value.Store;
 				if (!ReferenceEquals(store, _lastStore))
 				{
@@ -701,28 +542,23 @@ namespace DecaEngine.Editor
 					_lastStore = store;
 					_framePending = true;
 
-					// Перезагрузка префаба - это и есть «попробовать ещё раз»: сцена собирается с
-					// нуля, и держать вьюпорт остановленным после неё незачем.
+					// Reloading is the retry: the scene rebuilds from scratch.
 					_renderFailed = false;
 				}
 
-				// Устойчивая ошибка отрисовки останавливает вьюпорт до перезагрузки префаба (см.
-				// catch ниже): иначе сцена рушится и собирается заново каждый кадр.
 				if (_renderFailed)
 				{
 					return;
 				}
 
-				// Загрузки опрашивает ModelStreamingSystem внутри _env.Root.Update ниже (приоритет по
-				// камере, финализация порциями); догрузившаяся модель инстанцируется СЛЕДУЮЩИМ SyncScene.
+				// Loads are polled by ModelStreamingSystem inside Root.Update below; a finished
+				// model is instantiated by the NEXT SyncScene.
 				SyncScene(root.Value);
 				SyncSelectionHighlight(selected);
 				PollProbeBake(deltaTime);
 				PollSceneProbeDebugOverlay();
 			}
 
-			// Собственный accel SSR - и при закрытом префабе тоже (там он освобождается вместе с
-			// опустевшей сценой).
 			PollSsrOwnRayScene(deltaTime);
 
 			try
@@ -730,38 +566,28 @@ namespace DecaEngine.Editor
 				_lastEye = _camera.Eye;
 				_env.SetCameraTransform(_camera.Eye, _camera.Target);
 
-				// Солнце-сущность (направление света + дистанции каскадов) - ДО Root.Update, где
-				// CullingAndRenderSystem раскладывает каскады.
+				// Before Root.Update, where CullingAndRenderSystem lays out the cascades.
 				SyncSunEntity();
 
-				// Шаг времени временной адаптации экспозиции - каждый кадр, до записи (no-op без
-				// HDR). Кламп сверху - защита от «прыжка» после долгих пауз редактора.
+				// Clamp dt to avoid an exposure jump after long editor stalls.
 				_env.SetEyeAdaptationDeltaTime(Math.Min(deltaTime, 0.1f));
 
-				// Анимация - строго ДО Root.Update: внутри него CullingAndRenderSystem ЗАПИСЫВАЕТ
-				// команды кадра, а скиннинг может дозалить (и на пути роста - пересоздать)
-				// мега-буфер вершин. Вызов после записи освобождал бы буфер под уже записанными
-				// командами - ровно это роняло кадр в DrawIndexedIndirect при появлении скиннед-
-				// модели в сцене (см. DiligentBatchRenderer.ExecuteSkinning).
-				// Кадр дебага открывается ДО первой стадии, которая в него пишет: список линий - это
-				// кадр целиком, а не накопитель.
+				// Open the debug frame before the first stage that writes to it: the line list is
+				// the whole frame, not an accumulator.
 				BeginDebugFrame();
 
-				// Физика - ДО анимации: луч foot IK обязан щупать мир в том состоянии, в котором
-				// кадр будет нарисован, а рэгдолл читает позу из уже проинтегрированных тел.
+				// Physics BEFORE animation: foot IK rays must probe the world as it will be drawn,
+				// and the ragdoll reads its pose from already-integrated bodies.
 				PollScenePhysics(deltaTime);
 
-				// Анимация тоже идёт ТОЛЬКО в Play, и остановка сделана НУЛЕВЫМ ШАГОМ, а не пропуском
-				// вызова. Разница существенная: с нулевым шагом поза считается целиком (клип
-				// семплируется, foot IK и spring bones применяются) - просто время не двигается.
-				// Пропустив вызов, мы оставили бы персонажа с палитрой прошлого кадра, а свежую
-				// скиннед-модель - вовсе без неё, то есть схлопнутой в точку.
+				// Stopped = zero step, not a skipped call: the pose (clip sample, foot IK, spring
+				// bones) must still be computed, else fresh skinned models collapse to a point.
+				// Skinning must also run BEFORE Root.Update records frame commands: it may grow and
+				// recreate the mega vertex buffer under already-recorded DrawIndexedIndirect.
 				UpdateAnimation(IsPlaying ? deltaTime : 0f);
 
-				// Сброс на выходе из Play: время клипа и состояние цикла падения лежат в компонентах и
-				// откатываются снимком (см. InspectorWindow.Stop), а переход позы при подъёме живёт
-				// сбоку, в драйвере, и его надо снять руками - иначе персонаж остался бы навсегда в
-				// промежуточной позе того подъёма, на котором нажали Stop.
+				// Play->Stop edge: the stand-up pose transition lives outside the ECS snapshot and
+				// must be cleared manually, or the character stays mid-transition forever.
 				if (_wasPlaying && !IsPlaying)
 				{
 					_animation?.EndPlay();
@@ -771,12 +597,9 @@ namespace DecaEngine.Editor
 
 				_env.Root.Update(new UpdateTick(deltaTime, time));
 
-				// Замороженный граф сам инстанс-буферы не перезальёт: их аплоад живёт в
-				// CheckAndReallocateBuffers, который вызывается только из записи команд
-				// (ForwardPass.WriteCommands). GpuInstanceBufferSystem выше уже переписал CPU-массивы
-				// под новые позы - перезаливаем на GPU напрямую. Пересборка графа не нужна: движение
-				// не меняет ни числа инстансов, ни ёмкостей буферов, так что замороженные команды
-				// продолжают ссылаться на те же (перезалитые) буферы.
+				// A frozen graph won't re-upload instance buffers itself (that lives in command
+				// recording); movement changes neither instance counts nor buffer capacities, so
+				// the recorded commands keep pointing at the same, re-uploaded buffers.
 				if (_transformsDirty)
 				{
 					_transformsDirty = false;
@@ -784,36 +607,27 @@ namespace DecaEngine.Editor
 					_env.BatchRenderer.CheckAndReallocateBuffers();
 				}
 
-				// Дебаг-линии дорисовываются и заливаются ПОСЛЕ всех, кто в них пишет, и до графа:
-				// заливка идёт немедленным контекстом, а сам дроу - командой внутри ForwardPass.
+				// After all writers, before the graph: upload uses the immediate context, the draw
+				// itself is a command inside ForwardPass.
 				EndDebugFrame();
 
-				// Кадр исполняется ВСЕГДА, даже без открытого префаба (см. hasRoot выше), - пустая
-				// сцена показывает небо окружения (батч-рендерер безопасен при нуле инстансов:
-				// ExecuteComputeCulling/ExecuteDrawBatching выходят сразу), и назначенная сетка просто
-				// появляется в ней, как только пользователь открывает префаб.
+				// Execute even without an open prefab: the batch renderer is safe at zero instances
+				// and the empty scene shows the environment sky.
 				_env.Pipeline.Execute();
 			}
 			catch (Exception ex)
 			{
-				// См. комментарий в ModelPreviewViewport.Update: исключение отсюда сорвало бы Present
-				// всего редактора - теряем только кадр этого вьюпорта.
-				//
+				// An exception here would abort the whole editor's Present — lose only this frame.
 				LogRenderFailure(ex);
 
-				// Вьюпорт останавливается до перезагрузки префаба: сцена сносится и собирается
-				// заново на каждом кадре, поэтому устойчивая ошибка превращалась в поток одинаковых
-				// строк и в мигающий мусор во вьюпорте. Остановленная сцена честнее.
+				// Stop until the prefab reloads: a persistent error would otherwise rebuild and
+				// crash the scene every frame.
 				_renderFailed = true;
 				ClearScene();
 			}
 		}
 
-		/// <summary>
-		/// Рисует кадр сцены как ImGui.Image, обрабатывает ввод камеры (см. SceneCamera) и гизмо
-		/// выделенной сущности поверх кадра. Возвращает true, если трансформ выделенной сущности
-		/// изменён гизмо.
-		/// </summary>
+		/// <summary>Draws the frame as an ImGui image, handles camera input and the selection gizmo; returns true if the gizmo changed the selected transform.</summary>
 		public bool Render(ImGuiRender imGuiRender, Entity root, Entity? selected, Vector2 size, out PickResult pick)
 		{
 			_lastImGuiRender = imGuiRender;
@@ -838,17 +652,13 @@ namespace DecaEngine.Editor
 
 			var cursor = ImGui.GetCursorScreenPos();
 
-			// ВАЖНО: место в layout резервирует Dummy, а картинка рисуется напрямую в drawlist -
-			// НЕ ImGui.Image. Image регистрируется как hoverable item и «отравляет» hover, из-за
-			// чего ImGuizmo (его CanActivate требует !IsAnyItemHovered() && !IsAnyItemActive())
-			// считает себя перекрытым: гизмо рисуется, но на драг не реагирует. Тот же приём был
-			// в прежней версии этого вьюпорта.
+			// Dummy + direct drawlist, NOT ImGui.Image: Image registers as a hoverable item, which
+			// makes ImGuizmo's CanActivate (!IsAnyItemHovered && !IsAnyItemActive) refuse drags.
 			ImGui.Dummy(size);
 			bool hovered = ImGui.IsWindowHovered(ImGuiHoveredFlags.ChildWindows)
 				&& ImGui.IsMouseHoveringRect(cursor, cursor + size);
 
-			// Нейтральный градиент-подложка (см. ModelPreviewViewport.Render): офскрин-таргет
-			// очищается с alpha 0, ImGui-блендинг кладёт геометрию поверх этого прямоугольника.
+			// Neutral gradient backdrop: the offscreen target clears with alpha 0.
 			var drawList = ImGui.GetWindowDrawList();
 			uint backdropTop = ImGui.GetColorU32(new Vector4(0.55f, 0.55f, 0.55f, 1f));
 			uint backdropBottom = ImGui.GetColorU32(new Vector4(0.26f, 0.26f, 0.26f, 1f));
@@ -857,34 +667,26 @@ namespace DecaEngine.Editor
 
 			_camera.HandleInput(hovered, ImGui.GetIO().DeltaTime);
 
-			// Колесо при зажатой RMB (см. SceneCamera.HandleInput) меняет базовую скорость полёта -
-			// персистим в EditorSettings ТОЛЬКО когда она реально изменилась, а не каждый кадр: запись
-			// в EditorSettings тут в памяти дёшева, но незачем дёргать её без нужды на каждый Render.
 			if (_camera.FlySpeed != _editorSettings.SceneCameraSpeed)
 			{
 				_editorSettings.SceneCameraSpeed = _camera.FlySpeed;
 			}
 
-			// F - кадрирование на выделение (см. FrameSelection); не ворует хоткей у текстовых полей
-			// (см. задачу) и молчит, пока курсор не над вьюпортом - иначе F, набранный в любом текстовом
-			// поле редактора, дёргал бы камеру сцены просто потому, что окно Scene View где-то открыто.
+			// F frames the selection; ignored while text input is active or the cursor is elsewhere.
 			if (hovered && !ImGui.GetIO().WantTextInput && ImGui.IsKeyPressed(ImGuiKey.F))
 			{
 				FrameSelection(selected);
 			}
 
-			// Управление персонажем игрока (см. PlayerMoveComponent): WASD/стрелки в Play, Shift - бег.
-			// Правила те же, что у F: курсор над вьюпортом и текст не занят. ПКМ отдаёт WASD полёту
-			// камеры (SceneCamera) - у него приоритет. Направление переводится в мир ЗДЕСЬ: «W - от
-			// камеры» знает только тот, у кого есть камера, приводу приходит уже мировой вектор.
+			// Player input in Play; RMB gives WASD to camera fly (it has priority). Converted to a
+			// world vector HERE — only the camera knows what "W = away from camera" means.
 			if (IsPlaying && hovered && !ImGui.GetIO().WantTextInput &&
 				!ImGui.IsMouseDown(ImGuiMouseButton.Right))
 			{
 				var forward = _camera.Forward;
 				forward.Y = 0f;
 
-				// Камера, глядящая отвесно вниз, «от камеры» не определяет - берётся мировой +Z,
-				// чтобы управление не отключалось молча (произвольная, но стабильная привязка).
+				// Looking straight down, "away from camera" is undefined — fall back to world +Z.
 				forward = forward.LengthSquared() > 1e-6f ? Vector3.Normalize(forward) : Vector3.UnitZ;
 				var right = Vector3.Normalize(Vector3.Cross(Vector3.UnitY, forward));
 
@@ -898,13 +700,11 @@ namespace DecaEngine.Editor
 				{
 					MoveWorld = move.LengthSquared() > 0f ? Vector3.Normalize(move) : Vector3.Zero,
 					Run = ImGui.IsKeyDown(ImGuiKey.LeftShift) || ImGui.IsKeyDown(ImGuiKey.RightShift),
-					// Именно IsKeyPressed: фронт, а не удержание - зажатый Space не автоскок.
+					// IsKeyPressed: edge, not level — holding Space must not auto-jump.
 					Jump = ImGui.IsKeyPressed(ImGuiKey.Space, false),
 				};
 			}
 
-			// Сцена (небо окружения) рендерится и без единого объекта - текст поверх только про
-			// реальные события: идущие загрузки или ошибки.
 			var status = CollectStatusText();
 			if (status != null)
 			{
@@ -912,16 +712,13 @@ namespace DecaEngine.Editor
 				drawList.AddText(cursor + (size - textSize) * 0.5f, ImGui.GetColorU32(new Vector4(1f, 1f, 1f, 0.6f)), status);
 			}
 
-			// Подписи дебага (имена костей) - до гизмо: гизмо должно рисоваться ПОВЕРХ текста, иначе
-			// подпись кости перекрывает ручку, за которую тянут.
+			// Labels before the gizmo so the gizmo draws on top of bone names.
 			DrawDebugLabels(drawList, cursor, size);
 
 			bool gizmoChanged = RenderGizmo(drawList, cursor, size, selected);
 
-			// Пикинг ЛКМ - после гизмо, когда его состояние за этот кадр актуально: клик по самому
-			// гизмо (или во время манипуляции) выделение не трогает. Alt+ЛКМ - орбита камеры (см.
-			// SceneCamera.HandleInput), не пикинг: без этой проверки орбита кликом по объекту ещё и
-			// меняла бы выделение.
+			// Pick after the gizmo so clicks on/over it don't change selection; Alt+LMB is camera
+			// orbit, not picking.
 			bool gizmoBusy = selected.HasValue && !selected.Value.IsNull &&
 				(ImGuizmo.IsUsing() || ImGuizmo.IsOver());
 			bool altDown = ImGui.IsKeyDown(ImGuiKey.LeftAlt);
@@ -937,16 +734,8 @@ namespace DecaEngine.Editor
 			return gizmoChanged;
 		}
 
-		/// <summary>
-		/// Экранные подписи дебага (имена костей, см. <see cref="DebugDraw.Label"/>) поверх картинки
-		/// вьюпорта. Текст рисует ImGui, а не оверлей линий: у движка нет ни шрифта, ни разметки
-		/// текста в 3D, а имена костей нужны читаемыми - то есть постоянного размера на экране и не
-		/// перекошенными перспективой.
-		///
-		/// Проекция берётся ТЕМИ ЖЕ view/proj, под которыми камера рендерила кадр (см.
-		/// <see cref="RenderGizmo"/>), иначе подпись поедет относительно кости на краях кадра, где
-		/// расхождение проекций как раз и заметно.
-		/// </summary>
+		// Bone labels via ImGui text (the engine has no 3D text), projected with the SAME view/proj
+		// the frame was rendered with — otherwise labels drift off bones at the frame edges.
 		private void DrawDebugLabels(ImDrawListPtr drawList, Vector2 cursor, Vector2 size)
 		{
 			var labels = _debugDraw.Labels;
@@ -966,8 +755,7 @@ namespace DecaEngine.Editor
 				var label = labels[i];
 				var clip = Vector4.Transform(new Vector4(label.Position, 1f), viewProjection);
 
-				// За камерой и ровно в её плоскости - деление на w дало бы «отражённую» точку, то
-				// есть подпись кости, которая за спиной, приехала бы в кадр.
+				// Behind or exactly in the camera plane: dividing by w would mirror the point into view.
 				if (clip.W <= 1e-4f)
 				{
 					continue;
@@ -983,17 +771,15 @@ namespace DecaEngine.Editor
 					(ndc.X * 0.5f + 0.5f) * size.X,
 					(0.5f - ndc.Y * 0.5f) * size.Y);
 
-				// Тень на пиксель ниже-правее: подписи ложатся и на светлую, и на тёмную геометрию, и
-				// без неё половина имён нечитаема ровно там, где на них смотрят.
+				// 1px drop shadow keeps names readable on both light and dark geometry.
 				drawList.AddText(screen + new Vector2(1f, 1f), ImGui.GetColorU32(new Vector4(0f, 0f, 0f, 0.75f)),
 					label.Text);
 				drawList.AddText(screen, ImGui.GetColorU32(label.Color), label.Text);
 			}
 		}
 
-		/// <summary>Гизмо манипуляции выделенной сущностью - теми же view/proj, под которыми камера
-		/// рендерила кадр (левосторонний lookAt + LH-перспектива без reversed-Z: экранная проекция
-		/// та же, что у MakePerspectiveReversedZ, а глубина ImGuizmo нужна лишь монотонной).</summary>
+		// Same view/proj the camera rendered with: LH lookAt + LH perspective WITHOUT reversed-Z
+		// (screen projection matches MakePerspectiveReversedZ; ImGuizmo only needs monotonic depth).
 		private bool RenderGizmo(ImDrawListPtr drawList, Vector2 cursor, Vector2 size, Entity? selected)
 		{
 			if (!selected.HasValue || selected.Value.IsNull)
@@ -1048,7 +834,7 @@ namespace DecaEngine.Editor
 			return null;
 		}
 
-		// --- Синхронизация префаб -> env-сцена ------------------------------------------------------
+		// --- Prefab -> env scene sync ---------------------------------------------------------------
 
 		private static string? ResolveEnvironmentHdrPath(string configured)
 		{
@@ -1066,19 +852,16 @@ namespace DecaEngine.Editor
 			return File.Exists(relative) ? relative : configured;
 		}
 
-		// --- Камера/ресайз --------------------------------------------------------------------------
-		// Ввод камеры - см. SceneCamera.HandleInput (вызывается из Render); здесь остался только ресайз.
+		// --- Camera / resize ------------------------------------------------------------------------
 
-		/// <summary>Дебаунс ресайза таргетов - см. ModelPreviewViewport.TrackAndApplyResize.</summary>
+		// Debounced target resize; see ModelPreviewViewport.TrackAndApplyResize.
 		private bool TrackAndApplyResize(ImGuiRender imGuiRender, Vector2 imGuiSize)
 		{
 			var width = (uint)Math.Max(1, MathF.Round(imGuiSize.X));
 			var height = (uint)Math.Max(1, MathF.Round(imGuiSize.Y));
 			var requestedSize = new Vector2(width, height);
 
-			// Масштаб рендера применяется ЗДЕСЬ, а не из применения настроек - см.
-			// ModelPreviewViewport.TrackAndApplyResize (единственная точка кадра, где ресайз
-			// таргетов безопасен; настройка перечитывается каждый кадр и чинит расхождение сама).
+			// Render scale is applied HERE — the only point in the frame where resizing targets is safe.
 			var scale = Math.Clamp(_editorSettings.RenderScale, 0.25f, 1f);
 			_env.SetRenderScale(scale);
 
@@ -1105,8 +888,7 @@ namespace DecaEngine.Editor
 			return ResizeTargets(imGuiRender, requestedSize);
 		}
 
-		/// <summary>Ресайз офскрин-таргетов - тот же порядок барьеров/перепривязок, что у
-		/// ModelPreviewViewport.ResizeTargets.</summary>
+		// Same barrier/rebind order as ModelPreviewViewport.ResizeTargets.
 		private bool ResizeTargets(ImGuiRender imGuiRender, Vector2 newSize)
 		{
 			var width = (uint)newSize.X;
@@ -1117,39 +899,38 @@ namespace DecaEngine.Editor
 
 			imGuiRender.ReleaseRenderTargetBinding(_textureRef.GetTexID());
 
-			// Сценовые таргеты - в РЕНДЕР-размере, ColorTarget всегда display - см.
-			// ModelPreviewViewport.ResizeTargets (тот же порядок и те же причины).
+			// Scene targets use RENDER size; ColorTarget always stays at display size.
 			var sceneSize = _env.Pipeline.SceneSizeFor(newSize);
 
 			_env.ColorTarget.Resize(newSize);
 			_env.DepthTarget.Resize(sceneSize);
 			_env.SceneCopyTarget.Resize(sceneSize);
 
-			// G-buffer отражений живёт в рендер-размере вместе с дептом (его читают SSR-пассы).
+			// Reflection G-buffer lives at render size with depth (read by the SSR passes).
 			_env.Pipeline.Targets?.NormalRoughnessTarget?.Resize(sceneSize);
 			_env.Pipeline.Targets?.EnvFactorTarget?.Resize(sceneSize);
 			_env.AoTarget?.Resize(sceneSize);
 			_env.GiTarget?.Resize(sceneSize);
 
-			// HDR-кадр - размером со сцену, как и остальные; таргеты цепочки замера яркости
-			// фиксированного размера и ресайза не требуют (см. EyeAdaptationPass).
+			// HDR frame at scene size; the luminance-measure chain is fixed-size (see EyeAdaptationPass).
 			_env.HdrColorTarget?.Resize(sceneSize);
 
 			_env.RebindPostProcessTargets();
 
-			// Оверлей выделения рисует в display-кадр ПОСЛЕ тонемапа - его таргеты остаются
-			// отображаемого размера.
+			// Selection overlay draws into the display-size frame after tonemap.
 			_selectionOverlay?.Resize(newSize);
 
-			// Снимок сцены после Resize - другая нативная текстура: transmissive-материалам всех
-			// загруженных моделей нужно перепривязать _SceneColor (см. RegisterModelResources).
+			// Resize creates a new native texture: transmissive materials must rebind _SceneColor.
 			foreach (var state in _models.Values)
 			{
 				if (state.Model == null)
 				{
 					continue;
 				}
-				foreach (var material in state.Model.materialObjects.Values)
+				// Only this environment's material set: another set's _SceneColor points at a
+				// different SceneCopyTarget and must not be touched from here.
+				var rebindTargets = state.Materials ?? state.Model.materialObjects;
+				foreach (var material in rebindTargets.Values)
 				{
 					material.SetTexture("_SceneColor", _env.SceneCopyTarget);
 				}
@@ -1165,7 +946,7 @@ namespace DecaEngine.Editor
 			return true;
 		}
 
-		// --- TRS-иерархия префаба -------------------------------------------------------------------
+		// --- Prefab TRS hierarchy -------------------------------------------------------------------
 
 		public static Matrix4x4 ComputeWorldMatrix(Entity entity)
 		{
@@ -1174,9 +955,7 @@ namespace DecaEngine.Editor
 			return parent.IsNull ? local : local * ComputeWorldMatrix(parent);
 		}
 
-		/// <summary>Матрица РОДИТЕЛЬСКОГО пространства сущности, то есть то, чем нужно домножить её
-		/// Position/Rotation, чтобы получить мировые. Нужна всем, кто держит состояние сущности в
-		/// мире, - физике персонажа (см. <see cref="CharacterMotionDriver"/>) прежде всего.</summary>
+		// Parent-space matrix: multiply the entity's local Position/Rotation by this to get world.
 		internal static Matrix4x4 ParentToWorldMatrix(Entity entity)
 		{
 			var parent = entity.Parent;

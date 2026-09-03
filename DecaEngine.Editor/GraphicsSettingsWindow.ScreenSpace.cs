@@ -12,13 +12,9 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Экранные эффекты: AO (SSAO/GTAO), SSR и SSGI. Часть <see cref="GraphicsSettingsWindow"/> - файл на тему,
-/// поля и применение изменений живут в основном файле.</summary>
+/// <summary>Screen-space effects sections (AO, SSR, SSGI) of <see cref="GraphicsSettingsWindow"/>; fields and apply logic live in the main file.</summary>
 public partial class GraphicsSettingsWindow
 {
-	/// <summary>Экранное затенение (см. SsaoPass). Сам тумблер - фича конвейера: ресурсы пасса
-	/// заводятся на живом окружении по SetFeatures, модель не перечитывается (раньше секция обещала
-	/// обратное - обещание протухло вместе с переездом фич на живой конвейер).</summary>
 	private void DrawAoSection()
 	{
 		ImGui.Spacing();
@@ -29,7 +25,7 @@ public partial class GraphicsSettingsWindow
 			_settings.PreviewSsao = ssao;
 			_changed = true;
 		}
-		Tooltip("Затенение в стыках и нишах по глубине кадра. Применяется живьём.");
+		Tooltip("Darkening in creases and cavities, derived from the depth buffer. Applied live.");
 
 		if (ssao)
 		{
@@ -41,37 +37,36 @@ public partial class GraphicsSettingsWindow
 				_settings.PreviewAoMode = aoModeIndex == 1 ? AmbientOcclusionMode.Gtao : AmbientOcclusionMode.Ssao;
 				_changed = true;
 			}
-			Tooltip("SSAO - классическое спиральное затемнение.\nGTAO - горизонты + интеграл видимости: чище на плоскостях, чуть дороже.");
+			Tooltip("SSAO - classic spiral-sample occlusion.\nGTAO - horizon search plus a visibility integral: cleaner on flat surfaces, slightly costlier.");
 
-			// Ниже - кбуфер AoConstants: пуш на кадре, без перестройки конвейера, поэтому и не
-			// вызывают _changed = true (см. Slider).
+			// Sliders below push the AoConstants cbuffer per frame, so no _changed = true.
 			var aoStrength = _settings.AoStrength;
 			if (Slider("AO strength", ref aoStrength, 0.25f, 4f, "%.2f"))
 			{
 				_settings.AoStrength = aoStrength;
 			}
-			Tooltip("Контраст затемнения (степень видимости у GTAO, множитель интенсивности у SSAO).");
+			Tooltip("Occlusion contrast (visibility exponent for GTAO, intensity multiplier for SSAO).");
 
 			var aoFloor = _settings.AoFloor;
 			if (Slider("AO floor", ref aoFloor, 0f, 0.5f, "%.2f"))
 			{
 				_settings.AoFloor = aoFloor;
 			}
-			Tooltip("Нижний предел видимости: экранный AO - косвенная оценка и не вправе гасить свет в ноль.\n0 = разрешить полное затемнение.");
+			Tooltip("Lower bound on visibility: screen-space AO is an approximation and should not kill light entirely.\n0 = allow full occlusion.");
 
 			var aoRadiusWorld = _settings.AoRadiusWorld;
 			if (Slider("AO radius (world)", ref aoRadiusWorld, 0f, 5f, "%.2f"))
 			{
 				_settings.AoRadiusWorld = aoRadiusWorld;
 			}
-			Tooltip("Радиус поиска в МИРОВЫХ единицах. 0 - считать от габаритов модели ручкой ниже.\nНа сцене-уровне (Sponza: радиус баундов ~50) доля от баундов даёт метры, и тонкая\nгеометрия - шторы, флаги, листва - вместо контактной тени кладёт широкое пятно.\nДля таких сцен ставь 0.2-0.5.");
+			Tooltip("Search radius in WORLD units. 0 - derive it from the model bounds with the slider below.\nOn a full level (Sponza: bounds radius ~50) a fraction of the bounds means metres, and thin\ngeometry - curtains, flags, foliage - casts a wide blob instead of a contact shadow.\nUse 0.2-0.5 for such scenes.");
 
 			var aoRadius = _settings.AoRadiusFraction;
 			if (Slider("AO radius (bounds)", ref aoRadius, 0.02f, 0.6f, "%.3f"))
 			{
 				_settings.AoRadiusFraction = aoRadius;
 			}
-			Tooltip("Радиус поиска в долях габаритного радиуса модели - для превью ОДНОГО объекта\n(масштаб-инвариантно). Игнорируется, когда задана ручка выше.\nБольше - тень тянется дальше от стыков (крупные ниши), мельче - только контактная.");
+			Tooltip("Search radius as a fraction of the model's bounding radius - for previewing a SINGLE object\n(scale invariant). Ignored when the slider above is set.\nLarger reaches further from creases (big cavities), smaller keeps only contact shading.");
 
 			var aoDebug = _settings.AoDebugView;
 			if (ImGui.Checkbox("AO debug view", ref aoDebug))
@@ -79,12 +74,10 @@ public partial class GraphicsSettingsWindow
 				_settings.AoDebugView = aoDebug;
 				_changed = true;
 			}
-			Tooltip("Отладочный вид AO: композит выводит саму видимость в grayscale вместо затенения кадра\n(белое - открыто, чёрное - заслонено). Видно ровно то, чем AO-пасс глушит эмбиент,\nтак что ручки strength/floor/radius и разницу SSAO против GTAO можно сравнивать напрямую.\nПрозрачная геометрия рисуется ПОСЛЕ композита и поверх отладки остаётся обычной.");
+			Tooltip("AO debug view: the composite outputs raw visibility in greyscale instead of shading the frame\n(white - open, black - occluded). It shows exactly what the AO pass uses to damp ambient,\nso strength/floor/radius and SSAO vs GTAO can be compared directly.\nTransparent geometry is drawn AFTER the composite and stays normal on top of the debug view.");
 		}
 	}
 
-	/// <summary>Стохастические экранные отражения (см. SsrPass). Фича живого конвейера: тонкий
-	/// G-buffer пишется всегда, тумблер лишь ставит/снимает пассы.</summary>
 	private void DrawSsrSection()
 	{
 		ImGui.Spacing();
@@ -95,7 +88,7 @@ public partial class GraphicsSettingsWindow
 			_settings.PreviewSsr = ssr;
 			_changed = true;
 		}
-		Tooltip("Экранные отражения: стохастический GGX-луч на пиксель по глубине кадра,\nтемпоральная аккумуляция по векторам движения (включаются сами).\nРезультат ЗАМЕНЯЕТ префильтрованный env-спекуляр, а не складывается поверх.\nПрименяется живьём.");
+		Tooltip("Screen-space reflections: one stochastic GGX ray per pixel marched through the depth buffer,\ntemporally accumulated along motion vectors (enabled automatically).\nThe result REPLACES the prefiltered environment specular rather than adding on top.\nApplied live.");
 
 		if (ssr)
 		{
@@ -114,55 +107,52 @@ public partial class GraphicsSettingsWindow
 			{
 				ImGui.EndDisabled();
 			}
-			Tooltip("Лучи, промахнувшиеся мимо экрана, добираются inline RayQuery по TLAS сцены\n(та же геометрия, что у аппаратного probe GI - он должен быть включён,\nиначе фолбэк молча не активируется). Хиты, видимые на экране, берут готовый\nпиксель кадра; внеэкранные шейдятся упрощённо (солнце + probe-поле + лампы).\nТребует D3D12 с inline-трассировкой.");
+			Tooltip("Rays that miss the screen are resolved with an inline RayQuery against the scene TLAS\n(the same geometry as hardware probe GI - it must be enabled, otherwise the fallback\nsilently stays off). Hits visible on screen reuse the shaded pixel; off-screen hits get\nsimplified shading (sun + probe field + punctual lights).\nRequires D3D12 with inline ray tracing.");
 
-			// Текстурное альбедо внеэкранных RT-хитов - только при включённом RT-фолбэке.
 			if (rt && rtAvailable)
 			{
 				var hitTex = _settings.SsrHitTextures;
-				string[] hitTexModes = ["Off (потриугольное альбедо)", "Атлас 128² (дёшево)", "Bindless (полные текстуры)"];
+				string[] hitTexModes = ["Off (per-triangle albedo)", "Atlas 128² (cheap)", "Bindless (full textures)"];
 				ImGui.SetNextItemWidth(220 * _scale);
 				if (ImGui.Combo("RT hit textures", ref hitTex, hitTexModes, hitTexModes.Length))
 				{
 					_settings.SsrHitTextures = hitTex;
 					_changed = true;
 				}
-				Tooltip("Чем шейдить внеэкранный RT-хит:\nOff - один усреднённый цвет на треугольник (как раньше);\nАтлас - даунсемпленные плитки 128² всех base color текстур одним Texture2DArray\n(у стриминговых/cooked моделей плитка вырождается в средний цвет материала);\nBindless - массив полноразмерных текстур, честные UV-детали в отражениях\n(дороже по дескрипторам; без поддержки девайса тихо падает до атласа).\nСмена пересобирает материалы SSR.");
+				Tooltip("How to shade an off-screen RT hit:\nOff - one averaged colour per triangle (previous behaviour);\nAtlas - 128² downsampled tiles of every base color texture in a single Texture2DArray\n(for streamed/cooked models the tile collapses to the material's average colour);\nBindless - an array of full-size textures, real UV detail in reflections\n(costlier in descriptors; falls back to the atlas silently when the device lacks support).\nSwitching rebuilds the SSR materials.");
 
 				var traceMode = _settings.SsrTraceMode;
-				string[] traceModes = ["Экранный марш → RT", "Только RT (без марша)"];
+				string[] traceModes = ["Screen march → RT", "RT only (no march)"];
 				ImGui.SetNextItemWidth(220 * _scale);
 				if (ImGui.Combo("Trace mode", ref traceMode, traceModes, traceModes.Length))
 				{
 					_settings.SsrTraceMode = traceMode;
 					_changed = true;
 				}
-				Tooltip("Как ищется точка отражения:\nЭкранный марш → RT - сначала 48 шагов по буферу глубины, RT добирает промахи (по умолчанию);\nТолько RT - марш пропускается, луч сразу идёт по TLAS. Экранные ДАННЫЕ при этом\nне теряются: радианс в точке хита всё равно берётся с экрана репроекцией.\nУходят артефакты марша (ложные хиты за тонкой геометрией, ошибки SSR thickness,\nзатухание у краёв кадра); цена - обход BVH вместо выборок глубины. Live.");
+				Tooltip("How the reflection point is found:\nScreen march → RT - 48 steps through the depth buffer first, RT picks up the misses (default);\nRT only - the march is skipped, the ray goes straight to the TLAS. Screen DATA is not lost:\nradiance at the hit point is still reprojected from the screen.\nThis removes marching artifacts (false hits behind thin geometry, SSR thickness errors,\nfade-out at frame edges); the cost is a BVH traversal instead of depth samples. Live.");
 
 				var rtBounces = _settings.SsrRtBounces;
 				if (SliderInt("RT bounces", ref rtBounces, 1, 4))
 				{
 					_settings.SsrRtBounces = rtBounces;
 				}
-				Tooltip("Отскоков RT-луча ВСЕГО: 1 - только первичный луч (зеркало в зеркале чёрное),\n2 - плюс один зеркальный отскок с металлических хитов (по умолчанию),\n3-4 - длиннее цепочки взаимных отражений хрома. Цена - по трассировке\nна отскок, только на зеркальных пикселях с тёмным хитом. Live.");
+				Tooltip("TOTAL RT ray bounces: 1 - primary ray only (a mirror inside a mirror is black),\n2 - plus one specular bounce off metallic hits (default),\n3-4 - longer chains of mutual chrome reflections. Cost is one trace per extra\nbounce, only on mirror-like pixels with a dark hit. Live.");
 			}
 
-			// Статус ЧЕСТНЫЙ, по фактически собранным ресурсам: галка может стоять, а фича - молча
-			// остаться экранной (нет accel-а/трассировки). Без строки этот даунгрейд неотличим от
-			// «отражения сломаны»: зеркало в упор показывает голую env-карту, чёрную ниже горизонта.
+			// Status reflects actually-built resources: RT can silently downgrade to screen-only.
 			if (rt)
 			{
 				var sceneReason = _sceneViewport?.SsrRayTracedBlockReason;
 				ImGui.TextColored(sceneReason == null
 						? new Vector4(0.45f, 0.85f, 0.45f, 1f)
 						: new Vector4(1f, 0.6f, 0.2f, 1f),
-					sceneReason == null ? "Scene View: RT-фолбэк активен" : $"Scene View: {sceneReason}");
+					sceneReason == null ? "Scene View: RT fallback active" : $"Scene View: {sceneReason}");
 
 				var previewReason = _viewport?.SsrRayTracedBlockReason;
 				ImGui.TextColored(previewReason == null
 						? new Vector4(0.45f, 0.85f, 0.45f, 1f)
 						: new Vector4(1f, 0.6f, 0.2f, 1f),
-					previewReason == null ? "Превью: RT-фолбэк активен" : $"Превью: {previewReason}");
+					previewReason == null ? "Preview: RT fallback active" : $"Preview: {previewReason}");
 			}
 
 			var intensity = _settings.SsrIntensity;
@@ -170,14 +160,14 @@ public partial class GraphicsSettingsWindow
 			{
 				_settings.SsrIntensity = intensity;
 			}
-			Tooltip("Множитель заменяющего отражения. 1 - энергетически честно\n(сколько env-спекуляра вычли, столько трейса и вложили).");
+			Tooltip("Multiplier for the replacing reflection. 1 is energy-correct\n(as much traced light goes in as environment specular was taken out).");
 
 			var maxRough = _settings.SsrMaxRoughness;
 			if (Slider("SSR max roughness", ref maxRough, 0.05f, 1f, "%.2f"))
 			{
 				_settings.SsrMaxRoughness = maxRough;
 			}
-			Tooltip("Потолок шероховатости: выше отражения плавно гаснут (остаётся префильтрованный env).\nЛуч один на пиксель, и на матовых поверхностях остаточный шум дороже,\nчем недостающий спекуляр.");
+			Tooltip("Roughness ceiling: above it reflections fade out smoothly (the prefiltered environment remains).\nThere is one ray per pixel, and on rough surfaces the leftover noise costs more\nthan the missing specular.");
 
 			var thickness = _settings.SsrThickness;
 			if (Slider("SSR thickness", ref thickness, 0.01f, 5f, "%.2f",
@@ -185,7 +175,7 @@ public partial class GraphicsSettingsWindow
 			{
 				_settings.SsrThickness = thickness;
 			}
-			Tooltip("Толщина поверхности при проверке пересечения, мировые единицы.\nМало - лучи проскальзывают сквозь тонкую геометрию (дыры в отражении);\nмного - «прилипание» отражений к силуэтам переднего плана.");
+			Tooltip("Assumed surface thickness during the intersection test, in world units.\nToo small and rays slip through thin geometry (holes in the reflection);\ntoo large and reflections smear onto foreground silhouettes.");
 
 			var maxDist = _settings.SsrMaxDistance;
 			if (Slider("SSR max distance", ref maxDist, 1f, 500f, "%.0f",
@@ -193,21 +183,21 @@ public partial class GraphicsSettingsWindow
 			{
 				_settings.SsrMaxDistance = maxDist;
 			}
-			Tooltip("Дальность луча отражения в мировых единицах.");
+			Tooltip("Reflection ray range, in world units.");
 
 			var rays = _settings.SsrRaysPerPixel;
 			if (SliderInt("SSR ray reuse", ref rays, 1, 4))
 			{
 				_settings.SsrRaysPerPixel = rays;
 			}
-			Tooltip("Качество резолва: сколько чужих лучей переиспользует каждый пиксель (x2 тапов).\nВес каждого - BRDF/PDF (ratio estimator, как в Stochastic SSR Frostbite):\nрезкость зеркала и ширина матового лоба следуют из физики,\nручка меняет только остаточный шум и цену.");
+			Tooltip("Resolve quality: how many neighbouring rays each pixel reuses (x2 taps).\nEach is weighted by BRDF/PDF (ratio estimator, as in Frostbite's Stochastic SSR):\nmirror sharpness and rough-lobe width follow from the physics,\nthis knob only changes residual noise and cost.");
 
 			var history = _settings.SsrHistoryWeight;
 			if (Slider("SSR history weight", ref history, 0f, 0.97f, "%.2f"))
 			{
 				_settings.SsrHistoryWeight = history;
 			}
-			Tooltip("Вес истории темпоральной аккумуляции: больше - глаже и инертнее\n(шлейф на движении гасится клампом по окрестности), 0 - сырой шум одного луча.");
+			Tooltip("History weight of the temporal accumulation: higher is smoother and more sluggish\n(ghosting during motion is limited by a neighbourhood clamp), 0 is the raw single-ray noise.");
 
 			var debug = _settings.SsrDebugView;
 			string[] debugModes = ["Off", "Reflection only", "Confidence", "G-buffer normals", "RT hit albedo", "RT bounce chain"];
@@ -216,11 +206,10 @@ public partial class GraphicsSettingsWindow
 				_settings.SsrDebugView = debug;
 				_changed = true;
 			}
-			Tooltip("Отладочные виды: только отражения (что именно подмешивается), confidence\n(где лучи попали и с каким весом), нормали G-buffer-а (вход трейса).");
+			Tooltip("Debug views: reflection only (exactly what is blended in), confidence\n(where rays hit and with what weight), G-buffer normals (the trace input).");
 		}
 	}
 
-	/// <summary>Экранный отскок света (см. SsgiPass). Как и AO - фича живого конвейера.</summary>
 	private void DrawSsgiSection()
 	{
 		ImGui.Spacing();
@@ -231,7 +220,7 @@ public partial class GraphicsSettingsWindow
 			_settings.PreviewSsgi = ssgi;
 			_changed = true;
 		}
-		Tooltip("Экранный отскок света из кадра (color bleeding). Дополняет probe-GI\nконтактным переносом цвета там, где сетка проб слишком редкая.\nПрименяется живьём.");
+		Tooltip("Screen-space light bounce from the frame (color bleeding). Complements probe GI\nwith close-range colour transfer where the probe grid is too sparse.\nApplied live.");
 
 		if (ssgi)
 		{
@@ -240,14 +229,14 @@ public partial class GraphicsSettingsWindow
 			{
 				_settings.SsgiIntensity = giIntensity;
 			}
-			Tooltip("Множитель собранного отскока. 0 - пасс считается, но ничего не подмешивает.");
+			Tooltip("Multiplier for the gathered bounce. 0 - the pass still runs but contributes nothing.");
 
 			var giSamples = _settings.SsgiSamples;
 			if (SliderInt("GI samples", ref giSamples, 4, SsgiPassResources.MaxSampleCount))
 			{
 				_settings.SsgiSamples = giSamples;
 			}
-			Tooltip("Тапов на пиксель - главный рычаг шум/цена. 8 и ниже дают тот самый цветной снег,\n16-24 с размытием ниже уже читаются как мягкий отскок.");
+			Tooltip("Taps per pixel - the main noise/cost lever. 8 and below gives the familiar colour snow;\n16-24 with the blur below already reads as a soft bounce.");
 
 			var giMaxLum = _settings.SsgiMaxLuminance;
 			if (Slider("GI firefly clamp", ref giMaxLum, 0f, 32f, "%.2f",
@@ -255,35 +244,35 @@ public partial class GraphicsSettingsWindow
 			{
 				_settings.SsgiMaxLuminance = giMaxLum;
 			}
-			Tooltip("Потолок яркости ОДНОГО тапа. В HDR-кадре солнечное пятно рядом с тенью светит\nв десятки единиц, и один такой тап из выборки - это белая/цветная точка-искра.\nНиже - чище и тусклее в контрастных местах; 0 - снять ограничение.");
+			Tooltip("Luminance ceiling for a SINGLE tap. In an HDR frame a sunlit spot next to shadow can be\ntens of units bright, and one such tap in the sample set becomes a white/coloured firefly.\nLower is cleaner and dimmer in high-contrast areas; 0 removes the limit.");
 
 			var giSaturation = _settings.SsgiSaturation;
 			if (Slider("GI saturation", ref giSaturation, 0f, 1f, "%.2f"))
 			{
 				_settings.SsgiSaturation = giSaturation;
 			}
-			Tooltip("Насыщенность отскока: 1 - цвет отправителя как есть, 0 - серый bounce.\nАналог Bounce saturation у probe-GI: цветные ткани иначе светят как неон.");
+			Tooltip("Bounce saturation: 1 - the emitter's colour as is, 0 - a grey bounce.\nThe counterpart of probe GI's Bounce saturation: coloured fabrics otherwise glow like neon.");
 
 			var giBlur = _settings.SsgiBlurRadius;
 			if (SliderInt("GI blur radius", ref giBlur, 0, SsgiPassResources.MaxBlurRadius))
 			{
 				_settings.SsgiBlurRadius = giBlur;
 			}
-			Tooltip("Радиус билатерального (по глубине) размытия отскока в композите, пикселей.\nШире - глаже и дороже; силуэты не размазывает - вес режется по разрыву глубины.");
+			Tooltip("Radius of the depth-bilateral blur applied to the bounce in the composite, in pixels.\nWider is smoother and costlier; silhouettes stay crisp - weights drop across depth discontinuities.");
 
 			var giRadiusWorld = _settings.SsgiRadiusWorld;
 			if (Slider("GI radius (world)", ref giRadiusWorld, 0f, 20f, "%.2f"))
 			{
 				_settings.SsgiRadiusWorld = giRadiusWorld;
 			}
-			Tooltip("Радиус сбора в МИРОВЫХ единицах. 0 - считать от габаритов модели ручкой ниже.\nНа сцене-уровне (Sponza) доля от баундов даёт метры: отскок собирается с половины\nэкрана и вырождается в цветную дымку - ставь 1-3.");
+			Tooltip("Gather radius in WORLD units. 0 - derive it from the model bounds with the slider below.\nOn a full level (Sponza) a fraction of the bounds means metres: the bounce is gathered from\nhalf the screen and degenerates into a coloured haze - use 1-3.");
 
 			var giRadiusFraction = _settings.SsgiRadiusFraction;
 			if (Slider("GI radius (bounds)", ref giRadiusFraction, 0.02f, 2f, "%.3f"))
 			{
 				_settings.SsgiRadiusFraction = giRadiusFraction;
 			}
-			Tooltip("Радиус сбора в долях габаритного радиуса модели - для превью ОДНОГО объекта\n(масштаб-инвариантно). Игнорируется, когда задана ручка выше.");
+			Tooltip("Gather radius as a fraction of the model's bounding radius - for previewing a SINGLE object\n(scale invariant). Ignored when the slider above is set.");
 
 			var giDebug = _settings.SsgiDebugView;
 			if (ImGui.Checkbox("GI debug view", ref giDebug))
@@ -291,7 +280,7 @@ public partial class GraphicsSettingsWindow
 				_settings.SsgiDebugView = giDebug;
 				_changed = true;
 			}
-			Tooltip("Отладочный вид SSGI: композит выводит ОДИН отскок вместо кадра с ним -\nвидно ровно то, что пасс подмешивает, и как на это влияют ручки выше.");
+			Tooltip("SSGI debug view: the composite outputs the bounce ALONE instead of the frame with it -\nshowing exactly what the pass contributes and how the sliders above affect it.");
 		}
 	}
 

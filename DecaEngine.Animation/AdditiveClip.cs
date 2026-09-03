@@ -4,14 +4,8 @@ using System.Numerics;
 namespace DecaEngine.Animation;
 
 /// <summary>
-/// Построение ДЕЛЬТА-клипа для аддитивного бленда - портированный AdditiveAnimationBuilder ozz:
-/// каждый ключ переписывается отклонением от ОПОРЫ - первого ключа своей же дорожки (трансляция -
-/// разностью, поворот - Conjugate(опора)*значение, масштаб - отношением). Такой клип хранит не
-/// позу, а «на сколько поза отклоняется от нейтрали», и в BlendingJob идёт аддитивным слоем -
-/// суммируется поверх любой базы, не стирая её (в отличие от обычного бленда-усреднения).
-///
-/// Специально авторский клип не нужен: дельтой становится ЛЮБОЙ обычный клип - Survey лисы минус
-/// его первый кадр даёт «поводит головой и ушами», применимое поверх ходьбы и бега.
+/// Builds a delta clip for additive blending, a port of ozz's AdditiveAnimationBuilder: every key
+/// becomes an offset from the first key of its own track.
 /// </summary>
 public static class AdditiveClip
 {
@@ -25,12 +19,8 @@ public static class AdditiveClip
 			var track = new JointTrack();
 			tracks[joint] = track;
 
-			// Пустой канал дельты обязан быть ЕДИНИЦЕЙ, и полагаться на досев шима нельзя: тот
-			// сеет rest-позой (правильно для обычных клипов - там пустой канал значит «bind»), а
-			// rest-поза, прочитанная КАК ДЕЛЬТА, сдвигает кость на всю её bind-трансформацию.
-			// Поэтому каждый канал каждого джойнта заполняется явно - тождественным ключом, если
-			// дорожки нет.
-
+			// An empty delta channel must be IDENTITY: the shim would fill it with the rest pose,
+			// which read as a delta would offset the joint by its whole bind transform.
 			if (sourceTrack != null && sourceTrack.TranslationTimes.Length > 0)
 			{
 				var reference = sourceTrack.Translations[0];

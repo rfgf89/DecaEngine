@@ -7,153 +7,89 @@ using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Graphics.ProbeGi;
 
-/// <summary>Состояние ПРОГРЕССИВНОГО бейка probe-GI: сетка, аккумуляторы поля и геометрические
-/// суммы, копящиеся раунд за раундом (см. <see cref="ProbeGiBaker.RunRound"/>). Заменяет прежний
-/// «бейк одним куском», который на сцене-уровне занимал секунды и целиком повторялся при каждом
-/// движении ползунка света: теперь раунд стоит RaysPerRound лучей на пробу (единицы миллисекунд),
-/// поле после любого раунда уже можно показывать, качество набирается со временем, а поворот солнца
-/// не выбрасывает накопленное (см. <see cref="SetLighting"/>). Не потокобезопасна: раунды гонять
-/// строго по одному, <see cref="ProbeGiBaker.Snapshot"/> звать между ними.</summary>
+/// <summary>Progressive probe-GI bake state; not thread-safe: run rounds one at a time.</summary>
 public sealed class ProbeGiBakeSession
 {
-	/// <summary>Размер ПЛОТНОЙ сетки проб (см. ProbeGiBakeResult.CountX): проба есть в каждом узле.
-	/// </summary>
+	/// <summary>Dense probe grid size: a probe exists at every node.</summary>
 	public int CountX { get; }
 	public int CountY { get; }
 	public int CountZ { get; }
 
-	/// <summary>Номер раскладки. С уходом прокрутки объём неподвижен всю жизнь сессии, так что
-	/// растёт он больше никогда - оставлен, потому что по нему потребители (дебаг-оверлей)
-	/// по-прежнему сверяют актуальность своей копии сетки.</summary>
 	internal int LayoutGeneration;
 
 	public int ProbeCount { get; }
 	public Vector3 Origin { get; internal set; }
 	public Vector3 Cell { get; }
 
-	/// <summary>Сколько раундов влито в поле ПОСЛЕ последней смены освещения. Задаёт вес нового
-	/// раунда (бегущее среднее 1/(Round+1)) и сходимость.</summary>
+	/// <summary>Rounds accumulated since the last lighting change; sets round weight 1/(Round+1).</summary>
 	public int Round { get; internal set; }
 
-	/// <summary>Раундов до сходимости: RaysPerProbe/RaysPerRound, но не меньше минимума на разгон
-	/// мультибаунса (см. ProbeGiBaker). После сходимости вызывающий перестаёт крутить раунды - поле
-	/// статично и CPU свободен.</summary>
+	/// <summary>Rounds until convergence; callers stop running rounds after it is reached.</summary>
 	public int TargetRounds { get; }
 
-	/// <summary>Режим реального времени (см. <see cref="ProbeGiBakeOptions.Realtime"/>). Меняется на
-	/// ЖИВОЙ сессии - это не параметр раскладки, а всего лишь пол веса раунда и признак «не
-	/// останавливаться», так что накопленное поле переживает переключение в обе стороны и работает
-	/// стартовым приближением.</summary>
+	/// <summary>Realtime mode; togglable on a live session, accumulated field survives the switch.</summary>
 	public bool Realtime { get; set; }
 
-	/// <summary>Печь нечего (пустой BVH) - раунды крутить бессмысленно даже в реальном времени.
-	/// Ставится <see cref="ProbeGiBaker.RunRound"/>.</summary>
+	/// <summary>Nothing to bake (empty BVH); rounds are pointless even in realtime.</summary>
 	public bool NoGeometry { get; internal set; }
 
-	/// <summary>Альфа экспоненциального среднего в реальном времени - живая ручка (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeBlend"/>).</summary>
+	/// <summary>Realtime exponential-average alpha; live knob.</summary>
 	public float RealtimeBlend { get; set; } = ProbeGiBaker.RealtimeBlend;
 
-	/// <summary>Пол веса раунда: в запечке - почти ноль (среднее должно сходиться), в реальном
-	/// времени - фиксированная альфа экспоненциального среднего.</summary>
+	// Round-weight floor: near zero in bake (average must converge), fixed alpha in realtime.
 	internal float MinBlend => Realtime
 		? Math.Clamp(RealtimeBlend, 0.005f, 1f)
 		: ProbeGiBaker.MinRoundBlend;
 
-	/// <summary>Сошлось ли поле. В реальном времени - никогда: раунды идут, пока жива сессия, иначе
-	/// динамики не будет по определению. Пустая сцена - исключение, там крутить нечего.</summary>
+	/// <summary>Whether the field has converged; never true in realtime (except empty scenes).</summary>
 	public bool Converged => NoGeometry || (!Realtime && Round >= TargetRounds);
 
-	/// <summary>Прогресс сходимости 0..1 - для статуса в окне Graphics. В реальном времени понятия
-	/// сходимости нет, поле всегда «готово» и всегда обновляется.</summary>
+	/// <summary>Convergence progress 0..1; always 1 in realtime.</summary>
 	public float Progress => Realtime || TargetRounds <= 0
 		? 1f
 		: Math.Clamp(Round / (float)TargetRounds, 0f, 1f);
 
 	private readonly int _bakeRaysPerRound;
 
-	/// <summary>Лучей за раунд в режиме реального времени - живая ручка (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeRaysPerRound"/>): менять её между раундами можно, буфер
-	/// направлений заводится сразу под потолок.</summary>
+	/// <summary>Realtime rays per round; live knob, direction buffer is sized for the cap.</summary>
 	public int RealtimeRaysPerRound { get; set; }
 
-	/// <summary>Лучей за ТЕКУЩИЙ раунд - зависит от режима: запечка копит качество раундами и может
-	/// позволить себе редкий веер, реальное время платит за него мерцанием.</summary>
+	/// <summary>Rays for the current round; depends on mode.</summary>
 	public int RaysPerRound => Realtime ? RealtimeRaysPerRound : _bakeRaysPerRound;
 
-	/// <summary>Сколько первых лучей веера - ФИКСИРОВАННЫЕ (см.
-	/// <see cref="ProbeGiBaker.FixedRayCount"/>).</summary>
+	/// <summary>How many leading fan rays are fixed (see ProbeGiBaker.FixedRayCount).</summary>
 	public int FixedRays => ProbeGiBaker.FixedRayCount(RaysPerRound, Realtime);
 
-	/// <summary>Потолок яркости луча в реальном времени - живая ручка (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeMaxRayLuminance"/>).</summary>
+	/// <summary>Realtime per-ray luminance cap; live knob.</summary>
 	public float RealtimeMaxRayLuminance { get; set; }
 
-	/// <summary>Потолок яркости луча для ТЕКУЩЕГО режима. В запечке кламп выключен всегда: там он
-	/// был бы чистой потерей энергии, а выбросы и так растворяются усреднением по раундам. Заодно
-	/// это сохраняет побитовую сверку GPU с CPU-эталоном - она идёт по сессиям запечки.</summary>
+	// Bake mode never clamps: it would lose energy and break the bitwise GPU/CPU parity check.
 	internal float MaxRayLuminance => Realtime ? MathF.Max(RealtimeMaxRayLuminance, 0f) : 0f;
 
-	/// <summary>Предел изменения пробы за раунд - живая ручка (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeMaxStep"/>).</summary>
+	/// <summary>Realtime per-round probe change limit; live knob.</summary>
 	public float RealtimeMaxStep { get; set; }
 
-	/// <summary>Предел изменения для ТЕКУЩЕГО режима. В запечке выключен: там торопиться некуда, а
-	/// ограничитель только замедлил бы сходимость.</summary>
+	// Disabled in bake mode: it would only slow convergence.
 	internal float MaxStep => Realtime ? MathF.Max(RealtimeMaxStep, 0f) : 0f;
 
-	/// <summary>Предел релокации - живая ручка (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeRelocation"/>).</summary>
+	/// <summary>Relocation limit; live knob.</summary>
 	public float RealtimeRelocation { get; set; }
 
-	/// <summary>Гамма перцептивного накопления - живая ручка (см.
-	/// <see cref="ProbeGiBakeOptions.RealtimeGamma"/>).</summary>
+	/// <summary>Perceptual accumulation gamma; live knob.</summary>
 	public float RealtimeGamma { get; set; }
 
-	/// <summary>Гамма накопления для ТЕКУЩЕГО режима. В запечке всегда 1 (линейно): там среднее
-	/// обязано сходиться к честному интегралу, перцептивное смещение было бы чистой ошибкой, а
-	/// заодно сохраняется сверка с CPU-эталоном.</summary>
+	// Bake mode is always linear: the average must converge to the true integral (and match CPU ref).
 	internal float AccumulationGamma => Realtime ? Math.Clamp(RealtimeGamma, 1f, 8f) : 1f;
 
-	/// <summary>Сколько раундов релокации осталось в текущем окне. Релокация НЕ работает постоянно:
-	/// каждый переезд обесценивает и накопленное поле, и окто-карту глубин, то есть отправляет пробу
-	/// в холодный старт. Majercik 2021 (§5) на этом настаивает прямо - «we do not move probes around
-	/// dynamic geometry because this causes instability; a stable result is preferable to an unstable
-	/// result with lower average error», - и двигает пробы только на инициализации.
-	///
-	/// Замурованная движущимся объектом проба при этом не портит картинку: её ловят backface-
-	/// эвристики (§4.1, см. укорачивание глубин и валидность) - облучённость обнуляется, глубины
-	/// укорачиваются, вес в интерполяции падает, и проба просто молчит, пока объект её накрывает.
-	/// Окно открывается РОВНО ОДИН РАЗ - конструктором сессии, на инициализации. Раньше его
-	/// переоткрывала пересборка TLAS, то есть КАЖДЫЙ КАДР драга гизмо, и это было прямым
-	/// нарушением §5, процитированного выше: релокация включалась у всей сетки, сон проб
-	/// выключался, а вес раунда откатывался вдесятеро тоже у всей сетки - видимое кипение
-	/// поля всё время, пока тащат объект (см. PrefabSceneViewport.PollSceneProbePoses)
-	/// (пересобрался TLAS), а не каждый раунд просто так.</summary>
+	// Relocation window opens once, at session init (Majercik 2021 §5).
 	internal int RelocationRoundsLeft;
 
-	/// <summary>Предел релокации в МИРОВЫХ единицах для текущего режима. В запечке выключена: она
-	/// сдвигает пробы, а значит обесценивает и накопленное поле, и окто-карту глубин - в режиме,
-	/// который считает сходимость, это чистая потеря. Заодно сохраняется побитовая сверка с
-	/// CPU-эталоном, идущая по сессиям запечки.</summary>
+	// World-space relocation limit; disabled in bake, it would invalidate the accumulated field.
 	internal float RelocationLimit => Realtime && RelocationRoundsLeft > 0
 		? MathF.Max(RealtimeRelocation, 0f) * MathF.Min(Cell.X, MathF.Min(Cell.Y, Cell.Z))
 		: 0f;
 
-	/// <summary>Геометрия сцены сдвинулась (пересобрался TLAS).
-	///
-	/// ЗАПЕЧКЕ это обязано сбросить сходимость: она считает раунды до TargetRounds и после
-	/// этого останавливается совсем (см. Converged), так что без отката поле навсегда осталось бы
-	/// с объектом в старой позе.
-	///
-	/// В РЕАЛЬНОМ ВРЕМЕНИ не делает НИЧЕГО, и это главное: там alpha - экспоненциальное
-	/// среднее с постоянной MinBlend, поле следит за сценой само. Откат же поднимал вес
-	/// раунда с MinBlend (~0.05) до 0.5 - вдесятеро и у ВСЕЙ сетки разом, - а тащат объект
-	/// много кадров подряд, то есть всё время драга поле шло практически нефильтрованным
-	/// (видимое кипение — см. PrefabSceneViewport.PollSceneProbePoses).
-	///
-	/// Релокацию НЕ трогает намеренно ни в каком режиме: Majercik 2021 §5 двигает пробы
-	/// только на инициализации (см. <see cref="RelocationRoundsLeft"/>).</summary>
+	/// <summary>Scene geometry moved; realtime must not reset round weight, or the field boils.</summary>
 	public void InvalidateGeometry()
 	{
 		if (!Realtime)
@@ -161,24 +97,13 @@ public sealed class ProbeGiBakeSession
 			Round = Math.Min(Round, ProbeGiBaker.RestartRound);
 		}
 
-		// В реальном времени вес раунда НЕ откатывается (см. вызывающий код в PrefabSceneViewport -
-		// там разобрано, почему глобальный откат на каждый кадр драга гизмо хуже болезни). Но
-		// остановку сошедшегося объёма снять обязательно: она проверяет ровно то состояние, которое
-		// движение объекта не трогает - вес на полу и закрытое окно релокации, - и без этой отметки
-		// объём, признанный сошедшимся, замирает НАВСЕГДА. На картинке это выглядит как след:
-		// объект уехал, а его освещение осталось лежать на прежнем месте, потому что раунды больше
-		// не идут и экспоненциальному среднему нечем работать.
-		// Отметка снимается один раз, следующим же раундом (см. ProbeRoundGpu.IsConverged): дальше
-		// объём сходится заново обычным порядком и, если сцена успокоилась, снова остановится.
+		// Bump so ProbeRoundGpu lifts the converged-volume stop.
 		GeometryVersion++;
 	}
 
-	/// <summary>Счётчик изменений геометрии сцены. Растёт на каждый <see cref="InvalidateGeometry"/>;
-	/// <see cref="ProbeRoundGpu"/> сравнивает его со своим снимком и по расхождению снимает
-	/// остановку сошедшегося объёма.</summary>
+	// Incremented per InvalidateGeometry; ProbeRoundGpu compares against its snapshot.
 	internal int GeometryVersion { get; private set; }
 
-	/// <summary>Тратит раунд окна релокации - зовут оба пути, продвигая раунд.</summary>
 	internal void ConsumeRelocationRound()
 	{
 		if (RelocationRoundsLeft > 0)
@@ -187,70 +112,45 @@ public sealed class ProbeGiBakeSession
 		}
 	}
 
-	/// <summary>Смещения проб от их узлов сетки, мировые единицы (см.
-	/// <see cref="ProbeGiBakeResult.Offset"/>). CPU-путь копит их здесь, GPU - в своём буфере.</summary>
+	// Probe offsets from grid nodes, world units; CPU path accumulates here, GPU in its own buffer.
 	internal readonly Vector3[] ProbeOffset;
 
 	internal readonly float SkyIntensity, BounceSaturation, Feedback;
 
-	// Освещение меняется МЕЖДУ раундами (см. SetLighting) - поворот солнца больше не требует
-	// перезапуска бейка.
+	// May change between rounds via SetLighting: sun rotation does not restart the bake.
 	internal Vector3 SunDirection, SunColor;
 	internal float EnvYaw;
 	internal Func<Vector3, Vector3> SkyRadiance;
 
-	/// <summary>Punctual-света сцены (point/spot) - участвуют в прямом свете точек попадания лучей
-	/// наравне с солнцем (подход RTXGI: теневой луч к свету + затухание, зеркало формул шейдинга
-	/// UnlitInstancedPS). ShadowParams в записях ОБЯЗАН быть нулевым (см.
-	/// <see cref="LightCulling.TryBuildBakeLight"/>): раскладка теневых слайсов меняется от камеры
-	/// кадр к кадру и в сравнение изменений света входить не должна. Пустой массив = прежнее
-	/// поведение (только солнце и небо).</summary>
+	// ShadowParams must be zero here: slice layout is per-frame and must not affect comparison.
 	internal PunctualLight[] BakeLights = Array.Empty<PunctualLight>();
 
-	/// <summary>Сквозной номер раунда за всю жизнь сессии (в отличие от <see cref="Round"/> не
-	/// откатывается) - им поворачивается веер Фибоначчи, чтобы раунды после смены света не
-	/// повторяли уже отстрелянные направления.</summary>
+	/// <summary>Lifetime round counter, never reset; rotates the Fibonacci ray fan.</summary>
 	public int Sequence { get; internal set; }
 
-	// Поле проб в двойном буфере: раунд читает прошлое поле (мультибаунс собирается по соседним
-	// пробам в точках попаданий) и пишет новое, после чего буферы меняются местами. Прежний бейк
-	// клонировал массивы на каждой итерации - на сотнях тысяч проб это само по себе стоило дороже
-	// раунда трассировки.
+	// Double-buffered probe field: a round reads the previous field and writes the new one.
 	internal Vector3[] L0R, L1XR, L1YR, L1ZR, L0W, L1XW, L1YW, L1ZW;
 	internal float[] ValidityR, ValidityW, SunFracR, SunFracW;
 
-	/// <summary>Постоянная составляющая поля проб (L0) на ЧТЕНИЕ - то, что сейчас видят сэмплеры.
-	///
-	/// Отдаётся span'ом, а не самим массивом: снаружи это нужно ровно затем, чтобы сверить поле с
-	/// GPU-путём (см. сверочный прогон в пробах), и восемь буферов пинг-понга наружу выставлять
-	/// незачем - перепутать R и W со стороны потребителя значит сравнить поле с самим собой из
-	/// прошлого раунда и не заметить расхождения.</summary>
+	/// <summary>Read-side constant term (L0) of the probe field, as sampled right now.</summary>
 	public ReadOnlySpan<Vector3> IrradianceRead => L0R;
 
-	/// <summary>Видимость неба: чистая геометрия, читается только владеющей пробой - одинарный
-	/// буфер (в отличие от валидности, которую читает сбор по соседям).</summary>
+	// Sky visibility: pure geometry, read only by the owning probe - single buffer.
 	internal readonly float[] SkyVis;
 
-	// Геометрические накопители: от освещения не зависят, копятся точными суммами по ВСЕМ раундам
-	// и переживают поворот солнца без потери качества.
+	// Geometry accumulators: lighting-independent exact sums over ALL rounds; survive sun rotation.
 	internal readonly int[] RayTotal, MissTotal, BackTotal;
 
-	/// <summary>Суммы по окто-карте глубин. VisWeight - сумма ВЕСОВ, а не число лучей: глубина
-	/// укладывается по конусу с cosine-power лобой (см. RunRound и §4.4 статьи Majercik 2019), и
-	/// каждый луч вносит в тексель свою долю.</summary>
+	// VisWeight sums weights, not rays: depth splats over a cone lobe (Majercik 2019 §4.4).
 	internal readonly float[] VisSumT, VisSumT2, VisWeight;
 
-	/// <summary>Буферы атласов переиспользуются: снимок берётся каждый раунд, а это десятки
-	/// мегабайт - пересоздавать их незачем (см. ProbeGiBaker.Snapshot).</summary>
+	/// <summary>Atlas buffers are reused across snapshots (tens of MB per round).</summary>
 	public readonly ProbeGiBakeResult Result;
 
-	/// <summary>Кэш радианса на поверхностях - источник отскока для лучей бейка (см.
-	/// <see cref="SurfaceCache"/>). null, пока первый раунд его не построил, и навсегда, если кэш
-	/// выключен настройками.</summary>
+	/// <summary>Surface radiance cache feeding bounce rays; null until the first round builds it.</summary>
 	public SurfaceCache? Surface { get; internal set; }
 
-	/// <summary>Кэш поверхностей заказан, но ещё не построен - его захват стоит сотни миллисекунд и
-	/// потому отложен до первого (фонового) раунда.</summary>
+	// Surface cache requested but not yet built; capture costs hundreds of ms, deferred to a round.
 	internal bool WantsSurfaceCache;
 
 	internal ProbeGiBakeSession(Vector3 origin, Vector3 cell, int cx, int cy, int cz,
@@ -273,7 +173,7 @@ public sealed class ProbeGiBakeSession
 		RealtimeRelocation = Math.Clamp(options.RealtimeRelocation, 0f, 0.45f);
 		RealtimeGamma = Math.Clamp(options.RealtimeGamma, 1f, 8f);
 		VariabilityThreshold = MathF.Max(options.RealtimeVariabilityThreshold, 0f);
-		// Свежая сессия - пробы стоят в узлах сетки, часть из них внутри стен: окно открыто.
+		// Fresh session: probes sit at grid nodes, some inside walls - relocation window opens.
 		RelocationRoundsLeft = ProbeGiBaker.RelocationRounds;
 		Realtime = options.Realtime;
 		SkyIntensity = Math.Clamp(options.SkyIntensity, 0f, 16f);
@@ -308,7 +208,6 @@ public sealed class ProbeGiBakeSession
 			Cell = cell,
 		};
 
-		// Атлас ровно по сетке - дырок в нём больше нет, каждый тексель принадлежит своей пробе.
 		Result.Sh0 = new byte[n * 8];
 		Result.Sh1 = new byte[n * 8];
 		Result.Sh2 = new byte[n * 8];
@@ -317,13 +216,7 @@ public sealed class ProbeGiBakeSession
 		Result.Vis = new byte[n * ProbeGiBakeResult.VisRes * ProbeGiBakeResult.VisRes * 8];
 	}
 
-	/// <summary>Обновляет освещение между раундами. Если оно реально изменилось, сходимость
-	/// откатывается к <see cref="ProbeGiBaker.RestartRound"/>: вес раунда подскакивает, и поле
-	/// перетекает к новому решению за единицы раундов - при этом НЕ выбрасываются ни накопленная
-	/// геометрия (видимость/валидность/окто-глубины), ни старое поле как стартовое приближение.
-	/// Прежний код на любое движение ползунка света запускал полный ребейк с дебаунсом. Возвращает
-	/// true, если освещение изменилось. Небесную функцию сравнивать нечем (делегат), но её смена
-	/// означает перезагрузку окружения, а та и так пересоздаёт сессию.</summary>
+	/// <summary>Updates lighting between rounds; a change rolls convergence back to RestartRound.</summary>
 	public bool SetLighting(Vector3 sunDirection, Vector3 sunColor, float envYawRadians,
 		Func<Vector3, Vector3> skyRadiance)
 	{
@@ -345,10 +238,7 @@ public sealed class ProbeGiBakeSession
 		return changed;
 	}
 
-	/// <summary>Обновляет punctual-света между раундами - та же механика, что у
-	/// <see cref="SetLighting"/>: реальное изменение (сдвиг/перекраска/добавление лампы) откатывает
-	/// вес раунда, и поле перетекает к новому решению без потери геометрии. ShadowParams в записях
-	/// должен быть нулевым (см. <see cref="BakeLights"/>). Возвращает true при изменении.</summary>
+	/// <summary>Updates punctual lights between rounds; ShadowParams must be zero in entries.</summary>
 	public bool SetPunctualLights(ReadOnlySpan<PunctualLight> lights)
 	{
 		bool changed = lights.Length != BakeLights.Length;
@@ -378,10 +268,7 @@ public sealed class ProbeGiBakeSession
 		return changed;
 	}
 
-	/// <summary>Продвигает счётчики раунда, когда работу сделал GPU (см. ProbeRoundGpu). CPU-буферы
-	/// поля в этом режиме не используются и менять их местами незачем - пинг-понг ведёт сам
-	/// GPU-объект, - но номер раунда и порядковый номер веера обязаны идти в ногу: от первого
-	/// зависит вес раунда, от второго - направления лучей.</summary>
+	/// <summary>Advances round counters when the GPU did the work; both must track the GPU path.</summary>
 	public void AdvanceRound()
 	{
 		Sequence++;
@@ -389,12 +276,9 @@ public sealed class ProbeGiBakeSession
 		ConsumeRelocationRound();
 	}
 
-	/// <summary>Порог средней изменчивости, ниже которого объём считается сошедшимся и раунды
-	/// останавливаются (см. <see cref="ProbeGiBakeOptions.RealtimeVariabilityThreshold"/>). Живая
-	/// ручка - меняется между раундами.</summary>
+	/// <summary>Mean-variability threshold below which a volume counts as converged; live knob.</summary>
 	public float VariabilityThreshold { get; set; }
 
-	/// <summary>Меняет местами читающий и пишущий буферы поля - конец раунда.</summary>
 	internal void Swap()
 	{
 		(L0R, L0W) = (L0W, L0R);
@@ -406,24 +290,10 @@ public sealed class ProbeGiBakeSession
 	}
 }
 
-/// <summary>Кэш радианса НА ПОВЕРХНОСТЯХ (подход Lumen/Unity Surface GI, здесь - мировая
-/// разреженная воксельная параметризация). Смысл в том, чтобы отскок собирался не из редкой сетки
-/// проб, а из значений, привязанных к самой геометрии: у проб шаг в метры, и красная штора отдаёт
-/// свет на колонну «пятном размером с ячейку», тогда как вокселы кэша идут по поверхности с шагом
-/// в разы мельче. Луч бейка проб, попав в геометрию, берёт готовый радианс отсюда вместо того,
-/// чтобы каждый раз пересобирать его из поля проб.
-///
-/// Почему воксели, а не карты по мешам, как в Lumen: до пиксельного шейдера здесь не доходит
-/// стабильный идентификатор инстанса (ECS + куллинг раздают слоты сами), а UV-развёртки под
-/// лайтмап у glTF-моделей обычно нет. Мировая сетка не требует ни того, ни другого.
-///
-/// Вокселы существуют только там, где есть поверхность, поэтому при шаге вчетверо мельче пробного
-/// их получается не в 64 раза больше, а единицы-десятки тысяч. И стоят они дёшево: раунд тратит на
-/// воксель ОДИН теневой луч (резкая часть - солнце) плюс выборку поля проб (гладкая часть - небо и
-/// переотскок), тогда как проба тратит десятки лучей.</summary>
+/// <summary>World-space sparse voxel surface radiance cache read by probe bake rays.</summary>
 public sealed class SurfaceCache
 {
-	/// <summary>Во сколько раз шаг вокселя мельче шага сетки проб.</summary>
+	/// <summary>Voxel step subdivision relative to the probe grid step.</summary>
 	public const int Subdivision = 4;
 
 	public int CountX { get; }
@@ -432,15 +302,15 @@ public sealed class SurfaceCache
 	public Vector3 Origin { get; }
 	public Vector3 Voxel { get; }
 
-	/// <summary>Индекс вокселя в плотных массивах по координатам сетки, -1 = поверхности тут нет.</summary>
+	// Voxel index in dense arrays by grid coordinates; -1 = no surface here.
 	private readonly int[] _index;
 
-	/// <summary>Захваченная геометрия поверхности - считается один раз, от света не зависит.</summary>
+	/// <summary>Captured surface geometry; computed once, lighting-independent.</summary>
 	public Vector3[] Position = Array.Empty<Vector3>();
 	public Vector3[] Normal = Array.Empty<Vector3>();
 	public Vector3[] Albedo = Array.Empty<Vector3>();
 
-	/// <summary>Исходящий радианс вокселя и доля солнца в нём - то, что забирают лучи бейка проб.</summary>
+	/// <summary>Outgoing voxel radiance and its sun fraction, consumed by probe bake rays.</summary>
 	public Vector3[] Radiance = Array.Empty<Vector3>();
 	public float[] SunFraction = Array.Empty<float>();
 
@@ -456,9 +326,7 @@ public sealed class SurfaceCache
 		_index = new int[cx * cy * cz];
 	}
 
-	/// <summary>Индекс вокселя, накрывающего мировую точку, или -1. Точка сдвигается вдоль нормали
-	/// наружу: попадание луча лежит ровно НА поверхности, а из-за округления может оказаться в
-	/// соседнем вокселе по ту сторону геометрии.</summary>
+	/// <summary>Voxel index covering a world point, or -1; offset hits along the normal first.</summary>
 	public int Lookup(Vector3 worldPos)
 	{
 		var f = (worldPos - Origin) / Voxel;
@@ -471,8 +339,7 @@ public sealed class SurfaceCache
 		return _index[(z * CountY + y) * CountX + x];
 	}
 
-	/// <summary>Плотная карта «ячейка сетки → индекс вокселя или -1» - GPU-проход кэша ищет по ней
-	/// точку попадания (см. SurfaceLookup в ProbeRoundCS.hlsl).</summary>
+	/// <summary>Dense cell-to-voxel-index map (-1 = empty), used by the GPU cache pass lookup.</summary>
 	public int[] ExportIndex() => _index;
 
 	internal void Allocate(int[] denseIndex, int voxelCount)

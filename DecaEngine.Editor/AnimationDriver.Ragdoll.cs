@@ -10,31 +10,22 @@ using DecaEngine.Physics;
 using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
-// В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
-// имя разрешается неоднозначно.
+// Friflo defines its own Transform component; the alias resolves the ambiguity.
 using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Рэгдолл: синхронизация с Bepu, сборка описания тела, замер радиусов костей и масс. Часть <see cref="AnimationDriver"/> - файл на тему; состояние
-/// персонажа (Character) и кадровый Update живут в основном файле.</summary>
+/// <summary>Ragdoll part of <see cref="AnimationDriver"/>: Bepu sync, body description build, bone radii and mass.</summary>
 public sealed partial class AnimationDriver
 {
-	/// <summary>
-	/// Ведёт рэгдолл персонажа: собирает и разбирает его по компоненту, гонит тела к позе анимации и
-	/// - в физическом режиме - читает позу обратно из тел.
-	///
-	/// Идёт ПОСЛЕДНЕЙ стадией: рэгдолл либо получает готовую позу как цель, либо целиком её
-	/// заменяет, и обе роли требуют, чтобы поза к этому моменту была окончательной.
-	/// </summary>
+	// Must run as the LAST pose stage: the ragdoll either targets or replaces the final pose.
 	private void SyncRagdoll(Entity entity, Character character, float deltaSeconds)
 	{
 		bool wanted = Physics != null && entity.HasComponent<RagdollComponent>();
 		var settings = wanted ? entity.GetComponent<RagdollComponent>() : default;
 
-		// Хит-реакция живёт ПОВЕРХ компонента: у идущего персонажа рэгдолл авторски выключен (и
-		// FallRecover гасит его каждый кадр), а реагировать на удар он обязан всё равно. Конверт
-		// тикает здесь же - реакция без единого кадра рэгдолла обязана истечь, а не висеть вечно.
+		// Hit reaction runs even with the component disabled; the envelope ticks here so a
+		// reaction that never gets a ragdoll frame still expires instead of hanging forever.
 		bool reacting = wanted && character.ReactionDuration > 0f;
 		if (reacting)
 		{
@@ -55,6 +46,10 @@ public sealed partial class AnimationDriver
 			DestroyRagdoll(character);
 			return;
 		}
+
+		// Physical mode only once statics exist: released before the streamed floor reaches
+		// physics (see ScenePhysics.HasStatics), the ragdoll falls forever with no way back.
+		bool physical = settings.Physical && Physics!.HasStatics;
 
 		float worldScale = WorldScaleOf(character.ModelToWorld);
 
@@ -77,19 +72,16 @@ public sealed partial class AnimationDriver
 
 		ActiveRagdollCount++;
 
-		// Цель - поза анимации В МИРЕ. Считается ДО чтения из тел: в физическом режиме чтение
-		// затрёт character.Models, а сервоприводам нужна именно анимационная цель.
+		// Servo target must be computed BEFORE reading bodies: physical mode overwrites Models.
 		for (int i = 0; i < character.Models.Length; i++)
 		{
 			character.JointWorld[i] = character.Models[i] * character.ModelToWorld;
 		}
 
-		// Реакция переводит тела в физику с СИЛЬНЫМИ сервоприводами: они тянут корпус обратно к
-		// анимации, и толчок читается как «качнулся и выправился», а не «обмяк». Настоящее падение
-		// (Physical по компоненту) сильнее реакции: там поза целиком из тел, и подмешивать нечего.
-		bool reactionDrives = reacting && !settings.Physical;
+		// Reaction = physics with strong servos pulling back to animation; Physical mode wins over it.
+		bool reactionDrives = reacting && !physical;
 
-		ragdoll.SetAnimationDriven(!settings.Physical && !reactionDrives);
+		ragdoll.SetAnimationDriven(!physical && !reactionDrives);
 		ragdoll.DriveToPose(character.JointWorld, deltaSeconds,
 			reactionDrives ? ReactionServoStrength : settings.ServoStrength);
 
@@ -100,7 +92,7 @@ public sealed partial class AnimationDriver
 			character.ReactionImpulsePending = false;
 		}
 
-		if (settings.Physical)
+		if (physical)
 		{
 			ReadRagdollPose(character, ragdoll);
 		}
@@ -110,16 +102,10 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>Сила сервоприводов реакции. Порядок величины - как у демонстрационного active
-	/// ragdoll (60): достаточно, чтобы корпус вернулся к анимации за доли секунды, и мало,
-	/// чтобы толчок вообще был виден.</summary>
+	// ~60 as in typical active-ragdoll demos: recovers in fractions of a second, push still visible.
 	private const float ReactionServoStrength = 60f;
 
-	/// <summary>
-	/// Подмешивает позу тел к анимации по маске и конверту. Ноги в маске нулевые - они продолжают
-	/// идти анимацией (и foot IK уже отработал по ней); смешиваются РАЗЛОЖЕННЫЕ TRS по той же
-	/// причине, что и в подъёме: интерполяция матриц поворота напрямую плющит кости на полпути.
-	/// </summary>
+	// Blends decomposed TRS, not matrices: lerping rotation matrices squashes bones halfway.
 	private static void BlendReactionPose(Character character, Ragdoll ragdoll)
 	{
 		EnsureReactionMask(character);
@@ -132,7 +118,7 @@ public sealed partial class AnimationDriver
 		character.Models.CopyTo(character.ReactionAnimated, 0);
 		ReadRagdollPose(character, ragdoll);
 
-		// Конверт: быстрая атака (толчок обязан быть виден сразу) и плавный спад до конца реакции.
+		// Envelope: fast attack so the push reads immediately, smooth release to the end.
 		float t = Math.Clamp(character.ReactionElapsed / character.ReactionDuration, 0f, 1f);
 		float attack = Math.Clamp(character.ReactionElapsed / ReactionAttackSeconds, 0f, 1f);
 		float release = 1f - t * t * (3f - 2f * t);
@@ -173,11 +159,7 @@ public sealed partial class AnimationDriver
 		character.Models.CopyTo(character.Managed.ModelMatrices, 0);
 	}
 
-	/// <summary>
-	/// Маска реакции по humanoid-разметке: конечности (все шесть цепочек слотов и их поддеревья)
-	/// нулевые, таз приглушён (его качает и так - через корпус), остальное единица. Без разметки
-	/// маска целиком единичная - реакция честно качает всего персонажа, что хуже, но видно.
-	/// </summary>
+	// Limbs and their subtrees zeroed, hips damped; without an avatar the mask is all ones.
 	private static void EnsureReactionMask(Character character)
 	{
 		if (character.ReactionMaskBuilt && character.ReactionMask.Length == character.Skeleton.JointCount)
@@ -214,10 +196,8 @@ public sealed partial class AnimationDriver
 				character.ReactionMask[hips] = 0.3f;
 			}
 
-			// Поддеревья обнулённых костей (пальцы под кистью): джойнты топологически упорядочены,
-			// одного прохода хватает. Нулевой РОДИТЕЛЬ обнуляет ребёнка - но только нулевой:
-			// приглушённый таз своих детей не глушит, ноги обнулены явно, а корпус растёт из него
-			// с полным весом.
+			// Joints are topologically ordered, one pass suffices; only a ZERO parent zeroes its
+			// child - the damped hips must not mute the torso growing out of them.
 			var parents = character.Skeleton.Parents;
 			for (int i = 0; i < count; i++)
 			{
@@ -231,15 +211,8 @@ public sealed partial class AnimationDriver
 		character.ReactionMaskBuilt = true;
 	}
 
-	/// <summary>
-	/// Переносит позу из тел рэгдолла обратно в пространство модели.
-	///
-	/// Джойнты, у которых тела НЕТ (пальцы, кости хвоста, всё, что глубже MaxDepth), пересчитываются
-	/// от родителя по локальной TRS. Без этого они остались бы там, где их оставила анимация, -
-	/// то есть у лежащего персонажа кисти висели бы в воздухе на месте стоящей позы. Один проход по
-	/// массиву достаточен: джойнты топологически упорядочены, родитель к моменту обработки ребёнка
-	/// уже посчитан.
-	/// </summary>
+	// Joints without a body are rebuilt from parent local TRS or they'd stay in the animated pose;
+	// joints are topologically ordered, so one pass is enough.
 	private static void ReadRagdollPose(Character character, Ragdoll ragdoll)
 	{
 		if (!Matrix4x4.Invert(character.ModelToWorld, out var worldToModel))
@@ -258,14 +231,8 @@ public sealed partial class AnimationDriver
 
 		var parents = character.Skeleton.Parents;
 
-		// Поза тела Bepu ЖЁСТКАЯ - поворот и позиция, масштаб единичный, - а worldToModel несёт
-		// ОБРАТНЫЙ масштаб сущности. Голое произведение RagdollWorld * worldToModel даёт модельную
-		// матрицу с масштабом 1/scale в линейной части: позиция кости переводится в модельные
-		// единицы правильно, но каждый привязанный к кости офсет вершины раздувается в те же 1/scale
-		// раз. При масштабе лисы 0.01 это персонаж, разорванный в СТО раз (замерено headless-прогоном
-		// сцены: деформированный габарит 9501 при bind 175, и уже на ПЕРВОМ кадре физики - это не
-		// разлёт симуляции, а чистая ошибка пространства). Домножение на масштаб слева гасит его в
-		// линейной части, не трогая перевод позиции: строка трансляции у скейл-матрицы единичная.
+		// Bepu poses are rigid (unit scale) while worldToModel carries 1/scale; pre-multiplying by
+		// scale cancels it in the linear part without touching translation (its row is identity).
 		var counterScale = Matrix4x4.CreateScale(WorldScaleOf(character.ModelToWorld));
 
 		for (int i = 0; i < character.Models.Length; i++)
@@ -277,8 +244,6 @@ public sealed partial class AnimationDriver
 			}
 
 			var local = character.Locals[i];
-			// Полным именем: MathUtils есть в нескольких пространствах имён движка, и короткое имя
-			// разрешается не в то.
 			var localMatrix = MathUtils.CreateTrs(
 				local.position, local.rotation, local.scale);
 
@@ -297,12 +262,7 @@ public sealed partial class AnimationDriver
 		character.RagdollBuilt = false;
 	}
 
-	/// <summary>Совпадает ли СТРОЕНИЕ рэгдолла. Physical и ServoStrength сюда не входят: это ручки
-	/// режима, и пересобирать на них тела значило бы ронять персонажа заново на каждом кадре, пока
-	/// ползунок силы сервоприводов под курсором.</summary>
-	/// <summary>Средний масштаб трансформа - длина осей его линейной части. Средний, а не покомпонентный:
-	/// рэгдолл всё равно строится изотропным (капсула Bepu не умеет неравномерного масштаба), и
-	/// сравнивать по осям значило бы обещать точность, которой в сборке нет.</summary>
+	// Average of the axis lengths: the ragdoll is built isotropic (Bepu capsules can't scale per-axis).
 	private static float WorldScaleOf(in Matrix4x4 transform)
 	{
 		float x = new Vector3(transform.M11, transform.M12, transform.M13).Length();
@@ -312,13 +272,12 @@ public sealed partial class AnimationDriver
 		return (x + y + z) / 3f;
 	}
 
-	/// <summary>Сравнение масштабов ОТНОСИТЕЛЬНОЕ и с мёртвой зоной. Точное сравнение здесь недопустимо:
-	/// масштаб приезжает из разложения матрицы, его младшие разряды шумят на уровне 1e-7, и рэгдолл
-	/// пересобирался бы каждый кадр - то есть персонаж падал бы заново на каждом кадре, ни разу не
-	/// успев упасть.</summary>
+	// Relative compare with a dead zone: decomposed scale jitters ~1e-7 and an exact compare
+	// would rebuild the ragdoll (restart the fall) every single frame.
 	private static bool SameScale(float a, float b) =>
 		MathF.Abs(a - b) <= 1e-3f * MathF.Max(MathF.Abs(a), MathF.Abs(b));
 
+	// Structure only: Physical/ServoStrength are mode knobs, rebuilding on them would reset the fall.
 	private static bool SameRagdollSource(in RagdollComponent a, in RagdollComponent b) =>
 		string.Equals(a.RootJoint, b.RootJoint, StringComparison.Ordinal) &&
 		a.MaxDepth == b.MaxDepth && a.BoneRadius == b.BoneRadius && a.TotalMass == b.TotalMass;
@@ -333,9 +292,7 @@ public sealed partial class AnimationDriver
 		var description = BuildRagdollDescription(character, settings, WorldScaleOf(character.ModelToWorld));
 		if (description.Count < 2)
 		{
-			// Рэгдолл из одной кости - это не рэгдолл, а падающая капсула. Молча его не собираем:
-			// собранный он выглядел бы как «работает», и разбираться, почему персонаж не гнётся,
-			// пришлось бы в физике, а не в имени корневой кости.
+			// A one-bone ragdoll is just a falling capsule; refuse so a bad root joint stays visible.
 			return;
 		}
 
@@ -350,13 +307,8 @@ public sealed partial class AnimationDriver
 			System.Runtime.InteropServices.CollectionsMarshal.AsSpan(description), character.JointWorld);
 	}
 
-	/// <summary>
-	/// Колени и локти по humanoid-разметке становятся ШАРНИРАМИ (см.
-	/// <see cref="RagdollBoneDesc.HingeAxisWorld"/>): ball-socket с конусом разрешает согнуть их
-	/// назад, и упавший персонаж заламывает конечности, не нарушая ни одного предела. Ось и диапазон
-	/// считает <see cref="Ragdoll.MarkHinge"/> из позы сборки; без разметки (или с прямой в момент
-	/// сборки конечностью) сустав остаётся конусным - хуже, но не сломано.
-	/// </summary>
+	// Knees/elbows become hinges: a ball-socket cone would let them bend backwards. Axis and range
+	// come from the build pose; without an avatar the joint stays conical.
 	private static void MarkHingeBones(Character character, List<RagdollBoneDesc> description)
 	{
 		if (character.Avatar == null)
@@ -386,9 +338,8 @@ public sealed partial class AnimationDriver
 					continue;
 				}
 
-				// «Верх» - джойнт РОДИТЕЛЬСКОЙ КОСТИ РЭГДОЛЛА, а не родительский джойнт скелета:
-				// шарнир связывает именно эти два тела, и ось из пропущенного звена была бы осью
-				// не того сустава.
+				// "Upper" point is the parent RAGDOLL bone's joint, not the skeleton parent:
+				// the hinge links these two bodies, a skipped link would give the wrong axis.
 				Ragdoll.MarkHinge(ref bone,
 					character.JointWorld[description[bone.Parent].Joint].Translation,
 					character.JointWorld[bone.Joint].Translation,
@@ -400,24 +351,16 @@ public sealed partial class AnimationDriver
 		}
 	}
 
-	/// <summary>
-	/// Строит описание рэгдолла обходом скелета от корневой кости вглубь до <c>MaxDepth</c>. Костью
-	/// рэгдолла становится каждый посещённый джойнт, У КОТОРОГО ЕСТЬ РЕБЁНОК: концевые джойнты
-	/// (кончики пальцев, макушка) задают только длину родительской капсулы и своего тела не
-	/// получают - иначе у персонажа выросли бы висящие ни на чём обрубки.
-	///
-	/// Автоматика здесь допустима ровно потому, что глубину задаёт автор: это его способ сказать
-	/// «дальше кости служебные». Полный обход рига дал бы двести тел вместо двадцати.
-	/// </summary>
+	// Only visited joints WITH a child become bones; leaf joints (finger tips, head top) only
+	// set the parent capsule's length. Depth is authored via MaxDepth.
 	private static List<RagdollBoneDesc> BuildRagdollDescription(Character character,
 		in RagdollComponent settings, float worldScale)
 	{
 		var result = new List<RagdollBoneDesc>();
 		var skeleton = character.Skeleton;
 
-		// Корень рэгдолла - заданный автором, иначе таз из humanoid-разметки, иначе просто корень
-		// скелета. Последнее - именно фолбэк, а не выбор: у рига со служебным корнем («Armature»)
-		// рэгдолл от него получит лишнее звено, но это лучше, чем не собраться вовсе.
+		// Root: authored joint, else avatar hips, else skeleton root (a rig with a helper
+		// "Armature" root then gets one junk link - still better than not building at all).
 		string rootName = JointOf(character, settings.RootJoint, HumanoidBone.Hips);
 		int root = string.IsNullOrEmpty(rootName) ? 0 : skeleton.FindJoint(rootName);
 
@@ -426,19 +369,13 @@ public sealed partial class AnimationDriver
 			return result;
 		}
 
-		// Радиус капсулы каждой кости - ИЗ МЕША: средневзвешенное расстояние привязанных к джойнту
-		// вершин до оси кости. Один радиус на весь скелет (прежняя схема) не соответствует телу по
-		// построению: туловище лисы втрое толще лапы, и капсулы либо тонут в туловище (персонаж
-		// лежит наполовину В полу - замерено: таз на y=0.018 при видимой толщине корпуса ~0.15 м),
-		// либо распирают лапы. Авторское BoneRadius > 0 остаётся принудительным override на весь
-		// скелет - под риги без скин-стрима и под намеренную стилизацию.
+		// Per-bone capsule radius is measured from the mesh; authored BoneRadius > 0 forces a
+		// single radius for the whole skeleton (rigs without a skin stream, stylization).
 		float authoredRadius = settings.BoneRadius;
 		var meshRadii = authoredRadius > 0f ? [] : MeasureBoneRadii(character);
 
-		// Радиусы - в единицах МОДЕЛИ (и мешевые, и авторский: автор видит скелет в них же), в мир
-		// переводятся масштабом сущности. Длины костей приезжают из мировых матриц джойнтов, то есть
-		// уже отмасштабированными. Фолбэк - доля характерного размера скелета: масштаб моделей
-		// произволен, и любая константа осмысленна ровно для одного из них.
+		// Radii are in MODEL units and scaled to world here; bone lengths arrive already
+		// world-scaled from the joint world matrices. Fallback is relative to skeleton size.
 		float RadiusOf(int joint)
 		{
 			if (authoredRadius > 0f)
@@ -450,8 +387,7 @@ public sealed partial class AnimationDriver
 			return (measured > 1e-4f ? measured : character.Scale * 0.12f) * worldScale;
 		}
 
-		// Индекс кости рэгдолла по джойнту - чтобы найти РОДИТЕЛЬСКУЮ КОСТЬ, а не родительский
-		// джойнт: между двумя костями рэгдолла обычно есть пропущенные звенья скелета.
+		// Maps joint -> ragdoll bone: between two ragdoll bones there are usually skipped links.
 		var boneOfJoint = new Dictionary<int, int>();
 
 		var queue = new Queue<(int Joint, int Depth, int ParentBone)>();
@@ -476,20 +412,13 @@ public sealed partial class AnimationDriver
 					Parent = parentBone,
 					Radius = RadiusOf(joint),
 
-					// Запасная длина концевой кости - тоже в мире: её берут капсулы джойнтов без
-					// ребёнка (голова, кисть), и в пространстве модели она была бы в разы длиннее.
+					// Fallback length for end bones (head, hand) - in world units, like the radii.
 					Length = character.Scale * worldScale,
 
-					// Предел отклонения в суставе - не жёсткий и не свободный: 120 градусов размаха
-					// не мешают конечности лечь естественно, но не дают ей вывернуться назад через
-					// сустав, из-за чего рэгдолл выглядит сломанным, а не мёртвым.
+					// 120-degree swing: limbs can settle naturally but can't fold back through the joint.
 					SwingLimitCos = -0.5f,
 
-					// Скручивание - ДРУГАЯ степень свободы, конусом не ограниченная вовсе: без этого
-					// предела кость проворачивается вокруг себя на любой угол, формально оставаясь
-					// внутри конуса, и лапа выглядит вывернутой. 50° - примерно предел живого сустава
-					// на звено; ровно столько и остаётся, если не гнаться за анатомией конкретного
-					// рига, которой у произвольной модели всё равно нет.
+					// Twist is a separate DOF the cone never limits; ~50 deg is a plausible per-link cap.
 					TwistLimitAngle = 50f * (MathF.PI / 180f),
 				});
 			}
@@ -512,22 +441,14 @@ public sealed partial class AnimationDriver
 		return result;
 	}
 
-	/// <summary>
-	/// Толщина каждой кости ПО МЕШУ: средневзвешенное перпендикулярное расстояние от привязанных к
-	/// джойнту вершин до оси кости (джойнт → первый ребёнок), в единицах модели, в bind-позе.
-	///
-	/// Средневзвешенное, а не максимум: вершины лежат НА поверхности части тела, и их средняя
-	/// дистанция до оси - это и есть её радиус; максимум цеплял бы вершины смежных частей, слабо
-	/// привязанные к кости на стыке. Влияния легче 0.3 не считаются вовсе - вершина стыка, поровну
-	/// разделённая между двумя костями, говорит о толщине обеих хуже, чем «своя» вершина о своей.
-	/// </summary>
+	// Weighted MEAN vertex distance to the bone axis, in model units, in bind pose: a max would
+	// catch vertices of adjacent body parts. Influences below 0.3 are ignored (seam vertices).
 	private static unsafe float[] MeasureBoneRadii(Character character)
 	{
 		var skeleton = character.Skeleton;
 		int count = skeleton.JointCount;
 
-		// Модельные матрицы bind-позы. Managed-поза не годится: к моменту пересборки рэгдолла в ней
-		// уже текущий кадр клипа, и радиусы гуляли бы от позы к позе.
+		// Bind-pose matrices: the managed pose already holds the current clip frame, radii would drift.
 		var bind = new Matrix4x4[count];
 		for (int i = 0; i < count; i++)
 		{
@@ -601,8 +522,7 @@ public sealed partial class AnimationDriver
 		return radii;
 	}
 
-	/// <summary>Раскладывает общую массу по костям пропорционально ОБЪЁМУ капсулы. Поровну нельзя:
-	/// голова весила бы столько же, сколько таз, и персонаж падал бы, кувыркаясь через голову.</summary>
+	// Mass proportional to capsule volume: an equal split makes the head as heavy as the pelvis.
 	private static void DistributeMass(List<RagdollBoneDesc> bones, float totalMass)
 	{
 		if (bones.Count == 0)
@@ -629,7 +549,5 @@ public sealed partial class AnimationDriver
 			bones[i] = bone;
 		}
 	}
-
-	// --- Дебаг -------------------------------------------------------------------------------------
 
 }

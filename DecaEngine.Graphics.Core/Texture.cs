@@ -2,10 +2,7 @@ using DecaEngine.Core;
 
 namespace DecaEngine.Graphics
 {
-    /// <summary>
-    /// High-level texture class that manages both CPU and GPU resources.
-    /// This is what the user/scene should interact with.
-    /// </summary>
+    /// <summary>High-level texture that manages both CPU and GPU resources.</summary>
     public class Texture : IReleaseObject
     {
         public string Name { get; }
@@ -20,11 +17,7 @@ namespace DecaEngine.Graphics
             CpuData = cpuData;
         }
 
-        /// <summary>
-        /// Uploads the texture data from RAM to VRAM.
-        /// </summary>
-        /// <param name="api">The graphics pipeline to use for the upload.</param>
-        /// <param name="freeCpuMemory">If true, the CPU-side pixel data will be freed after upload.</param>
+        /// <summary>Uploads the texture data from RAM to VRAM.</summary>
         public void Upload(IGraphicsApi api, bool freeCpuMemory = true)
         {
             if (IsUploaded) return;
@@ -33,8 +26,7 @@ namespace DecaEngine.Graphics
 
             if (freeCpuMemory)
             {
-                // We can now free the CPU memory as the data is on the GPU
-                CpuData.Image = null; 
+                CpuData.Image = null;
                 CpuData = null;
             }
         }

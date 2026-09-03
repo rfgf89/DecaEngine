@@ -25,12 +25,7 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 	private readonly IGpuTexture? _envFactorTarget;
 	private readonly Vector4 _clearColor;
 
-	/// <summary>Инлайн-оверлей поверх геометрии (дебаг-вид проб и т.п.): рисуется в конце каждого
-	/// вида, в УЖЕ привязанный render target - оверлей честно тестируется депт-буфером сцены.
-	///
-	/// Геттер, а не значение: команды графа заморожены, но перезаписываются по InvalidateGraph -
-	/// геттер даёт вызывающему включать/выключать оверлей без пересоздания пасса (см.
-	/// GraphicsPipelineSimple.InlineOverlay). null-результат = оверлея нет.</summary>
+	// A getter, not a value: lets the caller toggle the overlay without recreating the pass.
 	private readonly Func<Action<ICommandBuffer>?>? _overlay;
 
 	public struct PassData
@@ -58,21 +53,16 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		_sky = sky;
 		_overlay = overlay;
 
-		// Тонкий G-buffer отражений (см. PipelineRenderTargets.NormalRoughnessTarget): геометрия
-		// пишет его вторым/третьим MRT-слотом. Требует офскрин-таргета. Оба таргета обязаны прийти
-		// вместе: PSO геометрии собраны под три слота (DiligentBatchRenderer.GeometryTargetFormats),
-		// и на Vulkan биндить меньше нельзя.
+		// Both reflection G-buffer targets must arrive together: geometry PSOs are built for three
+		// MRT slots, and Vulkan forbids binding fewer.
 		if (colorTarget is not null && normalRoughTarget is not null && envFactorTarget is not null)
 		{
 			_normalRoughTarget = normalRoughTarget;
 			_envFactorTarget = envFactorTarget;
 		}
 
-		// AO рисуется инлайн МЕЖДУ opaque- и transmissive-дроу (см. SsaoPassResources.
-		// WriteInlineCommands): стекло преломляет уже затенённый фон, но само экранным AO не
-		// глушится - окклюзия рассеянного амбиента к преломлённому свету неприменима. Требует
-		// refraction-пути (sceneCopy: композит читает снапшот), поэтому для swap-chain-пути
-		// игнорируется вместе с ним.
+		// AO is drawn inline between the opaque and transmissive draws, so it needs the refraction
+		// path; without a scene copy there is nothing for its composite to read.
 		_ssao = colorTarget is not null && sceneCopy is not null ? ssao : null;
 
 		_batchRenderer = batchRenderer;
@@ -82,19 +72,11 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		_depthTarget = depthTarget;
 		_clearColor = clearColor;
 
-		// Refraction-пасс имеет смысл только с явным офскрин-таргетом: back buffer свопчейна
-		// копировать нечем/незачем в этом движке, так что для swap-chain-пути sceneCopy игнорируется.
+		// Refraction needs an explicit offscreen target; the swap-chain back buffer can't be copied.
 		_sceneCopy = colorTarget is not null ? sceneCopy : null;
 	}
 
-	/// <summary>Объявляет графу таргеты, которых пасс касается (см.
-	/// <see cref="IRenderGraphBuilder.ImportTexture"/>): создаёт и владеет ими конвейер, но зная, кто
-	/// что читает и пишет, граф строит настоящие рёбра зависимостей вместо порядка добавления, а окно
-	/// отладки показывает времена жизни и вес ресурсов кадра.
-	///
-	/// Собственные таргеты AO/GTAO сюда не попадают намеренно: они целиком внутри ЭТОГО пасса
-	/// (композит рисуется инлайн, см. SsaoPassResources.WriteInlineCommands), и графу от их
-	/// объявления ни зависимостей, ни времён жизни не прибавится.</summary>
+	// The AO/GTAO targets are deliberately not declared: they live entirely inside this pass.
 	public override PassData Setup(IRenderGraphBuilder builder)
 	{
 		if (_colorTarget is not null)
@@ -109,8 +91,7 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 
 		if (_sceneCopy is not null)
 		{
-			// И пишется (снимок opaque-сцены), и читается - transmissive-материалы сэмплируют его
-			// как "_SceneColor".
+			// Both written (opaque snapshot) and read: transmissive materials sample it as _SceneColor.
 			var sceneCopy = builder.ImportTexture(_sceneCopy);
 			builder.WriteTarget(sceneCopy);
 			builder.ReadTarget(sceneCopy);
@@ -133,9 +114,8 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 
 		var punctualViews = _renderScene;
 
-		// Тени punctual-светов - ДО привязки цветового таргета: каждый слайс биндит свой depth-слайс
-		// массива теней. Петля фиксированная по ВСЕМ слайсам (команды замороженные): мёртвый слайс
-		// несёт drawCount = 0 и рисует пусто (см. PunctualShadowScheduler).
+		// Punctual shadows before any color target is bound: each slice binds its own depth slice.
+		// The loop covers all slices because commands are frozen; unused ones draw nothing.
 		if (punctualViews.IsCreated)
 		{
 			_batchRenderer.SetupPunctualShadowMatrices(cmd, punctualViews.punctualShadowMatrices);
@@ -150,8 +130,7 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				_batchRenderer.ExecuteDrawPunctualShadow(cmd, sliceCull, s);
 			}
 
-			// Всегда, даже без единого нарисованного слайса: текстура объявлена в PS безусловно,
-			// лейаут обязан быть валиден.
+			// Unconditional: the PS declares the texture always, so its layout must be valid.
 			_batchRenderer.TransitionPunctualShadowsForRead(cmd);
 		}
 
@@ -160,19 +139,31 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 
 		if (renderColor is not null)
 		{
-			cmd.SetRenderTarget(renderColor, renderDepth);
+			// Bind the G-buffer before clearing it: on Vulkan an unbound clear goes through
+			// vkCmdClearColorImage, which wants TRANSFER_DST and trips VUID-...-imageLayout-00004.
+			if (_normalRoughTarget is not null)
+			{
+				cmd.SetRenderTargets([renderColor, _normalRoughTarget, _envFactorTarget!], renderDepth);
+			}
+			else
+			{
+				cmd.SetRenderTarget(renderColor, renderDepth);
+			}
+
 			cmd.ClearRenderTarget(renderColor, _clearColor);
 			if (renderDepth is not null)
 			{
 				cmd.ClearDepthStencil(renderDepth, ClearDepthStencilFlags.Depth, 0.0f, 0);
 			}
 
-			// G-buffer отражений чистится нулями: нуль в w EnvFactor - «lit-путь не прошёл», такие
-			// пиксели SSR-композит не трогает (небо, режимы превью без PBR).
+			// Cleared to zero: w == 0 in EnvFactor means "no lit path", and SSR skips those pixels.
 			if (_normalRoughTarget is not null)
 			{
 				cmd.ClearRenderTarget(_normalRoughTarget, Vector4.Zero);
 				cmd.ClearRenderTarget(_envFactorTarget!, Vector4.Zero);
+
+				// Sky/AO/overlays use single-target PSOs; the MRT triple is rebound before batch draws.
+				cmd.SetRenderTarget(renderColor, renderDepth);
 			}
 		}
 		else
@@ -186,34 +177,28 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 		var views = _renderScene;
 		if (views.IsCreated)
 		{
-			// Пул punctual-светов кадра - один на все камеры пасса (каждая берёт свой сегмент по
-			// LightData.ClusterParams), заливается до пер-камерных диспатчей кластеризации.
+			// One light pool for all cameras; must be uploaded before the per-camera cluster dispatches.
 			_batchRenderer.SetupPunctualLights(cmd, views.punctualLights);
 
 			for (int i = 0; i < views.viewData.Capacity; i++)
 			{
-				// Свежие indirect-команды/счётчики батчей КАЖДОЙ камере: каллинг аллоцирует слоты
-				// инстансов атомарным инкрементом и без сброса копил бы их между камерами - та же
-				// аккумуляция, что мигала каскадами в ShadowPass (см. комментарий там).
+				// Per camera: culling allocates instance slots by atomic increment, and without a
+				// reset the counts would accumulate across cameras.
 				_batchRenderer.ClearIndirectDrawBuffers(cmd);
 
 				_batchRenderer.SetupViewData(cmd, ref views.viewData.GetRef(i, false));
 				_batchRenderer.SetupCullData(cmd, ref views.cullData.GetRef(i, false));
 				_batchRenderer.SetupLightData(cmd, ref views.lightData.GetRef(i, false));
 
-				// Раскладка сегмента светов ЭТОЙ камеры по фроксел-кластерам - читает свежезалитый
-				// Light-кбуфер (ClusterParams), поэтому строго после SetupLightData.
+				// Reads ClusterParams from the Light cbuffer, so strictly after SetupLightData.
 				_batchRenderer.ExecuteLightClustering(cmd);
 
-				// Фон-энвайронмент (см. SkyPassResources.Draw): в уже забинженный этим циклом render
-				// target, ДО геометрии.
 				_sky?.Draw(cmd);
 
 				var cullResult = _batchRenderer.ExecuteComputeCulling(cmd);
 
-				// PSO геометрии при G-buffer-е отражений собраны под три MRT-слота - все батч-дроу
-				// идут с привязанной тройкой, а небо/AO/оверлеи (одиночные PSO) - с одиночным
-				// таргетом; перепривязки ниже расставлены ровно по этим границам.
+				// Batch draws need the MRT triple bound, single-target PSOs need it unbound; the
+				// rebinds below sit exactly on those boundaries.
 				if (_sceneCopy is null)
 				{
 					if (_normalRoughTarget is not null)
@@ -232,15 +217,11 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 					continue;
 				}
 
-				// Refraction-пасс: сначала opaque-материалы, затем снимок цветового таргета в
-				// _sceneCopy, и только после - transmissive-материалы (см.
-				// IBatchRenderer.SetMaterialTransparent), сэмплирующие этот снимок как "сцену за
-				// стеклом" (_SceneColor в UnlitInstancedPS.hlsl). Копировать привязанный RT нельзя -
-				// таргет отвязывается на время копии и привязывается обратно.
+				// Refraction order: opaque draws, snapshot into _sceneCopy, then transmissive draws
+				// sampling that snapshot. A bound render target cannot be copied, so it is unbound.
 				//
-				// Переход снимка в ShaderResource ДО opaque-дроу обязателен: _SceneColor статически
-				// привязан в SRB всех материалов (в т.ч. opaque), и в первом кадре текстура ещё в
-				// UNDEFINED - валидация Vulkan падает на самом первом дроу, не дойдя до копии.
+				// This transition must precede the opaque draws: _SceneColor is statically bound in
+				// every material's SRB, and on frame one the texture is still UNDEFINED.
 				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
 
 				if (_normalRoughTarget is not null)
@@ -254,22 +235,9 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				cmd.CopyTexture(_colorTarget, _sceneCopy);
 				cmd.TransitionResource(_sceneCopy, ResourceState.ShaderResource);
 
-				// Экранное AO - здесь, а не пост-пассом поверх готового кадра: оценка по opaque-депту,
-				// композит в render-таргет (читает снапшот выше как _SceneTex). Сам снапшот при этом
-				// НЕ ПЕРЕСНИМАЕТСЯ, то есть transmissive-материалы преломляют кадр ДО композита AO.
-				//
-				// Раньше он переснимался - ради того, чтобы стекло преломляло уже затенённую сцену.
-				// Замерено, что это давало: на прозрачных шторах Sponza (KHR_materials_transmission,
-				// см. UnlitInstancedPS.hlsl, transmitted = lerp(backdrop, scene, scene.a)) сквозь
-				// ткань проступало AO-поле стены и арки за ней - тёмные пятна формой по арке, тем
-				// заметнее, чем контрастнее техника AO: с выключенным AO узор шторы ровный, с SSAO
-				// лёгкая грязь, с GTAO уже сплошные пятна.
-				//
-				// Пятна тут - не «слишком сильный AO», а двойной учёт: экранное AO аппроксимирует
-				// заслонённость рассеянного амбиента У ПОВЕРХНОСТИ, и переносить её на свет,
-				// прошедший сквозь материал насквозь, оснований нет. Стекло теперь преломляет
-				// незатенённый фон - это осознанный размен: контактная тень за стеклом сквозь него
-				// не видна.
+				// AO runs inline off the opaque depth. The snapshot is deliberately NOT retaken, so
+				// transmissive materials refract the pre-AO frame: screen-space AO approximates
+				// ambient occlusion at a surface and does not apply to light passing through one.
 				if (_ssao is not null)
 				{
 					_ssao.WriteInlineCommands(cmd, renderColor!, renderDepth!, _viewPortRef);
@@ -287,7 +255,6 @@ public sealed class ForwardPass : RenderGraphPass<ForwardPass.PassData>
 				cmd.SetViewport(_viewPortRef);
 				_batchRenderer.ExecuteDrawBatching(cmd, cullResult, BatchDrawFilter.TransparentOnly);
 
-				// Оверлей - одиночным PSO, см. комментарий у первой перепривязки выше.
 				if (_normalRoughTarget is not null)
 				{
 					cmd.SetRenderTarget(renderColor, renderDepth);

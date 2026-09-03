@@ -18,82 +18,52 @@ public readonly struct ModelLoadOptions
 	public bool OptimizeMesh { get; init; }
 	public bool GenerateLods { get; init; }
 
-	/// <summary>Анизотропная фильтрация (8x) для линейно-фильтруемых текстур модели. Тумблер уровня
-	/// ЗАГРУЗКИ: сэмплеры immutable и пекутся в материалы, поэтому смена настройки применяется при
-	/// следующей загрузке модели. Текстуры с авторским point-фильтром не трогает.</summary>
+	/// <summary>8x anisotropic filtering; load-time: samplers are immutable, applies on next load.</summary>
 	public bool AnisotropicFiltering { get; init; } = true;
 
-	/// <summary>Смещение выбора мип-уровня для сэмплеров текстур модели - log2 масштаба рендера при
-	/// темпоральном апскейле (см. IGraphicsApi.CreateSampler). Уровня ЗАГРУЗКИ, как и анизотропия:
-	/// сэмплеры immutable, смена масштаба подхватится при следующей загрузке модели.</summary>
+	/// <summary>Mip LOD bias for model samplers (log2 of render scale under temporal upscale); load-time.</summary>
 	public float MipLodBias { get; init; } = 0f;
 
-	/// <summary>Компилировать в пиксельные варианты фичи Lighting-превью (кейворды
-	/// FEATURE_NORMAL_MAPS/OCCLUSION/SHADOWS - см. UnlitInstancedPS.hlsl): live-тумблеры настроек
-	/// работают битами ВНУТРИ скомпилированной фичи. false - варианты без кода фич вовсе (для
-	/// потребителей без Lighting-превью).</summary>
+	/// <summary>Compile Lighting-preview feature keywords into pixel variants; live toggles then
+	/// work as bits inside the compiled feature.</summary>
 	public bool PreviewLightingFeatures { get; init; } = true;
 
-	/// <summary>Компилировать варианты с FEATURE_RT_SHADOWS (теневые лучи по TLAS, inline RayQuery -
-	/// см. UnlitInstancedPS.hlsl): вариант собирается DXC/SM6.5 вместо FXC и объявляет
-	/// RaytracingAccelerationStructure, поэтому включать можно ТОЛЬКО на устройстве с
-	/// inline-трассировкой (IGraphicsApi.RayTracing >= Inline, на практике D3D12). Тумблер уровня
-	/// ЗАГРУЗКИ, как PreviewLightingFeatures: смена перезагружает модель. Вызывающий, включивший
-	/// это, обязан привязать материалам TLAS (см. DiligentMaterial.SetAccelStructure) - иначе
-	/// коммит ресурсов упрётся в пустой дескриптор.</summary>
+	/// <summary>Compile FEATURE_RT_SHADOWS variants (DXC/SM6.5, inline RayQuery); only valid on
+	/// devices with inline ray tracing, and the caller MUST bind a TLAS to materials or resource
+	/// commit hits an empty descriptor. Load-time toggle.</summary>
 	public bool RtShadows { get; init; }
 
-	/// <summary>Компилировать пиксельные варианты с FEATURE_REFLECTION_GBUFFER (запись тонкого
-	/// G-buffer-а отражений вторым/третьим MRT-слотом - см. UnlitInstancedPS.hlsl и SsrPass).
-	/// Обязан совпадать с тем, собран ли батч-рендерер окружения под MRT
-	/// (<see cref="DecaEngine.Graphics.Diligent.DiligentBatchRenderer"/>, reflectionGbuffer):
-	/// на практике - «MSAA выключен». Тумблер уровня ЗАГРУЗКИ, как <see cref="RtShadows"/>.</summary>
+	/// <summary>Compile FEATURE_REFLECTION_GBUFFER pixel variants; must match whether the batch
+	/// renderer was built with MRT reflection slots (in practice: MSAA off). Load-time toggle.</summary>
 	public bool ReflectionGbuffer { get; init; }
 
 	public float[] LodRatios { get; init; } = DefaultLodRatios;
 
-	/// <summary>Максимальная сторона текстур материалов в пикселях; бо́льшие даунскейлятся (бокс 2x)
-	/// при фоновом декодировании. Текстуры хранятся несжатым RGBA8 с полной мип-цепочкой (~5.3
-	/// байта/пиксель), так что ассеты с сотнями 4K-текстур (Intel Sponza) без лимита кладут VRAM:
-	/// одна 4096x4096 - это ~89 МБ, с лимитом 2048 - ~22 МБ. 0 = без лимита. Потребителям с
-	/// маленьким выходом (бейкер иконок) имеет смысл ставить сильно меньше.</summary>
+	/// <summary>Max material texture side in pixels; larger ones are box-downscaled on decode
+	/// (uncompressed RGBA8 + mips is ~5.3 B/px, a 4K texture is ~89 MB). 0 = no limit.</summary>
 	public int MaxTextureSize { get; init; } = 2048;
 
-	/// <summary>Стриминг текстур: фоновая фаза загрузки не декодирует их вовсе (материалы строятся с
-	/// 1x1-филлерами), а сжатые исходники (PNG/JPG) сохраняются в
-	/// <see cref="ModelLoader.StreamedTextures"/> для фоновых декодов с горячей заменой в живых
-	/// материалах (см. DecaEngine.Editor.ECS.ModelStore). Самая дорогая CPU-фаза загрузки уходит из
-	/// критического пути: геометрия и материалы готовы почти сразу, а текстуры догружаются по
-	/// приоритету от камеры - причём модель, которую ещё никто не показывает, декодируется сразу в
-	/// целевой размер и показывается только целиком готовой (ModelStore.ModelTexturesReady).</summary>
+	/// <summary>Texture streaming: load builds materials with 1x1 fillers and keeps encoded
+	/// sources for background decode with hot swap, prioritized by camera distance.</summary>
 	public bool StreamTextures { get; init; }
 
-	/// <summary>Сторона текстур первого декода при <see cref="StreamTextures"/> (дальше качество
-	/// поднимается ступенями до <see cref="MaxTextureSize"/>).</summary>
+	/// <summary>First-decode texture side under StreamTextures; quality steps up to MaxTextureSize.</summary>
 	public int StreamInitialTextureSize { get; init; } = 64;
 
-	/// <summary>
-	/// Корень дискового кеша ассет-пайплайна ("&lt;project&gt;/EditorCache/Assets", см.
-	/// <see cref="DecaEngine.Graphics.Assets.AssetCache"/>). null/пусто - пайплайн выключен целиком
-	/// и загрузка идёт как раньше.
-	///
-	/// При ПОПАДАНИИ модель не парсится из glTF вовсе: читается .dmdl с уже подготовленной
-	/// геометрией и .dtex с блочно-сжатыми текстурами, готовыми к заливке в VRAM как есть. При
-	/// ПРОМАХЕ загрузка идёт обычным путём без единого изменения, а бейк ставится в фоновую очередь
-	/// (см. <see cref="DecaEngine.Graphics.Assets.AssetBakeQueue"/>) - то есть первое открытие
-	/// модели не становится медленнее, чем было, а все последующие становятся быстрее.
-	/// </summary>
+	/// <summary>Asset-pipeline disk cache root; null/empty disables the pipeline. On a hit the
+	/// glTF is not parsed at all (.dmdl geometry + .dtex BC textures); a miss loads normally and
+	/// queues a background bake.</summary>
 	public string CacheDirectory { get; init; } = AssetCache.DefaultRoot;
 
-	/// <summary>Качество BC-кодирования при бейке. Кодировщик managed, и BC7 на максимуме считается
-	/// ощутимо дольше - на больших сценах разница измеряется минутами фонового бейка.</summary>
+	/// <summary>BC encode quality for bakes; the managed encoder makes max-quality BC7 minutes
+	/// slower on large scenes.</summary>
 	public TextureBakeQuality BakeQuality { get; init; } = TextureBakeQuality.Balanced;
 
 	public ModelLoadOptions()
 	{
 	}
 
-	/// <summary>Кеш ассетов этой загрузки, либо null, если <see cref="CacheDirectory"/> не задан.</summary>
+	/// <summary>Asset cache for this load, or null when CacheDirectory is unset.</summary>
 	public AssetCache Cache => string.IsNullOrEmpty(CacheDirectory) ? null : new AssetCache(CacheDirectory);
 
 	/// <summary>
@@ -123,15 +93,9 @@ public readonly struct ModelLoadOptions
 			BakeQuality.ToString(), CacheDirectory ?? string.Empty);
 	}
 
-	/// <summary>
-	/// Подпись только тех полей, от которых зависит СОДЕРЖИМОЕ cooked-модели - ключ кеша (см.
-	/// <see cref="DecaEngine.Graphics.Assets.AssetCache.ModelKey"/>).
-	///
-	/// Отдельная от <see cref="Signature"/> намеренно. Та отвечает на вопрос «можно ли двум
-	/// загрузкам делить один ModelLoader» и потому включает и шейдеры, и сэмплеры, и режим
-	/// стриминга - ничего из чего в .dmdl не попадает. Считай кеш по ней - и один и тот же файл
-	/// пёкся бы заново на каждую комбинацию шейдеров превью, давая побайтово одинаковые .dmdl.
-	/// </summary>
+	/// <summary>Signature of only the fields that affect cooked-model CONTENT - the cache key.
+	/// Deliberately separate from Signature(): keying the cache on shader/sampler/streaming
+	/// fields would rebake byte-identical .dmdl files per preview-shader combination.</summary>
 	public string CookSignature()
 	{
 		var ratios = LodRatios ?? DefaultLodRatios;

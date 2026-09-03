@@ -9,15 +9,7 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// ??????? ????????? ?????? ??????????? ?????? ??????? (??????, ??????, ?????, ?????????)
-	/// ????? <see cref="AssemblyApp"/>. ??? ?? ???? ? ??? ????? ?????? ????????? ????????
-	/// ???????????? ???????, ???????????? ??????????? ?????? ????????? (<see cref="ProjectWindow"/>,
-	/// <see cref="GameViewWindow"/>, <see cref="MenuBarWindow"/>, <see cref="AssetBrowserWindow"/>).
-	/// ????? ???? ???? ?????????? ??? ?????????? ????? ? ProjectWindow, ??-?? ???? ????
-	/// "Project" ???????? ???????????? ? ?? ????????/?????? ???????, ? ?? ??? ???????????,
-	/// ???? ?? ?????? ???? ??????? ?????? ???????? ?????? ?? ???????????? ???????.
-	/// </summary>
+	/// <summary>Owns the user project's lifecycle (build, load, play, stop) via <see cref="AssemblyApp"/>.</summary>
 	public class ProjectSession
 	{
 		private AssemblyApp? _assemblyApp;
@@ -38,22 +30,18 @@ namespace DecaEngine.Editor
 
 		public string? ProjectSlnPath => _projectSlnPath;
 
-		/// <summary>???????, ?????????? .csproj ???????????? ??????? (????????, .../MyGame).</summary>
 		public string? ProjectDirectory => _projectCsprojPath is not null
 			? Path.GetDirectoryName(_projectCsprojPath)
 			: null;
 
-		/// <summary>???? ? ????? "Assets" ?????? ???????? ???????????? ???????.</summary>
 		public string? AssetsPath => ProjectDirectory is not null
 			? Path.Combine(ProjectDirectory, "Assets")
 			: null;
 
-		/// <summary>???????????? ??? ???????????? ??????? ??? ??????? ???????????? (????????, GameView).</summary>
 		public string DisplayName => _projectSlnPath is not null
 			? Path.GetFileNameWithoutExtension(_projectSlnPath)
 			: "Project";
 
-		/// <summary>?????????? ????? ????????/?????????? ??????? ???????? ?????? ???????.</summary>
 		public event Action? ProjectChanged;
 
 		public ProjectSession(IGraphicsApi graphicsApi, IRenderHandle renderHandle, EntityStore ecsWorld, SystemRoot root)
@@ -64,13 +52,7 @@ namespace DecaEngine.Editor
 			_root = root;
 		}
 
-		/// <summary>????????? ?????? ?? ?????????? ???? ? .sln (?????????? ?????, ???????? ?? MenuBarWindow).</summary>
-		/// <summary>
-		/// Платформа, под которую собирается проект пользователя. Не настройка, а СЛЕДСТВИЕ: сборка
-		/// проекта грузится В ЭТОТ ЖЕ процесс, значит обязана совпадать с ним по разрядности. Плюс
-		/// движок тянет DiligentEngine, который на AnyCPU отказывается собираться вовсе - без явной
-		/// платформы открытие проекта заканчивалось сообщением «не удалось собрать проект».
-		/// </summary>
+		/// <summary>Build platform for the user project: must match this process's bitness (the assembly loads in-process), and DiligentEngine refuses to build as AnyCPU.</summary>
 		public static string EditorPlatform =>
 			System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
 			{
@@ -79,20 +61,11 @@ namespace DecaEngine.Editor
 				_ => "x64",
 			};
 
-		/// <summary>Что подготовка нашла: пути проекта и собранная сборка, которую остаётся
-		/// загрузить.</summary>
 		private readonly record struct LoadedPaths(string SlnPath, string CsprojPath, string DllPath);
 
 		private Task<LoadedPaths>? _loadTask;
 
-		/// <summary>
-		/// Начинает открытие проекта. Тяжёлая часть - разбор csproj и ПОЛНАЯ СБОРКА проекта (он
-		/// тянет за собой два десятка проектов движка, на холодную это минуты) - уходит в фон;
-		/// завершается открытие в <see cref="PollLoad"/>, в потоке UI.
-		///
-		/// Раньше всё это шло синхронно из обработчика меню: редактор переставал рисовать кадры на
-		/// всё время сборки, и открытие проекта было неотличимо от зависания.
-		/// </summary>
+		/// <summary>Starts opening a project; the full build runs in the background and completes in <see cref="PollLoad"/> on the UI thread.</summary>
 		public void BeginLoadProject(string slnPath)
 		{
 			if (_loadTask is not null)
@@ -100,25 +73,19 @@ namespace DecaEngine.Editor
 				return;
 			}
 
-			// Остановка прежнего приложения - здесь, в UI-потоке: она трогает состояние редактора.
+			// Stop the previous app here on the UI thread: it touches editor state.
 			if (_assemblyApp is not null && _assemblyApp.State != AssemblyAppState.NotLoaded)
 			{
 				_assemblyApp.Quit();
 			}
 
 			IsBusy = true;
-			StatusMessage = "Открытие проекта: сборка...";
+			StatusMessage = "Opening project: building...";
 
 			_loadTask = Task.Run(() => PrepareProject(slnPath));
 		}
 
-		/// <summary>
-		/// Доводит начатое открытие до конца, если подготовка закончилась. Звать каждый кадр.
-		/// Возвращает true, если в этот раз открытие завершилось (успешно или нет).
-		///
-		/// Загрузка сборки, публикация путей и событие <see cref="ProjectChanged"/> живут ЗДЕСЬ, а не
-		/// в фоне: на них завязаны окна редактора, и трогать их из чужого потока нельзя.
-		/// </summary>
+		/// <summary>Finishes a started load if ready; call every frame on the UI thread (editor windows depend on it). Returns true when a load completed.</summary>
 		public bool PollLoad()
 		{
 			if (_loadTask is not { IsCompleted: true })
@@ -134,7 +101,7 @@ namespace DecaEngine.Editor
 				if (task.IsFaulted)
 				{
 					var error = task.Exception?.GetBaseException();
-					StatusMessage = $"Ошибка открытия проекта: {error?.Message}";
+					StatusMessage = $"Failed to open project: {error?.Message}";
 					EngineLog.Add(LogLevel.Error, error?.ToString() ?? "Project load failed");
 					return true;
 				}
@@ -143,7 +110,7 @@ namespace DecaEngine.Editor
 
 				if (string.IsNullOrEmpty(paths.DllPath))
 				{
-					StatusMessage = "Не удалось собрать проект (см. окно Console)";
+					StatusMessage = "Failed to build project (see the Console window)";
 					return true;
 				}
 
@@ -155,16 +122,14 @@ namespace DecaEngine.Editor
 				_projectSlnPath = paths.SlnPath;
 				_projectCsprojPath = paths.CsprojPath;
 
-				// Asset pipeline cache lives inside the opened project (see AssetCache.DefaultRoot):
-				// every ModelLoadOptions built from here on picks it up by default, so baked textures
-				// and cooked models follow the project rather than the editor install.
+				// Asset cache root follows the opened project (see AssetCache.DefaultRoot).
 				AssetCache.SetProjectRoot(ProjectDirectory);
 
-				StatusMessage = "Проект открыт, готов к запуску";
+				StatusMessage = "Project opened, ready to run";
 			}
 			catch (Exception ex)
 			{
-				StatusMessage = $"Ошибка открытия проекта: {ex.Message}";
+				StatusMessage = $"Failed to open project: {ex.Message}";
 				EngineLog.Add(LogLevel.Error, ex.ToString());
 			}
 			finally
@@ -176,8 +141,7 @@ namespace DecaEngine.Editor
 			return true;
 		}
 
-		/// <summary>Фоновая часть открытия: только файлы и процессы, ничего от редактора. Именно
-		/// поэтому её можно унести с UI-потока целиком.</summary>
+		// Background half of the load: files and processes only, no editor state.
 		private static LoadedPaths PrepareProject(string slnPath)
 		{
 			var slnDir = Path.GetDirectoryName(slnPath)!;
@@ -192,7 +156,7 @@ namespace DecaEngine.Editor
 				{
 					csprojPath = Directory.GetFiles(slnDir, "*.csproj", SearchOption.AllDirectories)
 						.FirstOrDefault(p => !Path.GetFileNameWithoutExtension(p).EndsWith(".Assembly", StringComparison.OrdinalIgnoreCase))
-						?? throw new FileNotFoundException("Не найден .csproj игрового проекта рядом с .sln", slnPath);
+						?? throw new FileNotFoundException("Game project .csproj not found next to the .sln", slnPath);
 				}
 			}
 
@@ -206,8 +170,9 @@ namespace DecaEngine.Editor
 				EditorBuilder.AttachEngineReferences(runnableCsprojPath);
 			}
 
+			// rebuild: a stale dll from an older engine loads fine, then crashes on first call in.
 			var outputs = CsprojOutputResolver.GetBuildOutputs(runnableCsprojPath,
-				buildIfMissing: true, platform: EditorPlatform);
+				buildIfMissing: true, platform: EditorPlatform, rebuild: true);
 			var assemblyName = Path.GetFileNameWithoutExtension(runnableCsprojPath);
 			var dllPath = outputs.FirstOrDefault(p =>
 				string.Equals(Path.GetFileNameWithoutExtension(p), assemblyName, StringComparison.OrdinalIgnoreCase) &&
@@ -216,8 +181,7 @@ namespace DecaEngine.Editor
 			return new LoadedPaths(slnPath, csprojPath, dllPath ?? string.Empty);
 		}
 
-		/// <summary>Синхронное открытие - для кода без кадрового цикла (командная строка, проверки).
-		/// В редакторе пользоваться им НЕЛЬЗЯ: он снова заморозит кадры на всё время сборки.</summary>
+		/// <summary>Synchronous load for non-frame-loop callers only; in the editor it would freeze rendering for the whole build.</summary>
 		public void LoadProject(string slnPath)
 		{
 			BeginLoadProject(slnPath);
@@ -268,4 +232,3 @@ namespace DecaEngine.Editor
 		}
 	}
 }
-

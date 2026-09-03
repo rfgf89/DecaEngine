@@ -16,12 +16,10 @@ public class GraphicsPipeline : IGraphicsPipeline
 
 	private Ref<Vector2> _viewPortRef;
 
-	// Живёт дольше графа: ShadowPass пересоздаётся каждым SignalGraph, а расписание каскадов
-	// делится с системой сборки видов (см. ShadowCascadeSchedule).
+	// Outlives the graph: ShadowPass is recreated on every SignalGraph.
 	private readonly ShadowCascadeSchedule _cascadeSchedule = new();
 
-	/// <summary>Расписание перерисовки теневых каскадов этого конвейера - его маску кадра пишет
-	/// CullingAndRenderSystem, а читает колбэк <see cref="ShadowPass"/> при реплее.</summary>
+	/// <summary>Shadow cascade redraw schedule; written by the culling system, read by ShadowPass.</summary>
 	public ShadowCascadeSchedule CascadeSchedule => _cascadeSchedule;
 
 	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer, string? debugName = null)
@@ -29,15 +27,7 @@ public class GraphicsPipeline : IGraphicsPipeline
 	{
 	}
 
-	/// <summary>
-	/// Overload for a self-contained, off-screen render-graph instance (e.g.
-	/// <see cref="DecaEngine.Editor.ModelPreviewViewport"/>'s isolated .gltf/.glb preview render
-	/// graph used by the Inspector) that writes into its own persistent <paramref name="colorTarget"/>
-	/// / <paramref name="depthTarget"/> instead of the swap chain, and doesn't need the swap-chain
-	/// resize hookup or the render-graph-debugger demo passes.
-	/// </summary>
-	/// <param name="debugName">Имя конвейера в окне отладки рендер-графа (см.
-	/// <see cref="GraphicsPipelineRegistry"/>). Null - имя по умолчанию, по режиму конвейера.</param>
+	/// <summary>Off-screen overload: renders into its own targets instead of the swap chain.</summary>
 	public GraphicsPipeline(IGraphicsApi api, IBatchRenderer batchRenderer, IGpuTexture? colorTarget, IGpuTexture? depthTarget, Vector4 clearColor, string? debugName = null)
 	{
 		_api = api;
@@ -57,15 +47,12 @@ public class GraphicsPipeline : IGraphicsPipeline
 			_api.WindowHandle.OnWindowResize += OnViewportChange;
 		}
 
-		// Конвейер сам встаёт в реестр - окно отладки рендер-графа набирает свой список именно так
-		// (см. GraphicsPipelineRegistry). Реестр держит слабую ссылку и жизнь конвейера не продлевает.
+		// The registry holds a weak reference and does not extend the pipeline's lifetime.
 		GraphicsPipelineRegistry.Register(this,
 			debugName ?? (_colorTarget is null ? "Main Scene (swap chain)" : "Offscreen (GraphicsPipeline)"));
 	}
 
-	/// <summary>Убирает конвейер из <see cref="GraphicsPipelineRegistry"/>, чтобы он пропал из окна
-	/// отладки сразу, как только перестал использоваться. Не обязателен - реестр держит слабую
-	/// ссылку, - но избавляет UI от мёртвой строки до ближайшей сборки мусора.</summary>
+	/// <summary>Removes the pipeline from <see cref="GraphicsPipelineRegistry"/> and frees the graph.</summary>
 	public void Release()
 	{
 		GraphicsPipelineRegistry.Unregister(this);
@@ -77,17 +64,8 @@ public class GraphicsPipeline : IGraphicsPipeline
 		_viewPortRef.Set(_api.WindowHandle.Size);
 	}
 
-	/// <summary>
-	/// Updates the render viewport for off-screen consumers (<see cref="_colorTarget"/> not null),
-	/// which don't get <see cref="OnViewportChange"/> from <see cref="IWindowHandle.OnWindowResize"/>
-	/// - callers must resize <see cref="_colorTarget"/>/<see cref="_depthTarget"/> themselves and then
-	/// call this so <see cref="ForwardPass"/>'s viewport (<see cref="_viewPortRef"/>) matches.
-	///
-	/// Also invalidates the render graph (<see cref="IRenderGraph.Invalidate"/>): resizing disposes
-	/// and recreates the native textures behind <see cref="_colorTarget"/>/<see cref="_depthTarget"/>,
-	/// but the graph's compiled/frozen commands still reference the old native objects until it
-	/// recompiles - without this, replaying those frozen commands touches disposed GPU resources.
-	/// </summary>
+	/// <summary>Updates the viewport for off-screen consumers; callers must resize the targets first.
+	/// Invalidates the graph, whose frozen commands would otherwise touch disposed textures.</summary>
 	public void SetOffscreenViewportSize(Vector2 size)
 	{
 		var change = _viewPortRef.Value != size;
@@ -98,25 +76,8 @@ public class GraphicsPipeline : IGraphicsPipeline
 		}
 	}
 
-	/// <summary>
-	/// Forces the render graph to re-record its frozen command buffers on the next
-	/// <see cref="Execute"/>. Passes record their draw/dispatch commands only during
-	/// <see cref="IRenderGraph.Compile"/> and are then merely replayed (see
-	/// <see cref="IRenderGraph.Invalidate"/>) - so after the batch set changes (new meshes/batches
-	/// registered in the <see cref="IBatchRenderer"/>, e.g. a different model or sub-mesh loaded
-	/// into an off-screen preview) the frozen commands silently keep drawing the OLD batch set;
-	/// callers that mutate batches must invalidate, or the new geometry never appears.
-	///
-	/// Recompiling disposes every native resource pinned by a pass (e.g. <see cref="ShadowPass"/>'s
-	/// shadow maps - see <c>RenderGraphNode.Clean</c>) and immediately recreates them. Just like
-	/// <see cref="SetOffscreenViewportSize"/>'s render-target resize, doing that while the GPU may
-	/// still be reading/writing those resources from a prior frame (this engine has no
-	/// frame-in-flight fence) races the GPU and can crash the driver - so callers must flush and wait
-	/// for the GPU to go idle (on their backend-specific device context) themselves before calling
-	/// this, exactly as <see cref="DecaEngine.Editor.ModelPreviewViewport"/>'s resize path already
-	/// does. This class only sees the backend through <see cref="IGraphicsApi"/>, so it cannot do
-	/// that synchronization itself.
-	/// </summary>
+	/// <summary>Forces the graph to re-record frozen commands; mandatory after the batch set changes.
+	/// There is no frame-in-flight fence, so callers must wait for GPU idle before calling this.</summary>
 	public void InvalidateGraph()
 	{
 		_renderGraph.Invalidate();
@@ -128,26 +89,8 @@ public class GraphicsPipeline : IGraphicsPipeline
 
 	public void SignalGraph(DirectionalLightCascadeData renderScene, RenderCamerasData renderViews)
 	{
-		// ResetPasses, а не Release: пассы пересоздаются, а нативные ресурсы графа переиспользуются
-		// (см. IRenderGraph.ResetPasses).
+		// ResetPasses, not Release: passes are rebuilt but the graph's native resources are reused.
 		_renderGraph.ResetPasses();
-
-		/*if (_colorTarget is null)
-		{
-			// NOTE: each ClearRenderTargetPass must get a *unique* pinned-texture name. PinTexture
-			// dedups by name, so reusing the same literal (as this used to do) silently collapses all
-			// 4 instances into writes against a single shared texture instead of 4 independent ones.
-			_renderGraph.AddPass(new ClearRenderTargetPass("ClearRenderTarget_0"));
-			_renderGraph.AddPass(new ClearRenderTargetPass("ClearRenderTarget_1"));
-			_renderGraph.AddPass(new ClearRenderTargetPass("ClearRenderTarget_2"));
-			_renderGraph.AddPass(new ClearRenderTargetPass("ClearRenderTarget_3"));
-
-			// Demo consumer: without this, ClearRenderTarget_0's texture is written once and never
-			// read again, so it correctly (and expectedly) shows a single-pass lifetime in the render
-			// graph debugger - that's not a deallocation bug, there's simply no reader. Declaring a
-			// read here lets its lifetime genuinely span from this pass to the read below.
-			_renderGraph.AddPass(new ReadRenderTargetPass("ReadClearRenderTarget_0", "ClearRenderTarget_0"));
-		}*/
 
 		_renderGraph.AddPass(new ShadowPass(_batchRenderer, renderScene, _cascadeSchedule));
 		_renderGraph.AddPass(new ForwardPass(_batchRenderer, renderViews, _viewPortRef, _colorTarget, _depthTarget, _clearColor));

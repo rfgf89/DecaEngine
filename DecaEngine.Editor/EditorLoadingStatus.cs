@@ -81,19 +81,11 @@ namespace DecaEngine.Editor
 			ImGui.SetNextWindowPos(pos);
 			ImGui.SetNextWindowSize(size);
 			ImGui.SetNextWindowBgAlpha(0.95f);
-			// С ImGuiConfigFlags.ViewportsEnable (см. ImGuiManager) любое недокнутое top-level окно по
-			// умолчанию превращается в СВОЁ отдельное нативное OS-окно вместо отрисовки поверх главного.
-			// Явно привязываем окно к главному viewport, чтобы оно рисовалось внутри него, а не улетало
-			// отдельным окном за пределы основного.
+			// With ViewportsEnable, an undocked top-level window becomes its own OS window;
+			// pin it to the main viewport so it draws inside it.
 			ImGui.SetNextWindowViewport(viewport.ID);
-			// Пересоздаётся только пока есть активные задачи (см. ранний return выше), а не каждый
-			// кадр - поэтому ImGui не считает её "новым" окном при повторном появлении и не поднимает
-			// её в топ z-порядка сама. Без явного фокуса любой клик по докнутым окнам редактора поднимал
-			// их группу выше, и бар пропадал за основным UI.
-			//
-			// НО: при ОТКРЫТОМ попапе фокус красть нельзя - ImGui закрывает модалку в тот же кадр,
-			// когда фокус уходит окну вне попап-стека. Пока шла любая загрузка (бейк иконок, превью),
-			// бар «убивал» Settings/New Project мгновенно после открытия - окна просто не появлялись.
+			// Explicit focus keeps the bar above docked windows, but stealing focus while a
+			// popup is open closes the modal the same frame - so skip it then.
 			if (!ImGui.IsPopupOpen("", ImGuiPopupFlags.AnyPopupId | ImGuiPopupFlags.AnyPopupLevel))
 			{
 				ImGui.SetNextWindowFocus();

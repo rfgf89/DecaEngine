@@ -31,8 +31,8 @@ struct DrawData
 {
     float4 positionScale;
     float4 orientation;
-    // xyz - покомпонентный масштаб (зеркало DrawData.cs): центр кулинг-сферы обязан масштабироваться
-    // им, а не максимумом из positionScale.w - см. комментарий в C#-структуре.
+    // xyz = per-component scale (mirrors DrawData.cs); the culling sphere centre must scale by this,
+    // not by the max in positionScale.w.
     float4 scale3;
 };
 
@@ -77,44 +77,39 @@ struct LightData
     float4 CascadeSizes;
     float4 CascadeNearPlanes;
 
-    // Кластеризованные punctual-света этой камеры: x - офсет сегмента камеры в пуле PunctualLights,
-    // y - число светов сегмента, z/w - zNear/zFar экспоненциальных срезов кластерной сетки.
-    // y == 0 - punctual-светов нет (превью, теневые каскады), кластерная ветка мёртвая.
+    // x = this camera's segment offset in the PunctualLights pool, y = its light count (0 disables
+    // the clustered branch), zw = zNear/zFar of the exponential cluster slices.
     float4 ClusterParams;
 };
 
 // ----- Clustered punctual lights (point/spot) ----------------------------------------------------
-// Фроксел-сетка вьюпорта: CLUSTER_GRID_X * CLUSTER_GRID_Y тайлов экрана, CLUSTER_GRID_Z
-// экспоненциальных срезов глубины. Зеркалит LightClusters (LightData.cs) - менять только парой.
+// Froxel grid: screen tiles x exponential depth slices. Mirrors LightClusters (LightData.cs) - change both.
 #define CLUSTER_GRID_X 16
 #define CLUSTER_GRID_Y 8
 #define CLUSTER_GRID_Z 24
 #define CLUSTER_COUNT (CLUSTER_GRID_X * CLUSTER_GRID_Y * CLUSTER_GRID_Z)
 #define CLUSTER_MAX_LIGHTS 32
-// Тредов в группе кластеризации (LightClusterCS.hlsl): один тред - один кластер, и он же за батч
-// подтягивает один свет в groupshared. Зеркалит LightClusters.CullGroupSize - им же считается
-// число групп в ExecuteLightClustering.
+// One thread per cluster; mirrors LightClusters.CullGroupSize, which sizes the dispatch.
 #define CLUSTER_CULL_GROUP 64
 #define PUNCTUAL_SHADOW_SLICES 16
-// Сторона одного слайса теней punctual-света. Зеркалит LightClusters.ShadowMapSize (LightData.cs) -
-// у каскадов солнца своё разрешение (4096), так что общей константы на все тени нет.
+// Mirrors LightClusters.ShadowMapSize; sun cascades use their own resolution.
 #define PUNCTUAL_SHADOW_MAP_SIZE 1024.0
 
-// Зеркало PunctualLight (LightData.cs): позиция/направление МИРОВЫЕ, кластеризация переводит их во
-// view сама (LightClusterCS.hlsl), шейдинг работает в мировом пространстве (UnlitInstancedPS.hlsl).
+// Mirrors PunctualLight (LightData.cs). Positions and directions are WORLD space; clustering
+// converts to view itself, shading stays in world space.
 struct PunctualLight
 {
-    float4 PositionRange;  // xyz - мировая позиция, w - радиус действия
-    float4 ColorIntensity; // rgb - линейный цвет, w - интенсивность
-    float4 DirectionType;  // xyz - мировое направление конуса (спот), w - тип: 0 point, 1 spot
-    float4 SpotAngles;     // x - cos внешнего полуугла, y - 1/(cosInner-cosOuter), z - sin внешнего
-    float4 ShadowParams;   // x - первый слайс тени (-1 = нет; точечный: 6 граней подряд), y - сила,
-                           // z - ближняя плоскость слайса (far = PositionRange.w),
-                           // w - мировой радиус светящегося тела (0 = дефолт, полутень PCSS)
+    float4 PositionRange;  // xyz = world position, w = range
+    float4 ColorIntensity; // rgb = linear color, w = intensity
+    float4 DirectionType;  // xyz = world cone direction, w = type: 0 point, 1 spot
+    float4 SpotAngles;     // x = cos outer half-angle, y = 1/(cosInner-cosOuter), z = sin outer
+    float4 ShadowParams;   // x = first shadow slice (-1 = none; point lights use 6 in a row),
+                           // y = strength, z = slice near plane (far = PositionRange.w),
+                           // w = world radius of the emitter (0 = default PCSS penumbra)
 };
 
-// Плоский индекс кластера: тайлы экрана идут строками, срезы глубины - самым старшим измерением.
-// ОБЩАЯ для записи (LightClusterCS) и чтения (UnlitInstancedPS) - раскладка обязана совпадать.
+// Flat cluster index: screen tiles by rows, depth slices as the outermost dimension. Shared by the
+// writer (LightClusterCS) and the reader (UnlitInstancedPS) - the layout must match.
 uint ClusterFlatIndex(uint3 c)
 {
     return (c.z * CLUSTER_GRID_Y + c.y) * CLUSTER_GRID_X + c.x;

@@ -1,10 +1,4 @@
-// Дебаг-вид probe-GI: сфера-октаэдр на каждую пробу, В ФАКТИЧЕСКОЙ позиции - узел сетки плюс
-// смещение релокации из атласа (см. ProbeGiBakeResult.Offset). Ровно для того и рисуется: глазами
-// проверить, вышли ли пробы из стен и колонн, и увидеть, ЧТО каждая из них накопила.
-//
-// Ни вершинного, ни индексного буфера, ни инстансинга: один Draw(24 * probeCount), номер пробы и
-// угол октаэдра восстанавливаются из SV_VertexID. Октаэдр - минимальный многогранник, читающийся
-// как «шарик» (8 треугольников); на тысячах проб это единственно разумная цена.
+// No vertex/index buffer: one Draw(24 * probeCount), probe and corner come from SV_VertexID.
 #include "Instancing.hlsl"
 
 cbuffer View
@@ -14,19 +8,16 @@ cbuffer View
 
 cbuffer ProbeDebugParams
 {
-    // xyz = угол сетки в мире, w = радиус сферы в мировых единицах.
+    // xyz = grid origin in world, w = sphere radius in world units.
     float4 DebugGridOrigin;
-    // xyz = шаг сетки проб, w = число проб.
+    // xyz = probe grid step, w = probe count.
     float4 DebugGridCell;
-    // xyz = размер сетки проб.
+    // xyz = probe grid size.
     float4 DebugGridCounts;
-    // xyz = цветовая метка объёма.
+    // xyz = volume color tag.
     float4 DebugTint;
 };
 
-// Буфера углов кирпичей здесь больше нет: у плотной сетки координаты узла ЕСТЬ номер шарика.
-
-// Атласы проб: смещение релокации, поле L0 (цвет) и валидность (альфа Sh1).
 Texture2D _ProbeOffset;
 Texture2D _ProbeSh0;
 Texture2D _ProbeSh1;
@@ -35,16 +26,14 @@ struct PSInput
 {
     float4 pos      : SV_POSITION;
     float3 normal   : NORMAL;
-    // rgb = SH L0 пробы (что она накопила), a = валидность (0 = проба считает себя в стене).
+    // rgb = probe SH L0, a = validity (0 = probe considers itself inside geometry).
     float4 color    : COLOR0;
-    // Длина смещения релокации в долях радиуса - PS подкрашивает переехавшие пробы.
+    // Relocation offset length in fractions of the radius.
     float  offsetLen : TEXCOORD0;
-    // Цветовая метка объёма (см. DebugTint).
     float3 tint      : TEXCOORD1;
 };
 
-// Октаэдр из 8 треугольников: 6 вершин ±X/±Y/±Z, обход наружу. Нормаль на дебаг-шарике берётся
-// по позиции вершины - для гранёного «шарика» этого достаточно.
+// Octahedron of 8 triangles, outward winding.
 static const float3 OctaVerts[24] =
 {
     float3(0, 1, 0), float3(1, 0, 0), float3(0, 0, 1),
@@ -57,7 +46,7 @@ static const float3 OctaVerts[24] =
     float3(0, -1, 0), float3(1, 0, 0), float3(0, 0, -1),
 };
 
-// Тексель пробы - зеркало ProbeGiBaker.ProbeTexel / ProbeAtlasTexel в ProbeRoundCS.hlsl.
+// Mirrors ProbeGiBaker.ProbeTexel / ProbeAtlasTexel in ProbeRoundCS.hlsl.
 int2 DebugProbeTexel(uint probe)
 {
     uint width = max((uint)DebugGridCounts.x, 1u);
@@ -69,8 +58,7 @@ PSInput Main(uint vid : SV_VertexID)
     uint probe = vid / 24;
     uint corner = vid - probe * 24;
 
-    // Мировая позиция узла - зеркало mainProbe в ProbeRoundCS.hlsl: номер шарика есть индекс
-    // хранения, а объём неподвижен - индекс хранения и есть координаты узла.
+    // Mirrors mainProbe in ProbeRoundCS.hlsl: the storage index doubles as grid coordinates.
     int3 counts = (int3)DebugGridCounts.xyz;
     int3 cell = int3((int)probe % counts.x, (int)probe / counts.x % counts.y,
                      (int)probe / (counts.x * counts.y));
@@ -79,7 +67,6 @@ PSInput Main(uint vid : SV_VertexID)
     float3 offset = _ProbeOffset.Load(texel).rgb;
     float3 probePos = DebugGridOrigin.xyz + (float3)cell * DebugGridCell.xyz + offset;
 
-    // Схлопывать шарик больше не за что: пустых слотов у плотной сетки нет, проба есть в каждом узле.
     float radius = DebugGridOrigin.w;
     float3 n = normalize(OctaVerts[corner]);
 

@@ -8,7 +8,6 @@ public abstract unsafe class RenderGraphPass<T>() : IRenderGraphPass
 {
 	public abstract string Name { get; }
 
-	/// <summary>См. <see cref="IRenderGraphPass.Enabled"/>. По умолчанию включён.</summary>
 	public bool Enabled { get; set; } = true;
 
 	private T _passData;
@@ -37,14 +36,8 @@ public interface IRenderGraphPass
 {
 	public string Name { get; }
 
-	/// <summary>Исполнять ли пасс. Учитывается при КОМПИЛЯЦИИ: выключенный пасс не проходит сетап, не
-	/// участвует в графе зависимостей и не пишет команд - для графа его просто нет. Поэтому переходы
-	/// состояний ресурсов расставляются между оставшимися пассами и выключать можно ЛЮБОЙ пасс,
-	/// включая структурные.
-	///
-	/// Смена значения помечает граф на перекомпиляцию (см. IRenderGraph.SetPassEnabled). Она дешёвая:
-	/// нативные текстуры и буферы переиспользуются из пула графа, пересобираются только командные
-	/// буферы - см. IRenderGraph.TrimResourcePool о том, где VRAM реально возвращается.</summary>
+	/// <summary>Whether to run the pass; honoured at compile time, so a disabled pass is absent from
+	/// the graph entirely and resource transitions are placed between the surviving passes.</summary>
 	public bool Enabled { get; set; }
 
 	public void SetupPassData(IRenderGraphBuilder builder);
@@ -84,15 +77,8 @@ public interface IRenderGraphBuilder
 
 	TextureResource PinTexture(TextureInfo info);
 
-	/// <summary>Объявляет графу УЖЕ СУЩЕСТВУЮЩИЙ таргет, созданный вне его (офскрин-таргеты конвейера,
-	/// собственные таргеты пассов - см. <see cref="PipelineRenderTargets"/>, <see cref="SsaoPassResources"/>).
-	/// Граф его не создаёт и не освобождает - он лишь узнаёт, кто его читает и пишет, и потому может
-	/// строить настоящие рёбра зависимостей вместо порядка добавления, а окно отладки - показывать
-	/// времена жизни и вес ресурсов кадра. Дальше с ним работают как с любым другим:
-	/// <see cref="ReadTarget"/>/<see cref="WriteTarget"/>.
-	///
-	/// Повторный импорт того же таргета в другом пассе - норма и обязателен: именно из повторов и
-	/// складывается граф. Вернёт тот же ресурс.</summary>
+	/// <summary>Declares an externally owned target to the graph; the graph never creates or releases
+	/// it. Re-importing the same target from another pass is required - that is what builds the edges.</summary>
 	TextureResource ImportTexture(IGpuTexture texture);
 
 	BufferResource PinBuffer(BufferInfo bufferInfo);
@@ -105,25 +91,12 @@ public interface IRenderGraphContext
 {
 	IGraphicsApi Api { get; }
 
-	/// <summary>
-	/// Wraps a texture pinned/read via <see cref="IRenderGraphBuilder.ReadTarget"/> (or written via
-	/// <see cref="IRenderGraphBuilder.WriteTarget"/>) as an <see cref="IGpuTexture"/>, so it can be
-	/// bound into materials (<see cref="IMaterialObject.SetTexture"/>/<see cref="IComputeMaterial.SetTexture"/>)
-	/// or passed to <see cref="ICommandBuffer"/> calls exactly like any other engine texture.
-	/// Must be called from within a pass's Execute, after the graph has allocated the resource.
-	/// The graph owns the returned wrapper's underlying native resource: never call
-	/// <see cref="IReleaseObject.Release"/> on it, the render graph releases it on <c>Clean</c>.
-	/// </summary>
+	/// <summary>Wraps a graph texture as an <see cref="IGpuTexture"/>; call only from a pass's Execute
+	/// and never Release the result - the graph owns it.</summary>
 	IGpuTexture GetTexture(TextureResource textureResource);
 
-	/// <summary>
-	/// Wraps a buffer pinned via <see cref="IRenderGraphBuilder.PinBuffer"/> as an <see cref="IBufferHandle"/>,
-	/// so it can be bound into materials, vertex/index buffer slots, or any other <see cref="ICommandBuffer"/>
-	/// call that expects an <see cref="IBufferHandle"/>.
-	/// Must be called from within a pass's Execute, after the graph has allocated the resource.
-	/// The graph owns the returned wrapper's underlying native resource: never call
-	/// <see cref="IReleaseObject.Release"/> on it, the render graph releases it on <c>Clean</c>.
-	/// </summary>
+	/// <summary>Wraps a graph buffer as an <see cref="IBufferHandle"/>; call only from a pass's Execute
+	/// and never Release the result - the graph owns it.</summary>
 	IBufferHandle GetBuffer(BufferResource bufferResource);
 
 	public ICommandBuffer cmd { get; }
@@ -135,54 +108,29 @@ public interface IRenderGraph : IReleaseObject
 
 	void Compile();
 
-	/// <summary>
-	/// Forces the next <see cref="Execute"/> to recompile before running. Passes record their
-	/// commands (and capture the native resource references they transition, e.g.
-	/// <c>ForwardPass</c>'s color/depth target) only during <see cref="Compile"/>, then get frozen
-	/// and merely replayed on every subsequent <see cref="Execute"/> - so if a pinned resource is
-	/// disposed and recreated later (e.g. an off-screen render target resized to match its ImGui
-	/// panel), the frozen commands would otherwise keep referencing the stale, disposed object.
-	/// Call this after any such resource is resized/recreated so the graph re-records against the
-	/// new one.
-	/// </summary>
+	/// <summary>Forces a recompile before the next <see cref="Execute"/>; mandatory after any pinned
+	/// resource is resized or recreated, since frozen commands hold its native reference.</summary>
 	void Invalidate();
 
-	/// <summary>Включает/выключает пасс ПО ИМЕНИ (<see cref="IRenderGraphPass.Name"/>) на уже
-	/// собранном графе. Изменение значения помечает граф на перекомпиляцию - выключенный пасс
-	/// исключается из графа целиком, вместе со своими переходами состояний, так что тумблер
-	/// безопасен для любого пасса (см. <see cref="IRenderGraphPass.Enabled"/>).
-	/// Возвращает false, если пасса с таким именем в графе нет.</summary>
+	/// <summary>Toggles a pass by name on an already built graph; false if no such pass exists.</summary>
 	bool SetPassEnabled(string name, bool enabled);
 
-	/// <summary>Сносит СПИСОК ПАССОВ (в отличие от <see cref="IReleaseObject.Release"/> - нативные
-	/// ресурсы при этом уходят в пул и переживут пересборку). Именно этим пользуется конвейер, когда
-	/// пересобирает граф под новую сцену или новый набор фич: пассы создаются заново, а текстуры,
-	/// буферы и вьюхи переиспользуются, пока совпадают их дескрипторы.
-	/// Вызывающий обязан гарантировать, что кадры со старыми командами уже не в полёте.</summary>
+	/// <summary>Drops the pass list, keeping native resources pooled; caller must ensure no frame with
+	/// the old commands is still in flight.</summary>
 	void ResetPasses();
 
-	/// <summary>Освобождает нативные ресурсы, лежащие в пуле и не востребованные текущей компиляцией,
-	/// - то есть VRAM выключенных фич и таргетов старого размера. Держать их в пуле дёшево по
-	/// времени, но не по памяти: этот метод - точка, где вызывающий решает, что пора отдать.
-	/// Вызывающий обязан дождаться GPU (Flush + WaitForIdle).</summary>
+	/// <summary>Frees pooled native resources unused by the current compile; caller must Flush + WaitForIdle first.</summary>
 	void TrimResourcePool();
 
-	/// <summary>Имена пассов текущего собранного графа, в порядке добавления - чтобы UI мог
-	/// показать список, а не хардкодить его.</summary>
+	/// <summary>Pass names of the current graph, in the order they were added.</summary>
 	IReadOnlyList<string> PassNames { get; }
 
 	void Execute();
 
-	/// <summary>
-	/// Debug-only snapshot of the last executed frame (per-pass timings, draw call counts,
-	/// resource lifetimes). Always null in Release builds. Populated at the end of <see cref="Execute"/>.
-	/// </summary>
+	/// <summary>Snapshot of the last executed frame; always null in Release builds.</summary>
 	RenderGraphDebugSnapshot DebugSnapshot { get; }
 
-	/// <summary>
-	/// Debug-only ring buffer of recent frame snapshots, for frame-time history graphs. Always
-	/// null in Release builds.
-	/// </summary>
+	/// <summary>Ring buffer of recent frame snapshots; always null in Release builds.</summary>
 	RenderGraphDebugHistory DebugHistory { get; }
 }
 

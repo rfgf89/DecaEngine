@@ -1,18 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<!--
-		Probe GI: CPU-бейкер с собственным BVH, GPU-путь раундов, ускоряющая структура сцены и
-		отладочная отрисовка проб.
+		Probe GI: the CPU baker with its own BVH, the GPU round path, the scene acceleration
+		structure and the debug rendering of probes.
 
-		Жил в DecaEngine.Editor - четыре с половиной тысячи строк рантайма среди окон ImGui.
-		Редактором тут не пахнет: бейкер зовут и превью модели, и вьюпорт сцены, и headless-пробы,
-		а завтра позовёт игра. Обратная сторона того же: чтобы протестировать математику веера
-		лучей, в тестовый проект приходилось тащить весь редактор целиком.
+		This used to live in DecaEngine.Editor - four and a half thousand lines of runtime among the
+		ImGui windows. Nothing about it is editor-specific: the baker is called by the model preview,
+		by the scene viewport and by the headless probes, and tomorrow it will be called by the game.
+		The flip side of the same thing: testing the ray fan math meant dragging the entire editor
+		into the test project.
 
-		Зависимость от Graphics.Diligent осознанная и временная: GPU-путь (ProbeRoundGpu,
-		ProbeRoundPipelines, ProbeSceneAccel) работает с DiligentGraphicsApi напрямую, потому что
-		вычислительных пайплайнов и структур ускорения в IGraphicsApi просто нет. Уедет, когда
-		абстракции дорастут.
+		The dependency on Graphics.Diligent is deliberate and temporary: the GPU path (ProbeRoundGpu,
+		ProbeRoundPipelines, ProbeSceneAccel) talks to DiligentGraphicsApi directly, because
+		IGraphicsApi simply has no compute pipelines or acceleration structures. It will go away once
+		the abstractions catch up.
 	-->
 	<ItemGroup>
 		<ProjectReference Include="..\DecaEngine.Core\DecaEngine.Core.csproj" />

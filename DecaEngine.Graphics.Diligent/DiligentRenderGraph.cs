@@ -14,19 +14,16 @@ public sealed class DiligentRenderGraph : IRenderGraph
 
 	private readonly List<DiligentRenderGraphContext> _graphContext = new();
 
-	/// <summary>Свободные контексты записи, оставшиеся от прошлой сборки графа - см. <see cref="AddPass"/>.</summary>
+	// Recording contexts left over from the previous graph build.
 	private readonly List<DiligentRenderGraphContext> _contextPool = new();
 
 	private readonly List<PassData> _passes = new();
 
-	/// <summary>Индексы в <see cref="_passes"/> тех пассов, что попали в ТЕКУЩУЮ компиляцию, то есть
-	/// включённых. Всё остальное (сетап, зависимости, топосортировка, запись команд, проигрывание)
-	/// работает в ЛОКАЛЬНОЙ нумерации - по позиции в этом списке. Именно поэтому выключенный пасс
-	/// безопасен: его для графа просто не существует, и переходы состояний ресурсов расставляются
-	/// между теми пассами, что остались.</summary>
+	// Indices into _passes for the enabled passes; everything downstream numbers passes by
+	// position in THIS list, so a disabled pass simply does not exist for the graph.
 	private readonly List<int> _activePasses = new();
 
-	/// <summary>Локальные индексы (позиции в <see cref="_activePasses"/>) в порядке исполнения.</summary>
+	// Local indices (positions in _activePasses) in execution order.
 	private readonly List<int> _topologicallySortedPasses = new();
 	private readonly List<List<int>> _adjacencyLists = new();
 
@@ -55,8 +52,7 @@ public sealed class DiligentRenderGraph : IRenderGraph
 		ArgumentNullException.ThrowIfNull(pass);
 		_passes.Add(new PassData(_passes.Count, pass));
 
-		// Контексты переиспользуются между пересборками: внутри каждого - управляемый буфер команд
-		// на сотни элементов, и пересоздавать его на каждую смену сцены незачем (см. ResetPasses).
+		// Contexts are pooled across rebuilds: each holds a command buffer of hundreds of entries.
 		DiligentRenderGraphContext context;
 		if (_contextPool.Count > 0)
 		{
@@ -81,9 +77,7 @@ public sealed class DiligentRenderGraph : IRenderGraph
 	{
 		_isCompiled = false;
 
-		// Ресурсы НЕ уничтожаются, а уходят в пул билдера: пересборка графа (смена сцены, тумблер
-		// фичи, ресайз одного таргета) переписывает командные буферы, но переиспользует уже
-		// созданные текстуры и вьюхи - см. RenderGraphNode. Полный снос - только через Release.
+		// Resources go back to the builder pool rather than being destroyed; only Release frees them.
 		_builder.Clean(recycle: true);
 
 		_activePasses.Clear();
@@ -183,13 +177,7 @@ public sealed class DiligentRenderGraph : IRenderGraph
 		}
 	}
 
-	/// <summary>См. <see cref="IRenderGraph.SetPassEnabled"/>. Ищет по имени, а не по индексу:
-	/// порядок пассов зависит от включённых фич конвейера, и индекс снаружи не воспроизводим.
-	///
-	/// Смена значения помечает граф на перекомпиляцию: выключенный пасс исключается из сетапа,
-	/// зависимостей и записи команд ЦЕЛИКОМ (см. <see cref="_activePasses"/>), поэтому переходы
-	/// состояний ресурсов остаются согласованными и выключать можно любой пасс. Перекомпиляция
-	/// дешёвая - ресурсы переиспользуются из пула билдера, пересобираются только командные буферы.</summary>
+	// By name, not index: pass order depends on which pipeline features are enabled.
 	public bool SetPassEnabled(string name, bool enabled)
 	{
 		bool found = false;
@@ -210,7 +198,6 @@ public sealed class DiligentRenderGraph : IRenderGraph
 		return found;
 	}
 
-	/// <summary>См. <see cref="IRenderGraph.PassNames"/>.</summary>
 	public IReadOnlyList<string> PassNames
 	{
 		get
@@ -242,8 +229,6 @@ public sealed class DiligentRenderGraph : IRenderGraph
 
 		foreach (var local in _topologicallySortedPasses)
 		{
-			// Выключенных пассов здесь уже нет: они отсеиваются на компиляции (см. Compile), так что
-			// проигрывать нечего и проверять нечего.
 			var passId = _activePasses[local];
 			_passes[passId].Pass.EarlyCommands();
 
@@ -285,15 +270,13 @@ public sealed class DiligentRenderGraph : IRenderGraph
 			TotalResourceMemoryBytes = totalMemory,
 			Passes = passInfos,
 			Resources = resources.ToArray(),
-			// Наружу - в нумерации AddPass (тем же, что PassNames), а не в локальной: список пассов
-			// в окне отладки строится по PassNames.
+			// Reported in AddPass numbering, matching PassNames, not the local one.
 			TopologicalOrder = _topologicallySortedPasses.Select(local => _activePasses[local]).ToArray(),
 		};
 		_debugHistory.Push(DebugSnapshot);
 #endif
 	}
 
-	/// <summary>См. <see cref="IRenderGraph.ResetPasses"/>.</summary>
 	public void ResetPasses()
 	{
 		ClearPasses(recycleResources: true);
@@ -304,7 +287,6 @@ public sealed class DiligentRenderGraph : IRenderGraph
 		ClearPasses(recycleResources: false);
 	}
 
-	/// <summary>См. <see cref="IRenderGraph.TrimResourcePool"/>.</summary>
 	public void TrimResourcePool()
 	{
 		_builder.TrimPool();

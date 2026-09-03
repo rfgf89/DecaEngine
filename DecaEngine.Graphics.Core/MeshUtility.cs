@@ -8,14 +8,7 @@ using UnsafeCollections.Collections.Unsafe;
 
 namespace DecaEngine.Graphics;
 
-/// <summary>
-/// Обработка геометрии поверх meshopt: склейка дублей вершин, оптимизация порядка и генерация LOD.
-///
-/// Жила в ModelLoader.cs - файле на четыре с лишним тысячи строк, где кроме загрузчика лежали ещё
-/// семь независимых типов. К разбору glTF эти пятьсот строк отношения не имеют: это чистая
-/// обработка буферов, и тесты на неё (см. DecaEngine.Tests) писались как на самостоятельный
-/// алгоритм.
-/// </summary>
+/// <summary>Geometry processing on top of meshopt: vertex dedup, reorder optimization and LOD generation.</summary>
 public static class MeshUtility
 {
 	public static unsafe void RecalculateBounds(this IMeshObject mesh)
@@ -208,20 +201,9 @@ public static class MeshUtility
 		mesh.SetLodGroup(lodsNative);
 	}
 
-	// --- Pure CPU-array variants below, operating on plain managed arrays instead of an already-created
-	// IMeshObject's native buffers. Used by ModelLoader's background load pipeline (see
-	// ModelImporter.PrepareModel) so mesh optimization/LOD generation - all pure CPU meshoptimizer work -
-	// can run off the main/GPU thread, before any GPU resource is created for the mesh. ---
+	// CPU-array variants below run off the GPU thread, before any GPU resource exists.
 
-	/// <summary>
-	/// Fills in <see cref="Vertex.Tangent"/> for every vertex from the triangle's positions/UVs (the
-	/// standard per-triangle tangent formula, accumulated per vertex across its adjacent triangles, then
-	/// Gram-Schmidt orthogonalized against <see cref="Vertex.Normal"/> and normalized). Mutates
-	/// <paramref name="vertices"/> in place. No-op (leaves whatever Tangent already holds) for a
-	/// non-triangle index list; a triangle with a degenerate UV mapping (zero UV area) simply doesn't
-	/// contribute to its vertices' accumulated tangent, and a vertex left with a near-zero accumulated
-	/// tangent (e.g. no real UVs at all) falls back to an arbitrary vector perpendicular to its normal.
-	/// </summary>
+	/// <summary>Fills <see cref="Vertex.Tangent"/> in place from triangle positions/UVs; degenerate UVs fall back to an arbitrary perpendicular.</summary>
 	public static void GenerateTangents(Vertex[] vertices, uint[] indices)
 	{
 		if (indices.Length == 0 || indices.Length % 3 != 0)
@@ -244,15 +226,11 @@ public static class MeshUtility
 			float det = duv1.X * duv2.Y - duv2.X * duv1.Y;
 			if (MathF.Abs(det) < 1e-12f)
 			{
-				// Degenerate (or absent) UV mapping for this triangle - it can't define a tangent
-				// direction, so it simply doesn't contribute to its vertices' accumulated tangent.
 				continue;
 			}
 
 			var tangent = (edge1 * duv2.Y - edge2 * duv1.Y) * (1f / det);
-			// Битангент (направление роста V) копится отдельно ради знака w ниже: у зеркальных
-			// UV-развёрток он смотрит ПРОТИВ cross(N, T), и без знака нормал-мапа применяется с
-			// перевёрнутым Y (инвертированный рельеф).
+			// Bitangent tracked separately for the w sign: mirrored UVs point against cross(N, T).
 			var bitangent = (edge2 * duv1.X - edge1 * duv2.X) * (1f / det);
 
 			accumulated[i0] += tangent;
@@ -268,14 +246,10 @@ public static class MeshUtility
 			var normal = vertices[i].Normal;
 			var tangent = accumulated[i];
 
-			// Gram-Schmidt: remove whatever component of the accumulated tangent already points along
-			// the normal, so the result is a valid tangent-plane direction even after averaging
-			// contributions from triangles that aren't perfectly coplanar.
+			// Gram-Schmidt against the normal so averaged non-coplanar contributions stay tangent-plane.
 			tangent -= normal * Vector3.Dot(normal, tangent);
 
-			// Знак битангента в пространстве движка: куда реально растёт V относительно cross(N, T).
-			// Вычислен из уже зеркалированной геометрии, так что никаких поправок на смену
-			// ориентации (в отличие от авторского glTF w) не требует.
+			// w sign computed from already-mirrored geometry, so no glTF handedness correction needed.
 			float w = Vector3.Dot(Vector3.Cross(normal, Vector3.Normalize(
 				tangent.LengthSquared() > 1e-12f ? tangent : ArbitraryTangent(normal))),
 				accumulatedBitangent[i]) < 0f ? -1f : 1f;
@@ -469,8 +443,7 @@ public static class MeshUtility
 		return (combinedVertices, combinedIndices, lodLevelsList.ToArray());
 	}
 
-	/// <summary>Сшивает геометрию и скин-стрим в одну вершину для прогона через meshopt (см.
-	/// <see cref="IMeshVertex"/>).</summary>
+	/// <summary>Interleaves geometry and skin streams into one vertex for a meshopt pass.</summary>
 	public static SkinnedVertex[] PackSkinned(Vertex[] vertices, SkinVertex[] skin)
 	{
 		var packed = new SkinnedVertex[vertices.Length];
@@ -479,9 +452,7 @@ public static class MeshUtility
 			packed[i] = new SkinnedVertex
 			{
 				Geometry = vertices[i],
-				// Скин-стрим короче геометрии быть не должен, но развариванием вершин под плоские
-				// нормали занимается вызывающий, и рассинхрон здесь дал бы не диагностируемый краш,
-				// а тихо покорёженного персонажа. Недостающие вершины прибиваются к корню.
+				// If the skin stream is shorter, missing vertices are pinned to the root joint.
 				Skin = i < skin.Length ? skin[i] : new SkinVertex { W0 = (ushort)SkinVertex.WeightScale },
 			};
 		}
@@ -489,8 +460,7 @@ public static class MeshUtility
 		return packed;
 	}
 
-	/// <summary>Обратная операция к <see cref="PackSkinned"/>: meshopt отработал, дальше стримы живут
-	/// порознь (в .dmdl и в GPU-буферах).</summary>
+	/// <summary>Inverse of <see cref="PackSkinned"/>: splits streams back apart after meshopt.</summary>
 	public static (Vertex[] Vertices, SkinVertex[] Skin) UnpackSkinned(SkinnedVertex[] packed)
 	{
 		var vertices = new Vertex[packed.Length];

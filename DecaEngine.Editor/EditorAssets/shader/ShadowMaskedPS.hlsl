@@ -1,22 +1,14 @@
-// Альфа-тест при записи shadow map - для «дырявой» геометрии: листва, ажурные решётки, ткань с
-// вырезами (см. ShadowRenderer.RegisterAlphaTestedMaterial).
-//
-// Зачем вообще пиксельный шейдер в депт-онли пассе. Без него теневой пасс пишет ГЕОМЕТРИЮ квада, а
-// не то, что на нём нарисовано: крона дерева состоит из плоских карточек с прозрачными краями, и в
-// shadow map она попадает набором сплошных прямоугольников. Тень выходит монолитной кляксой, а в
-// объёмном свете (см. VolumetricCommon.hlsl) сквозь такую крону не пробивается ни один луч - вместо
-// солнечного кружева получается ровный конус тьмы.
-//
-// Пасс остаётся депт-онли: цветовых таргетов у него нет (RenderTargetFormats = []), шейдер ничего
-// не возвращает и только выбрасывает пиксель через clip().
+// Alpha test during shadow map writes, for cut-out geometry such as foliage
+// (ShadowRenderer.RegisterAlphaTestedMaterial). Without it the depth-only pass writes the
+// quad geometry, not the cut-out shape, so foliage shadows solid rectangles.
+// The pass stays depth-only: no color targets, the shader only clips pixels.
 Texture2D    _MainTex;
 SamplerState _MainTex_sampler;
 
 cbuffer ShadowMaterial
 {
-    // glTF alphaCutoff материала (см. ModelLoader.MaterialPbrFactors.AlphaCutoff). Пушится ОДИН РАЗ
-    // при создании материала, до первого кадра: SetConstant переустанавливает переменную в SRB, а
-    // делать это на живом кадре нельзя (см. FogPassResources - там из-за этого целый кбуфер).
+    // glTF alphaCutoff. Pushed ONCE at material creation: SetConstant re-binds the SRB
+    // variable and must not run mid-frame (see FogPassResources).
     float shadowAlphaCutoff;
     float shadowPad0, shadowPad1, shadowPad2;
 }
@@ -29,13 +21,11 @@ struct PSInput
 
 void Main(in PSInput input)
 {
-    // Мип НЕ фиксируется нулевым: shadow map втрое-вчетверо грубее экрана по текселям на лист, и
-    // выборка нулевого мипа давала бы мерцающую кашу из отдельных листьев при движении камеры.
-    // Аппаратный выбор мипа усредняет альфу по площади текселя - крона в тени получается связной.
+    // Mip is NOT forced to 0: shadow texels are much coarser than screen texels and mip 0
+    // sampling flickers; hardware mip selection averages alpha over the texel footprint.
     float alpha = _MainTex.Sample(_MainTex_sampler, input.uv).a;
 
-    // Порог чуть НИЖЕ материального: у листвы альфа по краю карточки спадает плавно, а тень,
-    // обрезанная ровно по тому же порогу, что и цвет, выглядит на пару текселей у́же кроны -
-    // солнце протекает по контуру каждого листа. Занижение порога возвращает эти края в тень.
+    // Threshold slightly BELOW the material cutoff: shadows clipped at the color threshold
+    // read a couple texels narrower than the foliage and sun leaks around each leaf.
     clip(alpha - shadowAlphaCutoff * 0.8);
 }

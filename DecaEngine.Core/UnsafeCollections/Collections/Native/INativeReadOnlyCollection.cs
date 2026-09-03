@@ -31,14 +31,10 @@ namespace UnsafeCollections.Collections.Native
 {
     public interface INativeReadOnlyCollection<T> : IReadOnlyCollection<T>, IEnumerable, IDisposable where T : unmanaged
     {
-        /// <summary>
-        /// Returns 'True' if the underlying buffer is allocated.
-        /// </summary>
+        /// <summary>True if the underlying buffer is allocated.</summary>
         bool IsCreated { get; }
 
-        /// <summary>
-        /// Copies the collection into the provided array.
-        /// </summary>
+        /// <summary>Copies the collection into the provided array.</summary>
         void CopyTo(T[] array, int arrayIndex);
     }
 }

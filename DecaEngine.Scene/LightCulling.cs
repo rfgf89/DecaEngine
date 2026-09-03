@@ -8,19 +8,13 @@ using DecaEngine.Graphics;
 namespace DecaEngine.Scene;
 
 /// <summary>
-/// CPU-кулинг punctual-светов против фрустума камеры - у КАЖДОГО типа света свой метод со своей
-/// геометрией теста: точечный - сфера радиуса действия, спот - конус, направленный - виден всегда.
-/// Работает во view-пространстве камеры на компактном представлении фрустума из
-/// <see cref="CullData"/> (frustum = (fx.X, fx.Z, fy.Y, fy.Z), те же плоскости, что у GPU-кулинга
-/// геометрии в BatchingInstancingCS.hlsl::isVisible). Зовётся из <see cref="CullingAndRenderSystem"/>
-/// при сборке пер-камерного пула видимых светов; вторая, GPU-половина кулинга (свет против
-/// фроксел-кластеров, тоже по-типовая) живёт в LightClusterCS.hlsl.
+/// CPU frustum culling for punctual lights, one test geometry per light type.
+/// Runs in camera view space on the compact frustum of <see cref="CullData"/>
+/// (frustum = (fx.X, fx.Z, fy.Y, fy.Z)); the GPU half lives in LightClusterCS.hlsl.
 /// </summary>
 public static class LightCulling
 {
-    /// <summary>Точечный свет: сфера радиуса действия против фрустума - ровно та же математика, что
-    /// у GPU-теста сфер геометрии (BatchingInstancingCS.hlsl::isVisible): симметричные боковые
-    /// плоскости через компактный frustum-вектор плюс диапазон глубины.</summary>
+    /// <summary>Point light: range sphere against the frustum.</summary>
     public static bool IsPointLightVisible(in CullData cullData, in Vector3 viewPos, float range)
     {
         Vector4 f = cullData.frustum;
@@ -30,20 +24,16 @@ public static class LightCulling
         return visible;
     }
 
-    /// <summary>Спот: конус против шести плоскостей фрустума. Сначала дешёвый отсев ограничивающей
-    /// сферой конуса (минимальная охватывающая: до 45 градусов - через апекс и кромку основания,
-    /// дальше - вокруг основания), затем точный по-плоскостной тест конуса: конус целиком за
-    /// плоскостью, только если за ней И апекс, И ближайшая к плоскости точка кромки основания
-    /// (тест из майкрософтовского ForwardPlus-сэмпла).</summary>
+    /// <summary>Spot light: bounding-sphere reject, then an exact per-plane cone test.</summary>
     public static bool IsSpotLightVisible(in CullData cullData, in Vector3 apexView, in Vector3 dirView,
         float range, float outerHalfAngleRad)
     {
         float cosOuter = MathF.Cos(outerHalfAngleRad);
         float sinOuter = MathF.Sin(outerHalfAngleRad);
 
-        // Минимальная охватывающая сфера конуса высоты range с полууглом a:
-        // a <= 45°: центр на оси на t = range/(2cos^2 a), радиус t (сфера проходит через апекс);
-        // a  > 45°: центр в основании, радиус - радиус основания range*tan a.
+        // Minimal bounding sphere of a cone of height range and half-angle a:
+        // a <= 45deg: centre on the axis at t = range/(2cos^2 a), radius t;
+        // a  > 45deg: centre at the base, radius range*tan a.
         float sphereRadius;
         Vector3 sphereCenter;
         if (outerHalfAngleRad <= MathF.PI * 0.25f)
@@ -63,19 +53,18 @@ public static class LightCulling
             return false;
         }
 
-        // Точный тест: шесть плоскостей (нормали ВНУТРЬ фрустума, боковые проходят через начало
-        // координат view-пространства). Раскладка компактного frustum-вектора - см. CreateCullData.
+        // Plane normals point INTO the frustum; the side planes pass through the view origin.
         Vector4 f = cullData.frustum;
         float baseRadius = range * (sinOuter / MathF.Max(cosOuter, 1e-4f));
 
         Span<Vector4> planes =
         [
-            new Vector4(f.X, 0f, f.Y, 0f),             // левая
-            new Vector4(-f.X, 0f, f.Y, 0f),            // правая
-            new Vector4(0f, f.Z, f.W, 0f),             // нижняя
-            new Vector4(0f, -f.Z, f.W, 0f),            // верхняя
-            new Vector4(0f, 0f, 1f, -cullData.znear),  // ближняя
-            new Vector4(0f, 0f, -1f, cullData.zfar),   // дальняя
+            new Vector4(f.X, 0f, f.Y, 0f),             // left
+            new Vector4(-f.X, 0f, f.Y, 0f),            // right
+            new Vector4(0f, f.Z, f.W, 0f),             // bottom
+            new Vector4(0f, -f.Z, f.W, 0f),            // top
+            new Vector4(0f, 0f, 1f, -cullData.znear),  // near
+            new Vector4(0f, 0f, -1f, cullData.zfar),   // far
         ];
 
         foreach (ref readonly var plane in planes)
@@ -89,15 +78,11 @@ public static class LightCulling
         return true;
     }
 
-    /// <summary>Направленный свет: бесконечный, фрустумом не отсекается - виден всегда. (В кластерный
-    /// пул он и не попадает - солнце идёт своим путём через каскадные тени, см. CullingAndRenderSystem.)</summary>
+    /// <summary>Directional lights are infinite and never culled.</summary>
     public static bool IsDirectionalLightVisible() => true;
 
-    /// <summary>Сборка записи punctual-света БЕЗ кулинга и теневых слайсов - для бейкера проб
-    /// (<see cref="ProbeGiBakeSession.SetPunctualLights"/>): бейк видит весь объём, а не фрустум
-    /// камеры, и тени считает своими лучами. ShadowParams остаётся нулевым НАРОЧНО - раскладка
-    /// слайсов меняется от камеры каждый кадр и дёргала бы сравнение изменений света вхолостую.
-    /// Формулы углов/направления - зеркало <see cref="TryBuildPunctualLight"/>, менять парой.</summary>
+    /// <summary>Builds a punctual light record for the probe baker: no culling, no shadow slices.
+    /// Angle and direction formulas mirror <see cref="TryBuildPunctualLight"/>; change both.</summary>
     public static bool TryBuildBakeLight(ref LightComponent light, Entity lightEntity,
         out PunctualLight punctualLight)
     {
@@ -146,13 +131,8 @@ public static class LightCulling
         }
     }
 
-    /// <summary>Кулит один punctual-свет против фрустума камеры МЕТОДОМ ЕГО ТИПА (точечный - сферой
-    /// радиуса действия, спот - конусом) и, если свет видим, собирает его GPU-запись. Направленные
-    /// света в кластерный пул не идут - направленный свет сцены обслуживается каскадами. Общая для
-    /// обеих систем сборки камер: основной <see cref="CullingAndRenderSystem"/> и превью/Scene View
-    /// <see cref="SimpleCullingAndRenderSystem"/>. <paramref name="shadowSlices"/> - кадровая
-    /// раскладка теневых слайсов (id сущности - первый слайс, см.
-    /// <see cref="PunctualShadowScheduler"/>); свет вне раскладки светит без тени.</summary>
+    /// <summary>Culls a punctual light against the camera frustum and, if visible, builds its GPU
+    /// record. shadowSlices maps entity id to first slice; a light outside it casts no shadow.</summary>
     public static bool TryBuildPunctualLight(ref LightComponent light, Entity lightEntity,
         in CullData cullData, IReadOnlyDictionary<int, int> shadowSlices, out PunctualLight punctualLight)
     {
@@ -166,9 +146,8 @@ public static class LightCulling
         GetWorldPositionRotation(lightEntity, out Vector3 worldPos, out Quaternion worldRot);
         Vector3 viewPos = Vector3.Transform(worldPos, cullData.view);
 
-        // z - ближняя плоскость слайса ТЕМ ЖЕ выражением, каким её строил планировщик
-        // (PunctualShadowScheduler.SliceNearPlane): шейдер обязан получать её готовой, а не выводить
-        // из Range повторной копией формулы - такая копия у него уже была и уже разошлась.
+        // z is the slice near plane straight from PunctualShadowScheduler: the shader must be
+        // handed it rather than re-deriving it from Range.
         var shadowParams = shadowSlices.TryGetValue(lightEntity.Id, out var firstSlice)
             ? new Vector4(firstSlice, Math.Clamp(light.ShadowStrength, 0f, 1f),
                 PunctualShadowScheduler.SliceNearPlane(light.Range),
@@ -197,11 +176,11 @@ public static class LightCulling
 
             case LightType.Spot:
             {
-                // Конвенция направления - как у солнца: локальный +Z энтити (камера LH, forward = +Z).
+                // Direction convention as for the sun: entity local +Z (LH camera, forward = +Z).
                 Vector3 dirWorld = Vector3.Normalize(Vector3.Transform(Vector3.UnitZ, worldRot));
                 Vector3 dirView = Vector3.Normalize(Vector3.TransformNormal(dirWorld, cullData.view));
 
-                // SpotAngle - ПОЛНЫЙ внешний угол в градусах; тесты и спад работают с полууглом.
+                // SpotAngle is the FULL outer angle in degrees; the tests use the half-angle.
                 float outerHalfRad = Math.Clamp(light.SpotAngle, 1f, 179f) * (MathF.PI / 360f);
                 if (!IsSpotLightVisible(in cullData, in viewPos, in dirView, light.Range, outerHalfRad))
                 {
@@ -231,32 +210,15 @@ public static class LightCulling
         }
     }
 
-    /// <summary>Диапазон глубин экспоненциальной кластерной сетки камеры (LightData.ClusterParams.zw)
-    /// по её сегменту punctual-светов: <paramref name="minLightZ"/>/<paramref name="maxLightZ"/> -
-    /// границы влияния светов во view-глубине (для света на view-z с радиусом R это z ± R),
-    /// накопленные сборщиком пула.
-    ///
-    /// Раньше сюда шли znear/zfar САМОЙ КАМЕРЫ, и это выбрасывало почти всю сетку впустую: far
-    /// камеры - 2000 (а проекция вообще бесконечная reversed-Z, см. MakePerspectiveReversedZ, так что
-    /// это число ни на что больше не влияет), near - 0.05, отношение 40000:1. Двадцать четыре среза
-    /// экспоненциальны по этому отношению, то есть шаг среза - множитель 1.55, и реальная глубина
-    /// кадра (замер на Sponza: 25..75, отношение 3:1) забирала ТРИ среза из двадцати четырёх. Сетка
-    /// вырождалась в почти двумерный тайлинг: фроксел огромен по z, тест сфера-против-AABB проходит
-    /// для куда большего числа кластеров, чем нужно, и в каждый набивается больше светов.
-    ///
-    /// Границы именно по СВЕТАМ, а не по геометрии: кластеры существуют ровно для того, чтобы
-    /// разложить punctual-света, и вне их влияния кластер пуст по определению. Обрезка при этом
-    /// безопасна с обеих сторон - приёмник ближе minLightZ или дальше maxLightZ отстоит от любого
-    /// света дальше его радиуса уже по одной только оси z, и тест радиуса в шейдинге отбросил бы его
-    /// всё равно. (Пиксели вне [near, far] клампятся в крайний срез, чей AABB их не содержит - вот
-    /// почему это надо было проверить, а не просто сжать диапазон.)</summary>
+    /// <summary>Depth range of the exponential cluster grid, derived from the punctual light
+    /// segment (view-depth z +/- R per light) rather than the camera near/far, which would waste
+    /// almost every slice on depths no light reaches.</summary>
     public static Vector2 ClusterDepthRange(in CullData cullData, float minLightZ, float maxLightZ)
     {
         float cameraNear = MathF.Max(cullData.znear, 0.01f);
         if (minLightZ > maxLightZ)
         {
-            // Сегмент пуст - кластерная ветка мертва, но вырожденный диапазон в кбуфере оставлять
-            // нельзя: шейдер считает log2(far/near) безусловно.
+            // Empty segment: still no degenerate range, the shader computes log2(far/near) always.
             return new Vector2(cameraNear, MathF.Max(cullData.zfar, cameraNear * 2f));
         }
 
@@ -265,21 +227,14 @@ public static class LightCulling
         return new Vector2(near, far);
     }
 
-    /// <summary>DECA_PUNCTUAL_DUMP=1 - печать GPU-записи каждого punctual-света ровно в том виде, в
-    /// каком её прочтёт UnlitInstancedPS. Заведено потому, что визуальные каналы отладки этот вопрос
-    /// НЕ решают: в канале 11 серый цвет означает и "фон, шейдер не запускался", и "сэмпл вернул 0.85",
-    /// а по картинке не отличить конусный отсев спота от промаха по UV. Здесь же видно буквально:
-    /// DirType.w (0 = точечный, шейдер добавит смещение грани куба; 1 = спот, смещение НЕ добавляется
-    /// и весь кадр уходит в один слайс) и Shadow.x (база слайса, -1 = тени нет).
-    ///
-    /// Печатается только при ИЗМЕНЕНИИ строки - иначе это шестьдесят строк в секунду.</summary>
+    // DECA_PUNCTUAL_DUMP=1 prints each light's GPU record as UnlitInstancedPS will read it,
+    // and only when the line changes.
     private static readonly bool DumpPunctual =
         Environment.GetEnvironmentVariable("DECA_PUNCTUAL_DUMP") == "1";
 
     private static readonly Dictionary<int, string> LastDump = new();
 
-    /// <summary>См. <see cref="DumpPunctual"/>. Зовётся сборщиками пула ПОСЛЕ
-    /// <see cref="TryBuildPunctualLight"/>, чтобы дамп отражал ровно то, что уходит в буфер.</summary>
+    /// <summary>Call after <see cref="TryBuildPunctualLight"/> so the dump matches the buffer.</summary>
     public static void DumpPunctualLight(Entity lightEntity, in LightComponent light, in PunctualLight gpu)
     {
         if (!DumpPunctual)
@@ -302,12 +257,8 @@ public static class LightCulling
         Console.WriteLine(line);
     }
 
-    /// <summary>Мировые позиция/поворот сущности света: если TransformSystem сложил иерархию в
-    /// <see cref="WorldMatrix"/> (у сущности есть родитель), декомпозируем ЕЁ, а не читаем сырой
-    /// локальный Position/Rotation - иначе свет под вложенным родителем (Super > MegaEntity > ...)
-    /// светит и кастует тень из точки локальной системы координат родителя, а не из своего реального
-    /// места в мире (см. GpuInstanceBufferSystem в RenderingSystems.cs - та же декомпозиция для
-    /// геометрии). У корневых сущностей (нет WorldMatrix) своя локальная TRS и есть мировая.</summary>
+    /// <summary>World position and rotation of a light: decomposes WorldMatrix when present,
+    /// since a parented light's local TRS is not its world placement.</summary>
     public static void GetWorldPositionRotation(Entity entity, out Vector3 position, out Quaternion rotation)
     {
         position = entity.HasComponent<Position>() ? entity.Position.value : Vector3.Zero;
@@ -321,10 +272,7 @@ public static class LightCulling
         }
     }
 
-    /// <summary>Конус (апекс, ось dir, высота range, радиус основания baseRadius) целиком за
-    /// плоскостью (xyz - нормаль внутрь, w - смещение)? За ней должны оказаться и апекс, и самая
-    /// выступающая к плоскости точка кромки основания Q = apex + dir*range - m*baseRadius, где m -
-    /// проекция нормали на плоскость основания конуса.</summary>
+    // True when both the apex and the base-rim point nearest the plane lie behind it.
     private static bool ConeBehindPlane(in Vector3 apex, in Vector3 dir, float range, float baseRadius,
         in Vector4 plane)
     {
@@ -338,8 +286,7 @@ public static class LightCulling
 
         Vector3 m = Vector3.Cross(Vector3.Cross(n, dir), dir);
         float mLen = m.Length();
-        // Вырожденный m - ось конуса параллельна нормали: кромка основания равноудалена от
-        // плоскости, достаточно точки центра основания.
+        // Degenerate m means the cone axis is parallel to the normal: the base centre suffices.
         Vector3 q = mLen > 1e-6f
             ? apex + dir * range - (m / mLen) * baseRadius
             : apex + dir * range;

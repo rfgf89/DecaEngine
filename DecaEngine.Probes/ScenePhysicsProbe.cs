@@ -16,41 +16,19 @@ using DecaEngine.Editor;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Прогон НАСТОЯЩЕЙ сцены с физикой, без окна (DECA_PROBE_SCENE=1).
-///
-/// Отличие от <see cref="GameplayProbe"/> принципиальное. Тот гоняет драйвер на синтетическом полу -
-/// на идеальном квадрате, который сам же и построил. Здесь берётся демо-префаб целиком: та же
-/// иерархия, те же компоненты, та же геометрия площадки, прочитанная ТЕМ ЖЕ импортёром и запечённая
-/// в статику ТЕМ ЖЕ кодом, что и в редакторе (<see cref="PrefabSceneViewport.AppendModelGeometry"/>).
-/// Между «драйвер работает» и «персонаж ходит в сцене» помещается вся эта разница, и в редакторе она
-/// уже один раз выстрелила.
-///
-/// Печатается ТРАЕКТОРИЯ, а не итог. Итог отвечает «дошёл или нет», а вопрос обычно другой: где
-/// именно он перестал идти так, как задумано, - и на это отвечает только ряд чисел по секундам.
-///
-/// Путь префаба можно задать: DECA_PROBE_SCENEPATH=&lt;...&gt;.prefab.json. Без него сцена
-/// ГЕНЕРИРУЕТСЯ во временную папку тем же кодом, что и «File → New Project» - проверка не зависит
-/// от того, что лежит в чьём-то проекте.
-/// </summary>
+/// <summary>Headless run of the real demo scene with physics (DECA_PROBE_SCENE=1); prints the
+/// walker trajectory per second. DECA_PROBE_SCENEPATH overrides the prefab, otherwise the scene
+/// is generated into a temp folder by the same code as File -> New Project.</summary>
 public static class ScenePhysicsProbe
 {
 	private const float Step = 1f / 60f;
 
-	/// <summary>Позиция таза каждого рэгдолла в момент «уже улёгся» - точка отсчёта метрики покоя.</summary>
 	private static readonly Dictionary<int, Vector3> _hipAtSettle = new();
 
-	/// <summary>Последнее напечатанное состояние ходока - чтобы печатать ПЕРЕХОДЫ, а не состояние
-	/// каждого кадра.</summary>
 	private static CharacterMotionState? _lastState;
 
-	/// <summary>
-	/// Печатает смену состояния цикла «идёт → падает → встаёт».
-	///
-	/// Именно переходы, а не срез: цикл ломается не «неправильным состоянием», а застреванием в одном
-	/// из них - персонаж, который упал и не встал, по любому отдельному кадру выглядит нормально
-	/// лежащим. Видно это только по временной шкале переходов.
-	/// </summary>
+	// Prints state TRANSITIONS, not per-frame state: a character stuck lying down looks fine
+	// on any single frame; only the transition timeline shows it.
 	private static void ReportStateChange(Entity character, float time)
 	{
 		if (character.IsNull || !character.HasComponent<FallRecoverComponent>())
@@ -66,7 +44,7 @@ public static class ScenePhysicsProbe
 		}
 
 		_lastState = state;
-		Console.WriteLine($"[probe] scene: t={time:0.0} с - персонаж {state}");
+		Console.WriteLine($"[probe] scene: t={time:0.0} s - character {state}");
 	}
 
 	public static void Run(IGraphicsApi api, DecaEngine.Graphics.Diligent.DiligentSkinningPass skinning)
@@ -82,7 +60,7 @@ public static class ScenePhysicsProbe
 
 		if (!File.Exists(prefabPath))
 		{
-			Console.WriteLine($"[probe] scene: префаб не найден: {prefabPath}");
+			Console.WriteLine($"[probe] scene: prefab not found: {prefabPath}");
 			return;
 		}
 
@@ -94,10 +72,11 @@ public static class ScenePhysicsProbe
 		var root = PrefabAsset.Instantiate(store, prefabPath);
 
 		using var physics = new ScenePhysics(new Vector3(0f, -9.81f, 0f));
-		// Модели остаются жить до конца процесса намеренно: их CPU-копии вершин уже уехали в BVH
-		// статики, а пробник заканчивается сразу за прогоном - выселять их некому и незачем.
+		// Models intentionally live until process exit: their CPU vertex copies are referenced
+		// by the static BVH and the probe ends right after the run.
 		var models = BuildStatics(api, store, root, assetsDirectory, physics, flipWinding: false);
 
+		ProbeStairsAndRamp(physics);
 		ProbeWinding(api, store, root, assetsDirectory);
 		ProbeReferenceWinding(api);
 		ProbeBoneScaleBody(api, store, root, assetsDirectory);
@@ -106,47 +85,174 @@ public static class ScenePhysicsProbe
 		Simulate(store, root, physics, skinning, models, assetsDirectory);
 	}
 
-	/// <summary>
-	/// Сцена БЕЗ Play обязана стоять, а с Play - ожить.
-	///
-	/// Проверяется ПАРОЙ прогонов на одной сцене, отличающихся только флагом: «ничего не движется»
-	/// само по себе ничего не доказывает - ровно так же выглядит сцена, в которой физика не
-	/// заводится вовсе или анимация сломана. Смысл имеет только разница.
-	///
-	/// Меряются обе стороны сразу: положение рэгдолльной лисы (падает ли она) и время клипа у ходока
-	/// (идёт ли анимация). Гейт легко поставить на одно и забыть про другое, и по картинке это не
-	/// видно: стоящий персонаж с текущим временем клипа и лежащий с застывшим выглядят одинаково
-	/// неправильно.
-	/// </summary>
+	// Rays and a player capsule against the demo stairs/ramp: the static mesh is one-sided,
+	// so a wrongly-wound face is a hole, not a wall. Geometry constants must match
+	// SampleGroundBuilder on purpose - the probe must not share code with the builder.
+	private static void ProbeStairsAndRamp(ScenePhysics physics)
+	{
+		const float stepHeight = 0.16f;
+		const float stepDepth = 0.5f;
+		const int stepCount = 5;
+		const float stairsStart = 1.5f;
+
+		int risersHit = 0;
+		for (int i = 0; i < stepCount; i++)
+		{
+			float x = stairsStart + i * stepDepth;
+			float y = (i + 1) * stepHeight - stepHeight * 0.5f;
+			var hit = physics.SampleGround(new Vector3(x - 0.3f, y, 0f), Vector3.UnitX, 0.6f);
+			if (hit.Hit && MathF.Abs(hit.Position.X - x) < 0.01f)
+			{
+				risersHit++;
+			}
+		}
+
+		var side = physics.SampleGround(new Vector3(2.75f, 0.08f, -2.5f), Vector3.UnitZ, 1f);
+		bool sideOk = side.Hit && MathF.Abs(side.Position.Z + 2f) < 0.01f;
+
+		var ramp = physics.SampleGround(new Vector3(-4f, 2f, 0f), -Vector3.UnitY, 3f);
+		float rampExpected = 0.9f * (4f - 1.5f) / 5f;
+		bool rampOk = ramp.Hit && MathF.Abs(ramp.Position.Y - rampExpected) < 0.01f;
+
+		// End-cap ray cast from INSIDE the platform; from outside it would hit the outer wall first.
+		var cap = physics.SampleGround(new Vector3(-6.7f, 0.45f, 0f), Vector3.UnitX, 0.4f);
+		bool capOk = cap.Hit && MathF.Abs(cap.Position.X + 6.5f) < 0.01f;
+
+		Console.WriteLine($"[probe] scene: stairs by rays - risers from the front {risersHit} of {stepCount} " +
+			$"{(risersHit == stepCount ? "OK" : "FULL OF HOLES")}, side skirt {(sideOk ? "holds OK" : "PASSES THROUGH")}; " +
+			$"ramp from above y={(ramp.Hit ? ramp.Position.Y : float.NaN):0.###} (expected {rampExpected:0.###}) " +
+			$"{(rampOk ? "OK" : "FALLS THROUGH")}, end cap {(capOk ? "holds OK" : "PASSES THROUGH")}");
+
+		// Player capsule up the stairs: 1 m/s along +X from x=0.5; feet below the tread means
+		// the capsule is inside a step.
+		var store = new EntityStore();
+		var driver = new CharacterMotionDriver();
+
+		float Expected(float x) => x < stairsStart ? 0f
+			: x >= stairsStart + stepCount * stepDepth ? stepCount * stepHeight
+			: (MathF.Floor((x - stairsStart) / stepDepth) + 1f) * stepHeight;
+
+		// Two colliders: vertical capsule and one along the body (CharacterBodyComponent.Length).
+		// Besides feet, the NOSE (0.6 m ahead) is measured: with a vertical capsule the model
+		// sticks out past the collider and the nose sits inside risers most of the climb.
+		foreach (float length in new[] { 0f, 0.8f })
+		{
+			var entity = store.CreateEntity();
+			entity.AddComponent(new EntityName(length > 0f ? "stairs-long" : "stairs"));
+			entity.AddComponent(new Position(0.5f, 0f, 0f));
+			entity.AddComponent(new Rotation(0f, 0f, 0f, 1f));
+			entity.AddComponent(new PlayerMoveComponent { WalkSpeed = 1f, RunSpeed = 3f });
+			entity.AddComponent(new CharacterBodyComponent
+			{
+				Radius = 0.18f,
+				Height = 0.5f,
+				Mass = 12f,
+				StepHeight = 0.25f,
+				Length = length,
+			});
+
+			float worstSink = 0f;
+			float worstNose = 0f;
+			int noseInStep = 0;
+			int frames = 0;
+			int steps = (int)MathF.Round(8f / Step);
+			for (int i = 0; i < steps; i++)
+			{
+				driver.Input = new PlayerInput { MoveWorld = Vector3.UnitX };
+				driver.Steer(store, physics, active: true, Step);
+				physics.Update(Step);
+				driver.Apply(store, physics);
+
+				var feet = entity.GetComponent<Position>().value;
+
+				// Stop mid top landing (x 4..6): past its edge the character legitimately falls,
+				// and measuring "sink" there would measure the fall.
+				if (feet.X >= 5f)
+				{
+					break;
+				}
+
+				frames++;
+				worstSink = MathF.Min(worstSink, feet.Y - Expected(feet.X));
+				float nose = feet.Y - Expected(feet.X + 0.6f);
+				worstNose = MathF.Min(worstNose, nose);
+				if (nose < -0.03f)
+				{
+					noseInStep++;
+				}
+			}
+
+			var final = entity.GetComponent<Position>().value;
+			driver.Clear(physics);
+			entity.DeleteEntity();
+
+			bool climbed = final.X >= 5f && MathF.Abs(final.Y - stepCount * stepHeight) < 0.03f;
+			bool noSink = worstSink > -0.03f;
+			float noseShare = frames > 0 ? 100f * noseInStep / frames : 0f;
+			string kind = length > 0f ? $"along the body {length:0.#}" : "vertical";
+			Console.WriteLine($"[probe] scene: stairs with a {kind} capsule - reached x={final.X:0.##}, feet at y={final.Y:0.###} " +
+				$"(landing {stepCount * stepHeight:0.##}) {(climbed ? "CLIMBED OK" : "DID NOT CLIMB")}, " +
+				$"feet into the step {worstSink:0.###} {(noSink ? "OK" : "INSIDE THE STEP")}, " +
+				$"nose in the riser {noseShare:0}% of frames (worst {worstNose:0.###})");
+		}
+
+		// Side approach onto the third step along +Z: without side skirts the capsule slides
+		// under the tread and ends up inside the step. With skirts it must stop at the skirt.
+		var sideEntity = store.CreateEntity();
+		sideEntity.AddComponent(new EntityName("stairs-side"));
+		sideEntity.AddComponent(new Position(2.75f, 0f, -3f));
+		sideEntity.AddComponent(new Rotation(0f, 0f, 0f, 1f));
+		sideEntity.AddComponent(new PlayerMoveComponent { WalkSpeed = 1f, RunSpeed = 3f });
+		sideEntity.AddComponent(new CharacterBodyComponent
+		{
+			Radius = 0.18f,
+			Height = 0.5f,
+			Mass = 12f,
+			StepHeight = 0.25f,
+		});
+
+		int sideSteps = (int)MathF.Round(3f / Step);
+		for (int i = 0; i < sideSteps; i++)
+		{
+			driver.Input = new PlayerInput { MoveWorld = Vector3.UnitZ };
+			driver.Steer(store, physics, active: true, Step);
+			physics.Update(Step);
+			driver.Apply(store, physics);
+		}
+
+		var sideFinal = sideEntity.GetComponent<Position>().value;
+		driver.Clear(physics);
+
+		// Inside a step = capsule center (feet + 0.25) below the third tread while z is within
+		// the staircase (|z| < 2).
+		bool insideStep = MathF.Abs(sideFinal.Z) < 2f && sideFinal.Y + 0.25f < 3f * stepHeight;
+		bool blockedBySide = sideFinal.Z < -2f && sideFinal.Z > -2.3f && MathF.Abs(sideFinal.Y) < 0.03f;
+		Console.WriteLine($"[probe] scene: stairs from the side - capsule reached z={sideFinal.Z:0.##}, feet at y={sideFinal.Y:0.###} " +
+			$"{(blockedBySide ? "SKIRT HOLDS OK" : insideStep ? "INSIDE THE STEP (chest-deep in the stairs)" : "UNEXPECTED")}");
+	}
+
+	// The scene must stand still without Play and come alive with it. Verified as a PAIR of
+	// runs differing only by the flag - only the difference is meaningful - and on BOTH
+	// ragdoll motion and clip time at once.
 	private static void ProbeEditModeStillness(IGraphicsApi api, string prefabPath,
 		string assetsDirectory, DecaEngine.Graphics.Diligent.DiligentSkinningPass skinning)
 	{
 		var stopped = RunGated(api, prefabPath, assetsDirectory, skinning, playing: false);
 		var playing = RunGated(api, prefabPath, assetsDirectory, skinning, playing: true);
 
-		// Сантиметр по рэгдоллу и сотая секунды по клипу: в остановленной сцене это ровно нули, а
-		// допуск оставлен под накопление float, а не под «почти не движется».
+		// Tolerances cover float accumulation only; a stopped scene should be exactly zero.
 		bool stillWhenStopped = stopped.RagdollDrop < 0.01f && stopped.ClipTime < 0.01f;
 		bool aliveWhenPlaying = playing.RagdollDrop > 0.05f && playing.ClipTime > 0.1f;
 
-		Console.WriteLine($"[probe] scene: без Play - рэгдолл опустился на {stopped.RagdollDrop:0.####} м, " +
-			$"время клипа {stopped.ClipTime:0.###} с {(stillWhenStopped ? "OK (сцена стоит)" : "СЦЕНА ЖИВЁТ БЕЗ PLAY")}");
-		Console.WriteLine($"[probe] scene: с Play - рэгдолл опустился на {playing.RagdollDrop:0.####} м, " +
-			$"время клипа {playing.ClipTime:0.###} с {(aliveWhenPlaying ? "OK (сцена ожила)" : "СЦЕНА НЕ ОЖИЛА ПО PLAY")}");
+		Console.WriteLine($"[probe] scene: without Play - ragdoll dropped by {stopped.RagdollDrop:0.####} m, " +
+			$"clip time {stopped.ClipTime:0.###} s {(stillWhenStopped ? "OK (scene is still)" : "SCENE LIVES WITHOUT PLAY")}");
+		Console.WriteLine($"[probe] scene: with Play - ragdoll dropped by {playing.RagdollDrop:0.####} m, " +
+			$"clip time {playing.ClipTime:0.###} s {(aliveWhenPlaying ? "OK (scene came alive)" : "SCENE DID NOT COME ALIVE ON PLAY")}");
 	}
 
-	/// <summary>
-	/// Stop обязан вернуть сцену к последнему авторскому состоянию.
-	///
-	/// Проверяются ДВА разных механизма отката, и они не заменяют друг друга:
-	/// - трансформы сущностей откатывает снимок Play Mode (ECS-компоненты, см. InspectorWindow.Stop);
-	/// - поза персонажа - НЕТ. Тела рэгдолла живут сбоку от ECS, и у упавшей лисы в компонентах
-	///   ничего не менялось вовсе (Enabled и Physical у неё авторские). Такой персонаж остаётся
-	///   лежать там, где упал, при полностью корректном откате компонентов.
-	///
-	/// Поэтому меряется именно ПОЗА - высота корня рэгдолла, - а не позиция сущности: по второй
-	/// поломка не видна.
-	/// </summary>
+	// Stop must restore the authored state. Two separate rollback mechanisms are exercised:
+	// entity transforms come back via the Play Mode snapshot, but ragdoll bodies live outside
+	// ECS - so the RAGDOLL ROOT POSE is measured, not the entity position.
 	private static void ProbeStopRestores(IGraphicsApi api, string prefabPath, string assetsDirectory,
 		DecaEngine.Graphics.Diligent.DiligentSkinningPass skinning)
 	{
@@ -219,7 +325,7 @@ public static class ScenePhysicsProbe
 			}
 		}
 
-		// Снимок авторского состояния - ровно то, что делает Play Mode при нажатии Play.
+		// Snapshot of the authored state - exactly what Play Mode does on Play.
 		var authored = new Dictionary<int, (Vector3 Position, Quaternion Rotation)>();
 		foreach (var entity in Descendants(root))
 		{
@@ -236,7 +342,7 @@ public static class ScenePhysicsProbe
 
 		animation.TryGetRagdollRootWorld(ragdollFox.Id, out var during);
 
-		// Stop: откат компонентов (снимок) + снятие состояния, живущего сбоку.
+		// Stop: component rollback (snapshot) plus clearing state that lives outside ECS.
 		foreach (var entity in Descendants(root))
 		{
 			if (authored.TryGetValue(entity.Id, out var pose))
@@ -254,24 +360,19 @@ public static class ScenePhysicsProbe
 		float fell = before.Y - during.Y;
 		float residual = MathF.Abs(after.Y - before.Y);
 
-		// Сантиметр: поза пересобирается из тех же матриц, что и в начале, и расхождение здесь - это
-		// разложение матриц, а не «почти вернулось».
+		// 1 cm tolerance covers matrix decomposition only, not "almost restored".
 		bool restored = residual < 0.01f;
 
-		// Падение обязано быть заметным - иначе сравнивать не с чем и проверка слепа.
+		// The fall must be visible, otherwise there is nothing to compare and the check is blind.
 		bool fellEnough = fell > 0.1f;
 
-		Console.WriteLine($"[probe] scene: Stop - корень рэгдолла y={before.Y:0.###} → упал до " +
-			$"{during.Y:0.###} (на {fell:0.###} м{(fellEnough ? "" : " - СЛИШКОМ МАЛО, проверка слепая")}) " +
-			$"→ после Stop {after.Y:0.###}, остаточное расхождение {residual:0.####} " +
-			$"{(restored ? "OK (вернулось к авторскому)" : "НЕ ВЕРНУЛОСЬ")}");
+		Console.WriteLine($"[probe] scene: Stop - ragdoll root y={before.Y:0.###} → fell to " +
+			$"{during.Y:0.###} (by {fell:0.###} m{(fellEnough ? "" : " - TOO LITTLE, the check is blind")}) " +
+			$"→ after Stop {after.Y:0.###}, residual mismatch {residual:0.####} " +
+			$"{(restored ? "OK (restored to the authored state)" : "DID NOT RESTORE")}");
 
-		// --- Перенос гизмо в режиме редактирования --------------------------------------------------
-		//
-		// Физика персонажа обязана ЕХАТЬ ЗА трансформом сущности, пока идёт редактирование. Тела
-		// рэгдолла собираются один раз и ведутся СКОРОСТЬЮ - а при нулевом шаге скорость не двигает
-		// ничего, и персонаж, которого автор тащит гизмо, оставался стоять позой на прежнем месте:
-		// сущность уехала, поза - нет.
+		// Gizmo move in edit mode: ragdoll bodies are driven by VELOCITY, and with a zero step
+		// velocity moves nothing - the pose must still follow the entity transform.
 		const float shift = 3f;
 		var moved = ragdollFox.Position.value;
 		ragdollFox.Position = new Position(moved.X + shift, moved.Y, moved.Z);
@@ -281,32 +382,27 @@ public static class ScenePhysicsProbe
 
 		float travelled = afterMove.X - after.X;
 
-		// Сантиметр от заданного сдвига: тела ставятся ровно в позу, и расхождение здесь - только
-		// разложение матриц.
 		bool follows = MathF.Abs(travelled - shift) < 0.01f;
 
-		Console.WriteLine($"[probe] scene: перенос в редакторе на {shift} м - корень рэгдолла проехал " +
-			$"{travelled:0.###} м {(follows ? "OK (физика едет за трансформом)" : "ФИЗИКА НЕ ЗАВИСИТ ОТ ТРАНСФОРМА")}");
+		Console.WriteLine($"[probe] scene: editor move by {shift} m - ragdoll root travelled " +
+			$"{travelled:0.###} m {(follows ? "OK (physics follows the transform)" : "PHYSICS IGNORES THE TRANSFORM")}");
 	}
 
-	/// <summary>Две секунды сцены при заданном флаге Play. Возвращает, насколько опустился рэгдолл и
-	/// сколько времени накрутил клип.</summary>
+	// Two seconds of the scene with the given Play flag; returns ragdoll drop and clip time.
 	private static (float RagdollDrop, float ClipTime) RunGated(IGraphicsApi api, string prefabPath,
 		string assetsDirectory, DecaEngine.Graphics.Diligent.DiligentSkinningPass skinning,
 		bool playing)
 	{
-		// СВОЙ экземпляр сцены на каждый прогон. Проверка ДВИГАЕТ персонажей - это её предмет, - и
-		// сделанная на общем сторе, она отравила бы всё, что идёт после: главный прогон стартовал бы
-		// из середины круга, с уже сдвинутым таймером падения. Ровно это и случилось при первом
-		// запуске: «оборотов 0.933 (ожидалось 1.114) НЕ ДОШЁЛ» на исправном коде.
+		// A fresh scene instance per run: this check MOVES characters, and a shared store would
+		// poison every check that follows.
 		var store = new EntityStore();
 		var root = PrefabAsset.Instantiate(store, prefabPath);
 
 		using var physics = new ScenePhysics(new Vector3(0f, -9.81f, 0f));
 		BuildStatics(api, store, root, assetsDirectory, physics, flipWinding: false, quiet: true);
 
-		// Гейт воспроизводится ТОЧНО так же, как в редакторе (см. PrefabSceneViewport): пауза мира и
-		// нулевой шаг анимации. Пробник, гоняющий свой вариант гейта, проверял бы себя.
+		// The gate replicates the editor exactly (see PrefabSceneViewport): paused world plus a
+		// zero animation step. A probe running its own gate variant would only test itself.
 		physics.Paused = !playing;
 
 		var animation = new AnimationDriver(skinning) { Physics = physics };
@@ -346,7 +442,7 @@ public static class ScenePhysicsProbe
 			animation.AddInstance(entity.Id, model, -1);
 			animation.SetAvatar(entity.Id, HumanoidAvatarAsset.Load(path) ?? HumanoidAutoMap.Build(model.Skeleton));
 
-			// Рэгдолльная лиса - та, что падает без скрипта движения; ходок - та, у которой он есть.
+			// The ragdoll fox falls with no move script; the walker is the one that has it.
 			if (entity.HasComponent<RagdollComponent>() && !entity.HasComponent<CircleMoveComponent>() &&
 				ragdollFox.IsNull)
 			{
@@ -379,8 +475,8 @@ public static class ScenePhysicsProbe
 			}
 		}
 
-		// Опускание рэгдолла меряется по КОСТИ, а не по трансформу сущности: сущность стоит на месте
-		// всё падение, и по ней «упал» и «не упал» неразличимы.
+		// Ragdoll drop is measured on the BONE, not the entity transform: the entity stays put
+		// during the whole fall.
 		float drop = 0f;
 		if (!ragdollFox.IsNull && animation.TryGetRagdollRootWorld(ragdollFox.Id, out var rootWorld))
 		{
@@ -394,18 +490,11 @@ public static class ScenePhysicsProbe
 		return (drop, clipTime);
 	}
 
-	/// <summary>
-	/// В КАКОЙ БУФЕР дебага уезжают каркасы коллайдеров - в депт-тестируемый или в «поверх всего».
-	///
-	/// Проверяется числом, а не глазами, ровно потому, что глазами разница между «капсулы рисуются с
-	/// депт-тестом» и «капсулы не рисуются вовсе» неотличима: и там, и там пустой экран - персонаж
-	/// закрывает собой собственный коллайдер. У DebugDraw два независимых буфера (см. его шапку), и
-	/// вопрос сводится к тому, в котором из них оказались вершины.
-	///
-	/// Заодно сверяется, что общий флаг физики коллайдеров НЕ КАСАЕТСЯ: они разъехались на два поля
-	/// намеренно, и слияние обратно выглядело бы как «всё работает», пока кто-нибудь не включит
-	/// статику сцены и не получит сетку по всему экрану.
-	/// </summary>
+	// Which debug buffer collider wireframes land in (depth-tested vs on-top), checked by
+	// counting vertices: visually "depth-tested" and "not drawn at all" are identical when the
+	// character occludes its own collider. Also verifies the global physics flag stays
+	// independent from the collider depth flag - merging them floods the screen when scene
+	// statics are enabled.
 	private static void ProbeColliderOverlay(ScenePhysics physics)
 	{
 		var draw = new DebugDraw { Enabled = true };
@@ -422,7 +511,6 @@ public static class ScenePhysicsProbe
 		int depthOnTop = draw.OnTopCount;
 		int depthDepth = draw.DepthTestedCount;
 
-		// «Остальное поверх» при выключенных коллайдерах-поверх не должно перетащить их за собой.
 		var mixedOptions = new PhysicsDebugOptions
 		{
 			Colliders = true,
@@ -437,22 +525,17 @@ public static class ScenePhysicsProbe
 		bool switchable = depthDepth > 0 && depthOnTop == 0;
 		bool independent = mixedOnTop == 0;
 
-		Console.WriteLine($"[probe] scene: коллайдеры в дебаге - по умолчанию поверх: вершин " +
-			$"{onTopBucket} поверх / {depthBucket} с депт-тестом {(byDefaultOnTop ? "OK" : "НЕ ПОВЕРХ")}; " +
-			$"галочкой обратно: {depthOnTop} / {depthDepth} {(switchable ? "OK" : "НЕ ПЕРЕКЛЮЧАЕТСЯ")}; " +
-			$"общий флаг физики их не трогает {(independent ? "OK" : "ТАЩИТ ЗА СОБОЙ")}");
+		Console.WriteLine($"[probe] scene: debug colliders - on top by default: vertices " +
+			$"{onTopBucket} on top / {depthBucket} depth-tested {(byDefaultOnTop ? "OK" : "NOT ON TOP")}; " +
+			$"checkbox back: {depthOnTop} / {depthDepth} {(switchable ? "OK" : "DOES NOT SWITCH")}; " +
+			$"the global physics flag leaves them alone {(independent ? "OK" : "DRAGS THEM ALONG")}");
 
 		ReportCapsuleRadii(physics);
 	}
 
-	/// <summary>
-	/// РАЗБРОС радиусов капсул в мире.
-	///
-	/// Отвечает ровно на «у лисы все коллайдеры одинаковые»: у рэгдолла, построенного по мешу,
-	/// туловище в разы толще лапы, и одинаковые радиусы означают, что радиусы взяты не из меша - а
-	/// это ровно то, чего по картинке не отличить от «модель такая». Печатаются min/max и число
-	/// РАЗЛИЧНЫХ значений: одно значение на два десятка костей - диагноз сам по себе.
-	/// </summary>
+	// Spread of capsule radii in the world: identical radii across a mesh-built ragdoll mean
+	// the radii were not derived from the mesh, which a screenshot cannot distinguish from
+	// "the model just looks like that".
 	private static void ReportCapsuleRadii(ScenePhysics physics)
 	{
 		var simulation = physics.World.Simulation;
@@ -478,14 +561,14 @@ public static class ScenePhysicsProbe
 
 		if (radii.Count == 0)
 		{
-			Console.WriteLine("[probe] scene: капсул в мире нет - разброс радиусов проверять не на чем");
+			Console.WriteLine("[probe] scene: no capsules in the world - nothing to measure radius spread on");
 			return;
 		}
 
 		radii.Sort();
 
-		// Округление до десятых миллиметра: радиусы приезжают из усреднения по вершинам, и
-		// «различных значений» без округления считалось бы по шуму младших разрядов.
+		// Round to 0.1 mm: radii come from vertex averaging, and counting distinct values
+		// without rounding would count low-bit noise.
 		var distinct = new HashSet<int>();
 		foreach (float r in radii)
 		{
@@ -495,28 +578,17 @@ public static class ScenePhysicsProbe
 		float min = radii[0];
 		float max = radii[^1];
 
-		// Считаются ВСЕ капсулы мира, включая тело ходока (CharacterBodyComponent) - оно задано
-		// автором и в разброс костей рэгдолла не входит по смыслу. Вердикт поэтому по ЧИСЛУ
-		// РАЗЛИЧНЫХ значений, а не по отношению max/min: одно-два значения на три десятка костей
-		// означают override, сколько бы ни было между ними раз.
-		Console.WriteLine($"[probe] scene: радиусы капсул - {radii.Count} шт (с телом ходока), " +
-			$"{min:0.####}..{max:0.####} м, различных значений {distinct.Count} " +
-			$"{(distinct.Count > 3 ? "OK - по толщине частей тела" : "ВСЕ ОДИНАКОВЫЕ (BoneRadius override?)")}");
+		// All world capsules are counted, including the walker body, so the verdict is by the
+		// NUMBER of distinct values, not the max/min ratio.
+		Console.WriteLine($"[probe] scene: capsule radii - {radii.Count} of them (walker body included), " +
+			$"{min:0.####}..{max:0.####} m, distinct values {distinct.Count} " +
+			$"{(distinct.Count > 3 ? "OK - follows body part thickness" : "ALL IDENTICAL (BoneRadius override?)")}");
 	}
 
-	/// <summary>
-	/// Тело РАЗМЕРОМ С КОСТЬ РЭГДОЛЛА на полу сцены.
-	///
-	/// Кость лисы в мире - это капсула радиусом 2 единицы модели × масштаб сущности 0.01 = 0.02 м, а
-	/// <c>PhysicsWorld.AddDynamic</c> заводит тело со спекулятивной маржой 0.1 м по умолчанию. Маржа
-	/// впятеро больше самого тела означает, что контакт создаётся за пять радиусов до поверхности и
-	/// решатель весь шаг работает с «предсказанным» касанием - на таких телах это даёт дрожание и
-	/// разлёт. В картинке это выглядит как разъехавшаяся палитра скиннинга: кости уносит, и меш
-	/// растягивает в звезду.
-	///
-	/// Меряются ДВЕ вещи: осело ли тело на полу и не растёт ли его скорость. Первое ловит проваливание,
-	/// второе - расходящуюся симуляцию, и одно без другого не диагноз.
-	/// </summary>
+	// A body sized like a ragdoll bone (r=0.02 m) on the scene floor. AddDynamic's default
+	// 0.1 m speculative margin is 5x the body: contacts are created far off the surface and
+	// the solver jitters or ejects the body. Both settling and late speed are checked -
+	// one without the other is not a diagnosis.
 	private static void ProbeBoneScaleBody(IGraphicsApi api, EntityStore store, Entity root,
 		string assetsDirectory)
 	{
@@ -540,8 +612,8 @@ public static class ScenePhysicsProbe
 				float speed = physics.World.Simulation.Bodies[body].Velocity.Linear.Length();
 				peakSpeed = MathF.Max(peakSpeed, speed);
 
-				// Последняя секунда: тело обязано уже лежать. Скорость здесь - это ровно та энергия,
-				// которую симуляция не гасит, а накачивает.
+				// Last second: the body must already be at rest; speed here is energy the
+				// simulation is pumping, not dissipating.
 				if (i >= 180)
 				{
 					lateSpeed = MathF.Max(lateSpeed, speed);
@@ -551,28 +623,22 @@ public static class ScenePhysicsProbe
 			var pose = physics.World.Simulation.Bodies[body].Pose;
 			bool settled = lateSpeed < 0.05f && MathF.Abs(pose.Position.Y) < 0.2f;
 
-			Console.WriteLine($"[probe] scene: тело размером с кость (r={radius}), маржа {margin} - " +
-				$"легло на y={pose.Position.Y:0.####}, пик скорости {peakSpeed:0.###}, " +
-				$"в конце {lateSpeed:0.####} {(settled ? "OK" : "НЕ УСПОКОИЛОСЬ")}");
+			Console.WriteLine($"[probe] scene: bone-sized body (r={radius}), margin {margin} - " +
+				$"rested at y={pose.Position.Y:0.####}, peak speed {peakSpeed:0.###}, " +
+				$"at the end {lateSpeed:0.####} {(settled ? "OK" : "DID NOT SETTLE")}");
 		}
 	}
 
-	/// <summary>
-	/// Тот же вопрос об обходе, но на ЧУЖОЙ модели - Sponza из Khronos-семплов.
-	///
-	/// Нужна, чтобы отделить два совершенно разных диагноза, которые по демо-сцене неразличимы:
-	/// «обход неверен у ГЕНЕРАТОРА площадки» (тогда чинить SampleGroundBuilder) и «обход неверен на
-	/// границе движок↔Bepu для ЛЮБОЙ импортированной геометрии» (тогда чинить AddTriangleMesh).
-	/// Sponza сделана не нами и заведомо каноническая, поэтому её ответ - про конвенцию, а не про
-	/// нашу опечатку.
-	/// </summary>
+	// Winding check on a FOREIGN canonical model (Khronos Sponza): separates "our ground
+	// generator winds wrong" from "the engine<->Bepu winding convention is wrong for any
+	// imported geometry".
 	private static void ProbeReferenceWinding(IGraphicsApi api)
 	{
 		string path = Path.Combine(AppContext.BaseDirectory, "EditorAssets", "models", "Sponza.gltf");
 
 		if (!File.Exists(path))
 		{
-			Console.WriteLine("[probe] scene: Sponza не найдена - конвенцию обхода сверить не с чем");
+			Console.WriteLine("[probe] scene: Sponza not found - nothing to check the winding convention against");
 			return;
 		}
 
@@ -587,15 +653,13 @@ public static class ScenePhysicsProbe
 		float direct = DropOnModel(model, flipWinding: false);
 		float flipped = DropOnModel(model, flipWinding: true);
 
-		// Судить по «упало или нет» здесь нельзя: Sponza - закрытый интерьер, и сфера, прошедшая
-		// сквозь верхнюю грань пола, ложится на его ИЗНАНКУ, то есть тоже останавливается. Разница
-		// между обходами - в ВЫСОТЕ: правильный останавливает на первой же поверхности, то есть
-		// ВЫШЕ. Именно поэтому сравниваются два числа, а не проверяется одно.
+		// "Fell or not" is useless here: Sponza is a closed interior and a sphere passing the
+		// floor's top face still lands on its underside. The correct winding stops HIGHER.
 		bool directHigher = direct > flipped + 0.1f;
 
-		Console.WriteLine($"[probe] scene: Sponza (чужая модель, конвенция) - штатный обход: " +
-			$"y={direct:0.###}, испорченный: y={flipped:0.###} " +
-			$"{(directHigher ? "OK (штатный держит на верхней поверхности)" : "ШТАТНЫЙ ПРОПУСКАЕТ СКВОЗЬ ПОЛ")}");
+		Console.WriteLine($"[probe] scene: Sponza (foreign model, convention) - stock winding: " +
+			$"y={direct:0.###}, broken: y={flipped:0.###} " +
+			$"{(directHigher ? "OK (stock holds on the upper surface)" : "STOCK LETS IT THROUGH THE FLOOR")}");
 	}
 
 	private static float DropOnModel(ModelLoader model, bool flipWinding)
@@ -639,29 +703,24 @@ public static class ScenePhysicsProbe
 		return physics.World.Simulation.Bodies[body].Pose.Position.Y;
 	}
 
-	/// <summary>
-	/// Держит ли статика сцены тело ВООБЩЕ - и в каком обходе треугольников.
-	///
-	/// Меш в Bepu ОДНОСТОРОННИЙ, и цена ошибки обхода не «нормали чуть не те», а полное отсутствие
-	/// столкновений: тело уходит сквозь пол в свободном падении. Определяется ЭКСПЕРИМЕНТОМ, а не по
-	/// памяти о конвенции: сфера роняется на настоящую геометрию сцены обоими обходами, и держит её
-	/// ровно один. Ровно тот же способ, которым обход выбирали для PhysicsWorld.AddTriangleMesh.
-	/// </summary>
+	// Does the scene static hold a body at all, and in which triangle winding. Bepu meshes are
+	// ONE-SIDED: a winding mistake means no collision at all, so the winding is determined by
+	// experiment (drop a sphere both ways), not by remembering the convention.
 	private static void ProbeWinding(IGraphicsApi api, EntityStore store, Entity root, string assetsDirectory)
 	{
 		float direct = DropSphere(api, store, root, assetsDirectory, flipWinding: false);
 		float flipped = DropSphere(api, store, root, assetsDirectory, flipWinding: true);
 
-		// Сфера падает с двух метров на пол сцены (y=0) и обязана лечь на свой радиус.
+		// The sphere drops from 2 m onto the floor (y=0) and must rest at its radius.
 		const float expected = 0.25f;
 		bool directOk = MathF.Abs(direct - expected) < 0.02f;
 		bool flippedOk = MathF.Abs(flipped - expected) < 0.02f;
 
-		// Держать обязан ШТАТНЫЙ путь: разворот под односторонний меш Bepu делает сам
-		// PhysicsWorld.AddTriangleMesh, и «развёрнутый» здесь - это геометрия, испорченная нарочно.
-		Console.WriteLine($"[probe] scene: обход треугольников - штатный: сфера на y={direct:0.###} " +
-			$"{(directOk ? "ДЕРЖИТ OK" : "ПРОВАЛИЛАСЬ")}, испорченный нарочно: y={flipped:0.###} " +
-			$"{(flippedOk ? "тоже держит - РАЗВОРОТ НИ НА ЧТО НЕ ВЛИЯЕТ, проверка слепая" : "проваливается, как и должна")}");
+		// The STOCK path must hold: PhysicsWorld.AddTriangleMesh does the one-sided flip
+		// itself; "flipped" here is geometry broken on purpose.
+		Console.WriteLine($"[probe] scene: triangle winding - stock: sphere at y={direct:0.###} " +
+			$"{(directOk ? "HOLDS OK" : "FELL THROUGH")}, deliberately broken: y={flipped:0.###} " +
+			$"{(flippedOk ? "holds too - THE FLIP CHANGES NOTHING, the check is blind" : "falls through, as it should")}");
 	}
 
 	private static float DropSphere(IGraphicsApi api, EntityStore store, Entity root,
@@ -670,7 +729,7 @@ public static class ScenePhysicsProbe
 		using var physics = new ScenePhysics(new Vector3(0f, -9.81f, 0f));
 		BuildStatics(api, store, root, assetsDirectory, physics, flipWinding, quiet: true);
 
-		// Точка старта - там же, где стоит персонаж: пол там ровный, и вопрос ровно о нём.
+		// Drop where the character stands: the floor is flat there and that is the spot in question.
 		var body = physics.World.AddDynamic(new RigidPose(new Vector3(2f, 2f, -4.3f)),
 			physics.World.AddSphere(0.25f), mass: 10f);
 
@@ -682,11 +741,9 @@ public static class ScenePhysicsProbe
 		return physics.World.Simulation.Bodies[body].Pose.Position.Y;
 	}
 
-	/// <summary>
-	/// Статика сцены - тем же правилом, что и в редакторе: все НЕскиннед-модели одним мешом, каждая
-	/// со своей мировой матрицей из иерархии префаба. Скиннед в статику не идут (персонаж не должен
-	/// быть полом сам себе).
-	/// </summary>
+	// Scene statics built by the same rule as the editor: every non-skinned model into one
+	// mesh with its prefab world matrix; skinned models are excluded (a character must not be
+	// its own floor).
 	private static Dictionary<int, ModelLoader> BuildStatics(IGraphicsApi api, EntityStore store,
 		Entity root, string assetsDirectory, ScenePhysics physics, bool flipWinding, bool quiet = false)
 	{
@@ -712,7 +769,7 @@ public static class ScenePhysicsProbe
 			string path = Path.Combine(assetsDirectory, reference);
 			if (!File.Exists(path))
 			{
-				Console.WriteLine($"[probe] scene: модель не найдена: {path}");
+				Console.WriteLine($"[probe] scene: model not found: {path}");
 				continue;
 			}
 
@@ -730,12 +787,9 @@ public static class ScenePhysicsProbe
 			{
 				if (!quiet)
 				{
-					// Габарит скиннед-модели В МИРЕ - тем же составлением трансформа, которым её
-					// ставит в сцену рендер (ComposeInstanceTransform: локальный трансформ инстанса ×
-					// мировая матрица сущности). Число отвечает на вопрос, который по картинке
-					// решить нельзя: персонаж «гигантский» потому, что рендер потерял масштаб
-					// сущности, или потому, что его разорвала палитра скиннинга. Первое видно здесь,
-					// второе - нет, и разделить их можно только так.
+					// World-space bind extent via the same transform composition the renderer
+					// uses; distinguishes "renderer lost the entity scale" from "skinning
+					// palette exploded" - only the first is visible here.
 					positions.Clear();
 					indices.Clear();
 
@@ -759,9 +813,9 @@ public static class ScenePhysicsProbe
 					var size = positions.Count > 0 ? max - min : Vector3.Zero;
 
 					Console.WriteLine($"[probe] scene: '{entity.GetComponent<EntityName>().value}' - " +
-						$"скиннед ({model.Skeleton.JointCount} костей), в статику не идёт; " +
-						$"габарит в мире (bind) {size.X:0.###}×{size.Y:0.###}×{size.Z:0.###}, " +
-						$"низ y={min.Y:0.###}");
+						$"skinned ({model.Skeleton.JointCount} bones), not added to statics; " +
+						$"world extent (bind) {size.X:0.###}×{size.Y:0.###}×{size.Z:0.###}, " +
+						$"bottom y={min.Y:0.###}");
 				}
 
 				continue;
@@ -793,7 +847,7 @@ public static class ScenePhysicsProbe
 			if (!quiet)
 			{
 				Console.WriteLine($"[probe] scene: '{entity.GetComponent<EntityName>().value}' - " +
-					$"{indices.Count / 3} треугольников в статику");
+					$"{indices.Count / 3} triangles into statics");
 			}
 		}
 
@@ -801,29 +855,23 @@ public static class ScenePhysicsProbe
 
 		if (!quiet)
 		{
-			Console.WriteLine($"[probe] scene: статика собрана, треугольников {physics.StaticTriangleCount}");
+			Console.WriteLine($"[probe] scene: statics built, triangles {physics.StaticTriangleCount}");
 		}
 
 		return loaded;
 	}
 
-	/// <summary>
-	/// Шагает сцену КАК РЕДАКТОР: тот же порядок кадра, что у PrefabSceneViewport (Steer → шаг
-	/// физики → Apply → AnimationDriver.Update на каждого персонажа), с настоящим AnimationDriver -
-	/// клипы, foot IK и рэгдоллы работают, а не имитируются. Печатает траекторию ходока по секундам
-	/// и, главное, ГАБАРИТ ДЕФОРМИРОВАННОГО МЕША каждого персонажа: CPU-скиннинг вершин той самой
-	/// палитрой, которая ушла бы в GPU. «Части гигантского размера» на скриншоте - это палитра, и
-	/// увидеть её иначе, чем прогнав весь путь позы, нельзя.
-	/// </summary>
+	// Steps the scene with the editor's frame order (Steer -> physics step -> Apply ->
+	// AnimationDriver.Update per character) using the real AnimationDriver, and prints the
+	// walker trajectory plus the DEFORMED mesh extent of every character (CPU skinning with
+	// the same palette the GPU would get).
 	private static void Simulate(EntityStore store, Entity root, ScenePhysics physics,
 		DecaEngine.Graphics.Diligent.DiligentSkinningPass skinning,
 		Dictionary<int, ModelLoader> models, string assetsDirectory)
 	{
 		var driver = new CharacterMotionDriver();
 
-		// Персонажи - через настоящий AnimationDriver, без участков палитры (offset -1: инстансы в
-		// батч-рендерере не регистрируются, заливать нечего). Аватар - из файла рядом с моделью, как
-		// в редакторе; без файла - автоматический.
+		// Palette offset -1: instances are not registered in the batch renderer, nothing to upload.
 		var animation = new AnimationDriver(skinning) { Physics = physics };
 		var skinnedEntities = new List<Entity>();
 		var hipJointOf = new Dictionary<int, int>();
@@ -856,17 +904,16 @@ public static class ScenePhysicsProbe
 
 		if (character.IsNull)
 		{
-			Console.WriteLine("[probe] scene: персонажа со скриптом движения и Character Body в сцене нет");
+			Console.WriteLine("[probe] scene: no character with a move script and a Character Body in the scene");
 			return;
 		}
 
 		var start = character.Position.value;
-		Console.WriteLine($"[probe] scene: персонаж '{character.GetComponent<EntityName>().value}' " +
-			$"из {start}, круг R={move.Radius} вокруг {move.Center}, {move.Speed} ед/с");
+		Console.WriteLine($"[probe] scene: character '{character.GetComponent<EntityName>().value}' " +
+			$"from {start}, circle R={move.Radius} around {move.Center}, {move.Speed} units/s");
 
-		// Длину прогона можно вытянуть переменной: 14 секунд покрывают ОДИН цикл падения, а утечка
-		// на повторных циклах (рэгдолл теперь пересобирается на каждом падении) видна только на
-		// длинной дистанции - см. счётчик тел в строках траектории.
+		// 14 s covers one fall cycle; leaks across repeated cycles need a long run - see the
+		// body counter in trajectory lines. DECA_PROBE_SCENESECONDS overrides.
 		float seconds = float.TryParse(
 			Environment.GetEnvironmentVariable("DECA_PROBE_SCENESECONDS"),
 			System.Globalization.NumberStyles.Float,
@@ -899,27 +946,23 @@ public static class ScenePhysicsProbe
 		float worstFrameJumpAt = 0f;
 		var characterInfos = new List<AnimationDriver.CharacterInfo>();
 
-		// Лиса игрока: в headless-прогоне ввода нет, и её локомоушен обязан стоять В СТОЙКЕ - это
-		// проверка пары «идущий в шаге, стоящий в стойке» на одной сцене одним механизмом.
+		// The player fox gets no input in a headless run: its locomotion must idle - the
+		// walk/idle pair is checked on one scene with one mechanism.
 		Entity player = default;
 		store.Query<PlayerMoveComponent, CharacterBodyComponent>().ForEachEntity(
 			(ref PlayerMoveComponent _, ref CharacterBodyComponent _, Entity entity) => player = entity);
 
-		// Кочка - лучом ДО прогона: «капсула не поднялась» не различает «геометрии нет», «геометрия
-		// изнанкой вверх» и «капсула не взяла склон», а луч над гребнем отвечает на первые два.
-		// Луч на ЗЕРКАЛЬНОЙ стороне - ловушка RH→LH импорта: площадка до кочки была z-симметричной,
-		// и зеркалирование Z в ней было невидимо; уехавшая на +z кочка на самой сцене выглядит так
-		// же, как невзятая.
+		// Ray over the mound crest BEFORE the run distinguishes "no geometry", "geometry
+		// inside-out" and "capsule failed the slope". The MIRRORED-side ray catches the
+		// RH->LH import trap: only the mound made the platform z-asymmetric.
 		var crest = physics.SampleGround(new Vector3(0f, 1f, -2.3f), -Vector3.UnitY, 2f);
 		var mirrored = physics.SampleGround(new Vector3(0f, 1f, 2.3f), -Vector3.UnitY, 2f);
-		Console.WriteLine($"[probe] scene: кочка - луч над гребнем (z=-2.3) " +
-			$"{(crest.Hit ? $"y={crest.Position.Y:0.###}" : "МИМО")}, " +
-			$"на зеркальной стороне (z=+2.3) {(mirrored.Hit ? $"y={mirrored.Position.Y:0.###}" : "МИМО")}");
+		Console.WriteLine($"[probe] scene: mound - ray over the crest (z=-2.3) " +
+			$"{(crest.Hit ? $"y={crest.Position.Y:0.###}" : "MISSED")}, " +
+			$"on the mirrored side (z=+2.3) {(mirrored.Hit ? $"y={mirrored.Position.Y:0.###}" : "MISSED")}");
 
-		// DECA_PROBE_SCENEINPUT=1 - синтетический ввод игрока: направление медленно вращается, бег
-		// перемежается. За долгий прогон игрок побывает у стен, на кочке, в лежащем рэгдолле и в
-		// идущей лисе - ровно те столкновения, которых у сцены без ввода не бывает вовсе, а у живого
-		// игрока случаются в первую минуту.
+		// DECA_PROBE_SCENEINPUT=1: synthetic player input (rotating heading, alternating run)
+		// to exercise wall/mound/character collisions a no-input run never produces.
 		bool syntheticInput = Environment.GetEnvironmentVariable("DECA_PROBE_SCENEINPUT") == "1";
 
 		for (int i = 0; i < steps; i++)
@@ -936,25 +979,17 @@ public static class ScenePhysicsProbe
 				};
 			}
 
-			// С пятой секунды игрок бежит НАИСКОСЬ В ПРАВУЮ СТЕНУ и скользит вдоль неё на ~1.7 м/с -
-			// между Walk и Run. Это решающая проверка дискретного аллюра: у весов по скорости
-			// персонаж, паркующийся между аллюрами, вечно жил бы в полусмеси (передние ноги галопа
-			// в корпусе шага), у гистерезиса он обязан прийти к ЧИСТОМУ аллюру. До t=4 игрок стоит -
-			// срез «стойка без ввода» на t=3 остаётся честным. Направление (2,0,1) выбрано, чтобы
-			// скольжение шло В СТОРОНУ ОТКРЫТОГО КРАЯ, но не доходило до него за прогон: первая
-			// версия с (1,1) бежала вдоль стены быстрее и УБЕГАЛА С ПЛОЩАДКИ - на срезе парковки
-			// «прижатый к стене» игрок свободно падал за краем мира на полной скорости.
-			// После среза парковки (t=10) ввод отпускается: скольжение вдоль стены идёт в сторону
-			// открытого края площадки, и к t=14 игрок успевал убежать за него - в отчёте появлялся
-			// «низ в мире y=-12», который через месяц кто-нибудь примет за провал сквозь пол.
+			// From t=4 to t=10 the player runs diagonally into the right wall and slides at
+			// ~1.7 m/s, between Walk and Run: the gait hysteresis must settle on a PURE gait.
+			// Direction (2,0,1) keeps the slide short of the open platform edge; input is
+			// released at t=10 so the player doesn't run off the world by t=14.
 			if (!syntheticInput && i + 1 > 240 && i + 1 <= 600)
 			{
 				driver.Input = new PlayerInput { MoveWorld = new Vector3(2f, 0f, 1f), Run = true };
 			}
 
-			// Порядок кадра - как в PrefabSceneViewport: физика (рулевое → шаг → перенос поз) СТРОГО
-			// до анимации, потому что луч foot IK щупает мир этого кадра, а рэгдолл читает уже
-			// проинтегрированные тела.
+			// Frame order matches PrefabSceneViewport: physics strictly before animation -
+			// foot IK rays probe this frame's world and the ragdoll reads integrated bodies.
 			driver.Steer(store, physics, active: true, Step, animation);
 			physics.Update(Step);
 			driver.Apply(store, physics);
@@ -968,9 +1003,8 @@ public static class ScenePhysicsProbe
 			ReportStateChange(character, (i + 1) * Step);
 			LegSnapshotProbe.Poll(physics, animation, skinnedEntities, models, (i + 1) * Step, Step);
 
-			// Конечность координат - КАЖДЫЙ шаг: улетевшее в бесконечность тело даёт NaN-габарит, и
-			// широкая фаза Bepu умирает переполнением стека при построении дерева, не сказав, какое
-			// тело виновато. Ловить надо на первом же нефинитном значении, пока стек цел.
+			// Finiteness check EVERY step: a body at infinity gives a NaN bound and Bepu's
+			// broad phase dies with a stack overflow that names no culprit.
 			foreach (var skinnedEntity in skinnedEntities)
 			{
 				var entityPos = skinnedEntity.Position.value;
@@ -985,28 +1019,24 @@ public static class ScenePhysicsProbe
 
 				if (!finite)
 				{
-					Console.WriteLine($"[probe] scene: НЕФИНИТНАЯ ПОЗА у " +
-						$"'{skinnedEntity.GetComponent<EntityName>().value}' на t={(i + 1) * Step:0.00} с - " +
-						$"сущность {entityPos}, дальше мир не жилец");
+					Console.WriteLine($"[probe] scene: NON-FINITE POSE on " +
+						$"'{skinnedEntity.GetComponent<EntityName>().value}' at t={(i + 1) * Step:0.00} s - " +
+						$"entity {entityPos}, the world cannot go on");
 					return;
 				}
 			}
 
-			// Время ХОДЬБЫ, а не время прогона: лежащий и встающий персонаж по кругу не движется,
-			// и ожидание оборотов из полного времени было выполнимо только с посторонней тягой.
-			// Ровно так и было: проверка «оборотов 1.07 из 1.11 OK» годами проходила потому, что
-			// капсулу выталкивали kinematic-тела собственного рэгдолла и она ехала быстрее заказа.
+			// WALKING time, not run time: a lying/recovering character doesn't circle, and an
+			// expectation based on total time only passes with some external push.
 			if (!character.HasComponent<FallRecoverComponent>() ||
 				character.GetComponent<FallRecoverComponent>().State == CharacterMotionState.Moving)
 			{
 				movingSeconds += Step;
 			}
 
-			// НЕПРЕРЫВНОСТЬ подъёма: мировая позиция таза в кадре Falling→Recovering обязана
-			// остаться у места лёжки. Сущность в этом кадре ПЕРЕНОСИТСЯ к рэгдоллу, и снимок
-			// лежачей позы обязан быть ребейзнут в новый трансформ (см. BeginRecovery) - без
-			// ребейза видимая поза прыгала на весь увоз рэгдолла («встаёт телепортом», жалоба
-			// с толчка тряпичной лисы).
+			// Recovery continuity: the hip world position on the Falling->Recovering frame must
+			// stay at the lying spot - the entity is re-based to the ragdoll that frame and the
+			// lying-pose snapshot must be rebased too (see BeginRecovery).
 			if (character.HasComponent<FallRecoverComponent>() &&
 				hipJointOf.TryGetValue(character.Id, out int walkerHip) && walkerHip >= 0 &&
 				animation.TryGetPose(character.Id, out var walkerPose, out _))
@@ -1025,9 +1055,8 @@ public static class ScenePhysicsProbe
 						worstRecoveryJump = MathF.Max(worstRecoveryJump, jump);
 					}
 
-					// Худший скачок ЗА ВЕСЬ прогон - ловец любых телепортов позы: разворота
-					// вставания, рестарта конверта хит-реакции, потери направления при пересоздании
-					// тела. Честные скорости (падение, толчок) дают сантиметры за кадр.
+					// Worst per-frame jump over the WHOLE run catches any pose teleport;
+					// honest velocities move centimeters per frame.
 					if (jump > worstFrameJump)
 					{
 						worstFrameJump = jump;
@@ -1055,8 +1084,8 @@ public static class ScenePhysicsProbe
 				highestAt = (i + 1) * Step;
 			}
 
-			// Foot IK и веса локомоушена ходока снимаются НА ГРЕБНЕ КОЧКИ (t=3, angle=pi/2), а не в
-			// конце прогона: к 14-й секунде персонаж лежит рэгдоллом, и оба ответа там не про то.
+			// Foot IK and locomotion weights are sampled ON THE MOUND CREST (t=3), not at the
+			// end of the run where the character is already a ragdoll.
 			if (i + 1 == 180)
 			{
 				animation.DescribeCharacters(characterInfos);
@@ -1064,16 +1093,13 @@ public static class ScenePhysicsProbe
 				{
 					if (info.EntityId == character.Id)
 					{
-						// НЕ МЕНЬШЕ двух ног: задняя пара обязательна, а точное равенство устарело с
-					// приходом FrontLegs - у четвероногого ходока ног четыре.
+						// AT LEAST two legs: a quadruped walker has four, exact equality is stale.
 					walkerIkSeen = info.LegCount >= 2 && info.IkApplied;
 						walkerWalkWeight = info.Locomotion ? info.LocoWalkWeight : -1f;
 
-						// Информативно, без вердикта: фазы события аллюра в клипах (см.
-						// GaitPhaseOffset). Ноль у ОБОИХ - подозрение на потерянную humanoid-разметку
-						// (выравнивание тогда молча мертво), но и легальный случай клипов, авторски
-						// начатых с события.
-						Console.WriteLine($"[probe] scene: локомоушен - фазы аллюра walk=" +
+						// Informational: zero phase on BOTH clips may mean lost humanoid mapping
+						// (alignment silently dead) but is also legal for authored clips.
+						Console.WriteLine($"[probe] scene: locomotion - gait phases walk=" +
 							$"{info.LocoWalkPhaseOffset:0.00}, run={info.LocoRunPhaseOffset:0.00}");
 					}
 					else if (!player.IsNull && info.EntityId == player.Id)
@@ -1083,10 +1109,9 @@ public static class ScenePhysicsProbe
 				}
 			}
 
-			// Хит-реакция: толчок ходоку на t=3.5 (идёт по ровному после кочки, до падения на 6-й
-			// ещё далеко). Пик ищется МАКСИМУМОМ по окну реакции, а не срезом на фиксированном
-			// кадре: форма конверта - деталь реализации, и проверка не должна знать, где у него
-			// вершина. «После» - срез на t=4.6, когда конверт обязан истечь.
+			// Hit reaction: push at t=3.5. Peak is the MAX over the reaction window, not a
+			// fixed-frame slice - the envelope shape is an implementation detail; "after" is
+			// sampled at t=4.6 when the envelope must have expired.
 			if (i + 1 == 210)
 			{
 				animation.TriggerHitReaction(character.Id, new Vector3(0f, 0.8f, 2.2f));
@@ -1116,8 +1141,8 @@ public static class ScenePhysicsProbe
 				}
 			}
 
-			// Срез парковки - t=10: игрок трётся о стену уже секунды четыре, все кроссфейды давно
-			// закончились, и вес обязан быть чистым.
+			// Gait-parking slice at t=10: the player has rubbed the wall for seconds, all
+			// crossfades are over, the weight must be pure.
 			if (i + 1 == 600 && !player.IsNull)
 			{
 				animation.DescribeCharacters(characterInfos);
@@ -1131,9 +1156,8 @@ public static class ScenePhysicsProbe
 				}
 			}
 
-			// Лежачий срез - ПО СОСТОЯНИЮ, а не по секунде: момент подъёма зависит от того, как
-			// улёгся рэгдолл, и фиксированное «t=8» попадает то в лежание, то уже в разгон после
-			// подъёма (замерено: стойка 1.00 в одном прогоне и 0.20 в другом на исправном коде).
+			// Lying slice by STATE, not by second: when recovery starts depends on how the
+			// ragdoll settled, so a fixed time lands anywhere in the cycle.
 			if (character.HasComponent<FallRecoverComponent>() &&
 				character.GetComponent<FallRecoverComponent>() is { State: CharacterMotionState.Falling, StateTime: > 1f })
 			{
@@ -1151,27 +1175,25 @@ public static class ScenePhysicsProbe
 			turned += CircleMotion.Wrap(angle - previousAngle);
 			previousAngle = angle;
 
-			// Раз в секунду - строка. Персонаж, который встал на четвёртой секунде, и персонаж,
-			// который не пошёл вовсе, по итоговым числам неразличимы.
+			// One line per second: final numbers can't distinguish "recovered at t=4" from
+			// "never walked at all".
 			if ((i + 1) % 60 == 0)
 			{
-				Console.WriteLine($"[probe] scene: t={(i + 1) * Step:0.0} с  " +
-					$"поз=({position.X:0.00}, {position.Y:0.000}, {position.Z:0.00})  " +
-					$"радиус={distance:0.000}  оборотов={turned / MathF.Tau:0.000}  " +
-					$"тел={physics.BodyCount}");
+				Console.WriteLine($"[probe] scene: t={(i + 1) * Step:0.0} s  " +
+					$"pos=({position.X:0.00}, {position.Y:0.000}, {position.Z:0.00})  " +
+					$"radius={distance:0.000}  laps={turned / MathF.Tau:0.000}  " +
+					$"bodies={physics.BodyCount}");
 			}
 
-			// Дебаг коллайдеров - на первом же кадре, когда тела персонажей уже заведены: до первого
-			// Steer/Update в мире одна статика, и проверка «в какой буфер уехали каркасы» ответила бы
-			// «ни в какой», не заметив разницы между «не поверх» и «нечего рисовать».
+			// Collider debug on the first frame WITH character bodies: before the first
+			// Steer/Update the world holds only statics and the check would see nothing.
 			if (i == 0)
 			{
 				ProbeColliderOverlay(physics);
 			}
 
-			// Габарит деформированного меша - в НАЧАЛЕ (первый кадр физики) и в конце: разрыв,
-			// который случается от первого же шага симуляции, и разрыв, который накапливается,
-			// диагностируются по-разному.
+			// Deformed extent at the START (first physics frame) and at the END: a tear from
+			// the very first step and an accumulating tear are diagnosed differently.
 			if (i == 0 || i == steps - 1)
 			{
 				foreach (var skinnedEntity in skinnedEntities)
@@ -1179,9 +1201,8 @@ public static class ScenePhysicsProbe
 					float? low = ReportDeformedExtents(animation, models[skinnedEntity.Id], skinnedEntity,
 						(i + 1) * Step);
 
-					// Низ ИДУЩЕГО персонажа на последнем кадре - ловец «вминается в пол»: провал
-					// был в ПОЗЕ (foot IK прижимал лапу в замахе и утягивал таз), и ни одна метрика
-					// тела его не видела - капсула шла ровно по поверхности.
+					// Walker's lowest point on the last frame catches "sinking into the floor"
+					// that lives in the POSE, invisible to any body metric.
 					if (i == steps - 1 && skinnedEntity.Id == character.Id)
 					{
 						walkerLowY = low;
@@ -1189,17 +1210,15 @@ public static class ScenePhysicsProbe
 				}
 			}
 
-			// Таз каждого рэгдолльного персонажа - для метрики ПОКОЯ ниже. Снимается на 6-й секунде
-			// (упасть с 1.8 м и улечься - меньше двух) и в конце: разница между этими точками и есть
-			// «уполз».
-			// По НОМЕРУ шага, не по времени: накопленное (i+1)*Step никогда не равно 6.0 точно.
+			// Hip of each ragdoll character for the rest metric: sampled at 6 s (settled) and
+			// at the end; the difference is the drift. By STEP NUMBER, not time: accumulated
+			// (i+1)*Step never equals 6.0 exactly.
 			if (i + 1 == 360 || i + 1 == steps)
 			{
 				foreach (var skinnedEntity in skinnedEntities)
 				{
-					// Метрика покоя - только для персонажей, которые ДОЛЖНЫ лежать. У ходока и
-					// игрока снос равен пройденному пути, и «ПОЛЗЁТ» на них означало бы, что они
-					// исправно ходят (игрок ловится на прогоне с синтетическим вводом).
+					// Rest metric only for characters that SHOULD be lying; for walkers/players
+					// drift equals distance walked.
 					if (skinnedEntity.HasComponent<CircleMoveComponent>() ||
 						skinnedEntity.HasComponent<PlayerMoveComponent>() ||
 						!skinnedEntity.HasComponent<RagdollComponent>() ||
@@ -1218,16 +1237,15 @@ public static class ScenePhysicsProbe
 					}
 					else
 					{
-						// Рэгдолл, ЛЕЖАЩИЙ на полу, за восемь секунд никуда не ползёт: снос таза -
-						// это ровно то «катится по полу, как камни», которое видно в редакторе и
-						// которое не ловится ни габаритом палитры, ни скоростями отдельного кадра.
+						// A ragdoll at rest must not creep: hip drift is the "rolls along the
+						// floor" failure no palette extent or single-frame velocity catches.
 						var settled = _hipAtSettle.TryGetValue(skinnedEntity.Id, out var s) ? s : hipWorld;
 						float drift = new Vector2(hipWorld.X - settled.X, hipWorld.Z - settled.Z).Length();
 
 						Console.WriteLine($"[probe] scene: '{skinnedEntity.GetComponent<EntityName>().value}' " +
-							$"покой - таз на y={hipWorld.Y:0.###}, снос за 6..14 с {drift:0.###} м " +
-							$"{(drift < 0.15f ? "ЛЕЖИТ OK" : "ПОЛЗЁТ/КАТИТСЯ")}" +
-							$"{(hipWorld.Y < -0.05f ? " ПОД ПОЛОМ" : "")}");
+							$"rest - hip at y={hipWorld.Y:0.###}, drift over 6..14 s {drift:0.###} m " +
+							$"{(drift < 0.15f ? "LIES STILL OK" : "CREEPS/ROLLS")}" +
+							$"{(hipWorld.Y < -0.05f ? " UNDER THE FLOOR" : "")}");
 					}
 				}
 			}
@@ -1239,72 +1257,61 @@ public static class ScenePhysicsProbe
 		bool circleOk = worstRadius < 0.1f;
 		bool progressOk = MathF.Abs(turned / MathF.Tau - expectedTurns) < 0.1f;
 
-		// Кочка на пути круга (SampleGroundBuilder.AddMound, высота 0.12): подъём тела на её высоту
-		// доказывает, что капсула склон ВЗЯЛА, а не проехала сквозь или обогнула. Нижняя граница -
-		// чуть ниже высоты гребня по хорде пути; верхняя ловит подлёт, и она ТЕСНАЯ не из
-		// перфекционизма: капсула, дравшаяся с вывернутой изнанкой шапки гребня, взлетала на 0.288
-		// при гребне 0.18 - по щедрому допуску это выглядело бы «взял кочку особенно хорошо».
+		// Mound on the circle path (height 0.12): rising by its height proves the capsule TOOK
+		// the slope. The upper bound is deliberately tight - it catches launching off broken
+		// crest geometry, which a generous bound would grade as "took the mound especially well".
 		bool moundOk = highest - start.Y > 0.08f && highest - start.Y < 0.18f;
 
-		Console.WriteLine($"[probe] scene: ИТОГ - оборотов {turned / MathF.Tau:0.000} " +
-			$"(ожидалось {expectedTurns:0.000} за {movingSeconds:0.0} с ходьбы) " +
-			$"{(progressOk ? "OK" : "НЕ ДОШЁЛ")}, " +
-			$"худшее отклонение радиуса {worstRadius:0.####} {(circleOk ? "OK" : "СОШЁЛ С КРУГА")}, " +
-			$"ниже всего опускался на {lowest - start.Y:0.####} {(onGround ? "OK" : "ПРОВАЛИЛСЯ")}, " +
-			$"выше всего поднимался на {highest - start.Y:0.###} (t={highestAt:0.00}) " +
-			$"{(moundOk ? "КОЧКУ ВЗЯЛ OK" : "КОЧКУ НЕ ВЗЯЛ")}, " +
-			$"foot IK на гребне {(walkerIkSeen ? "применён OK" : "НЕ ПРИМЕНЁН")}, " +
-			// Нижняя граница - по природному провису САМОГО КЛИПА: у лисы без foot IK вовсе (Run)
-			// низ меша -0.036, и требовать от IK строже, чем от клипа, значит ловить не провал, а
-			// анимацию. Старый провал (лапа в замахе прижималась к полу и тянула таз) давал десятки
-			// сантиметров.
-			$"лапы в конце y={walkerLowY:0.###} " +
-			$"{(walkerLowY is > -0.06f and < 0.05f ? "НА ПОЛУ OK" : "ВМИНАЕТСЯ/ВИСИТ")}");
+		Console.WriteLine($"[probe] scene: TOTAL - laps {turned / MathF.Tau:0.000} " +
+			$"(expected {expectedTurns:0.000} over {movingSeconds:0.0} s of walking) " +
+			$"{(progressOk ? "OK" : "DID NOT GET THERE")}, " +
+			$"worst radius deviation {worstRadius:0.####} {(circleOk ? "OK" : "LEFT THE CIRCLE")}, " +
+			$"lowest descent {lowest - start.Y:0.####} {(onGround ? "OK" : "FELL THROUGH")}, " +
+			$"highest rise {highest - start.Y:0.###} (t={highestAt:0.00}) " +
+			$"{(moundOk ? "TOOK THE MOUND OK" : "DID NOT TAKE THE MOUND")}, " +
+			$"foot IK on the crest {(walkerIkSeen ? "applied OK" : "NOT APPLIED")}, " +
+			// Lower bound matches the clip's own natural sag (-0.036 without foot IK): demanding
+			// more from IK than from the clip would flag the animation, not a failure.
+			$"paws at the end y={walkerLowY:0.###} " +
+			$"{(walkerLowY is > -0.06f and < 0.05f ? "ON THE FLOOR OK" : "SINKS IN/FLOATS")}");
 
-		// Порог - обычное кадровое движение падающего тела (сантиметры), а не точность: при
-		// пропавшем ребейзе снимка скачок равен всему увозу рэгдолла от точки падения (дециметры
-		// и больше, чем сильнее толкнули). -1 - подъём за прогон не случился, и проверка молчит.
+		// Threshold is normal per-frame motion of a falling body (centimeters); a missing
+		// snapshot rebase jumps by the whole ragdoll travel. -1 = no recovery happened.
 		if (worstRecoveryJump >= 0f)
 		{
 			bool recoveryOk = worstRecoveryJump < 0.1f && worstFrameJump < 0.15f;
-			Console.WriteLine($"[probe] scene: непрерывность позы - скачок таза в кадре старта подъёма " +
-				$"{worstRecoveryJump:0.###} м, худший за прогон {worstFrameJump:0.###} м " +
-				$"(t={worstFrameJumpAt:0.00}) {(recoveryOk ? "БЕЗ ТЕЛЕПОРТОВ OK" : "ЕСТЬ ТЕЛЕПОРТ ПОЗЫ")}");
+			Console.WriteLine($"[probe] scene: pose continuity - hip jump on the recovery start frame " +
+				$"{worstRecoveryJump:0.###} m, worst over the run {worstFrameJump:0.###} m " +
+				$"(t={worstFrameJumpAt:0.00}) {(recoveryOk ? "NO TELEPORTS OK" : "POSE TELEPORT PRESENT")}");
 		}
 
-		// Локомоушен - ПАРАМИ на одной сцене: идущий в шаге И стоящий в стойке (игрок без ввода),
-		// идущий в шаге И он же лёжа в стойке. Один вес в одиночку не доказывает ничего: вечная
-		// единица у walk выглядит так же, как работающий бленд, ровно до первой остановки.
+		// Locomotion verified in PAIRS on one scene (walking-in-step AND idle-in-stance): a
+		// single weight alone proves nothing - a stuck 1.0 on walk looks like a working blend
+		// until the first stop.
 		bool locoOk = walkerWalkWeight > 0.8f && walkerLyingIdleWeight > 0.8f && playerIdleWeight > 0.8f;
 
-		Console.WriteLine($"[probe] scene: локомоушен - ходок на гребне шаг={walkerWalkWeight:0.00}, " +
-			$"он же лёжа стойка={walkerLyingIdleWeight:0.00}, игрок без ввода стойка={playerIdleWeight:0.00} " +
-			$"{(locoOk ? "OK" : "ВЕСА НЕ ТЕ")}");
+		Console.WriteLine($"[probe] scene: locomotion - walker on the crest walk={walkerWalkWeight:0.00}, " +
+			$"same one lying idle={walkerLyingIdleWeight:0.00}, player with no input idle={playerIdleWeight:0.00} " +
+			$"{(locoOk ? "OK" : "WRONG WEIGHTS")}");
 
-		// Пик доказывает, что физика реально двигала кости (отклонение - разница блендованной позы
-		// с анимационной, единицы модели), «после» - что реакция ЗАКОНЧИЛАСЬ: застрявший конверт на
-		// глаз неотличим от прошедшего, персонаж просто «как-то странно держит спину». Круговые
-		// метрики выше заодно доказывают, что толчок не сломал ходьбу.
+		// Peak proves physics actually moved bones; "after" proves the reaction ENDED - a
+		// stuck envelope is visually indistinguishable from a finished one.
 		bool reactionOk = reactionPeak > 1.5f && reactionAfter >= 0f && reactionAfter < 0.2f;
 
-		Console.WriteLine($"[probe] scene: хит-реакция - отклонение позы в пике {reactionPeak:0.##} " +
-			$"ед. модели, после спада {reactionAfter:0.###} {(reactionOk ? "OK" : "НЕ КАЧНУЛО/ЗАСТРЯЛО")}");
+		Console.WriteLine($"[probe] scene: hit reaction - peak pose deviation {reactionPeak:0.##} " +
+			$"model units, after decay {reactionAfter:0.###} {(reactionOk ? "OK" : "NO SWING/STUCK")}");
 
-		// Игрок трётся о стену посреди отрезка Walk..Run: вес обязан быть чистым аллюром, а
-		// замеренная скорость - действительно посередине (иначе проверка проверяет не парковку, а
-		// свободный бег, у которого вес чист и со сломанным переключением).
+		// Speed must actually sit between Walk and Run, otherwise this tests free running,
+		// whose weight is pure even with broken gait switching.
 		bool parkedOk = parkedPurity > 0.9f && parkedSpeed > 1.2f && parkedSpeed < 2.7f;
 
-		Console.WriteLine($"[probe] scene: парковка между аллюрами - игрок у стены {parkedSpeed:0.00} м/с, " +
-			$"чистота аллюра {parkedPurity:0.00} {(parkedOk ? "ЧИСТЫЙ OK" : "ПОЛУСМЕСЬ/НЕ ТА СКОРОСТЬ")}");
+		Console.WriteLine($"[probe] scene: gait parking - player at the wall {parkedSpeed:0.00} m/s, " +
+			$"gait purity {parkedPurity:0.00} {(parkedOk ? "PURE OK" : "HALF-BLEND/WRONG SPEED")}");
 	}
 
-	/// <summary>
-	/// CPU-скиннинг вершин ТОЙ ЖЕ палитрой, что ушла бы в GPU, и сравнение габарита деформированного
-	/// меша с bind-габаритом. Это и есть числовой ответ на «части персонажа гигантского размера»:
-	/// у здоровой палитры отношение около единицы (поза меняет размах процентов на десятки), у
-	/// палитры без обратной bind-матрицы или с разлетевшимся рэгдоллом - в разы и десятки раз.
-	/// </summary>
+	// CPU-skins vertices with the same palette the GPU would get and compares the deformed
+	// extent to the bind extent: a healthy palette stays near 1x, a palette missing the
+	// inverse bind matrix blows up by orders of magnitude.
 	private static unsafe float? ReportDeformedExtents(AnimationDriver animation, ModelLoader model,
 		Entity entity, float time)
 	{
@@ -1347,7 +1354,7 @@ public static class ScenePhysicsProbe
 					continue;
 				}
 
-				// Та же свёртка, что в SkinningCS.hlsl: сумма weight * (skin[joint] * bindPos).
+				// Same convolution as SkinningCS.hlsl: sum of weight * (skin[joint] * bindPos).
 				var deformed =
 					Vector3.Transform(bind, skin[s.J0]) * (s.W0 / SkinVertex.WeightScale) +
 					Vector3.Transform(bind, skin[s.J1]) * (s.W1 / SkinVertex.WeightScale) +
@@ -1371,12 +1378,12 @@ public static class ScenePhysicsProbe
 		float deformedExtent = (max - min).Length();
 		float ratio = bindExtent > 1e-6f ? deformedExtent / bindExtent : 0f;
 
-		// Тройка - щедрый потолок: живая поза (бег, свернувшийся рэгдолл) меняет размах в разы
-		// меньше, а сломанная палитра даёт десятки (кости уезжают на всю длину скелета от корня).
-		Console.WriteLine($"[probe] scene: '{entity.GetComponent<EntityName>().value}' t={time:0.0} с - " +
-			$"деформированный габарит {deformedExtent:0.##} (bind {bindExtent:0.##}, ×{ratio:0.##}), " +
-			$"низ в мире y={worldLowY:0.###} " +
-			$"{(!finite ? "NAN В ПАЛИТРЕ" : ratio < 3f ? "OK" : "ПАЛИТРА РАЗОРВАНА")}");
+		// 3x is a generous ceiling: a live pose changes extent far less, a broken palette
+		// gives tens.
+		Console.WriteLine($"[probe] scene: '{entity.GetComponent<EntityName>().value}' t={time:0.0} s - " +
+			$"deformed extent {deformedExtent:0.##} (bind {bindExtent:0.##}, ×{ratio:0.##}), " +
+			$"world bottom y={worldLowY:0.###} " +
+			$"{(!finite ? "NAN IN THE PALETTE" : ratio < 3f ? "OK" : "PALETTE BLOWN APART")}");
 
 		return worldLowY;
 	}

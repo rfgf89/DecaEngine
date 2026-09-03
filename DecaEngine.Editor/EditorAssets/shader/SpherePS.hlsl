@@ -1,6 +1,3 @@
-//Texture2D    g_texture;
-//SamplerState g_texture_sampler; // By convention, texture samplers must use the '_sampler' suffix
-
 struct PSInput
 {
     float4 pos  : SV_POSITION;

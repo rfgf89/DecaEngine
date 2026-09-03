@@ -7,26 +7,17 @@ using DecaEngine.Graphics;
 
 namespace DecaEngine.Probes;
 
-/// <summary>
-/// Сверка GPU-трассировки (см. SceneTrace.hlsl) с CPU-эталоном из <see cref="ProbeGiBaker"/>. Один
-/// и тот же набор лучей прогоняется обоими путями, дистанции попадания сравниваются.
-///
-/// Зачем: CPU-трассировщик уже рабочий и на нём испечены все нынешние пробы, так что он - готовый
-/// эталон. Без такой сверки ошибка в обходе BVH на GPU (перепутанный ребёнок узла, знак в
-/// пересечении с коробкой, раскладка структуры) вылезла бы гораздо позже и выглядела бы как
-/// «необъяснимо кривой GI», а не как явный баг трассировки.
-/// </summary>
+/// <summary>Cross-checks the GPU BVH traversal against the CPU tracer in <see cref="ProbeGiBaker"/>.</summary>
 public static class SceneTraceVerifier
 {
-	/// <summary>Допуск на расхождение дистанции. Нулевого совпадения ждать нельзя: CPU считает в
-	/// double-расширенных регистрах, GPU - строго в float, и порядок операций у них разный.
-	/// Относительный, потому что абсолютная ошибка растёт с дальностью луча.</summary>
+	// Relative, because absolute error grows with ray length; exact equality is impossible since
+	// the CPU works in extended-precision registers and the GPU strictly in float.
 	private const float RelativeTolerance = 1e-3f;
 
 	public readonly record struct Report(int RayCount, int Mismatches, float WorstRelativeError,
 		int CpuHits, int GpuHits, int ShaderNodeCount, int UploadedNodeCount);
 
-	/// <summary>Зеркало cbuffer TraceTestParams в SceneTraceTestCS.hlsl - именно uint, а не float.</summary>
+	// Mirrors cbuffer TraceTestParams in SceneTraceTestCS.hlsl - uint, not float.
 	[StructLayout(LayoutKind.Sequential)]
 	private struct TraceTestParams
 	{
@@ -39,9 +30,7 @@ public static class SceneTraceVerifier
 	{
 		var (nodes, order, triangles) = baker.ExportBvh();
 
-		// Лучи из детерминированного низкодискрепансного набора: тест обязан быть воспроизводимым,
-		// иначе расхождение не переловишь. Начала разбросаны по баундам сцены, направления - по
-		// сфере, так что выборка бьёт и в геометрию, и мимо.
+		// Deterministic low-discrepancy rays: the test must be reproducible to be debuggable.
 		var origins = new Vector4[rayCount];
 		var directions = new Vector4[rayCount];
 		var size = boundsMax - boundsMin;
@@ -90,10 +79,7 @@ public static class SceneTraceVerifier
 			CPUAccessFlags = CpuAccessFlags.Write,
 			Size = 16,
 		});
-		// Discard, а не DoNotWait: с DoNotWait маппинг динамического буфера имеет право не удаться,
-		// и помощник ТИХО пропускает запись - кбуфер остаётся нулевым, шейдер выходит по guard-у, и
-		// выглядит это как «GPU не совпал с CPU по всем лучам». Тип тоже обязан совпадать с
-		// объявленным uint4: float 4096 в uint-поле - это не 4096.
+		// Discard, not DoNotWait: DoNotWait may silently skip the write, leaving a zero cbuffer.
 		context.UploadBufferExt(paramsBuffer, new TraceTestParams { Count = (uint)rayCount },
 			MapFlags.Discard);
 
@@ -151,8 +137,7 @@ public static class SceneTraceVerifier
 			context.ReadBufferExt<Vector4>(device, resultBuffer, dst, (uint)(rayCount * sizeof(Vector4)));
 		}
 
-		// Маркер из шейдера (см. SceneTraceTestCS): без него «расхождение во всех лучах» неотличимо
-		// от непривязанного/незаписанного буфера, а это совсем разные баги.
+		// Shader marker: distinguishes a traversal mismatch from an unwritten result buffer.
 		if (gpu[0].Z != 777f)
 		{
 			throw new InvalidOperationException(
@@ -160,8 +145,7 @@ public static class SceneTraceVerifier
 				"dispatch or UAV binding is broken, not the traversal");
 		}
 
-		// Число узлов, как его видит шейдер, - только СПРАВКА, не приговор: сам GetDimensions мог
-		// оказаться ненадёжным на конкретном бэкенде. Судим по фактическим результатам трассировки.
+		// Informational only: GetDimensions is unreliable on some backends (see Bind).
 		int shaderNodeCount = (int)gpu[0].W;
 
 		int mismatches = 0, cpuHits = 0, gpuHits = 0;
@@ -199,11 +183,6 @@ public static class SceneTraceVerifier
 		return new Report(rayCount, mismatches, worst, cpuHits, gpuHits, shaderNodeCount, nodes.Length);
 	}
 
-	/// <summary>Сверяет GPU-раунд обновления проб (см. <see cref="ProbeRoundGpu"/>) с CPU-эталоном.
-	/// Освещение нарочно упрощено - без неба и без переотскока: небо на CPU считается функцией, а
-	/// на GPU было бы текстурой, и их расхождение замусорило бы результат, вместо того чтобы
-	/// проверить то, что проверяется - генерацию лучей, трассировку, теневые лучи, сборку SH и
-	/// смешивание раундов.</summary>
 	public readonly record struct RoundReport(int Probes, int Rounds, float WorstRelativeError,
 		int Mismatches, float CpuMeanLuminance, float GpuMeanLuminance,
 		double CpuMsPerRound, double GpuMsPerRound,
@@ -216,45 +195,38 @@ public static class SceneTraceVerifier
 	{
 		var (nodes, order, triangles) = baker.ExportBvh();
 
-		// Небо включается, только если вызывающий дал и карту, и её CPU-выборку: сравнивать
-		// CPU-функцию с GPU-сэмплером точно нельзя (разная фильтрация и мип-логика), поэтому со
-		// светом неба сверка становится проверкой ПОРЯДКА ВЕЛИЧИНЫ, а не побитовой.
+		// With sky the check is order-of-magnitude only: a CPU function cannot match a GPU sampler.
 		bool withSky = environmentMap != null && skyRadiance != null;
 
 		var options = new ProbeGiBakeOptions
 		{
 			SkyIntensity = withSky ? 1f : 0f,
-			Bounces = 2,         // переотскок включён: сбор поля - самая замысловатая часть порта
-			SurfaceCache = true, // и кэш поверхностей, ради которого весь порт и затевался
+			Bounces = 2,
+			SurfaceCache = true,
 		};
 
 		var session = baker.BeginBake(boundsMin, boundsMax, sunDirection, sunColor,
 			withSky ? envYaw : 0f, skyRadiance ?? (_ => Vector3.Zero), options);
 
-		// Кэш строится лениво первым раундом (см. WantsSurfaceCache), а GPU-стороне он нужен уже
-		// при создании буферов. Прогонять ради этого раунд нельзя - CPU ушёл бы на раунд вперёд и
-		// сверка потеряла бы смысл; строим захват отдельно.
+		// The cache is built lazily by the first round, but the GPU side needs it at buffer
+		// creation; running a round here would put the CPU one round ahead.
 		baker.EnsureSurfaceCache(session);
 
-		// Атласы обязаны быть привязаны, даже если сверка сравнивает буфер поля: шейдер пишет в них
-		// безусловно, а непривязанный UAV - это ошибка валидации (VUID-vkCmdDispatch-None-08114) и
-		// поведение «работает, пока не перестанет». Заодно прогоняется путь записи в атласы.
+		// Atlases must be bound even though this compares the field buffer: the shader writes them
+		// unconditionally, and an unbound UAV is a validation error.
 		var atlases = new ProbeGiTextures(api, session.Result, "_probeGiVerify", gpuWritable: true);
-		// НЕ using: освобождать надо строго раньше атласов - GPU-объект держит на них
-		// представления, и обратный порядок роняет драйвер в Dispose.
+		// Deliberately not `using`: gpu holds views on the atlases and must be released first.
 		using var pipelines = new ProbeRoundPipelines(api, hardware: false);
 		var gpu = new ProbeRoundGpu(api, pipelines, session, baker, atlases, environmentMap,
 			withSky ? envYaw : 0f);
 
-		// Раунды гоняются попарно: CPU двигает сессию, GPU получает ТЕ ЖЕ направления лучей и тот
-		// же вес раунда. Сравнивать поля после разного числа раундов бессмысленно - бегущее
-		// среднее зависит от истории.
+		// Both paths must see the SAME ray directions and blend weight: the field is a running
+		// average, so comparing after differing round counts is meaningless.
 		for (int i = 0; i < rounds; i++)
 		{
 			var directions = ProbeGiBaker.RoundRayDirections(session);
 			float alpha = ProbeGiBaker.RoundBlendWeight(session);
-			// Раунд идёт порциями - здесь докручиваем его целиком, сверка сравнивает поля после
-			// ОДИНАКОВОГО числа раундов.
+			// A GPU round runs in chunks; drain it fully before stepping the CPU.
 			while (!gpu.RunRound(session, baker, directions, alpha))
 			{
 			}
@@ -280,9 +252,8 @@ public static class SceneTraceVerifier
 			worstAbs = MathF.Max(worstAbs, absError);
 			magnitudeSum += cpu.Length();
 
-			// Относительная ошибка считается только для проб с ОСМЫСЛЕННОЙ яркостью. На тёмных
-			// пробах (внутри геометрии, в глубокой тени) L0 около нуля, и любая разница в последнем
-			// бите даёт относительную ошибку в разы - это шум метрики, а не расхождение путей.
+			// Relative error only for probes bright enough to have one: near zero, a last-bit
+			// difference produces an arbitrarily large ratio.
 			float scale = cpu.Length();
 			if (scale < 1e-3f)
 			{
@@ -298,9 +269,8 @@ public static class SceneTraceVerifier
 			}
 		}
 
-		// Замер стоимости раунда - ради него всё и затевалось. GPU меряется с Flush+WaitForIdle:
-		// сам по себе диспатч только пишет команды, и «мгновенный» раунд без синка ничего не
-		// значил бы. Синк добавляет накладных, так что цифра GPU скорее пессимистична.
+		// GPU timing needs Flush+WaitForIdle: a dispatch alone only records commands. The sync
+		// adds overhead, so the GPU figure is pessimistic.
 		const int timedRounds = 4;
 		var context = api.ImmediateContext;
 
@@ -336,21 +306,14 @@ public static class SceneTraceVerifier
 			significant, worstAbs, (float)(magnitudeSum / Math.Max(session.ProbeCount, 1)));
 	}
 
-	/// <summary>Замер МЕРЦАНИЯ поля в режиме реального времени. Отвечает на вопрос, который на глаз
-	/// не различить: поле «кипит» от дисперсии оценки (каждая проба скачет сама по себе, средняя
-	/// яркость стоит) или РАСКАЧИВАЕТСЯ петлёй мультибаунса (вся сцена дышит целиком)? Лечится это
-	/// противоположным - в первом случае лучами и весом раунда, во втором обратной связью, - поэтому
-	/// разделить причины важнее, чем померить амплитуду.
-	///
-	/// MeanRelativeDelta - средняя по пробам относительная смена L0 за раунд (кипение).
-	/// MeanLuminance* - разброс СРЕДНЕЙ по всей сетке яркости по раундам (дыхание).</summary>
+	/// <summary>Realtime field flicker: per-probe boiling (MeanRelativeDelta) vs whole-scene
+	/// breathing from the multibounce loop (MeanLuminance*), which need opposite fixes.</summary>
 	public readonly record struct FlickerReport(int Probes, int Rays, float Alpha, int Rounds,
 		float MeanRelativeDelta, float MaxRelativeDelta,
 		float MeanLuminanceMin, float MeanLuminanceMax, float MeanLuminanceAvg,
 		float P50, float P90, float P99, float ShareAbove10,
 		float Variability, float SkippedRoundShare)
 	{
-		/// <summary>Размах средней яркости в долях от неё самой: дыхание всей сцены.</summary>
 		public float GlobalSwing => MeanLuminanceAvg > 1e-6f
 			? (MeanLuminanceMax - MeanLuminanceMin) / MeanLuminanceAvg
 			: 0f;
@@ -368,31 +331,23 @@ public static class SceneTraceVerifier
 		bool withSky = environmentMap != null && skyRadiance != null;
 		var options = new ProbeGiBakeOptions
 		{
-			// Яркость неба сюда вынесена не для полноты: она задаёт КОНТРАСТ между небом и
-			// поверхностями, а он и есть источник разброса пробы. Луч в небо приносит радианс в
-			// skyIntensity раз больший, чем луч в стену, поэтому поворот веера, перекинувший пару
-			// лучей через край арки, двигает оценку тем сильнее, чем выше эта ручка.
+			// Sets sky-vs-surface CONTRAST, which is the dominant source of per-probe variance.
 			SkyIntensity = withSky ? skyIntensity : 0f,
 			Bounces = 2,
 			SurfaceCache = true,
-			// Именно РЕАЛТАЙМОВЫЙ бюджет лучей: сессия в этом режиме берёт его, а не RaysPerRound
-			// (см. ProbeGiBakeSession.RaysPerRound) - иначе замер молча мерил бы дефолт.
+			// In realtime mode the session reads this, not RaysPerRound.
 			RealtimeRaysPerRound = raysPerRound,
 			RealtimeMaxRayLuminance = maxRayLuminance,
-			// -1 = «оставить дефолт», 0 = явно выключить: ноль тут осмысленное значение, поэтому
-			// признаком «не задано» служит отрицательное.
+			// Negative means "keep the default"; 0 is a meaningful value here.
 			RealtimeMaxStep = maxStep < 0f ? new ProbeGiBakeOptions().RealtimeMaxStep : maxStep,
 			RealtimeRelocation = relocation < 0f
 				? new ProbeGiBakeOptions().RealtimeRelocation
 				: relocation,
 			RealtimeGamma = gamma < 0f ? new ProbeGiBakeOptions().RealtimeGamma : gamma,
-			// По умолчанию остановка сошедшегося объёма ВЫКЛЮЧЕНА: замер меряет мерцание, а
-			// пропущенный раунд даёт нулевую разницу и подменил бы метрику нулями. Включается
-			// отдельно (DECA_PROBE_FLICKERVAR), чтобы померить долю пропусков.
+			// Off by default: a skipped round reports zero delta and would dilute the metric.
 			RealtimeVariabilityThreshold = variabilityThreshold,
 			RealtimeBlend = blend > 0f ? blend : ProbeGiBaker.RealtimeBlend,
-			// Ради чего всё и меряется: в запечке вес раунда падает к нулю, и любое мерцание
-			// затухает само - вопрос стоит только для постоянного веса.
+			// Flicker only matters at constant blend weight; a bake's weight decays to zero.
 			Realtime = true,
 		};
 
@@ -408,9 +363,7 @@ public static class SceneTraceVerifier
 
 		var atlases = new ProbeGiTextures(api, session.Result, "_probeGiFlicker", gpuWritable: true);
 
-		// Аппаратная трассировка здесь не роскошь: на плотной сетке (density 64 - это сотни тысяч
-		// проб) программный обход считает раунд секундами, и замер из инструмента превращается в
-		// получасовое ожидание.
+		// On a dense grid (hundreds of thousands of probes) software traversal takes seconds/round.
 		using var pipelines = new ProbeRoundPipelines(api, hardware);
 		using var accel = hardware ? new ProbeSceneAccel(api, baker.InstancedGeometry) : null;
 		var gpu = new ProbeRoundGpu(api, pipelines, session, baker, atlases, environmentMap,
@@ -427,8 +380,7 @@ public static class SceneTraceVerifier
 			session.AdvanceRound();
 		}
 
-		// Разгон: первые раунды идут с полным весом и мерцания не показывают - поле в них ещё
-		// строится, а не колеблется вокруг решения.
+		// Settle: early rounds run at full weight and are still building the field.
 		for (int i = 0; i < settleRounds; i++)
 		{
 			RunOne();
@@ -441,9 +393,7 @@ public static class SceneTraceVerifier
 		double lumSum = 0;
 		int probes = session.ProbeCount;
 
-		// Относительные смены ПО ВСЕМ пробам и раундам: максимум сам по себе врёт (одна выродившаяся
-		// проба из тысяч выглядит как катастрофа), а видно глазу распределение - какая ДОЛЯ сетки
-		// заметно дёргается.
+		// Kept per probe and round: the max alone lies, the distribution is what the eye sees.
 		var deltas = new List<float>(probes * measureRounds);
 
 		for (int round = 0; round < measureRounds; round++)
@@ -463,8 +413,7 @@ public static class SceneTraceVerifier
 				roundMagnitude += magnitude.Length();
 				roundLum += Luminance(magnitude);
 
-				// Пробы у нуля из относительной метрики выбрасываются: там любое дрожание в
-				// последнем бите даёт разы, и распределение перестало бы что-либо значить.
+				// Near-zero probes are excluded: a last-bit jitter there dominates the ratio.
 				if (magnitude.Length() > 1e-2f)
 				{
 					deltas.Add(d.Length() / magnitude.Length());
@@ -507,10 +456,8 @@ public static class SceneTraceVerifier
 
 	private static void Bind(IShaderResourceBinding srb, string name, IBuffer buffer)
 	{
-		// Явное описание представления, а не GetDefaultView. Строго говоря, работает и дефолтное:
-		// подозрение на пустое SRV у D3D12 не подтвердилось - врал сам GetDimensions, которым это
-		// проверялось (на D3D12 он даёт ноль при полностью исправной привязке, см. отчёт
-		// ShaderNodeCount). Явный вид оставлен как менее двусмысленный.
+		// Explicit view rather than GetDefaultView; both work, but this one is less ambiguous.
+		// Note: on D3D12, GetDimensions reports zero even for a perfectly valid binding.
 		var desc = buffer.GetDesc();
 		using var view = buffer.CreateView(new BufferViewDesc
 		{
@@ -523,8 +470,7 @@ public static class SceneTraceVerifier
 		Require(srb, name).Set(view, SetShaderResourceFlags.AllowOverwrite);
 	}
 
-	/// <summary>Привязка ОБЯЗАНА найтись: молча проглоченный промах имени даёт нулевой буфер и
-	/// «расхождение» во всех лучах - самая дорогая для отладки форма отказа.</summary>
+	// A swallowed name miss would leave a zero buffer and look like a traversal mismatch.
 	private static IShaderResourceVariable Require(IShaderResourceBinding srb, string name) =>
 		srb.GetVariableByName(ShaderType.Compute, name)
 		?? throw new InvalidOperationException(
@@ -536,8 +482,8 @@ public static class SceneTraceVerifier
 		var desc = new BufferDesc
 		{
 			Name = name,
-			// Default, а не Immutable: у D3D12-бэкенда immutable structured-буфер с начальными
-			// данными не доезжал до шейдера - тот видел ноль элементов (поймано сверкой, см. Run).
+			// Default, not Immutable: on D3D12 an immutable structured buffer with initial data
+			// reaches the shader as zero elements.
 			Usage = Usage.Default,
 			BindFlags = BindFlags.ShaderResource,
 			Mode = BufferMode.Structured,

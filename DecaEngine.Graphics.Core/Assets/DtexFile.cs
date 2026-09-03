@@ -2,35 +2,24 @@ using System.Buffers.Binary;
 
 namespace DecaEngine.Graphics.Assets;
 
-/// <summary>
-/// Контейнер запечённой текстуры ассет-пайплайна: заголовок фиксированного размера, таблица длин
-/// мип-уровней и сами уровни подряд, без какой-либо упаковки поверх.
-///
-/// Отсутствие внешнего сжатия (Deflate/Zstd) - осознанный выбор, а не недоделка. Смысл кеша в том,
-/// чтобы путь «диск -&gt; VRAM» не требовал НИКАКОЙ обработки: BC-блоки читаются с диска ровно в том
-/// виде, в каком уедут в текстуру, поэтому загрузка модели упирается только в скорость носителя, а
-/// не в CPU. Deflate поверх BC даёт единицы процентов (блоки уже энтропийно плотные) и вернул бы в
-/// критический путь распаковку, ради устранения которой всё и затевалось.
-///
-/// Сэмплер (wrap/filter) здесь НЕ хранится: он свойство слота материала в glTF, а не картинки, и
-/// один и тот же .dtex законно шарится слотами с разными сэмплерами. Живёт в записи материала
-/// cooked-модели (см. <see cref="CookedModelFile"/>).
-/// </summary>
+// Deliberately uncompressed: BC blocks go disk -> VRAM untouched, so loading is I/O bound.
+// The sampler is not stored here - it belongs to the glTF material slot, not the image.
+/// <summary>Baked texture container: fixed header, mip length table, then the mip levels back to back.</summary>
 public static class DtexFile
 {
-	/// <summary>"DTEX" little-endian.</summary>
+	// "DTEX" little-endian.
 	private const uint Magic = 0x58455444;
 
 	private const int Version = 1;
 
-	/// <summary>Magic + версия + формат + ширина + высота + число мипов = 6 * 4 байта.</summary>
+	// Magic + version + format + width + height + mip count = 6 * 4 bytes.
 	private const int HeaderBytes = 24;
 
 	public const string Extension = ".dtex";
 
 	public readonly record struct Header(TextureObjectFormat Format, int Width, int Height, int MipCount);
 
-	/// <summary>Запечённая текстура целиком: заголовок + данные по уровням (0 = полный размер).</summary>
+	/// <summary>A whole baked texture: header plus per-level data, level 0 being full size.</summary>
 	public sealed class Payload
 	{
 		public required TextureObjectFormat Format { get; init; }
@@ -53,12 +42,8 @@ public static class DtexFile
 		}
 	}
 
-	/// <summary>
-	/// Пишет .dtex атомарно: сначала во временный файл рядом, потом Move поверх цели. Бейк идёт в
-	/// фоновых потоках и может быть убит закрытием редактора в любой момент - без атомарной подмены
-	/// на диске остался бы обрезанный файл, который выглядит валидным по имени (ключ кеша совпадает)
-	/// и при следующем запуске поехал бы в текстуру мусором.
-	/// </summary>
+	/// <summary>Writes a .dtex atomically (temp file then Move): a bake killed mid-write must not leave
+	/// a truncated file whose name still matches the cache key.</summary>
 	public static void Write(string path, Payload payload)
 	{
 		var directory = Path.GetDirectoryName(path);
@@ -104,25 +89,11 @@ public static class DtexFile
 		}
 	}
 
-	/// <summary>
-	/// Читает .dtex целиком. Возвращает null, если файла нет или он не проходит проверку заголовка -
-	/// вызывающий трактует это как промах кеша и перебейкивает, вместо того чтобы падать. Битый кеш
-	/// (обрезанная запись, файл от старой версии формата) обязан лечиться сам: чинить его вручную
-	/// пользователь всё равно не станет, а «редактор не запускается, сотрите папку» - плохой контракт.
-	/// </summary>
+	/// <summary>Reads a whole .dtex; null on a missing or invalid file, which callers treat as a cache miss.</summary>
 	public static Payload? TryRead(string path) => TryReadFromLevel(path, 0);
 
-	/// <summary>
-	/// Читает ХВОСТ мип-цепочки начиная с уровня <paramref name="firstLevel"/> (0 = весь файл).
-	/// Возвращает payload, чей нулевой уровень - это <paramref name="firstLevel"/> исходного файла,
-	/// то есть готовую текстуру уменьшенного размера с полной цепочкой под ней.
-	///
-	/// Это и есть механика постепенной подгрузки. Уровни лежат в файле от большого к малому, поэтому
-	/// «показать текстуру в 64px» - это ОДИН seek и ОДНО чтение до конца файла, а самые тяжёлые
-	/// уровни (нулевой занимает три четверти файла) не читаются вовсе, пока качество до них не
-	/// дошло. Ни декода, ни пересжатия на этом пути нет ни на одной ступени - в отличие от
-	/// стриминга из PNG, где каждая ступень требует полного разжатия исходника.
-	/// </summary>
+	/// <summary>Reads the mip chain tail from <paramref name="firstLevel"/> down, giving a smaller
+	/// texture with a full chain under it - one seek, one read, no decode. This is the streaming path.</summary>
 	public static Payload? TryReadFromLevel(string path, int firstLevel)
 	{
 		try
@@ -146,9 +117,7 @@ public static class DtexFile
 				stream.ReadExactly(lengthField);
 				lengths[i] = BinaryPrimitives.ReadInt32LittleEndian(lengthField);
 
-				// Длина каждого уровня выводима из формата и размеров - сверяем и отвергаем файл при
-				// расхождении. Иначе повреждённая таблица длин заставила бы аллоцировать мусорный
-				// размер и залить в текстуру не те байты (артефакты вместо честного промаха кеша).
+				// Level length is derivable from format and size: a mismatch means a corrupt table.
 				int width = Math.Max(1, header.Width >> i);
 				int height = Math.Max(1, header.Height >> i);
 				if (lengths[i] != TextureFormatLayout.LevelBytes(header.Format, width, height))
@@ -157,8 +126,7 @@ public static class DtexFile
 				}
 			}
 
-			// Пропускаемые уровни именно ПЕРЕПРЫГИВАЮТСЯ по смещению, а не вычитываются в никуда:
-			// ради этого таблица длин и лежит в заголовке отдельно от данных.
+			// Skipped levels are seeked over, never read: that is why the length table is separate.
 			long skipBytes = 0;
 			for (int i = 0; i < firstLevel; i++)
 			{
@@ -192,11 +160,7 @@ public static class DtexFile
 		}
 	}
 
-	/// <summary>
-	/// Индекс уровня, чья бо́льшая сторона не превышает <paramref name="size"/>, для цепочки с верхним
-	/// уровнем <paramref name="topWidth"/>x<paramref name="topHeight"/>. Ноль для size &gt;= верхнего
-	/// уровня, последний уровень - для слишком мелких запросов.
-	/// </summary>
+	/// <summary>Index of the first mip level whose longer side is at most <paramref name="size"/>.</summary>
 	public static int LevelForSize(int topWidth, int topHeight, int size)
 	{
 		int level = 0;
@@ -213,8 +177,7 @@ public static class DtexFile
 		return level;
 	}
 
-	/// <summary>Читает только заголовок - для диагностики и для решений «стоит ли грузить целиком»
-	/// без чтения мегабайт данных.</summary>
+	/// <summary>Reads the header only, without touching the mip data.</summary>
 	public static bool TryReadHeader(string path, out Header header)
 	{
 		header = default;
@@ -273,7 +236,7 @@ public static class DtexFile
 		return true;
 	}
 
-	/// <summary>Готовит данные .dtex к заливке в текстуру одним вызовом графического API.</summary>
+	/// <summary>Wraps .dtex data for a single graphics-API texture upload.</summary>
 	public static CpuTextureData ToCpuTextureData(this Payload payload, string name) => new()
 	{
 		Name = name,
@@ -292,7 +255,6 @@ public static class DtexFile
 		}
 		catch (IOException)
 		{
-			// Уборка мусора; исходная ошибка записи важнее и пробрасывается выше.
 		}
 		catch (UnauthorizedAccessException)
 		{

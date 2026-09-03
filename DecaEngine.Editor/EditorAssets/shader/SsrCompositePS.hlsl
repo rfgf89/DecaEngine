@@ -1,9 +1,5 @@
-// Композит SSR в HDR-кадр (см. SsrPass.cs). Энергетически корректная ЗАМЕНА, а не сложение:
-// форвард-пасс уже вложил в кадр env-спекуляр envColor * factor (factor записан в G-buffer,
-// см. FEATURE_REFLECTION_GBUFFER в UnlitInstancedPS), поэтому здесь
-//   out = scene + conf * factor * (ssr * intensity - envColor)
-// - на confidence-долю пикселя префильтрованное окружение вычитается и вместо него встаёт
-// трейс; при conf = 0 кадр не меняется вовсе (промахи честно остаются на env-карте).
+// SSR composite (SsrPass.cs): REPLACES env specular already added by forward, not adds.
+//   out = scene + conf * factor * (ssr * intensity - envColor), conf = 0 is a no-op.
 #include "SsrCommon.hlsl"
 
 Texture2D<float> _DepthTex;
@@ -34,8 +30,7 @@ PSOutput Main(in VSOutput input)
 
     if (ssrDebugView > 3.5)
     {
-        // Вид 4: альбедо RT-хитов; вид 5: карта цепочки отскоков (см. SsrTracePS - там же
-        // расшифровка цветов). Оба приходят из трейса как есть.
+        // View 4: RT-hit albedo; view 5: bounce chain map (color key in SsrTracePS).
         output.color = float4(ssr.rgb, 1.0);
         return output;
     }
@@ -62,8 +57,7 @@ PSOutput Main(in VSOutput input)
         return output;
     }
 
-    // Зеркальный env-цвет, который вложил форвард-пасс, - восстанавливается из G-buffer той же
-    // формулой (нормаль шейдинга, roughness-мип префильтрованной equirect-карты, тот же yaw).
+    // Must reproduce the forward pass formula exactly: same normal, mip and yaw.
     float3 nWorld = normalize(gbuffer.xyz);
     float3 P = SsrViewPos(pixel, centerRaw, viewportSize);
     float3 vView = -normalize(P);
@@ -71,17 +65,8 @@ PSOutput Main(in VSOutput input)
     float3 rWorld = SsrViewDirToWorld(reflect(-vView, nView));
     float3 envColor = SsrSampleEnvironment(_EnvMap, _EnvMap_sampler, rWorld, gbuffer.a);
 
-    // envFactor.rgb - множитель БЕЗ окклюзии неба, envFactor.a - сама окклюзия (см.
-    // FEATURE_REFLECTION_GBUFFER в UnlitInstancedPS): вычитается ровно тот env-вклад, что
-    // сложил форвард (factor * envOcclusion * envColor), а трейс подмешивается без неё -
-    // экранная геометрия в отражении не «небо» и запечённой видимостью неба не глушится.
-    //
-    // НО только у зеркала: его один луч честно знает, что видит, и глушить его окклюзией
-    // нельзя (зеркало в интерьере чернело - причина решения выше). У шероховатой поверхности
-    // лоб широкий, трейс покрывает его парой стохастических направлений, а запечённая
-    // окклюзия - честная средняя видимость по полусфере; без неё МАТОВЫЕ поверхности в
-    // тёмных углах ДОБАВЛЯЛИ яркость там, где вычитать было нечего (envOcclusion ~ 0) -
-    // «в тени всё слишком отражает».
+    // envFactor.rgb = factor without sky occlusion, envFactor.a = the occlusion itself.
+    // Mirrors keep full energy; rough surfaces need occlusion or dark corners gain energy.
     float occlusionGate = lerp(envFactor.a, 1.0, smoothstep(0.45, 0.1, gbuffer.a));
     float3 delta = envFactor.rgb * conf *
         (ssr.rgb * ssrIntensity * occlusionGate - envFactor.a * envColor);

@@ -1,6 +1,7 @@
 using System.Numerics;
 using DecaEngine;
 using DecaEngine.Core;
+using DecaEngine.Graphics;
 
 namespace AnimationSample;
 

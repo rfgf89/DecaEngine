@@ -18,9 +18,7 @@ namespace DecaEngine.Graphics
 		public HandleAccess access;
 		public bool dynamic;
 
-		/// <summary>MSAA sample count (0/1 = без мультисемплинга). Мультисемпловый таргет нельзя
-		/// сэмплировать обычным шейдером - перед использованием он резолвится в одиночный
-		/// (см. ICommandBuffer.ResolveTexture).</summary>
+		/// <summary>MSAA sample count (0/1 = none); multisampled targets need ResolveTexture first.</summary>
 		public uint sampleCount;
 	}
 
@@ -44,50 +42,36 @@ namespace DecaEngine.Graphics
 		D24UNormS8UInt = 5,
 		D32FloatS8X24UInt = 6,
 
-		/// <summary>Двухканальный полуплавающий таргет - экранные ВЕКТОРЫ, а не цвет: motion vectors
-		/// (см. <see cref="DecaEngine.Core.MotionVectorPassResources"/>). Знаковый формат обязателен -
-		/// смещение к прошлому кадру бывает любого знака, а UNorm срезал бы половину направлений.</summary>
+		/// <summary>Motion vectors; signed format is required, UNorm would clip half the directions.</summary>
 		R16G16Float = 7,
 
-		/// <summary>Одноканальный float32 - ТИПИЗИРОВАННАЯ копия глубины для нативных апскейлеров:
-		/// сам депт Diligent создаёт как R32_TYPELESS, и внешний рантайм, строящий SRV по дескриптору
-		/// ресурса, читал бы его нулями (см. FsrUpscalerBackend).</summary>
+		/// <summary>Typed depth copy for native upscalers: Diligent's own depth is R32_TYPELESS.</summary>
 		R32Float = 8,
 
-		// Блочно-сжатые форматы ассет-пайплайна (см. DecaEngine.Graphics.Assets.TextureBaker). Пекутся
-		// оффлайн в редакторе и грузятся с диска готовой мип-цепочкой, минуя и CPU-декод, и генерацию
-		// мипов на GPU. sRGB-вариантов тут НЕТ намеренно: шейдер материалов разворачивает базовый цвет
-		// в линейное пространство вручную (pow(texel.rgb, 2.2) в UnlitInstancedPS.hlsl), так что
-		// аппаратный *_SRGB-view применил бы ту же кривую второй раз и вымыл бы все текстуры.
+		// No *_SRGB variants on purpose: the material shader linearizes base color itself
+		// (pow(texel.rgb, 2.2) in UnlitInstancedPS.hlsl), an sRGB view would apply it twice.
 
-		/// <summary>BC1 (DXT1), 4 бита/тексель - RGB без альфы. Вчетверо меньше RGBA8, но заметно
-		/// грубее BC7 на градиентах; в авто-выборе не используется, доступен ручной настройкой.</summary>
+		/// <summary>BC1 (DXT1), 4 bits/texel, RGB without alpha; manual selection only.</summary>
 		BC1UNorm = 9,
 
-		/// <summary>BC3 (DXT5), 8 бит/тексель - RGB + полная альфа. Дешевле BC7 по времени
-		/// кодирования, хуже по качеству; ручная настройка.</summary>
+		/// <summary>BC3 (DXT5), 8 bits/texel, RGB + full alpha; manual selection only.</summary>
 		BC3UNorm = 10,
 
-		/// <summary>BC4, 4 бита/тексель - ОДИН канал (R). Для однокональных масок: толщина
-		/// KHR_materials_volume и т.п.</summary>
+		/// <summary>BC4, 4 bits/texel, single channel (R) for masks.</summary>
 		BC4UNorm = 11,
 
-		/// <summary>BC5, 8 бит/тексель - ДВА канала (RG) с точностью заметно выше, чем у любого
-		/// трёхканального BC на тех же битах. Штатный формат карт нормалей: Z не хранится, а
-		/// восстанавливается в шейдере из XY (тангенциальные нормали всегда имеют z &gt; 0).</summary>
+		/// <summary>BC5, 8 bits/texel, two channels (RG); normal maps rebuild Z from XY in the shader.</summary>
 		BC5UNorm = 12,
 
-		/// <summary>BC7, 8 бит/тексель - RGB(A) высокого качества. Дефолт для всех цветовых и
-		/// ORM-каналов: вдвое меньше RGBA8 и практически неотличим от него на глаз.</summary>
+		/// <summary>BC7, 8 bits/texel, high quality RGB(A); default for color and ORM.</summary>
 		BC7UNorm = 13
 	}
 
-	/// <summary>Свойства <see cref="TextureObjectFormat"/>, нужные и загрузчику ассетов, и бэкенду:
-	/// размер блока в байтах и раскладка мип-уровня. Живут здесь, а не в бэкенде, потому что
-	/// .dtex-контейнер считает те же смещения на CPU при бейке и чтении.</summary>
+	/// <summary>Block size and mip layout of <see cref="TextureObjectFormat"/>, shared by the asset
+	/// loader and the backend.</summary>
 	public static class TextureFormatLayout
 	{
-		/// <summary>true для BC*-форматов: данные хранятся блоками 4x4 текселя, а не построчно.</summary>
+		/// <summary>True for BC* formats: data is stored in 4x4 texel blocks, not scanlines.</summary>
 		public static bool IsBlockCompressed(TextureObjectFormat format) => format
 			is TextureObjectFormat.BC1UNorm
 			or TextureObjectFormat.BC3UNorm
@@ -95,7 +79,7 @@ namespace DecaEngine.Graphics
 			or TextureObjectFormat.BC5UNorm
 			or TextureObjectFormat.BC7UNorm;
 
-		/// <summary>Байт на блок 4x4 для блочных форматов; 0 для остальных.</summary>
+		/// <summary>Bytes per 4x4 block for block formats; 0 otherwise.</summary>
 		public static int BlockBytes(TextureObjectFormat format) => format switch
 		{
 			TextureObjectFormat.BC1UNorm or TextureObjectFormat.BC4UNorm => 8,
@@ -103,7 +87,7 @@ namespace DecaEngine.Graphics
 			_ => 0
 		};
 
-		/// <summary>Байт на тексель для НЕблочных форматов; 0 для блочных.</summary>
+		/// <summary>Bytes per texel for non-block formats; 0 for block formats.</summary>
 		public static int BytesPerPixel(TextureObjectFormat format) => format switch
 		{
 			TextureObjectFormat.R8G8B8A8UNorm => 4,
@@ -114,9 +98,7 @@ namespace DecaEngine.Graphics
 			_ => 0
 		};
 
-		/// <summary>Длина одной строки данных мип-уровня в байтах. Для блочных форматов строка - это
-		/// РЯД БЛОКОВ (4 текселя по высоте), поэтому округление вверх до кратного 4 обязательно:
-		/// мип 3x3 всё равно занимает один полный блок.</summary>
+		/// <summary>Row pitch of a mip level; for block formats a row is a row of 4x4 blocks.</summary>
 		public static int RowPitch(TextureObjectFormat format, int width)
 		{
 			if (IsBlockCompressed(format))
@@ -127,7 +109,7 @@ namespace DecaEngine.Graphics
 			return width * BytesPerPixel(format);
 		}
 
-		/// <summary>Полный размер мип-уровня в байтах.</summary>
+		/// <summary>Total size of a mip level in bytes.</summary>
 		public static int LevelBytes(TextureObjectFormat format, int width, int height)
 		{
 			if (IsBlockCompressed(format))
@@ -138,7 +120,7 @@ namespace DecaEngine.Graphics
 			return width * height * BytesPerPixel(format);
 		}
 
-		/// <summary>Число уровней полной мип-цепочки до 1x1.</summary>
+		/// <summary>Number of levels in a full mip chain down to 1x1.</summary>
 		public static int FullMipCount(int width, int height)
 		{
 			int levels = 1;
@@ -158,38 +140,25 @@ namespace DecaEngine.Graphics
 		public string Name { get; set; }
 		public TextureInfo Info { get; set; }
 
-		// For now, holding the SharpGLTF Image.
-		// Ideally, this would be a raw byte array (byte[]) or Memory<byte>
-		// after decoding, to decouple from GLTF entirely.
 		public Image Image { get; set; }
 
-		/// <summary>
-		/// Already-decoded RGBA8 pixels for <see cref="Image"/>, if decoding was done ahead of time
-		/// (e.g. on a background thread by <see cref="DecaEngine.Graphics.ModelLoader"/>) so that
-		/// IGraphicsApi.CreateTexture, which must run on the GPU/main thread, can skip the decode step.
-		/// Null if the implementation should decode <see cref="Image"/> itself.
-		/// </summary>
+		/// <summary>Pre-decoded RGBA8 pixels for <see cref="Image"/>; null if not decoded yet.</summary>
 		public byte[] DecodedPixels { get; set; }
 		public int DecodedWidth { get; set; }
 		public int DecodedHeight { get; set; }
 
-		/// <summary>Сгенерировать полную мип-цепочку на GPU при создании (см.
-		/// DiligentGraphicsApi.CreateTexture). Без мипов любая минификация (доска под острым
-		/// углом) шумит и мылится, а анизотропная фильтрация не работает вовсе. 1x1-филлеры
-		/// пропускаются автоматически. Игнорируется для <see cref="CompressedMips"/>: там цепочка
-		/// уже забейкана оффлайн, а BC-формат на GPU не отфильтруешь.</summary>
+		/// <summary>Generate the full mip chain on the GPU at creation; ignored when
+		/// <see cref="CompressedMips"/> is set, BC data cannot be filtered on the GPU.</summary>
 		public bool GenerateMips { get; set; } = true;
 
-		/// <summary>Готовая мип-цепочка в блочно-сжатом формате <see cref="CompressedFormat"/>, уровень
-		/// на элемент (0 = полный размер). Приходит прямо из .dtex-кеша ассет-пайплайна, то есть путь
-		/// «диск -&gt; VRAM» не проходит ни через декод PNG, ни через RGBA8-буфер, ни через генерацию
-		/// мипов. Когда не null, <see cref="DecodedPixels"/>/<see cref="Image"/> не используются.</summary>
+		/// <summary>Baked mip chain in <see cref="CompressedFormat"/>, one level per element (0 = full
+		/// size). When set, <see cref="DecodedPixels"/> and <see cref="Image"/> are ignored.</summary>
 		public byte[][] CompressedMips { get; set; }
 
-		/// <summary>Формат данных в <see cref="CompressedMips"/>.</summary>
+		/// <summary>Format of the data in <see cref="CompressedMips"/>.</summary>
 		public TextureObjectFormat CompressedFormat { get; set; } = TextureObjectFormat.Unknown;
 
-		/// <summary>Размеры нулевого уровня <see cref="CompressedMips"/>.</summary>
+		/// <summary>Size of level 0 of <see cref="CompressedMips"/>.</summary>
 		public int CompressedWidth { get; set; }
 		public int CompressedHeight { get; set; }
 

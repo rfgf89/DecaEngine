@@ -201,12 +201,11 @@ public class DiligentComputeMaterial : IComputeMaterial
 			_pipelineState?.Dispose();
 			_pipelineState = _api.PsoManager.CreateComputePipelineState(psoCreateInfo);
 
-			// Протухший блоб дискового PSO-кэша (изменившийся байткод шейдера под старым именем) - не
-			// повод ронять процесс: пересоздаём БЕЗ кэша. null дальше по коду - это бинд null-PSO и AV
-			// без единого сообщения (ровно как в графическом RebuildPipelineIfNeeded).
+			// A stale disk PSO cache blob (new bytecode under an old name) must not kill the process:
+			// retry without the cache, since a null PSO binds silently and then access-violates.
 			if (_pipelineState is null)
 			{
-				Console.WriteLine($"[compute-material] PSO '{psoCreateInfo.PSODesc.Name}': кэш отверг создание - пересоздаю без кэша");
+				Console.WriteLine($"[compute-material] PSO '{psoCreateInfo.PSODesc.Name}': cache rejected creation - recreating without the cache");
 				_pipelineState = _api.Device.CreateComputePipelineState(psoCreateInfo);
 			}
 
@@ -249,8 +248,7 @@ public class DiligentComputeMaterial : IComputeMaterial
 
 	public void SetPipelineState(IDeviceContext context)
 	{
-		// DECA_MAT_DIAG=2 - трассировка биндов PSO, как у графического материала (охота на AV
-		// в реплее замороженных команд: последний напечатанный - виновник).
+		// DECA_MAT_DIAG=2 traces PSO binds; the last one printed is the culprit on a replay crash.
 		if (Environment.GetEnvironmentVariable("DECA_MAT_DIAG") == "2")
 		{
 			Console.WriteLine($"[matdiag] compute SetPipelineState '{Name}' dirty={_isDirty}");

@@ -10,22 +10,19 @@ public unsafe struct RenderCamerasData
     public NativeList<ViewData> viewData;
     public NativeList<LightData> lightData;
 
-    /// <summary>Общий пул видимых punctual-светов кадра (PunctualLight, фиксированная ёмкость
-    /// <see cref="LightClusters.MaxLights"/>): каждая камера владеет своим отрезком, границы - в её
-    /// LightData.ClusterParams. Именно UnsafeArray, а не NativeList: замороженные команды графа
-    /// (см. ForwardPass -> IBatchRenderer.SetupPunctualLights) запоминают сырой указатель и
-    /// перечитывают память на каждом реплее - память обязана быть стабильной, без переаллокаций.</summary>
+    /// <summary>Per-frame pool of visible punctual lights; each camera owns a segment bounded by
+    /// its LightData.ClusterParams. UnsafeArray, not NativeList: frozen graph commands capture the
+    /// raw pointer and re-read it on every replay, so the memory must never reallocate.</summary>
     public UnsafeArray* punctualLights;
 
-    /// <summary>Данные слайсов теней punctual-светов кадра - РОВНО <see cref="LightClusters.MaxShadowSlices"/>
-    /// записей каждый кадр (замороженный ForwardPass пишет фиксированную петлю по всем слайсам;
-    /// мёртвый слайс несёт drawCount = 0 и рисует пусто). cullData - фрустум света для GPU-кулинга,
-    /// lightData - CascadeMatrix0 = viewProj слайса (ShadowVS трансформирует по ней).</summary>
+    /// <summary>Punctual shadow slice data, exactly <see cref="LightClusters.MaxShadowSlices"/>
+    /// entries every frame (frozen ForwardPass loops over all slices; dead slices draw nothing).
+    /// lightData.CascadeMatrix0 holds the slice viewProj used by ShadowVS.</summary>
     public NativeList<CullData> punctualShadowCullData;
     public NativeList<LightData> punctualShadowLightData;
 
-    /// <summary>viewProj каждого слайса теней для СЭМПЛИНГА в пиксельном шейдере (структурный буфер
-    /// PunctualShadowMatrices). Стабильная unmanaged-память - по той же причине, что punctualLights.</summary>
+    /// <summary>Per-slice viewProj for pixel-shader sampling (PunctualShadowMatrices buffer).
+    /// Stable unmanaged memory for the same reason as punctualLights.</summary>
     public UnsafeArray* punctualShadowMatrices;
 
     public RenderCamerasData(int capacity)
@@ -70,8 +67,8 @@ public unsafe struct RenderCamerasData
         lightData.Clear();
         punctualShadowCullData.Clear();
         punctualShadowLightData.Clear();
-        // punctualLights/punctualShadowMatrices не чистятся: пул перезаписывается каждый кадр, а
-        // занятость сегментов/слайсов сообщают LightData.ClusterParams и PunctualLight.ShadowParams.
+        // punctualLights/punctualShadowMatrices are rewritten each frame; occupancy is conveyed
+        // by LightData.ClusterParams and PunctualLight.ShadowParams, so no clear is needed.
     }
 }
 

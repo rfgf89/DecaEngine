@@ -10,25 +10,7 @@ using Friflo.Engine.ECS.Systems;
 
 namespace DecaEngine.Editor
 {
-	/// <summary>
-	/// Фоновый "бейкер" превью-иконок моделей для AssetBrowser: при первом выборе .gltf/.glb
-	/// ассета (см. AssetBrowserWindow) модель ставится в очередь на иконку ЦЕЛОЙ модели +
-	/// манифест имён сабмешей; иконки отдельных SubMesh-ей бейкаются ЛЕНИВО, по одной, только
-	/// когда соответствующая строка сабмеша реально стала видна в развёрнутом дереве Asset
-	/// Browser (см. AssetBrowserWindow.RenderEntry -> EnqueueSubMeshIcon). Так модель с
-	/// большим числом сабмешей не фризит редактор целиком одним нажатием - каждый бейк-этап
-	/// делает Flush+WaitForIdle на общем GPU-контексте (см. BakeNextStage), и до этого рефакторинга
-	/// это происходило разом для всех сабмешей сразу при первом выборе модели.
-	///
-	/// Каждая задача в очереди - это ровно один этап (128x128, целая модель или один сабмеш):
-	/// рендерится оффскрин, пиксели считываются на CPU (<see cref="DiligentTextureReadback"/>)
-	/// и сохраняются PNG в EditorCache проекта через <see cref="ModelIconCache"/>. Устроен как
-	/// урезанный <see cref="ModelPreviewViewport"/> (свой EntityStore/DiligentBatchRenderer/
-	/// GraphicsPipeline), но без интерактива и с фиксированным размером таргета.
-	///
-	/// Update() должен вызываться на GPU-потоке под lock (GameHostBridge.GpuSync) - как и
-	/// ModelPreviewViewport.Update (см. EditorManager.OnUpdate).
-	/// </summary>
+	/// <summary>Background baker of 128x128 model preview icons; Update() must run on the GPU thread under GpuSync.</summary>
 	public class ModelIconBaker
 	{
 		private const uint IconSize = 128;
@@ -44,35 +26,17 @@ namespace DecaEngine.Editor
 		private readonly Queue<(string ModelPath, string ProjectDirectory, int Stage)> _queue = new();
 		private readonly HashSet<string> _queued = new(StringComparer.OrdinalIgnoreCase);
 
-		// Этапы, у которых при бейке не оказалось ни одной renderable-геометрии (пустой сабмеш без
-		// треугольников, мёртвая ссылка meshId и т.п. - см. BakeNextStage): PNG для них не сохраняется
-		// (AssetBrowser рисует векторный глиф-фолбэк), а без этой пометки браузер, видя что иконки
-		// по-прежнему нет, ставил бы тот же этап в очередь заново КАЖДЫЙ кадр - бесконечный цикл
-		// холостых бейков. Пометки этой модели сбрасываются при перебейке её целой иконки (модель
-		// изменилась на диске - у сабмешей появляется новый шанс).
+		// Stages with no geometry: without this mark the browser re-queues them every frame.
 		private readonly HashSet<string> _emptyStages = new(StringComparer.OrdinalIgnoreCase);
 
-		// Состояние текущей задачи (один этап - целая модель либо один сабмеш - за раз).
 		private string? _currentPath;
 		private string? _currentProjectDirectory;
 		private int _currentStage;
 
-		/// <summary>Заявка на модель в <see cref="ModelStore"/>, пока она ещё не готова - см.
-		/// <see cref="PollPendingLoad"/>. Загрузка/декод/финализация теперь целиком в столе (общие на
-		/// весь редактор), бейкер только ждёт готовности и регистрирует СВОИ материалы/меши.</summary>
 		private ModelStore.Handle? _pendingHandle;
 		private EditorLoadingStatus.Handle? _statusHandle;
 
-		// Резидентные модели: сабмеши - это логические части уже распарсенного файла, так что
-		// задачи по одному и тому же modelPath (например все видимые сабмеши только что
-		// развёрнутого узла) не должны каждый раз заново грузить .gltf/.glb с диска. Держим LRU
-		// на несколько последних моделей (не одну) - при бейке нескольких моделей вперемешку
-		// (например разворачивают то один, то другой узел в браузере) это избавляет от повторной
-		// загрузки уже виденных файлов. Вытеснение из кеша теперь корректно освобождает GPU-
-		// регистрации этого бейкера (см. ReleaseResident) - раньше (до переезда на ModelStore) они
-		// молча утекали, потому что у батч-рендерера не было API частичного удаления; теперь есть
-		// (DiligentBatchRenderer.UnregisterModel), а сама модель отпускается через _store.Release,
-		// а не разваливается вместе с бейкером.
+		// LRU of parsed models: sub-mesh stages of one file must not re-parse it from disk.
 		private sealed class ResidentModel
 		{
 			public ModelStore.Handle Handle = null!;
@@ -80,6 +44,9 @@ namespace DecaEngine.Editor
 			public readonly Dictionary<int, MeshId> MeshIdMap = new();
 			public readonly Dictionary<int, MaterialId> MaterialIdMap = new();
 			public readonly Dictionary<(int, int), BatchId> BatchCache = new();
+
+			// This baker's own material set: pushing into model.materialObjects would clobber the live scene.
+			public OrderedDictionary<int, IMaterialObject> Materials = null!;
 		}
 
 		private const int DefaultResidentCacheCapacity = 4;
@@ -90,10 +57,7 @@ namespace DecaEngine.Editor
 		private ResidentModel? _currentResident;
 		private readonly List<Entity> _stageEntities = new();
 
-		/// <summary>
-		/// Сколько последних моделей держать резидентными одновременно (см. class-doc у поля
-		/// <see cref="_residentModels"/>). При уменьшении лишние сразу вытесняются. Минимум 1.
-		/// </summary>
+		/// <summary>How many recently baked models stay parsed in memory; clamped to at least 1.</summary>
 		public int ResidentCacheCapacity
 		{
 			get => _residentCacheCapacity;
@@ -112,27 +76,16 @@ namespace DecaEngine.Editor
 			_cache = cache;
 			_store = modelStore;
 
-			// Бейкер не рисует небо/тени/HDRI (см. ctor defaults ниже) - shared-контейнер ему нужен
-			// только затем, чтобы получить ТУ ЖЕ процедурную энвайронмент-текстуру и сэмплеры, что и у
-			// остальных вьюпортов, вместо своей копии (см. class-doc SharedViewportResources).
+			// Shared container only to reuse the viewports' environment texture and samplers.
 			_env = new ModelViewportEnvironment(graphicsApi, IconSize, IconSize,
 				"Model Icon Bake Color", "Model Icon Bake Depth", sharedResources);
 		}
 
-		/// <summary>
-		/// Ставит в очередь бейк иконки ЦЕЛОЙ модели (плюс манифест имён сабмешей - см.
-		/// <see cref="BakeNextStage"/>). Дубликаты (уже в очереди или в работе) игнорируются -
-		/// проверять актуальность кеша должен вызывающий (через <see cref="ModelIconCache.GetManifest"/>),
-		/// тут только защита от повторной постановки.
-		/// </summary>
+		/// <summary>Queues a whole-model icon bake; duplicates are ignored, cache freshness is the caller's job.</summary>
 		public void Enqueue(string modelPath, string projectDirectory) =>
 			EnqueueInternal(modelPath, projectDirectory, ModelIconCache.WholeModelIndex);
 
-		/// <summary>
-		/// Ставит в очередь бейк иконки ОДНОГО сабмеша - вызывается лениво, когда строка этого
-		/// сабмеша реально стала видна в развёрнутом дереве Asset Browser, а не сразу для всех
-		/// сабмешей при выборе модели целиком (см. class-doc выше).
-		/// </summary>
+		/// <summary>Queues one sub-mesh icon; call lazily, only when that row becomes visible.</summary>
 		public void EnqueueSubMeshIcon(string modelPath, string projectDirectory, int subMeshIndex) =>
 			EnqueueInternal(modelPath, projectDirectory, subMeshIndex);
 
@@ -151,14 +104,7 @@ namespace DecaEngine.Editor
 			_queue.Enqueue((modelPath, projectDirectory, stage));
 		}
 
-		/// <summary>
-		/// Убирает бейк сабмеша из очереди, если его строка перестала быть видна в AssetBrowser
-		/// (проскроллили мимо, свернули узел модели и т.п.) - вызывается каждый кадр из
-		/// AssetBrowserWindow.RenderEntry для невидимых строк, поэтому дешёвый no-op, если задачи
-		/// нет. Если сабмеш уже бейкается прямо сейчас (see cref="_currentPath"/) - не трогаем,
-		/// прервать бейк в процессе (модель уже грузится/рендерится на GPU) безопасно нельзя,
-		/// достраиваем его до конца.
-		/// </summary>
+		/// <summary>Drops a queued sub-mesh bake; a bake already in flight cannot be cancelled and runs to the end.</summary>
 		public void CancelSubMeshIcon(string modelPath, int subMeshIndex)
 		{
 			if (_currentPath != null && _currentStage == subMeshIndex &&
@@ -196,8 +142,6 @@ namespace DecaEngine.Editor
 
 		public void Update(float deltaTime, float time)
 		{
-			// _currentPath != null - есть активная задача (грузится или уже готова к бейку);
-			// в отличие от _residentModels, которые остаются в LRU-кеше между задачами (см. поле выше).
 			if (_currentPath != null)
 			{
 				if (_pendingHandle != null)
@@ -234,11 +178,7 @@ namespace DecaEngine.Editor
 
 			if (_residentModels.TryGetValue(modelPath, out var resident))
 			{
-				// Модель уже резидентна в LRU-кеше (эта же модель с предыдущей задачи или одна из
-				// недавних, к которой вернулись) - грузить .gltf/.glb заново незачем, следующий
-				// Update() сразу перейдёт к BakeNextStage. Но _statusHandle предыдущей задачи уже
-				// обнулён в FinishCurrentJob - без нового хендла BakeNextStage упадёт с NullReferenceException
-				// на _statusHandle!.Progress.
+				// A fresh status handle is mandatory: BakeNextStage dereferences _statusHandle.
 				_currentResident = resident;
 				TouchResident(modelPath);
 				_statusHandle = EditorLoadingStatus.Begin($"Baking icon: {Path.GetFileName(modelPath)}");
@@ -252,10 +192,7 @@ namespace DecaEngine.Editor
 				$"(resident cache has {_residentModels.Count} model(s): [{string.Join(", ", _residentLru)}]) - " +
 				"not found in resident cache, re-parsing from disk.");
 
-			// Опции бейка ОТЛИЧАЮТСЯ от опций вьюпортов (MaxTextureSize=512, без стриминга текстур -
-			// иконка не нуждается в полном качестве) - это намеренно даёт ДРУГОЙ ключ в столе
-			// (см. ModelLoadOptions.Signature), т.е. свою, отдельную от вьюпортов запись/ModelLoader,
-			// даже для того же самого файла.
+			// Bake options differ from the viewports' on purpose: a distinct ModelStore key.
 			_pendingHandle = _store.Acquire(modelPath, BuildBakeOptions());
 			_statusHandle = EditorLoadingStatus.Begin($"Baking icon: {Path.GetFileName(modelPath)}");
 		}
@@ -266,8 +203,7 @@ namespace DecaEngine.Editor
 			PixelShader = _editorSettings.DefaultPixelShader,
 			OptimizeMesh = false,
 			GenerateLods = false,
-			// Иконка - крохотный офскрин-кадр; полноразмерные текстуры (Intel Sponza: сотни
-			// 4K) кладут VRAM ещё на стадии бейка, до открытия самого превью.
+			// Full-size textures (Sponza: hundreds of 4K) blow VRAM during the bake itself.
 			MaxTextureSize = 512
 		};
 
@@ -286,8 +222,7 @@ namespace DecaEngine.Editor
 
 			if (!_store.TryGetReady(handle, out var model))
 			{
-				// Стол не даёт прогресс на отдельный handle (общий на процесс) - фиксированное
-				// значение "идёт загрузка", вторая половина (см. ниже) - сам бейк.
+				// ModelStore has no per-handle progress, so this is a fixed "loading" value.
 				_statusHandle!.Progress = 0.25f;
 				return;
 			}
@@ -301,9 +236,8 @@ namespace DecaEngine.Editor
 				ModelViewportGeometry.RegisterModelResources(_env.BatchRenderer, resident.Model, resident.MeshIdMap, resident.MaterialIdMap,
 					_env.SharedResources.EnvMapSampler, _env.SceneCopyTarget, _env.EnvironmentMap, materials,
 					_env.SharedResources.SceneColorSampler);
-				// Помечаем модель резидентной только ПОСЛЕ успешной регистрации ресурсов - если
-				// RegisterModelResources упадёт на середине, MeshIdMap/MaterialIdMap останутся не
-				// полностью заполненными, и в кеш эта модель попадать не должна (см. StartNextJob).
+				resident.Materials = materials;
+				// Cache only after registration succeeds: a half-filled id map must not go resident.
 				_currentResident = resident;
 				AddResident(_currentPath!, resident);
 			}
@@ -316,13 +250,6 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>
-		/// Рендерит и сохраняет одну иконку (<see cref="_currentStage"/>): создаёт сущности этапа,
-		/// кадрирует камеру, гоняет пайплайн, читает пиксели и пишет PNG. Для этапа "целая модель"
-		/// заодно сохраняет манифест имён сабмешей (нужен только для списка имён и не требует
-		/// бейка их иконок - те бейкаются отдельными ленивыми задачами, см. EnqueueSubMeshIcon).
-		/// Всегда завершает задачу целиком - здесь больше нет цикла по всем сабмешам модели.
-		/// </summary>
 		private void BakeNextStage(float deltaTime, float time)
 		{
 			var model = _currentResident!.Model;
@@ -330,9 +257,7 @@ namespace DecaEngine.Editor
 
 			if (_currentStage == ModelIconCache.WholeModelIndex)
 			{
-				// Перебейк целой модели = исходник изменился (или кеша не было) - сбрасываем
-				// empty-пометки всех её этапов ДО бейка (ниже пустой этап может пометиться заново):
-				// в новой версии файла у пустых прежде сабмешей могла появиться геометрия.
+				// Source changed: clear empty marks first, previously empty sub-meshes may have geometry now.
 				var prefix = _currentPath!;
 				_emptyStages.RemoveWhere(key => key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
 			}
@@ -342,7 +267,7 @@ namespace DecaEngine.Editor
 			if (_stageEntities.Count > 0)
 			{
 				FrameCamera(model, _currentStage);
-				ApplyIconPreviewSettings(model, _currentStage);
+				ApplyIconPreviewSettings(model, _currentResident!.Materials, _currentStage);
 
 				_env.Pipeline.InvalidateGraph();
 
@@ -356,9 +281,6 @@ namespace DecaEngine.Editor
 			}
 			else
 			{
-				// Нечего рендерить (сабмеш без треугольников, мёртвая ссылка meshId и т.п.) - PNG не
-				// сохраняем (браузер оставит векторный глиф) и помечаем этап пустым, чтобы браузер не
-				// ставил его в очередь заново каждый кадр (см. _emptyStages/EnqueueInternal).
 				EngineLog.Add(LogLevel.Warning,
 					$"Icon bake: stage {_currentStage} of '{_currentPath}' produced 0 renderable instances " +
 					$"(resident MeshIdMap has {_currentResident.MeshIdMap.Count} mesh(es), model has {model.instances.Count} instance(s)) - marked empty.");
@@ -382,20 +304,11 @@ namespace DecaEngine.Editor
 			var bakedStage = _currentStage;
 			FinishCurrentJob();
 
-			// Сбросить рантайм-состояние кеша ПОСЛЕ записи файлов - чтобы AssetBrowser перечитал
-			// свежий манифест/иконку и подхватил новый PNG вместо запомненного "кеша нет". Только для
-			// этой стадии - иначе уже показанные иконки других сабмешей той же модели без нужды
-			// перегружались бы с диска (см. ModelIconCache.Invalidate).
+			// Must run after the files are written, or the browser re-reads its stale "no cache" state.
 			_cache.Invalidate(bakedPath, bakedStage);
 		}
 
-		/// <summary>
-		/// Создаёт сущности для этапа: stage &lt; 0 - все инстансы модели, иначе только инстансы
-		/// данного сабмеша. Если у сабмеша нет ни одного инстанса (бывает у неиспользуемых мешей
-		/// в glTF) - ничего не создаём: BakeNextStage увидит пустой _stageEntities и корректно
-		/// пропустит бейк этого этапа (см. _emptyStages), вместо того чтобы рисовать несуществующий
-		/// в сцене инстанс с единичным трансформом.
-		/// </summary>
+		// stage < 0 means every instance of the model, otherwise only that sub-mesh's instances.
 		private void CreateStageEntities(ModelLoader model, int stage)
 		{
 			for (int i = 0; i < model.instances.Count; i++)
@@ -427,11 +340,6 @@ namespace DecaEngine.Editor
 			_stageEntities.Clear();
 		}
 
-		/// <summary>
-		/// Ставит камеру так, чтобы объект этапа целиком влезал в кадр (та же математика, что
-		/// ModelPreviewViewport.FrameAll + его Update): bounding-сфера вокруг центра AABB, дистанция
-		/// из вертикального FOV, фиксированный ракурс yaw=-0.6 / pitch=0.35.
-		/// </summary>
 		private void FrameCamera(ModelLoader model, int stage)
 		{
 			Vector3 min, max;
@@ -462,23 +370,16 @@ namespace DecaEngine.Editor
 			_env.SetCameraTransform(eye, target);
 		}
 
-		/// <summary>
-		/// Baked icons never expose a mode picker (see <see cref="ModelPreviewViewport"/> for the
-		/// interactive version) - the whole-model icon is always Textured, sub-mesh icons always
-		/// Highlight (today's flat camera-rim-lit look), matching PreviewSettings' shared layout in
-		/// UnlitInstancedPS.hlsl. Must be re-applied every stage: whole-model and sub-mesh bake jobs for
-		/// the same resident model share the same <see cref="ModelLoader.materialObjects"/> instances.
-		/// </summary>
-		private static void ApplyIconPreviewSettings(ModelLoader model, int stage)
+		// Must be re-applied every stage: stages of one resident model share material instances.
+		private static void ApplyIconPreviewSettings(ModelLoader model,
+			OrderedDictionary<int, IMaterialObject> materials, int stage)
 		{
 			var data = new PreviewSettingsData { Mode = stage == ModelIconCache.WholeModelIndex ? 0 : 1, Channel = 0 };
 
-			// KHR_texture_transform - пер-материальный, а Textured-режим иконки сэмплирует _MainTex:
-			// без матрицы UV дерево/ткань в иконке тайлились бы не так, как в превью (см.
-			// MaterialPbrFactors.UvTransform).
-			for (int i = 0; i < model.materialObjects.Count; i++)
+			// Writes the baker's own material set, never model.materialObjects (shared with the live scene).
+			for (int i = 0; i < materials.Count; i++)
 			{
-				var kvp = model.materialObjects.GetAt(i);
+				var kvp = materials.GetAt(i);
 
 				model.MaterialPbr.TryGetValue(kvp.Key, out var pbr);
 				data.UvOffset = pbr.UvOffset;
@@ -516,12 +417,7 @@ namespace DecaEngine.Editor
 			}
 		}
 
-		/// <summary>Снимает регистрации ЭТОГО бейкера (мешы/материалы/батчи в его батч-рендерере) для
-		/// вытесненного из LRU резидента и отпускает его заявку в столе. Безопасно без GPU-барьера
-		/// (см. тот же приём в ModelStreamer.OnStoreModelEvicted/DiligentBatchRenderer.UnregisterModel):
-		/// у вытесняемого резидента к этому моменту нет живых инстанс-сущностей - ClearStageEntities
-		/// снимает их сразу после КАЖДОГО этапа бейка (см. BakeNextStage), а вытесняется тут только НЕ
-		/// текущий (см. AddResident - только что добавленный/тронутый резидент всегда в голове LRU).</summary>
+		// Safe without a GPU barrier: an evicted resident has no live instance entities left.
 		private void ReleaseResident(ResidentModel resident)
 		{
 			_env.BatchRenderer.UnregisterModel(resident.BatchCache.Values, resident.MaterialIdMap.Values,
@@ -538,9 +434,7 @@ namespace DecaEngine.Editor
 		{
 			ClearStageEntities();
 
-			// _currentResident НЕ сбрасывается здесь - модель остаётся в LRU-кеше (см.
-			// _residentModels выше) для следующей задачи по тому же (или недавнему) пути;
-			// StartNextJob сам подставит нужную запись или создаст новую при вытеснении.
+			// _currentResident is deliberately kept: the model stays in the LRU for the next job.
 
 			if (_statusHandle != null)
 			{

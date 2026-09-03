@@ -10,28 +10,17 @@ using DecaEngine.Physics;
 using DecaEngine.Scene;
 using Friflo.Engine.ECS;
 
-// В Friflo есть свой Transform-компонент, а поза скелета оперирует TRS движка - без явного алиаса
-// имя разрешается неоднозначно.
+// Friflo ships its own Transform component; without this alias the name is ambiguous.
 using Transform = DecaEngine.Core.Transform;
 
 namespace DecaEngine.Editor;
 
-/// <summary>Подъём после рэгдолла и хит-реакция: запуск, блендинг, определение лежачей позы. Часть <see cref="AnimationDriver"/> - файл на тему; состояние
-/// персонажа (Character) и кадровый Update живут в основном файле.</summary>
+/// <summary>Ragdoll get-up and hit reaction: start, blending, lying-pose detection.</summary>
 public sealed partial class AnimationDriver
 {
-	/// <summary>
-	/// Начинает переход «поза рэгдолла → поза анимации»: запоминает ТЕКУЩУЮ позу как исходную.
-	///
-	/// Снимок обязателен. Рэгдолл к этому моменту лежит в произвольной позе, а клип начинается со
-	/// своей; переключить одно на другое мгновенно - это рывок на весь размах позы, ровно то, что в
-	/// игре читается как «персонаж дёрнулся и телепортировался в стойку».
-	///
-	/// <paramref name="modelToWorld"/> - трансформ сущности ПОСЛЕ переноса к месту лёжки: снимок
-	/// РЕБЕЙЗИТСЯ в него, потому что модельные матрицы позы считаны ещё в старом. Без ребейза
-	/// лежачая поза рендерилась под новым трансформом со сдвигом на весь перенос - «телепорт» в
-	/// момент начала подъёма, тем заметнее, чем дальше утолкали рэгдолл от точки падения.
-	/// </summary>
+	/// <summary>Starts the ragdoll-to-animation pose transition, snapshotting the current pose.</summary>
+	// modelToWorld is the entity transform AFTER the move to the lying spot; the snapshot is
+	// rebased into it, since the pose matrices were read in the old one.
 	public void BeginRecovery(int entityId, float duration, in Matrix4x4 modelToWorld,
 		string getUpClip = "")
 	{
@@ -43,23 +32,19 @@ public sealed partial class AnimationDriver
 		var rebase = Matrix4x4.Identity;
 		if (Matrix4x4.Invert(modelToWorld, out var worldToNew))
 		{
-			// Старая модель -> мир -> новая модель. Без переноса матрицы совпадают, и ребейз
-			// вырождается в единичный сам собой.
+			// Old model -> world -> new model.
 			rebase = character.ModelToWorld * worldToNew;
 		}
 
 		character.RecoveryFrom ??= new Transform[character.Skeleton.JointCount];
 		DecomposeModelMatrices(character, rebase, character.RecoveryFrom);
 
-		// Авторский клип подъёма (пусто или не нашёлся - процедурный морф, прежнее поведение):
-		// клип ведёт позу целиком на всю свою длительность (см. ApplyGetUpClip).
+		// Empty or missing clip name falls back to the procedural morph.
 		character.GetUpClip = string.IsNullOrEmpty(getUpClip) ? null : FindClip(character, getUpClip);
 
 		if (character.GetUpClip != null && character.GetUpClip.Duration > 0f)
 		{
-			// Окно вливания снимка в начальную позу клипа - авторское (duration = GetUpDuration
-			// компонента): им регулируется, как быстро лежащий перетекает в сидячую стартовую позу.
-			// Кламп половиной клипа: окно длиннее половины разбавляло бы снимком уже сам подъём.
+			// Clamp the blend window to half the clip: longer would dilute the get-up itself.
 			character.RecoveryDuration = character.GetUpClip.Duration;
 			character.RecoveryBlendSeconds = MathF.Min(duration, character.GetUpClip.Duration * 0.5f);
 		}
@@ -73,14 +58,8 @@ public sealed partial class AnimationDriver
 		character.RecoveryElapsed = 0f;
 	}
 
-	/// <summary>
-	/// Снимает состояние, накопленное за игру и живущее СБОКУ от ECS. Звать на выходе из Play.
-	///
-	/// Всё, что лежит в компонентах (время клипа, состояние цикла падения), откатывает снимок Play
-	/// Mode. А переход позы при подъёме - нет: он живёт здесь. Персонаж, на котором нажали Stop в
-	/// середине подъёма, остался бы навсегда смешанным между лежачей и стоячей позой, и выглядело бы
-	/// это как «поза сломалась», а не как «забыли сбросить».
-	/// </summary>
+	/// <summary>Clears play-time state that lives outside ECS. Call when leaving Play mode.</summary>
+	// The Play Mode snapshot only rolls back components; everything reset here lives beside them.
 	public void EndPlay()
 	{
 		foreach (var character in _characters.Values)
@@ -89,8 +68,6 @@ public sealed partial class AnimationDriver
 			character.RecoveryDuration = 0f;
 			character.GetUpClip = null;
 
-			// Локомоушен - тот же случай, что и переход позы: фаза, замер скорости и его история
-			// живут сбоку от ECS, снимком Play Mode не откатываются и накапливаются за игру.
 			character.LocoPhase = 0f;
 			character.LocoIdleTime = 0f;
 			character.LocoSpeed = 0f;
@@ -99,33 +76,23 @@ public sealed partial class AnimationDriver
 			character.LocoRunGait = false;
 			character.LocoGaitBlend = 0f;
 
-			// Хит-реакция - тоже: Stop посреди толчка не должен оставлять персонажа полукачнувшимся.
 			character.ReactionDuration = 0f;
 			character.ReactionElapsed = 0f;
 			character.ReactionImpulsePending = false;
 
-			// Рэгдолл СНОСИТСЯ, а не «возвращается в анимацию». Его тела - это и есть накопленное за
-			// игру состояние: персонаж, упавший за секунду до Stop, лежит там, где упал, и никакой
-			// откат КОМПОНЕНТОВ его оттуда не поднимет - в компонентах ничего и не менялось
-			// (Enabled и Physical у него авторские). Снесённый рэгдолл на следующем же кадре
-			// собирается заново по восстановленной позе, то есть ровно там, где его поставил автор.
+			// Destroyed, not returned to animation: the bodies ARE the accumulated state, and they
+			// rebuild next frame from the restored pose.
 			DestroyRagdoll(character);
 
-			// Цепочки spring bones копят инерцию - тот же случай. Пересобираются по позе.
+			// Spring bone chains carry inertia; they rebuild from the pose too.
 			character.Chains.Clear();
 			character.ChainsBuilt = false;
 		}
 	}
 
-	/// <summary>
-	/// Запускает хит-реакцию: временный частичный рэгдолл. Корпус получает толчок
-	/// <paramref name="velocityChange"/> (м/с, приращение скорости - от массы не зависит) и на
-	/// <paramref name="duration"/> секунд поза корпуса подмешивается из физики, ноги продолжают
-	/// идти анимацией. Требует <see cref="RagdollComponent"/> на сущности (нечем реагировать);
-	/// выключенный компонент - нормальный случай, тела соберутся на время реакции и снесутся после.
-	/// Повторный удар во время реакции ПЕРЕЗАПУСКАЕТ конверт и добавляет толчок - очередь ударов
-	/// сливается в один длинный, а не теряется.
-	/// </summary>
+	/// <summary>Starts a hit reaction: a temporary partial ragdoll on the upper body.</summary>
+	// velocityChange is in m/s (a velocity delta, mass-independent). Requires a RagdollComponent;
+	// a repeat hit restarts the envelope and adds to the impulse instead of being dropped.
 	public void TriggerHitReaction(int entityId, Vector3 velocityChange, float duration = 0.7f,
 		float strength = 1f)
 	{
@@ -134,10 +101,8 @@ public sealed partial class AnimationDriver
 			return;
 		}
 
-		// Перезапуск ПОВЕРХ идущей реакции - БЕЗ обнуления конверта: атака стартует с ТЕКУЩЕГО
-		// веса, а не с нуля. Обнуление на кадр возвращало позу в чистую анимацию и тут же снова
-		// роняло в физику - при серии ударов (капсулы в контакте, кулдаун тарана короче конверта)
-		// это читалось как «дёргается между рэгдоллом и анимацией».
+		// Restart carries the CURRENT envelope weight; resetting to zero snaps back to pure
+		// animation for one frame, which reads as a twitch under a burst of hits.
 		float carried = 0f;
 		if (character.ReactionDuration > 0f && character.ReactionElapsed < character.ReactionDuration)
 		{
@@ -154,18 +119,15 @@ public sealed partial class AnimationDriver
 		character.ReactionImpulsePending = true;
 	}
 
-	/// <summary>Длительность атаки конверта реакции, с: толчок обязан быть виден почти сразу.</summary>
+	// Reaction envelope attack, seconds.
 	private const float ReactionAttackSeconds = 0.06f;
 
-	/// <summary>Идёт ли ещё подъём. По нему вызывающий понимает, когда персонаж снова управляем.</summary>
+	/// <summary>True while the get-up is still running, i.e. the character is not yet controllable.</summary>
 	public bool IsRecovering(int entityId) =>
 		_characters.TryGetValue(entityId, out var character) && character.RecoveryElapsed < character.RecoveryDuration;
 
-	/// <summary>
-	/// Успокоился ли рэгдолл: скорость самой быстрой кости в ДОЛЯХ характерного размера скелета за
-	/// секунду. Доля, а не абсолют - у лисы габарит 160 единиц модели, у метрового персонажа 1.8, и
-	/// одно и то же число означает для них совершенно разное.
-	/// </summary>
+	/// <summary>Whether the ragdoll has settled.</summary>
+	// relativeSpeed is in skeleton spans per second, not world units: rig scales differ wildly.
 	public bool IsRagdollSettled(int entityId, float relativeSpeed)
 	{
 		if (!_characters.TryGetValue(entityId, out var character) || character.Ragdoll == null ||
@@ -188,14 +150,8 @@ public sealed partial class AnimationDriver
 		return true;
 	}
 
-	/// <summary>
-	/// Куда «смотрит» лежащий персонаж: горизонтальная проекция оси таз→шея текущей позы в мире.
-	/// Для разворота сущности ПЕРЕД подъёмом: встать вдоль тела, а не докручиваться из поворота,
-	/// с которым персонаж когда-то упал, - укатившийся рэгдолл лежит под произвольным углом, и
-	/// подъём без разворота проворачивал корпус на весь этот угол («странно поднимается»).
-	/// Ложь (false) - у почти вертикально лежащей оси (рэгдолл замер сидя): горизонтальной
-	/// проекции не из чего взяться, и прежний поворот честнее случайного.
-	/// </summary>
+	/// <summary>World facing of a lying character: horizontal projection of the hips-to-neck axis.</summary>
+	// False when that axis is near vertical (ragdoll settled sitting): no meaningful projection.
 	public bool TryGetLyingFacing(int entityId, out Vector3 worldForward)
 	{
 		worldForward = default;
@@ -223,7 +179,7 @@ public sealed partial class AnimationDriver
 			Vector3.Transform(character.Models[hips].Translation, character.ModelToWorld);
 		direction.Y = 0f;
 
-		// Порог - доля длины оси: лежащее тело даёт почти всю длину в горизонталь, сидящее - крохи.
+		// Threshold is a fraction of the axis length, so it holds across rig scales.
 		float span = Vector3.Distance(character.Models[neck].Translation, character.Models[hips].Translation) *
 			WorldScaleOf(character.ModelToWorld);
 
@@ -236,9 +192,8 @@ public sealed partial class AnimationDriver
 		return true;
 	}
 
-	/// <summary>Мировая позиция таза (или корня рэгдолла) - туда персонаж встаёт. Именно кость, а не
-	/// трансформ сущности: сущность всё это время стояла там, откуда персонаж упал, а лежит он уже в
-	/// другом месте.</summary>
+	/// <summary>World position of the ragdoll root bone - where the character gets up.</summary>
+	// The bone, not the entity transform: the entity never left the spot where the fall started.
 	public bool TryGetRagdollRootWorld(int entityId, out Vector3 position)
 	{
 		position = Vector3.Zero;
@@ -253,12 +208,7 @@ public sealed partial class AnimationDriver
 		return true;
 	}
 
-	/// <summary>
-	/// Поза подъёма из АВТОРСКОГО клипа (см. BeginRecovery): семплирует клип по времени
-	/// восстановления, без зацикливания. Возвращает true, пока подъём ведёт позу, - обычный стек
-	/// (локомоушен, наложения, IK) в это время не работает. Снимок лёжки вливается поверх в
-	/// ApplyRecoveryBlend коротким окном.
-	/// </summary>
+	// True while the get-up clip drives the pose: the normal stack (locomotion, layers, IK) is off.
 	private bool ApplyGetUpClip(Character character)
 	{
 		if (character.GetUpClip == null)
@@ -295,10 +245,8 @@ public sealed partial class AnimationDriver
 		return true;
 	}
 
-	/// <summary>
-	/// На спине ли лежит персонаж: куда смотрит в мире «спинной верх» таза - ось, которая в
-	/// bind-позе смотрела в модельный +Y. Для выбора клипа подъёма (со спины/с живота).
-	/// </summary>
+	/// <summary>Whether the character lies on its back, for picking the get-up clip.</summary>
+	// Measured from the hips axis that pointed at model +Y in the bind pose.
 	public bool TryGetLyingSide(int entityId, out bool onBack)
 	{
 		onBack = false;
@@ -331,7 +279,6 @@ public sealed partial class AnimationDriver
 		return true;
 	}
 
-	/// <summary>Модельная матрица джойнта в BIND-позе - композицией локалей вверх по родителям.</summary>
 	private static Matrix4x4 BindModelMatrix(PreparedSkeleton skeleton, int joint)
 	{
 		var result = Matrix4x4.Identity;
@@ -345,15 +292,8 @@ public sealed partial class AnimationDriver
 		return result;
 	}
 
-	/// <summary>
-	/// Смешивает позу подъёма с позой анимации. Идёт ПОСЛЕДНЕЙ стадией, после рэгдолла: он к этому
-	/// моменту уже переведён в режим анимации и позу не пишет, а всё, что до него, - это как раз та
-	/// целевая поза, к которой персонаж встаёт.
-	///
-	/// Смешиваются РАЗЛОЖЕННЫЕ TRS, а не матрицы напрямую: покомпонентная интерполяция матриц
-	/// поворота даёт неортогональный базис в середине перехода, то есть кости, которые на полпути
-	/// сплющиваются и растягиваются.
-	/// </summary>
+	// Must run LAST, after the ragdoll stage. Blends decomposed TRS, not matrices: componentwise
+	// matrix lerp yields a non-orthogonal basis mid-transition, i.e. bones that squash and stretch.
 	private void ApplyRecoveryBlend(Character character)
 	{
 		if (character.RecoveryElapsed >= character.RecoveryDuration || character.RecoveryFrom == null)
@@ -363,15 +303,13 @@ public sealed partial class AnimationDriver
 
 		character.RecoveryElapsed += character.LastDelta;
 
-		// Вес - по ОКНУ ВЛИВАНИЯ, не по всей длительности: у морфа они совпадают (прежнее
-		// поведение), у авторского клипа окно короткое - дальше клип ведёт позу сам.
+		// Weighted by the blend window, not the full duration: after it the clip drives alone.
 		float window = character.RecoveryBlendSeconds > 0f
 			? character.RecoveryBlendSeconds
 			: character.RecoveryDuration;
 		float t = Math.Clamp(character.RecoveryElapsed / window, 0f, 1f);
 
-		// Сглаживание на концах (smoothstep): линейный вес даёт заметный излом скорости в начале и в
-		// конце подъёма - персонаж трогается и останавливается рывком.
+		// Smoothstep: a linear weight kinks the velocity at both ends of the get-up.
 		float weight = t * t * (3f - 2f * t);
 
 		for (int i = 0; i < character.Models.Length; i++)

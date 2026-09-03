@@ -5,19 +5,9 @@ using DecaEngine.Graphics.Diligent;
 
 namespace DecaEngine.Graphics.ProbeGi;
 
-/// <summary>
-/// Дебаг-вид probe-GI: шарик-октаэдр на каждую пробу в её ФАКТИЧЕСКОЙ позиции - узел сетки плюс
-/// смещение релокации из атласа (см. ProbeDebugVS.hlsl). Кодировка на шарике: цвет = накопленный
-/// SH L0, красный = невалидная («в стене»), голубая кромка = переехала релокацией.
-///
-/// Рисуется инлайн в конце ForwardPass (см. GraphicsPipelineSimple.InlineOverlay) - в уже
-/// привязанный render target, с депт-тестом сцены. Ни вершинного буфера, ни
-/// инстансинга: один Draw(24 * probeCount), всё восстанавливается из SV_VertexID.
-///
-/// Живёт по СЕССИИ (сетка и атласы меняются вместе с ней): пересоздаётся там же, где
-/// ProbeGiTextures. Позиции читаются из тех же атласов, что пишет раунд, поэтому вид одинаково
-/// честен для GPU- и CPU-пути и не требует ни снимков, ни синхронизации.
-/// </summary>
+/// <summary>Probe-GI debug view: one octahedron per probe at its ACTUAL position (grid node plus
+/// relocation offset). Color = SH L0, red = invalid ("in wall"), cyan rim = relocated. No vertex
+/// buffer: one Draw(24 * probeCount), everything reconstructed from SV_VertexID.</summary>
 public sealed class ProbeDebugOverlay : IDisposable
 {
 	private struct ProbeDebugParams
@@ -25,7 +15,7 @@ public sealed class ProbeDebugOverlay : IDisposable
 		public Vector4 GridOriginRadius;
 		public Vector4 GridCellCount;
 
-		/// <summary>xyz - размер сетки проб; по нему VS разворачивает номер шарика в узел.</summary>
+		// xyz = probe grid size; the VS unpacks a probe index into a node from it.
 		public Vector4 GridCounts;
 
 		public Vector4 Tint;
@@ -36,13 +26,9 @@ public sealed class ProbeDebugOverlay : IDisposable
 	private readonly float _radius;
 	private readonly Vector3 _tint;
 
-	/// <summary>Положение, под которое залит кбуфер. Прокрутка его меняет (см.
-	/// ProbeGiBakeSession.LayoutGeneration), и без сверки шарики остались бы стоять там, откуда
-	/// объём уже уехал.</summary>
+	// Layout the cbuffer was filled for; without checking it, spheres would lag a scrolled volume.
 	private int _layoutGeneration = -1;
 
-	/// <param name="tint">Цветовая метка объёма (аддитивная подкраска шариков): каскады получают
-	/// свой цвет, чтобы отличаться от базовых проб - их шарики мельче и стоят среди базовых.</param>
 	public ProbeDebugOverlay(DiligentGraphicsApi dilApi, IGraphicsApi api,
 		IBatchRenderer batchRenderer, ProbeGiBakeSession session, ProbeGiTextures textures,
 		TextureObjectFormat colorFormat, Vector3 tint = default)
@@ -62,11 +48,9 @@ public sealed class ProbeDebugOverlay : IDisposable
 			RenderTargetFormats = [colorFormat],
 			DepthStencilFormat = TextureObjectFormat.D32Float,
 			PrimitiveTopology = PrimitiveTopologyType.TriangleList,
-			// Без отбраковки: октаэдр выпуклый и перерисовка мизерная, а от порядка обхода вершин
-			// массива в шейдере PSO зависеть не должен.
+			// No culling: the PSO must not depend on the shader's vertex winding order.
 			RasterizerState = new RasterizerStateInfo { CullMode = CullModeType.None },
-			// Reversed-Z, как у всей сцены (см. ForwardPass: клир глубины нулём): шарики честно
-			// прячутся за геометрией.
+			// Reversed-Z, matching the scene (ForwardPass clears depth to zero).
 			DepthStencilState = new DepthStencilStateInfo
 			{
 				DepthEnable = true,
@@ -77,25 +61,17 @@ public sealed class ProbeDebugOverlay : IDisposable
 
 		batchRenderer.BindViewConstants(_material);
 
-		// Буфера углов кирпичей здесь больше нет: у плотной сетки координаты узла ЕСТЬ номер шарика,
-		// и VS разворачивает его делением с остатком (см. ProbeDebugVS.hlsl).
 		_material.SetTexture("_ProbeOffset", textures.Offset, HandleAccess.Vertex);
 		_material.SetTexture("_ProbeSh0", textures.Sh0, HandleAccess.Vertex);
 		_material.SetTexture("_ProbeSh1", textures.Sh1, HandleAccess.Vertex);
 
-		// Радиус шарика - доля минимального шага сетки: на плотной сетке шарики мельче и не
-		// сливаются в кашу, на редкой - крупнее и видны издалека.
+		// Sphere radius scales with the minimum grid step so dense grids stay readable.
 		_radius = textures.MinCellSize * 0.12f;
 		_tint = tint;
 		Refresh(session);
 	}
 
-	/// <summary>Догоняет положение объёма: угол сетки в мире и тороидальное смещение. Зовётся по
-	/// номеру раскладки, то есть фактически только после прокрутки - без этого шарики остались бы
-	/// стоять там, откуда объём уехал.
-	///
-	/// Заливки буфера здесь больше нет вовсе: раньше на каждую прокрутку сюда ехали углы всех
-	/// кирпичей, теперь всё состояние - пять векторов кбуфера.</summary>
+	/// <summary>Re-uploads volume placement; effectively runs only after a layout change.</summary>
 	public void Refresh(ProbeGiBakeSession session)
 	{
 		if (_layoutGeneration == session.LayoutGeneration)
@@ -115,8 +91,7 @@ public sealed class ProbeDebugOverlay : IDisposable
 		_material.SetConstant("ProbeDebugParams", ref constants, HandleAccess.Vertex);
 	}
 
-	/// <summary>Рисует шарики в УЖЕ привязанный render target - зовётся из ForwardPass через
-	/// GraphicsPipelineSimple.InlineOverlay.</summary>
+	/// <summary>Draws into the ALREADY bound render target (ForwardPass inline overlay).</summary>
 	public void Draw(ICommandBuffer cmd)
 	{
 		cmd.SetPipelineState(_material);
