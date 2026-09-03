@@ -1,25 +1,25 @@
 ﻿[shim] agility: SetSDKVersion(619, ".\D3D12\") hr=0x00000000
 [probe] backend: D3D12
 [probe] meshes=1 materials=2 instances=1
-[probe] alpha-tested shadows: 0 materials, не кастеры: 0
+[probe] alpha-tested shadows: 0 materials, non-casters: 0
 [probe] entities created: 1 (subMesh=-1)
-[probe] physics: сфера легла на y=0,4997 (ожидалось 0,5) OK, снос по XZ 0
-[probe] physics: райкаст попал на 4,0003 (ожидалось 4), нормаль <0  1  -1,7669836E-10> OK
-[probe] physics: райкаст мимо сферы попал в статик на 5 OK
-[probe] physics: сфера на МЕШЕ легла на y=0,4999 (ожидалось 0,5) OK
-[probe] physics: пересборка статики - треугольников 2 -> 2, сфера легла на y=2,4999 (ожидалось 2,5) OK
-[probe] physics: ПУСТАЯ пересборка - треугольников осталось 2, сфера на y=2,4999 OK
-[probe] physics: контактов собрано 1, дальше всех от центра тела на 0,4999 OK
-[probe] skinning: 1 персонажей через компоненты, клип нет (bind-поза), t=0s
-[probe] bounds: min=<-79,419914  -42,42504  -68,936676> max=<79,419914  116,41479  89,90315> size=<158,83983  158,83983  158,83983>
-[probe] eye=<-238,32623  191,06735  358,84372> target=<0  36,994873  10,483238> distance=449,32477
-[probe] surface cache: 9934 voxels over 438976 cells (2,3% filled), voxel 2,17
-[probe] probe-gi field: skyVis avg=0,929 max=1,000, validity avg=0,989, sunFrac avg=0,008 max=0,258
-[probe] lighting: pixels=262144 lum avg=131,2 min=32 max=242 chroma avg=16,2 max=190
-[probe] lighting_flat: pixels=262144 lum avg=131,1 min=32 max=238 chroma avg=15,9 max=177
-[probe] debug_ambient: pixels=262144 lum avg=138,4 min=2 max=210 chroma avg=12,9 max=91
-[probe] debug_direct: pixels=262144 lum avg=138,3 min=0 max=210 chroma avg=12,6 max=93
-[probe] debug_envspec: pixels=262144 lum avg=137,5 min=1 max=210 chroma avg=11,3 max=15
-[probe] debug_probes: pixels=262144 lum avg=142,0 min=103 max=210 chroma avg=15,8 max=250
-[probe] highlight: pixels=262144 lum avg=141,3 min=28 max=255 chroma avg=11,4 max=15
-[probe] channel_normal: pixels=262144 lum avg=140,7 min=46 max=212 chroma avg=14,9 max=184
+[probe] physics: sphere rested at y=0.4997 (expected 0.5) OK, XZ drift 0
+[probe] physics: raycast hit at 4.0003 (expected 4), normal <0, 1, -1.7669836E-10> OK
+[probe] physics: raycast past the sphere hit a static at 5 OK
+[probe] physics: sphere on a MESH rested at y=0.4999 (expected 0.5) OK
+[probe] physics: statics rebuild - triangles 2 -> 2, sphere rested at y=2.4999 (expected 2,5) OK
+[probe] physics: EMPTY rebuild - triangles left 2, sphere at y=2.4999 OK
+[probe] physics: contacts collected 1, farthest from the body center by 0.4999 OK
+[probe] skinning: 1 characters via components, clip none (bind pose), t=0s
+[probe] bounds: min=<-79.419914, -42.42504, -68.936676> max=<79.419914, 116.41479, 89.90315> size=<158.83983, 158.83983, 158.83983>
+[probe] eye=<-238.32623, 191.06735, 358.84372> target=<0, 36.994873, 10.483238> distance=449.32477
+[probe] surface cache: 9934 voxels over 438976 cells (2.3% filled), voxel 2.17
+[probe] probe-gi field: skyVis avg=0.929 max=1.000, validity avg=0.989, sunFrac avg=0.008 max=0.258
+[probe] lighting: pixels=262144 lum avg=131.2 min=32 max=242 chroma avg=16.2 max=190
+[probe] lighting_flat: pixels=262144 lum avg=131.1 min=32 max=238 chroma avg=15.9 max=177
+[probe] debug_ambient: pixels=262144 lum avg=138.4 min=2 max=210 chroma avg=12.9 max=91
+[probe] debug_direct: pixels=262144 lum avg=138.3 min=0 max=210 chroma avg=12.6 max=93
+[probe] debug_envspec: pixels=262144 lum avg=137.5 min=1 max=210 chroma avg=11.3 max=15
+[probe] debug_probes: pixels=262144 lum avg=142.0 min=103 max=210 chroma avg=15.8 max=250
+[probe] highlight: pixels=262144 lum avg=141.3 min=28 max=255 chroma avg=11.4 max=15
+[probe] channel_normal: pixels=262144 lum avg=140.7 min=46 max=212 chroma avg=14.9 max=184

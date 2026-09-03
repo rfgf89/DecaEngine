@@ -1,34 +1,37 @@
 ﻿[shim] agility: SetSDKVersion(619, ".\D3D12\") hr=0x00000000
 [probe] backend: D3D12
 [probe] meshes=1 materials=2 instances=1
-[probe] alpha-tested shadows: 0 materials, не кастеры: 0
+[probe] alpha-tested shadows: 0 materials, non-casters: 0
 [probe] entities created: 1 (subMesh=-1)
-[probe] gameplay: круг - худшее отклонение радиуса 0 OK, высота 0,5 (ожидалась 0,5)
-[probe] gameplay: путь за оборот 12,5663 (ожидался 12,5664) OK
-[probe] gameplay: замыкание оборота 0,00003 OK
-[probe] gameplay: разворот по ходу - худшее расхождение 0,303° OK
-[probe] gameplay: обратный обход - z 0 -> -0,249 OK, разворот 3,58° OK
-[probe] gameplay: модель смотрит в <-0  -0  -1> - расхождение с ходом 3,58° OK, ось +Z против хода -0,998 OK
-[probe] gameplay: выключенный компонент - смещение 0 OK
-[probe] gameplay: нулевой радиус - позиция <1  2  3> OK
-[probe] gameplay: физический круг - худшее отклонение радиуса 0,001 OK, отрыв ног от пола 0,0003 OK
-[probe] gameplay: физический круг - путь 12,562 (ожидался 12,566) OK, пройдено 0,999 оборота OK
-[probe] gameplay: стена поперёк круга - тело дошло до x=0,279 OK (не прошло), трансформ - до x=-2 OK (прошёл, как и должен)
-[probe] gameplay: статика стабильна - ноги на -0,0003 OK; статика пересобирается каждый кадр - ноги на -0,0003 (тоже держится)
-[probe] gameplay: игрок - ходьба 1,999 м за 2 с (ожидалось 2, вдоль ввода 0,7071) НЕ ТУДА/НЕ СТОЛЬКО, бег 2,999 м за 1 с (ожидалось 3) OK
-[probe] gameplay: игрок - без ввода снесло на 0 м СТОИТ OK, разворот по ходу 0,7071 СМОТРИТ НЕ ТУДА
-[probe] gameplay: step-up - со ступенькой дошёл до x=0 (поднимался до y=0) НЕ ВЗЯЛ СТУПЕНЬ, стена ДЕРЖИТ OK; без step-up дошёл до x=0 СТУПЕНЬ ДЕРЖИТ OK
-[probe] gameplay: прыжок - апекс 0,605 (баллистика 0,624) OK, второй Space в воздухе - апекс 0,605 ДАБЛДЖАМПА НЕТ OK, JumpSpeed=0 - подъём 0 НЕ ПРЫГАЕТ OK
-[probe] skinning: 1 персонажей через компоненты, клип нет (bind-поза), t=0s
-[probe] bounds: min=<-79,419914  -42,42504  -68,936676> max=<79,419914  116,41479  89,90315> size=<158,83983  158,83983  158,83983>
-[probe] eye=<-238,32623  191,06735  358,84372> target=<0  36,994873  10,483238> distance=449,32477
-[probe] surface cache: 9934 voxels over 438976 cells (2,3% filled), voxel 2,17
-[probe] probe-gi field: skyVis avg=0,929 max=1,000, validity avg=0,989, sunFrac avg=0,008 max=0,258
-[probe] lighting: pixels=262144 lum avg=131,2 min=32 max=242 chroma avg=16,2 max=190
-[probe] lighting_flat: pixels=262144 lum avg=131,1 min=32 max=238 chroma avg=15,9 max=177
-[probe] debug_ambient: pixels=262144 lum avg=138,4 min=2 max=210 chroma avg=12,9 max=91
-[probe] debug_direct: pixels=262144 lum avg=138,3 min=0 max=210 chroma avg=12,6 max=93
-[probe] debug_envspec: pixels=262144 lum avg=137,5 min=1 max=210 chroma avg=11,3 max=15
-[probe] debug_probes: pixels=262144 lum avg=142,0 min=103 max=210 chroma avg=15,8 max=250
-[probe] highlight: pixels=262144 lum avg=141,3 min=28 max=255 chroma avg=11,4 max=15
-[probe] channel_normal: pixels=262144 lum avg=140,7 min=46 max=212 chroma avg=14,9 max=184
+[probe] gameplay: circle - worst radius deviation 0 OK, height 0.5 (expected 0.5)
+[probe] gameplay: path per lap 12.5663 (expected 12.5664) OK
+[probe] gameplay: lap closure 0.00003 OK
+[probe] gameplay: facing along motion - worst mismatch 0.303° OK
+[probe] gameplay: reverse direction - z 0 -> -0.249 OK, facing 3.58° OK
+[probe] gameplay: model faces <-0, -0, -1> - mismatch with motion 3.58° OK, +Z axis against motion -0.998 OK
+[probe] gameplay: disabled component - displacement 0 OK
+[probe] gameplay: zero radius - position <1, 2, 3> OK
+[probe] gameplay: physical circle - worst radius deviation 0.001 OK, feet off the floor 0.0003 OK
+[probe] gameplay: physical circle - path 12.562 (expected 12.566) OK, covered 0.999 of a lap OK
+[probe] gameplay: wall across the circle - body reached x=0.279 OK (did not pass), transform - reached x=-2 OK (passed, as it should)
+[probe] gameplay: statics stable - feet at -0.0003 OK; statics rebuilt every frame - feet at -0.0003 (holds too)
+[probe] gameplay: own bones inside the capsule - feet end at -0.0009, minimum -0.0016, rescues from under the floor 0 OK (holds)
+[probe] gameplay: capsule under the floor (feet at -0.3) - rescues 1, feet immediately at -0.0002, half a second later at -0.0003, rescues in total 1 OK (lifted by a single rescue)
+[probe] gameplay: floor arrived a second after Play - without a floor bodies 0, feet at 0; with a floor bodies 1, feet at -0.0003, travelled 0.99 m OK (waited for the floor)
+[probe] gameplay: player - walk 1.99 m in 2 s (expected 2, along input 0.9998) OK, run 2.999 m in 1 s (expected 3) OK
+[probe] gameplay: player - with no input drifted 0 m STANDS OK, facing along motion 1 OK
+[probe] gameplay: step-up - with a step reached x=4.82 (rose to y=0.185) CLIMBED OK, wall HOLDS OK; without step-up reached x=1.03 STEP HOLDS OK
+[probe] gameplay: jump - apex 0.605 (ballistic 0.624) OK, second Space in mid-air - apex 0.605 NO DOUBLE JUMP OK, JumpSpeed=0 - lift 0 DOES NOT JUMP OK
+[probe] skinning: 1 characters via components, clip none (bind pose), t=0s
+[probe] bounds: min=<-79.419914, -42.42504, -68.936676> max=<79.419914, 116.41479, 89.90315> size=<158.83983, 158.83983, 158.83983>
+[probe] eye=<-238.32623, 191.06735, 358.84372> target=<0, 36.994873, 10.483238> distance=449.32477
+[probe] surface cache: 9934 voxels over 438976 cells (2.3% filled), voxel 2.17
+[probe] probe-gi field: skyVis avg=0.929 max=1.000, validity avg=0.989, sunFrac avg=0.008 max=0.258
+[probe] lighting: pixels=262144 lum avg=131.2 min=32 max=242 chroma avg=16.2 max=190
+[probe] lighting_flat: pixels=262144 lum avg=131.1 min=32 max=238 chroma avg=15.9 max=177
+[probe] debug_ambient: pixels=262144 lum avg=138.4 min=2 max=210 chroma avg=12.9 max=91
+[probe] debug_direct: pixels=262144 lum avg=138.3 min=0 max=210 chroma avg=12.6 max=93
+[probe] debug_envspec: pixels=262144 lum avg=137.5 min=1 max=210 chroma avg=11.3 max=15
+[probe] debug_probes: pixels=262144 lum avg=142.0 min=103 max=210 chroma avg=15.8 max=250
+[probe] highlight: pixels=262144 lum avg=141.3 min=28 max=255 chroma avg=11.4 max=15
+[probe] channel_normal: pixels=262144 lum avg=140.7 min=46 max=212 chroma avg=14.9 max=184

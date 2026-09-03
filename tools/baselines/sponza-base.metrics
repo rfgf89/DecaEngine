@@ -1,20 +1,20 @@
 ﻿[shim] agility: SetSDKVersion(619, ".\D3D12\") hr=0x00000000
 [probe] backend: D3D12
 [probe] meshes=103 materials=26 instances=103
-[probe] alpha-tested shadows: 3 materials, не кастеры: 0
-[probe] transparent material 0: mode=Mask cutoff=0,50 avgAlpha=0,321 soft=0,179
-[probe] transparent material 3: mode=Mask cutoff=0,50 avgAlpha=0,341 soft=0,019
-[probe] transparent material 20: mode=Mask cutoff=0,50 avgAlpha=0,232 soft=0,009
+[probe] alpha-tested shadows: 3 materials, non-casters: 0
+[probe] transparent material 0: mode=Mask cutoff=0.50 avgAlpha=0.321 soft=0.179
+[probe] transparent material 3: mode=Mask cutoff=0.50 avgAlpha=0.341 soft=0.019
+[probe] transparent material 20: mode=Mask cutoff=0.50 avgAlpha=0.232 soft=0.009
 [probe] entities created: 103 (subMesh=-1)
-[probe] bounds: min=<-18,346436  -13,026234  -17,478916> max=<17,38559  28,140556  18,253109> size=<35,732025  41,16679  35,732025>
-[probe] eye=<-56,942562  44,058647  82,91757> target=<-0,48042297  7,5571613  0,3870964> distance=106,45004
-[probe] surface cache: 15155 voxels over 311296 cells (4,9% filled), voxel 0,58
-[probe] probe-gi field: skyVis avg=0,783 max=0,979, validity avg=0,978, sunFrac avg=0,029 max=0,881
-[probe] lighting: pixels=262144 lum avg=128,0 min=15 max=205 chroma avg=12,9 max=40
-[probe] lighting_flat: pixels=262144 lum avg=129,5 min=20 max=205 chroma avg=12,9 max=44
-[probe] debug_ambient: pixels=262144 lum avg=133,2 min=0 max=210 chroma avg=11,2 max=25
-[probe] debug_direct: pixels=262144 lum avg=132,6 min=0 max=210 chroma avg=11,1 max=18
-[probe] debug_envspec: pixels=262144 lum avg=131,9 min=1 max=210 chroma avg=10,9 max=15
-[probe] debug_probes: pixels=262144 lum avg=143,1 min=110 max=210 chroma avg=23,6 max=246
-[probe] highlight: pixels=262144 lum avg=141,3 min=32 max=255 chroma avg=11,1 max=15
-[probe] channel_normal: pixels=262144 lum avg=142,1 min=58 max=220 chroma avg=20,0 max=177
+[probe] bounds: min=<-18.346436, -13.026234, -17.478916> max=<17.38559, 28.140556, 18.253109> size=<35.732025, 41.16679, 35.732025>
+[probe] eye=<-56.942562, 44.058647, 82.91757> target=<-0.48042297, 7.5571613, 0.3870964> distance=106.45004
+[probe] surface cache: 15155 voxels over 311296 cells (4.9% filled), voxel 0.58
+[probe] probe-gi field: skyVis avg=0.783 max=0.979, validity avg=0.978, sunFrac avg=0.029 max=0.881
+[probe] lighting: pixels=262144 lum avg=128.0 min=15 max=205 chroma avg=12.9 max=40
+[probe] lighting_flat: pixels=262144 lum avg=129.5 min=20 max=205 chroma avg=12.9 max=44
+[probe] debug_ambient: pixels=262144 lum avg=133.2 min=0 max=210 chroma avg=11.2 max=25
+[probe] debug_direct: pixels=262144 lum avg=132.6 min=0 max=210 chroma avg=11.1 max=18
+[probe] debug_envspec: pixels=262144 lum avg=131.9 min=1 max=210 chroma avg=10.9 max=15
+[probe] debug_probes: pixels=262144 lum avg=143.1 min=110 max=210 chroma avg=23.6 max=246
+[probe] highlight: pixels=262144 lum avg=141.3 min=32 max=255 chroma avg=11.1 max=15
+[probe] channel_normal: pixels=262144 lum avg=142.1 min=58 max=220 chroma avg=20.0 max=177
